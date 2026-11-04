@@ -10,13 +10,19 @@ RFC1_REPO = "pdtgct/vllm"
 RFC1_TIP_BRANCH = "persistent-state-primitive-v2"
 RFC1_TIP_COMMIT = "8b8327e2eece1df39eb6318eff4c9dc207b3ab61"
 
+# Interface tree for imports and the CPU register test. This commit's
+# tree is the ``465f10ad65`` tree named in the staging plan.
+RFC12_BRANCH = "rfc12-integration"
+RFC12_COMMIT = "4c1809692dfa46fcdd7a9891f69a997afa1dbb78"
+RFC12_TREE = "465f10ad65c7742fca01e25e3a1a0f58c4608094"
+
 SOURCE_BRANCH = "rfc1-5212-vllm"
 SOURCE_COMMIT = "43c0bed5bf877dc74de2e1494a3a542f497493de"
 SOURCE_TREE = "vllm/models/nemotron_asr"
 
-# Named in the staging plan. The branch was not on pdtgct/vllm when this
-# scaffold was written, so none of its trees were read.
-INTEGRATION_BRANCH = "rfc12-integration"
+# Kept as the branch name. The commit and tree that were read are
+# ``RFC12_COMMIT`` and ``RFC12_TREE``.
+INTEGRATION_BRANCH = RFC12_BRANCH
 
 # ``git merge-tree`` of the RFC1 tip and the source branch. These paths
 # changed on both sides. Do not merge the source branch over the tip.

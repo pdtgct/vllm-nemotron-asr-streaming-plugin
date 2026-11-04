@@ -9,17 +9,26 @@ from tests.fakes import drop_cached_plugin_modules, install
 def test_register_leaves_offline_architecture_untouched() -> None:
     registry = install()
     registry.models["Nemotron3_5AsrForRNNT"] = "offline-plugin"
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+    MODELS_CONFIG_MAP["Nemotron3_5AsrForRNNT"] = "offline-config"
     drop_cached_plugin_modules()
     from vllm_nemotron_asr_streaming import register
 
     register()
     register()
     assert registry.models["Nemotron3_5AsrForRNNT"] == "offline-plugin"
+    assert MODELS_CONFIG_MAP["Nemotron3_5AsrForRNNT"] == "offline-config"
     assert (
         registry.models["Nemotron3_5AsrStreamingForRNNT"]
         == "vllm_nemotron_asr_streaming.model:Nemotron3_5AsrStreamingForRNNT"
     )
+    assert (
+        MODELS_CONFIG_MAP["Nemotron3_5AsrStreamingForRNNT"].__name__
+        == "Nemotron3_5AsrStreamingConfig"
+    )
     assert "vllm_nemotron_asr_streaming.model" not in sys.modules
+    assert "vllm_nemotron_asr_streaming.nemotron_asr" not in sys.modules
 
 
 def test_register_refuses_offline_name(monkeypatch) -> None:

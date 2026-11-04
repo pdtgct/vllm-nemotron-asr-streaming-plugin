@@ -77,26 +77,52 @@ def test_pyproject_entry_point() -> None:
     assert "nemotron_asr" not in entry
 
 
-def test_lookahead_trap_is_unresolved() -> None:
+def test_lookahead_arm_must_be_explicit_and_supported() -> None:
     from vllm_nemotron_asr_streaming.lookahead import (
         CARD_DEFAULT_NUM_LOOKAHEAD_TOKENS,
         CARD_SUPPORTED_NUM_LOOKAHEAD_TOKENS,
         SOURCE_CADENCE_BY_LOOKAHEAD,
         SOURCE_NATIVE_BURST_REQUIRED_LOOKAHEADS,
         SOURCE_TRANSLATE_PINNED_LOOKAHEAD,
+        resolve_served_lookahead,
+        validate_selected_lookahead,
     )
 
     assert CARD_DEFAULT_NUM_LOOKAHEAD_TOKENS in CARD_SUPPORTED_NUM_LOOKAHEAD_TOKENS
     assert SOURCE_TRANSLATE_PINNED_LOOKAHEAD in CARD_SUPPORTED_NUM_LOOKAHEAD_TOKENS
     assert SOURCE_TRANSLATE_PINNED_LOOKAHEAD != CARD_DEFAULT_NUM_LOOKAHEAD_TOKENS
-    assert SOURCE_NATIVE_BURST_REQUIRED_LOOKAHEADS not in (
-        CARD_SUPPORTED_NUM_LOOKAHEAD_TOKENS,
-    )
     for token in SOURCE_NATIVE_BURST_REQUIRED_LOOKAHEADS:
         assert token not in CARD_SUPPORTED_NUM_LOOKAHEAD_TOKENS
     assert set(SOURCE_CADENCE_BY_LOOKAHEAD) >= set(
         CARD_SUPPORTED_NUM_LOOKAHEAD_TOKENS
     )
+    with pytest.raises(ValueError, match="must be passed explicitly"):
+        resolve_served_lookahead(
+            CARD_SUPPORTED_NUM_LOOKAHEAD_TOKENS,
+            None,
+            card_default=CARD_DEFAULT_NUM_LOOKAHEAD_TOKENS,
+        )
+    assert (
+        resolve_served_lookahead(
+            CARD_SUPPORTED_NUM_LOOKAHEAD_TOKENS,
+            3,
+            card_default=3,
+        )
+        == 3
+    )
+    with pytest.raises(ValueError, match="not in the card"):
+        resolve_served_lookahead(CARD_SUPPORTED_NUM_LOOKAHEAD_TOKENS, 1)
+    validate_selected_lookahead(
+        selected=13,
+        supported=CARD_SUPPORTED_NUM_LOOKAHEAD_TOKENS,
+        require_160ms_profile=False,
+    )
+    with pytest.raises(ValueError, match="160ms"):
+        validate_selected_lookahead(
+            selected=13,
+            supported=CARD_SUPPORTED_NUM_LOOKAHEAD_TOKENS,
+            require_160ms_profile=True,
+        )
 
 
 def test_engine_flag_overrides_are_explicit_and_unused() -> None:
@@ -113,13 +139,20 @@ def test_engine_flag_overrides_are_explicit_and_unused() -> None:
     assert "async scheduling" in REFUSED_WHEN_ENABLED
     assert "prefix caching" in REFUSED_WHEN_ENABLED
     assert "tensor_parallel_size" in PARALLEL_SIZES_MUST_BE_ONE
-    # The overrides are data. No module in the package reads them to
-    # launch an engine.
+    from vllm_nemotron_asr_streaming.engine_flags import (
+        persistent_state_config_errors,
+    )
+
+    assert persistent_state_config_errors is not None
+    used_by = []
     for path in _python_files():
         if path.name == "engine_flags.py":
             continue
         text = path.read_text(encoding="utf-8")
-        assert "REQUIRED_OVERRIDES" not in text
+        if "persistent_state_config_errors" in text:
+            used_by.append(path.name)
+    assert "streaming_config.py" in used_by
+    assert "factory.py" in used_by
 
 
 def test_merge_conflict_list_does_not_include_the_model_tree() -> None:

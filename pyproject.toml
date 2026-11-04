@@ -32,6 +32,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+extend-exclude = ["vllm_nemotron_asr_streaming/nemotron_asr"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]

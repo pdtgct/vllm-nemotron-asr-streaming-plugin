@@ -57,12 +57,14 @@ def register() -> None:
     """
     from vllm.model_executor.layers.state import PersistentStateLayerBase
     from vllm.model_executor.models import ModelRegistry
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
     from vllm.v1.engine.async_llm import AsyncLLM
     from vllm.v1.engine.core_client import EngineCoreClient
     from vllm.v1.kv_cache_interface import StateCompletion
     from vllm.v1.worker.gpu.model_states import resolve_model_state_cls
 
     from .identity import ARCHITECTURE, LAZY_MODEL, OFFLINE_ARCHITECTURE
+    from .streaming_config import Nemotron3_5AsrStreamingConfig
 
     _require_rfc1_tip(
         persistent_state_layer=PersistentStateLayerBase,
@@ -78,7 +80,14 @@ def register() -> None:
         )
 
     offline_before = ModelRegistry.models.get(OFFLINE_ARCHITECTURE)
+    config_before = MODELS_CONFIG_MAP.get(OFFLINE_ARCHITECTURE)
     ModelRegistry.register_model(ARCHITECTURE, LAZY_MODEL)
+    MODELS_CONFIG_MAP[ARCHITECTURE] = Nemotron3_5AsrStreamingConfig
+    if MODELS_CONFIG_MAP.get(OFFLINE_ARCHITECTURE) != config_before:
+        raise RuntimeError(
+            "streaming registration changed the offline config hook "
+            f"{OFFLINE_ARCHITECTURE!r}"
+        )
     if ModelRegistry.models.get(OFFLINE_ARCHITECTURE) != offline_before:
         raise RuntimeError(
             "streaming registration changed the offline architecture "
