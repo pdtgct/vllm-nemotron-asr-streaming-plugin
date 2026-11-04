@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-nemotron-asr-streaming"
+version = "0.0.1"
+description = "Staging out-of-tree plugin for cache-aware streaming Nemotron ASR on vLLM core. Not runnable yet."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{name = "Pete Tanski"}]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.entry-points."vllm.general_plugins"]
+nemotron_asr_streaming = "vllm_nemotron_asr_streaming:register"
+
+[project.urls]
+Repository = "https://github.com/pdtgct/vllm-nemotron-asr-streaming-plugin"
+SourceModel = "https://github.com/pdtgct/vllm/tree/rfc1-5212-vllm/vllm/models/nemotron_asr"
+Rfc1Tip = "https://github.com/pdtgct/vllm/tree/persistent-state-primitive-v2"
+
+[tool.setuptools.packages.find]
+include = ["vllm_nemotron_asr_streaming*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
