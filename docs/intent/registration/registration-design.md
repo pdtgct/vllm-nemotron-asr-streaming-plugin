@@ -32,7 +32,8 @@ registered before the model is built. When `VLLM_PLUGINS` is set it is an allowl
 entry-point names and must include `nemotron_asr_streaming`; otherwise the parser and tokenizer
 mode below do not exist and core rejects `--config-format nemotron_asr_streaming` as unknown.
 
-`register()` performs, in order:
+`register()` performs the following, and changes no registry until the client-path check has
+passed:
 1. **Client-path check.** `AsyncLLM.generate` must accept `stream_admission` and
    `AsyncLLM.wait_stream_retired` must exist. A missing one raises, naming it and stating that the
    plugin targets an RFC 1 + RFC 2 build. `register()` initializes no device and loads no model;
@@ -55,38 +56,62 @@ The Hub card's `model_type` (`nemotron3_5_asr`) has no vLLM configuration class,
 `architectures` names the offline key. The served configuration is produced by a config parser
 selected with `--config-format nemotron_asr_streaming`.
 
-`parse(model, trust_remote_code, revision, code_revision, **kwargs)` loads `config.json` (local
-path or Hub revision) and accepts one of two inputs:
+`parse(model, trust_remote_code, revision, code_revision, **kwargs)` loads `config.json` and
+`processor_config.json` from the local path or the requested Hub revision, and accepts one of two
+inputs:
 - **A Hub card** (has `encoder_config`): translated as below.
-- **An already-translated configuration** (its `architectures` is the streaming key): used as is,
-  then validated.
-Anything else raises, naming the expected inputs.
+- **An already-translated configuration** (its `architectures` is the streaming key, and it has no
+  `encoder_config`): used as is.
+Anything else raises, naming the expected inputs. For both inputs the parser stores the locale
+table from `processor_config.json` in the configuration as `prompt_dictionary` (an already-translated
+configuration that stores its own table must agree with the file), and both pass the same schema
+check: the control-token layout, `eos_token_id` and `vocab_size`; a non-empty locale table whose row
+indices are exactly `0 … num_prompts − 1`; and a non-empty `card_num_lookahead_tokens` drawn from
+the five implemented right contexts. Post-override validation repeats this check on the final
+configuration, since overrides can change any of these fields.
+
+The returned `PretrainedConfig` is an instance of the model's configuration class
+(`NemotronASRConfig`), which supplies the model's remaining fields and defaults. In particular its
+`hidden_size` is the stream carrier row width (17,927), the width core's architecture conversion
+reads, and `num_asr_labels` is `blank`. The configuration carries no top-level `sliding_window`:
+core would cap the derived context at it, and the encoder's attention window is the model's own
+`att_context_left`.
+
+The parser is a function of the checkpoint alone. It does not read `hf_overrides`: core passes it
+only the flat overrides, applies them again to the returned configuration, applies dictionary-valued
+overrides such as `language_locales` later still, and also calls the parser with no overrides at all
+when it derives a generation configuration from a checkpoint that has no `generation_config.json`.
+Every rule that depends on launch options runs in post-override validation (below). A callable
+`hf_overrides` given to the parser is refused with a message to use the dictionary form.
 
 Translation of a card:
 - requires `encoder_config`, `vocab_size == blank_token_id + 1` (labels are `0 … blank-1`) and
   `encoder_config.supported_num_lookahead_tokens`;
-- mints the control tokens after the blank (see the `transcription` design for the table) and sets
-  `vocab_size = blank + 6` and the model's logit width to `vocab_size`;
-- maps the encoder fields, writes the streaming architecture key, and drops `model_type` and
-  `is_encoder_decoder`;
-- reads the locale table `prompt_dictionary` from the card's `processor_config.json` and sets
-  `num_prompts` to its size; a missing or invalid table raises;
+- mints the control tokens after the blank (see the `transcription` design for the table), sets
+  `eos_token_id` to the park token `blank + 1` as the only EOS, `vocab_size = blank + 6` and the
+  model's logit width to `vocab_size`;
+- maps the encoder fields, each required to be an integer: `hidden_size` → `d_model`,
+  `num_hidden_layers` → `n_layers`, `conv_kernel_size` → `conv_kernel`, `sliding_window` →
+  `att_context_left` (`sliding_window − 1`), `num_mel_bins` → `n_mels`; maps
+  `decoder_hidden_size` → `pred_hidden` and `num_decoder_layers` → `pred_rnn_layers` when present;
+  refuses a `prompt_intermediate_size` other than `2 × hidden_size`; carries no other encoder
+  field; writes the streaming architecture key; and drops `model_type` and `is_encoder_decoder`;
+- sets `num_prompts` to the size of the locale table; a missing or invalid table raises;
 - sets `max_position_embeddings` to 2^24. The model has no positional limit; this value only lifts
   core's derived context ceiling, so the deployment's `max_model_len` is the effective bound;
-- records the served lookahead set and the default lookahead (below).
+- records the card's lookahead set as `card_num_lookahead_tokens`, drops any default lookahead and
+  any top-level `supported_num_lookahead_tokens` the card carries, and declares
+  `decode_dispatch_arm = "dense-eager"`, the decoder dispatch the model requires a configuration to
+  declare.
 
-Precedence is fixed: values the translation computes (control tokens, vocabulary, logit width,
-architecture) win over any same-named card key, and an override of any of them is refused.
+Values the translation computes (control-token IDs, `eos_token_id`, vocabulary, logit width,
+architecture) win over any same-named card key. Post-override validation refuses a final
+configuration in which a computed token or vocabulary value differs from the computed layout,
+which catches an override of one. An override of `architectures` selects a different model, whose
+own hook runs instead; this plugin does not govern it.
 
-**Overrides.** Core applies `--hf-overrides` only after the parser returns, but translation needs
-the lookahead while it builds the configuration. So the parser reads `num_lookahead_tokens`,
-`supported_num_lookahead_tokens`, `experimental_native_burst` and `language_locales` (see the
-`transcription` design) from the `hf_overrides` keyword it receives. Only dictionary overrides are supported; a callable override is refused with a message
-to use the dictionary form. Core then applies the same overrides, and post-override validation
-confirms they agree.
-
-The parser returns the translated dictionary and a `PretrainedConfig` built from it. It provides no
-generation configuration: the served model has no generation-config `max_tokens`.
+The parser returns the translated dictionary and a `PretrainedConfig` built from it. A generation
+configuration derived from it carries only the park token as EOS and no length limit.
 
 ## Tokenizer mode
 
@@ -94,8 +119,11 @@ The card's tokenizer holds the label pieces only. Core detokenizes every emitted
 `skip_special_tokens` drops only tokens the tokenizer marks special. The tokenizer mode
 `nemotron_asr_streaming` (selected with `--tokenizer-mode nemotron_asr_streaming`) loads the card's
 tokenizer and appends, in order, a blank placeholder at `blank` and the control tokens at
-`blank + 1 … blank + 5`, all special, and checks that each lands at its expected ID. Startup fails
-otherwise.
+`blank + 1 … blank + 5`, all special, and sets the park token `blank + 1` as the tokenizer's
+`eos_token_id`. Core takes a request's primary EOS from the tokenizer, and a persistent-state
+stream parks only on that EOS (any other stop ends the stream), so this binding is what lets a
+stream resume after each unit. Loading fails if any token lands at an unexpected ID or the
+tokenizer reports any other EOS.
 
 ## Lookahead selection
 
@@ -103,14 +131,20 @@ The model implements five encoder geometries, `80ms`, `160ms`, `320ms`, `560ms` 
 (left context 56 frames, right context 0, 1, 3, 6 and 13). The card declares the lookaheads it was
 trained for (0, 3, 6 and 13).
 
-- **Served set.** The card's set, or the `supported_num_lookahead_tokens` override when given. An
-  override replaces the card's set; every value must be one of the five right contexts, and the set
-  must not be empty. A value outside the card's set (lookahead 1) is allowed but logged as a
+The launch options are flat `--hf-overrides` keys, which core applies to the served configuration:
+`supported_num_lookahead_tokens`, `num_lookahead_tokens` and `experimental_native_burst`.
+
+- **Served set.** `supported_num_lookahead_tokens` when the final configuration has it (from
+  `--hf-overrides`, or stored by an already-translated configuration), else
+  `card_num_lookahead_tokens`. Translation removes a top-level `supported_num_lookahead_tokens` a Hub
+  card carries, so for a card only the override can set it. It replaces the card's set; every value must be one of the five right contexts, and the
+  set must not be empty. A value outside the card's set (lookahead 1) is allowed but logged as a
   geometry the checkpoint does not declare.
-- **Default lookahead.** `num_lookahead_tokens` must be given explicitly in `--hf-overrides` and
-  must be in the served set. It is the cadence for complete files and core's `/v1/realtime`, and the
-  configuration's nominal `att_context_right`. A card's own default or top-level value is never
-  used.
+- **Default lookahead.** `num_lookahead_tokens` must be present in the final configuration and in
+  the served set. For a Hub card it can only come from `--hf-overrides`, since translation drops the
+  card's own; an already-translated configuration may store it. It is the cadence for complete
+  files and core's `/v1/realtime`; validation sets the configuration's nominal `att_context_right`
+  to it.
 - **Native burst.** `experimental_native_burst: true` requires the default lookahead to be 1; it
   does not restrict the served set.
 
@@ -118,10 +152,23 @@ trained for (0, 3, 6 and 13).
 
 The configuration hook runs twice during startup:
 - `verify_and_update_model_config(model_config)` runs at the end of model configuration, after
-  overrides. It checks `num_lookahead_tokens == att_context_right`, membership in the served set,
-  every served value being one of the five right contexts, the architecture being the streaming
-  key, the control-token layout, and `max_model_len ≥ 1 + realtime_max_tokens` (the smallest
-  context in which one stream unit fits).
+  core has applied every override. It resolves the served set and the default lookahead (above),
+  sets `att_context_right`, and checks: the default lookahead is present and served; every served
+  value is one of the five right contexts; native burst; the
+  control-token layout, `eos_token_id` and `vocab_size` equal the computed values;
+  `language_locales`, when given, maps ISO 639-1 languages to locales of that language in the
+  locale table; and `max_model_len ≥ 1 + realtime_max_tokens` (the smallest context in which one
+  stream unit fits). It repeats the parser's schema check, and checks generation defaults in two places, because core
+reads them in two places. Request EOS and stop tokens come from
+`model_config.try_get_generation_config()`, which loads the checkpoint's `generation_config.json`
+under both `--generation-config auto` and `vllm` (a directory selects another file): any `eos_token_id` there must be the park token alone, because
+core turns any other EOS into a stop token that ends a stream at its first park; the remedy is
+`--generation-config <dir>` naming a directory whose generation configuration has no other EOS.
+Default sampling limits come from `model_config.get_diff_sampling_param()`, which also merges
+`--override-generation-config`: it must contain no `max_tokens`; the remedy is
+`--generation-config vllm` and no token-limit override. It logs each language
+  that has several locales and no `language_locales` entry, which complete-file transcription will
+  refuse.
 - `verify_and_update_config(vllm_config)` runs once while the engine configuration is resolved and
   refuses the engine settings below. Settings that core resolves only later are re-checked when the
   model state is constructed.
@@ -180,7 +227,8 @@ The vendored code differs from this design in ways the implementation changes: t
 registration checks `StateCompletion` and `EngineCoreClient.admit_stream_async`, registers no
 parser or tokenizer mode, and has an empty model-config hook; the translation mints four control
 tokens with `vocab_size = blank + 5`, lets leftover card keys overwrite computed fields, falls back
-to the card's lookahead, and validates an override set against the card's set; the logit width is a
+to the card's lookahead, needs the default lookahead while translating, and validates an override
+set against the card's set; the logit width is a
 constant; the engine-flag check has no eager-runner refusal and treats a missing parallel setting
 as a refusal.
 
@@ -189,11 +237,11 @@ as a refusal.
 | Decision | Chosen | Alternatives Considered | Rationale |
 |----------|--------|------------------------|-----------|
 | How the card becomes a served config | A registered config parser selected by `--config-format nemotron_asr_streaming` | `AutoConfig` registration for `nemotron3_5_asr`; `--hf-overrides` alone | Registering the card's `model_type` would claim the offline plugin's configuration; overrides apply after the configuration is built, too late for translation |
-| Where the parser gets the lookahead | The dictionary `hf_overrides` passed to `parse`, re-validated after core applies them | A plugin-specific environment variable or CLI option | One user-facing setting, and post-override validation catches disagreement |
-| Control tokens in the tokenizer | A registered tokenizer mode that appends them as special tokens | Publishing a modified tokenizer; leaving them unknown | Core detokenizes every token; unknown IDs break detokenization and unmarked ones appear in text; the card must stay usable unmodified |
+| Where launch options are resolved | Post-override validation of the final configuration; the parser reads only the checkpoint | Reading `hf_overrides` inside the parser; a plugin-specific environment variable | Core gives the parser only flat overrides, applies dictionary overrides after it, and also calls it with none when deriving a generation configuration |
+| Control tokens in the tokenizer | A registered tokenizer mode that appends them as special tokens, with park as the tokenizer's EOS | Publishing a modified tokenizer; leaving them unknown | Core detokenizes every token; unknown IDs break detokenization and unmarked ones appear in text; the card must stay usable unmodified |
 | Context ceiling | Translation sets `max_position_embeddings` to 2^24 | Requiring `VLLM_ALLOW_LONG_MAX_MODEL_LEN` | The model has no positional limit; long files need a context far above the card's 32,768 |
 | Override of the served set | Replaces the card's set; values limited to the five geometries | Union with the card's set; any value | Replacement lets a deployment narrow the warmed set; values without a geometry cannot run |
-| Load-time checks | Client calls in `register()`; adapter symbols at model import | All checks in `register()` | Worker symbols belong to the worker; the API server should not import them |
+| Load-time checks | Client calls in `register()`; adapter symbols at model import | All checks in `register()` | Worker symbols belong to the worker; the API server, which runs `register()` and the session factory, does not import the model class modules; the parser's configuration module and engine modules pulled in by the public client and configuration APIs are allowed |
 | `generate` task | Not advertised (model-state override) | Advertise for compatibility | The model emits transcript labels, not text generation |
 
 ## Open Questions & Future Decisions

@@ -44,7 +44,7 @@ class SessionFactory(Protocol):
     served_cadences: frozenset[str]
     locales: frozenset[str]
     async def open(self, *, cadence: str, locale: str) -> SessionLease: ...
-    async def drain(self, deadline: float) -> None: ...
+    async def drain(self, deadline: float) -> list[BaseException]: ...
     def teardown_all(self) -> set[asyncio.Task]: ...
 
 class SessionLease(Protocol):
@@ -58,8 +58,10 @@ class SessionLease(Protocol):
 ```
 
 `samples` is a one-dimensional `float32` array of 16 kHz mono audio; other shapes or dtypes and
-non-finite values raise `ValueError`, and an empty array is accepted and does nothing. `feed`
-returns cumulative transcript strings, one per unit whose text changed; `flush` returns the final
+non-finite values raise `ValueError` and leave the lease unchanged; an empty array is accepted (`on_accepted(0)`) and sends nothing. A valid
+`feed` appends all its samples, calls `on_accepted` exactly once with their count, sends every unit
+they complete in order, and returns only after the last of those units' outcomes; it returns the
+cumulative transcript strings, one per unit whose text changed. `flush` returns the final
 cumulative transcript.
 
 **Time bounds.** Calls take no deadline argument; the caller bounds them by cancellation (for
@@ -77,9 +79,20 @@ except `abort`, `release`, `finish` and `teardown` raises `SessionFailed(reason=
 | `aborted` | `abort` | `release`, `teardown` |
 | `released` | `release` returns | `teardown` |
 
-Calls are serialized: a call made while another call on the same lease is running raises
-`RuntimeError` (a caller bug). A call not allowed in the current state raises `SessionFailed` with
-`reason="state"`, except that `finish` and `release` are idempotent once their end is reached.
+A lease call checks, in order:
+1. **Serialization.** A call made while another call on the same lease is running raises
+   `RuntimeError` (a caller bug) and changes nothing. `teardown()` is exempt: it is synchronous and
+   may be called at any time, including during another call.
+2. **Closed factory.** After `teardown_all()`, every call other than `teardown()` raises
+   `SessionFailed(reason="cancelled")`.
+3. **State.** A call not allowed in the current state raises `SessionFailed`: in `failed`, with the
+   reason of the failure that put the lease there (for example `cancelled` or `expired`); in any
+   other state, with `reason="state"`. `finish` once the `generate()` task has ended, and `release`
+   once it has returned, return without effect.
+
+The cleanup calls `abort`, `finish`, `release` and `teardown` never raise a failure already
+reported through the lease. `finish` returns `None` once the task has ended, retrieving and not
+re-raising the task's exception.
 
 ## Engine binding
 
@@ -96,26 +109,32 @@ stream_admission=True)` running as a factory-owned task.
   builds admission contexts. Exhausting the generator is the close.
 - **Outcome of a unit.** Either its parked output, which is complete at the output whose new token
   IDs end with the park token, or a rejection output carrying `stream_rejection`, whose
-  `input_index` is the generator position of the rejected unit.
+  `input_index` is the generator position of the rejected unit. Core numbers every yielded input,
+  so a resent unit occupies a new position; the session matches outcomes by position, never by
+  `chunk_sequence`.
 
 ## Lease calls
 
 | Call | Behaviour |
 | --- | --- |
-| `open(cadence, locale)` | Refuse a cadence not in `served_cadences` (`refused`, `cadence`) or a locale not in `locales` (`refused`, `locale`). Mint the caller ID, insert the session record, start the `generate()` task. Admission is signalled by the input generator's first read. Return the lease on that signal. If the task ends first: `StreamAdmissionError` → `refused` with its reason; another exception → `failed`; a normal end → `failed` (`abnormal_end`). |
+| `open(cadence, locale)` | Refuse a cadence not in `served_cadences` (`refused`, `cadence`) or a locale not in `locales` (`refused`, `locale`). Mint the caller ID, insert the session record, start the `generate()` task. Admission is signalled by the input generator's first read. Return the lease on that signal. If the task ends first: `StreamAdmissionError` → `refused` with its reason; `EngineDeadError` → `failed` (`engine_dead`); another exception or a normal end → `failed` (`abnormal_end`). |
 | cancellation of `open` | Cancel the `generate()` task and hand the session to the factory's cleanup (below), which owns it through the cancellation and the retirement-wait outcome. The record is removed at once only if the task never started. Once `open` has returned the lease, the caller owns cleanup. |
+| stream end while a unit is outstanding | If the `generate()` task ends while `feed`, `update_locale` or `flush` awaits a unit's outcome, the lease fails with `engine_dead` for `EngineDeadError`, otherwise `abnormal_end` (an `error` or `abort` finish, or any end without the unit's park). |
 | `feed(samples, on_accepted)` | Append to the packer and call `on_accepted(len(samples))`. For each complete unit: send it, await its outcome, project it. Return the cumulative transcript after each unit whose text changed; with no complete unit, return `[]` at once. |
-| rejection of a unit | `engine_paused`: resend after a short backoff, until the caller cancels. `mm_cache_miss`: resend once. Any other reason, or a second `mm_cache_miss`: the lease fails with `rejected_input`. A resent unit keeps its `chunk_sequence` and timestamp. |
-| `update_locale(locale)` | Refuse a locale not in `locales`; otherwise every unit packed after the call, including one built from samples already buffered and the final tail, uses the new locale. |
-| `flush()` | Pack and send the final-tail unit, await its outcome, end the input generator, and await the stream's end. Success only for a normal close: `finished=True`, finish reason `stop`, after our close. A rejected final tail or close, a deadline `abort`, preemption or a failed state step (`error`), cancellation or a dead engine fail the lease. Returns the final cumulative transcript. |
+| rejection of a unit | `engine_paused`: resend after a backoff (a factory parameter; default 50 ms, doubling to at most 1 s), until the caller cancels. `mm_cache_miss`: resend once. Any other reason, or a second `mm_cache_miss`: the lease fails with `rejected_input`. A resent unit keeps its `chunk_sequence` and timestamp. |
+| `update_locale(locale)` | Refuse a locale not in `locales` (`refused`, `locale`), leaving the lease open with its current locale; otherwise every unit packed after the call, including one built from samples already buffered and the final tail, uses the new locale. |
+| `flush()` | Pack and send the final-tail unit, await its outcome, end the input generator, and await the stream's end. Success only for a normal close: `finished=True`, finish reason `stop`, after our close; returns the final cumulative transcript. Any other end fails the lease: a rejected final tail (`rejected_input`); an `error` or `abort` finish (preemption, a failed state step, a rejected close, which core turns into an abort) or any other end (`abnormal_end`); a dead engine (`engine_dead`); cancellation (`cancelled`). |
 | `finish()` | Await the `generate()` task's single end. |
 | `abort()` | Cancel the `generate()` task (the engine client then aborts the request) and await it, bounded by the caller. |
-| `release()` | Await `wait_stream_retired(caller_id)`, bounded by the caller, and resolve it as in Factory ownership. `EngineDeadError` fails `release` with `engine_dead`, a cleanup fault the frontend escalates. A timeout hands the session to the factory's cleanup. |
+| `release()` | Await `wait_stream_retired(caller_id)`, bounded by the caller, and resolve it as in Factory ownership. `EngineDeadError` removes the record and fails `release` with `engine_dead`, a cleanup fault the frontend escalates, unless the lease already failed with `engine_dead`; then `release` removes the record and returns. A timeout hands the session to the factory's cleanup. |
 | `teardown()` | Cancel the `generate()` task; no awaits and no direct engine calls. |
 
-**Engine deadlines.** The engine aborts an admitted stream that is never fed, parked idle or
-draining past its configured deadlines. The session learns this when its `generate()` task ends;
-the next call fails with `SessionFailed(reason="expired")`.
+**Engine aborts while idle.** The engine aborts an admitted stream that is never fed, parked idle
+or draining past its configured deadlines; an operator abort looks the same to the client. When the
+`generate()` task ends with an `abort` finish while the session has no unit outstanding, no `flush`
+is in progress and its input is not closed, the lease fails with `expired` (the engine ended an idle stream; deadlines are the
+usual cause), and the next call raises it. An idle end by `EngineDeadError` fails it with
+`engine_dead`, and any other idle end with `abnormal_end`.
 
 ## Factory ownership
 
@@ -132,8 +151,12 @@ the next call fails with `SessionFailed(reason="expired")`.
 - **Cleanup tasks.** A session whose owner is gone (a cancelled or failed `open`, a `release` that
   timed out) gets one tracked cleanup task running the retirement wait with no deadline of its own.
   Cleanup tasks run until they finish or the factory is torn down.
-- **`drain(deadline)`** awaits the cleanup tasks until the deadline and returns; any still running
-  stay owned by the factory.
+- **Cleanup faults.** A cleanup task whose retirement wait raises `EngineDeadError`, or ends with an
+  unexpected exception, records the exception as a cleanup fault and logs it. No caller is waiting
+  for an orphaned session, so faults are reported through `drain`.
+- **`drain(deadline)`** awaits the cleanup tasks until `deadline`, an absolute time on
+  `time.monotonic()`, and returns the cleanup faults recorded since the previous `drain`, clearing
+  them; tasks still running stay owned by the factory.
 - **`teardown_all()`** is terminal: it sets `closed` synchronously, cancels every task it owns and
   returns them. After it, `open` raises (`failed`, `cancelled`), pending-open cancellation paths
   only cancel and drop (never start cleanup), and lease calls other than `teardown()` raise. Every
@@ -145,7 +168,7 @@ Exceptions raised by `open` or a lease carry two attributes the frontend reads w
 - `session_error = "refused"`, with `reason` one of `capacity`, `active_limit`, `engine_paused`,
   `request_id_in_use`, `cadence`, `locale`;
 - `session_error = "failed"`, with `reason` one of `rejected_input`, `abnormal_end`, `expired`,
-  `engine_dead`, `cancelled`, `output_capacity`, `state`.
+  `engine_dead`, `cancelled`, `output_capacity`, `input_capacity`, `state`.
 
 The plugin defines `SessionRefused` and `SessionFailed` carrying them. Other exceptions
 (`ValueError` for bad audio, `RuntimeError` for concurrent calls) carry neither and indicate a
@@ -168,29 +191,35 @@ it is exact in float32.
 carries the remaining samples, strictly fewer than `s_g` and possibly zero, and is always the last
 unit.
 
-**Fields.** `geometry_id` is the geometry's index in the implemented order. `prompt_index` is the
+**Fields.** The row is `float32`. `valid_samples` is the number of samples the unit carries;
+`final_tail` is 1 for the final tail and 0 for every other unit. `geometry_id` is the geometry's index in the implemented order. `prompt_index` is the
 locale's row in the locale table, as of when the unit is packed. `admission_ms_mod` is the
 wall-clock time, in epoch milliseconds modulo 2^24, at which the unit became complete (its last
 sample was appended, or `flush` was called for the final tail); a resent unit keeps it. The model
 reconstructs each unit's deadline from it, which is valid while a unit is used within 2^24 ms
 (about 4.6 hours) of being stamped.
 
-**Limits.** A stream longer than 2^24 units fails rather than wrapping `chunk_sequence`.
+**Limits.** A unit whose `chunk_sequence` would reach 2^24 is not emitted: the packer raises its
+capacity error rather than wrap (about 15.5 days at 80 ms). The session maps it to
+`SessionFailed(reason="input_capacity")`; on core `/v1/realtime` the error ends the stream.
 
 ## Served-set enforcement in the model
 
-The model fixes a session's geometry from its first unit and checks later units against it. A
-first unit whose geometry is not in the served set fails that row, which ends the stream with an
-error. Through the session factory this cannot happen (`open` refuses the cadence first); it
-protects core's `/v1/realtime` and any other direct client.
+The model fixes a stream's geometry from its first unit and fails the row of a later unit whose
+geometry differs. It also fails the row of a first unit whose geometry is not in the served set.
+A failed row ends the request with finish reason `error`, which a session reports as
+`abnormal_end`. Neither plugin path can send such a unit (`open` refuses an unserved cadence, and
+`buffer_realtime_audio` packs at the default lookahead, which is served); the check protects direct
+clients of the engine.
 
 ## Core `/v1/realtime`
 
 The model's `buffer_realtime_audio(audio_stream, input_stream, model_config)` hook runs the packer at
 the server's default lookahead, with the locale `auto` when the locale table has it, else its only
-locale; a multi-locale table without `auto` makes the hook raise. It yields one prompt per unit and
-the final tail when `audio_stream` ends, and ignores `input_stream` (the model needs no
-generated-token context). Core drives this route as a streaming request without stream admission,
+locale; a multi-locale table without `auto` makes the hook raise `ValueError` naming the locales.
+It yields one prompt per unit and the final tail when `audio_stream` ends. Core puts every output's
+token IDs on `input_stream`; the model needs no generated-token context, so the hook drains that
+queue without using it, keeping it from growing for the life of the connection. Core drives this route as a streaming request without stream admission,
 so a rejected unit ends that stream; that is core's contract for this route.
 
 ## Transcript projection
@@ -198,7 +227,6 @@ so a rejected unit ends that stream; that is core's contract for this route.
 The session reads the engine's delta outputs:
 - **Text.** Core detokenizes with special tokens skipped; the session appends each output's delta
   text to the current transcript, so word-piece spacing is handled by core's detokenizer.
-- **Segments.** An EOU token in an output's token IDs closes the current segment (reason `model`).
 - **End of unit.** The park token ends the unit and carries no text.
 
 The cumulative transcript is held in a bounded transcript (default retained limit 1 MiB of UTF-8
@@ -208,10 +236,11 @@ per session); exceeding it fails the lease with `output_capacity`.
 
 The model's endpoint detector runs only when a request carries an endpoint policy, which the model
 reads from a request field that core does not populate. This plugin defines no binding for the
-policy on core (core's generic channels, such as sampling `extra_args`, could carry one), so every
+policy on core, and neither the session nor `buffer_realtime_audio` nor the file prompt sets one (core's generic channels, such as sampling `extra_args`, could carry one), so every
 stream and file runs with endpointing disabled and no EOU token is emitted. Binding a policy is
 deferred until per-utterance finals are designed with the frontend, since a policy without a way to
-report segments to the frontend changes nothing it can use.
+report segments to the frontend changes nothing it can use. Segment boundaries from EOU tokens are
+part of that later design.
 
 ## Current source
 
@@ -229,6 +258,8 @@ output consumption, and waits for a completion object the engine does not provid
 | Rejection retries | `engine_paused`: resend with backoff until cancelled; `mm_cache_miss`: resend once; otherwise fail | A fixed retry count for both; fail on any rejection | A pause lasts as long as it lasts; a cache miss is fixed by one resend; any other lost unit corrupts the transcript |
 | Unit timestamp | When the unit became complete, kept on resend | Session admission time | The model derives each unit's deadline from it; a fixed time makes later units look ever more overdue |
 | Cancelled calls | Lease becomes broken | Try to resynchronize | A cancelled call may leave a unit in flight with unknown outcome |
+| Orphan cleanup faults | Recorded and returned by `drain` | A fault callback given to the factory; logging only | `drain` is already the frontend's shutdown step, and its result reaches the frontend without a new registration path |
+| Idle abort | `expired`, whatever its cause | Distinguishing deadlines from operator aborts | Core does not tell the client which deadline fired; both mean the stream ended while idle |
 | Text | Core's detokenized delta text | Detokenizing label IDs in the session | Core already detokenizes incrementally and handles word-piece spacing |
 | Final tail | One explicit final-tail unit, then close | A flush control token | The model finalizes from the final-tail unit and the close |
 | Packer ownership | One implementation shared by the factory and `buffer_realtime_audio` | Separate packers | Two packers could segment the same audio differently |

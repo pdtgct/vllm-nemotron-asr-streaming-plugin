@@ -26,6 +26,7 @@ Guiding principles:
 
 The model class adds `SupportsTranscription` with:
 - `supports_transcription_only = False` (the model also serves `realtime`);
+- `supports_segment_timestamp = False` and `supports_diarized_transcription = False`;
 - `supported_languages`: a static class table of the ISO 639-1 languages of the checkpoints this
   plugin supports (core validates it when the class is defined); per-request support is decided
   against the served configuration (Language);
@@ -54,9 +55,10 @@ optional `language_locales` mapping:
 - A locale `ll` or `ll-RR` belongs to ISO 639-1 language `ll`.
 - A language with exactly one locale maps to it.
 - A language with several locales (for example `en-US`, `en-GB`) maps to the locale named for it in
-  `language_locales`, given as `--hf-overrides '{"language_locales": {"en": "en-US"}}'`; the card
-  parser copies it into the served configuration and validates that every target is in the locale
-  table. Without an entry, that language is refused, and startup logs the unmapped languages.
+  `language_locales`, given as `--hf-overrides '{"language_locales": {"en": "en-US"}}'`; core
+  applies it to the served configuration, and post-override validation checks every entry (see the
+  `registration` design). Without an entry, that language is refused, and startup logs the unmapped
+  languages.
 - A language with no locale is refused.
 - No language: the `auto` locale when the table has it, else the table's only locale, else the
   request is refused.
@@ -66,11 +68,13 @@ optional `language_locales` mapping:
 The prompt is exactly one token, the **file-carrier token**, plus one audio item with two
 `keep_on_cpu` fields, so core's batching never moves the file to the device:
 - `samples`: the file's 16 kHz float32 samples;
-- `file_header`: int64 values: geometry (the server's default lookahead), locale row, sample count,
-  and a per-request random nonce.
+- `file_header`: int64 values: geometry (the server's default lookahead), locale row and sample
+  count.
 
-The nonce makes every file item's content hash unique, so core's multimodal cache never
-recognizes a repeated upload and drops its data before the model sees it.
+The prompt gives the audio item a random per-request multimodal UUID (`multi_modal_uuids`). Core
+hashes an item from its UUID and the request's processor arguments, so every file item's hash is
+unique and core's multimodal cache never recognizes a repeated upload and drops its data before the
+model sees it.
 
 Core schedules the item as an encoder input of one placeholder. The model's multimodal embedding
 for a file item returns a one-row placeholder embedding without reading the samples; the
@@ -117,7 +121,7 @@ Each step for a FILE row does exactly one of the following, checked in order:
    the continuation token if it queued none.
 4. **End.** Else emit EOS.
 
-The label queue is the same per-slot queue streams use (capacity 141). A FILE row advances audio
+The label queue is the same per-slot queue streams use, with capacity 141. A FILE row advances audio
 only when it is empty, and one chunk, or the tail, queues at most `Q_g = (r + 1) × 10 + 1` tokens
 for geometry `g` with right context `r` (labels, at most 10 per encoder frame, plus an optional
 EOU), at most 141. So the queue cannot overflow.
@@ -151,14 +155,23 @@ produce at most `Q_g` tokens (at least one), plus one EOS:
 
 `B = 1 + (C + 1) × Q_g + 1`
 
-`get_generation_prompt` refuses the file when `B > max_model_len`. With `B ≤ max_model_len` the
-request reaches EOS before core's length limit, so a `length` ending cannot occur.
+`get_generation_prompt` refuses the file when `B > max_model_len`. With `B ≤ max_model_len`, and
+no smaller completion limit (the frontend refuses client completion limits and a generation-config
+`max_tokens`), the request reaches EOS before core's length limit, so a `length` ending cannot
+occur. An abort or error can still end it earlier (Completion).
 
 At 560 ms (`s = 8,960`, `Q = 71`), one hour is `N = 57,600,000` samples: `C = 6,428`, a tail of
 5,120 samples, and `B = 456,461`. Typical output is a small fraction of that. A deployment sets
 `max_model_len` for the longest file it accepts; for this attention-free model it costs no KV
 memory, but core preallocates token history for `max_num_seqs × max_model_len` tokens (about
 4 bytes each).
+
+## Equivalence with streams
+
+A file's **label sequence** is the sequence of emitted token IDs below `blank` (the park, EOU,
+continuation and other control tokens excluded). For a file request that ends with EOS, it equals
+the label sequence of a session that is fed the same samples at the same geometry and locale, with
+the same precision settings and endpointing disabled on both, and then flushed successfully.
 
 ## Completion
 
@@ -194,7 +207,7 @@ not implement `SupportsTranscription`.
 | Cadence | The server's default lookahead | Request-chosen | Core's transcription request has no lookahead field |
 | Where samples live | Request-owned host buffer, one chunk staged per step | A device copy of the file; reading from the encoder cache | A device copy grows with file length; core may drop encoder-cache entries once the prompt is consumed |
 | When the buffer is freed | When the request is reported finished (any reason) | A release-fence hook | The engine exposes no model hook at the release fence; under synchronous scheduling no in-flight step reads the buffer |
-| Repeated uploads | A per-request nonce in the header | Disabling the multimodal cache | The nonce keeps the server's cache settings untouched |
+| Repeated uploads | A random per-request multimodal UUID | A nonce in the header; disabling the multimodal cache | Core hashes items by their UUID, so no header field is needed, and the server's cache settings stay untouched |
 | Silence | A continuation token | Emitting nothing; the park/EOS token | Every step emits a token; EOS would end the request |
 | Distinguishing file rows | A dedicated file-carrier prompt token | The stream carrier with a different field | Row roles come from the scheduled token |
 | Budget | Worst case, checked before submission | A typical-output bound | Only the worst case makes a `length` ending impossible |
