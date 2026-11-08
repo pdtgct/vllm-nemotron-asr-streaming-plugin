@@ -2,22 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """HF config for the streaming ASR model (PORT-WGT-004).
 
-The served checkpoint has no upstream HF modeling code, so the port
-authors its own ``config.json`` at conversion time and registers this
-class with ``AutoConfig`` (see ``transformers_utils/configs``) so vLLM
-loads it without ``trust_remote_code``. Only the fields vLLM's config
-machinery and this model's ``__init__`` actually read live here; the
-values are produced by the conversion publisher
-(``convert.author_config``), never hand-authored.
+The served checkpoint has no upstream HF modeling code. The card parser
+(``vllm_nemotron_asr_streaming.card_parser``, selected with
+``--config-format nemotron_asr_streaming``) translates the published
+card into this class's fields, and the conversion publisher
+(``convert.author_config``) authors the same schema. Only the fields
+vLLM's config machinery and this model's ``__init__`` actually read live
+here; the values are produced by one of those two, never hand-authored.
 """
 
 import json
 from pathlib import Path
-from typing import Any
 
 from transformers import PreTrainedConfig
 
-from vllm_nemotron_asr_streaming.lookahead import resolve_served_lookahead
 from vllm_nemotron_asr_streaming.nemotron_asr.identity import ARCHITECTURE
 from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
     ENVELOPE_HEADER_FIELDS,
@@ -25,11 +23,6 @@ from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
 )
 
 MODEL_TYPE = "nemotron_asr"
-
-#: The public HuggingFace card's model type (owned by transformers'
-#: ``nemotron3_5_asr`` implementation; this port serves that checkpoint
-#: directly through the translating config below).
-CARD_MODEL_TYPE = "nemotron3_5_asr"
 
 #: The raw chunk-envelope carrier width: header slots plus the largest
 #: admitted raw cadence (1120 ms at 16 kHz) — DERIVED from the
@@ -90,9 +83,12 @@ class NemotronASRConfig(PreTrainedConfig):
 
     ``hidden_size`` is the multimodal-carrier row width (D-BU-2), not
     an LM width — this model has no LM stack; the encoder's true width
-    is ``d_model``. ``vocab_size`` covers the checkpoint's label set
-    plus the minted specials (park = ``eos_token_id``, the audio-chunk
-    placeholder).
+    is ``d_model``. ``vocab_size`` (also the model's logit width) covers
+    the checkpoint's label set, the blank, and the five minted control
+    tokens at ``blank + 1`` to ``blank + 5``: park (``eos_token_id``),
+    stream chunk carrier (``audio_chunk_token_id``), end of utterance
+    (``eou_token_id``), file carrier (``file_carrier_token_id``) and
+    continuation (``continuation_token_id``).
     """
 
     model_type = MODEL_TYPE
@@ -100,13 +96,15 @@ class NemotronASRConfig(PreTrainedConfig):
     def __init__(
         self,
         *,
-        vocab_size: int = 13090,
+        vocab_size: int = 13093,
         num_asr_labels: int = 13087,
         hidden_size: int = _CARRIER_WIDTH,
         eos_token_id: int | None = None,
         audio_chunk_token_id: int | None = None,
         eou_token_id: int | None = None,
-        flush_token_id: int | None = None,
+        file_carrier_token_id: int | None = None,
+        continuation_token_id: int | None = None,
+        card_num_lookahead_tokens: list[int] | None = None,
         endpoint_history_capacity_frames: int = 12,
         encoder_execution_arm: str | None = None,
         decode_dispatch_arm: str | None = None,
@@ -138,20 +136,30 @@ class NemotronASRConfig(PreTrainedConfig):
         self.hidden_size = hidden_size
         self.audio_chunk_token_id = audio_chunk_token_id
         self.eou_token_id = eou_token_id
-        self.flush_token_id = flush_token_id
+        self.file_carrier_token_id = file_carrier_token_id
+        self.continuation_token_id = continuation_token_id
+        #: The right contexts the published card declares. The served set
+        #: and the default lookahead are launch options, resolved in the
+        #: model-configuration hook, so no default is stored here.
+        self.card_num_lookahead_tokens = (
+            None
+            if card_num_lookahead_tokens is None
+            else list(card_num_lookahead_tokens)
+        )
         self.endpoint_history_capacity_frames = endpoint_history_capacity_frames
         controls = (
             eos_token_id,
             audio_chunk_token_id,
             eou_token_id,
-            flush_token_id,
+            file_carrier_token_id,
+            continuation_token_id,
         )
         if any(value is not None for value in controls):
             if any(
                 isinstance(value, bool) or not isinstance(value, int)
                 for value in controls
             ):
-                raise ValueError("all four control token ids must be integers")
+                raise ValueError("all five control token ids must be integers")
             typed_controls = tuple(
                 int(value) for value in controls if value is not None
             )
@@ -202,172 +210,6 @@ class NemotronASRConfig(PreTrainedConfig):
             torch_dtype=torch_dtype,
             **kwargs,
         )
-
-
-def _require_int(mapping: dict, key: str, source: str) -> int:
-    value = mapping.get(key)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{source} requires an integer {key!r}")
-    return value
-
-
-def translate_card_config(
-    card: dict,
-    *,
-    num_lookahead_tokens: int | None = None,
-) -> dict:
-    """Translate the public HF card schema into this port's schema.
-
-    The card (transformers' ``nemotron3_5_asr``) declares the joint
-    width as ``vocab_size`` with blank last; this port's ``vocab_size``
-    is the engine logit width, which additionally covers four minted
-    control ids. The controls are minted deterministically as the four
-    ids immediately past blank, matching the offline publisher's
-    arithmetic (``convert.author_config``): a control must be a genuinely
-    new id (> V) and the logit width must cover every id.
-
-    ``num_lookahead_tokens`` is required. The card's
-    ``default_num_lookahead_tokens`` is not applied, and this function
-    does not substitute 13 or 1.
-
-    Raises:
-        ValueError: If the card's identity arithmetic is inconsistent,
-            a required encoder field is absent, or the requested
-            lookahead arm is outside the card's supported set.
-
-    """
-    card = dict(card)
-    encoder = card.pop("encoder_config", None)
-    if not isinstance(encoder, dict):
-        encoder = (
-            dict(getattr(encoder, "__dict__", None) or {})
-            if encoder is not None
-            else None
-        )
-    if not encoder:
-        raise ValueError("public card requires encoder_config")
-    blank = _require_int(card, "blank_token_id", "public card")
-    joint_width = _require_int(card, "vocab_size", "public card")
-    if joint_width != blank + 1:
-        raise ValueError(
-            "public card identity mismatch: vocab_size must be "
-            f"blank_token_id + 1 (blank last), got vocab_size={joint_width} "
-            f"blank_token_id={blank}"
-        )
-    card.pop("vocab_size")
-    supported = encoder.get("supported_num_lookahead_tokens")
-    if num_lookahead_tokens is None and "num_lookahead_tokens" in card:
-        num_lookahead_tokens = card.get("num_lookahead_tokens")
-    lookahead = resolve_served_lookahead(
-        supported,
-        num_lookahead_tokens,
-        card_default=encoder.get("default_num_lookahead_tokens"),
-    )
-    if supported is not None:
-        # Retained verbatim: session admission validates each requested
-        # cadence's implied lookahead against this declared set
-        # (PORT-SESS-015) — the card, not the code, decides which arms
-        # the publisher stands behind.
-        card["supported_num_lookahead_tokens"] = [int(v) for v in supported]
-    # The Hub card's architectures string is the offline plugin's key.
-    # Translation selects this package's registry name instead of
-    # registering that string.
-    card["architectures"] = [ARCHITECTURE]
-    for key in (
-        "hidden_size",
-        "num_hidden_layers",
-        "conv_kernel_size",
-        "sliding_window",
-        "num_mel_bins",
-    ):
-        _require_int(encoder, key, "public card encoder_config")
-    d_model = int(encoder["hidden_size"])
-    prompt_intermediate = card.get("prompt_intermediate_size")
-    if prompt_intermediate is not None and int(prompt_intermediate) != 2 * d_model:
-        raise ValueError(
-            "prompt fusion width mismatch: the port's prompt kernel is "
-            f"Linear(hidden+prompts -> 2*hidden); card declares "
-            f"{prompt_intermediate} for hidden {d_model}"
-        )
-    translated = {
-        "num_asr_labels": blank,
-        "eos_token_id": blank + 1,
-        "audio_chunk_token_id": blank + 2,
-        "eou_token_id": blank + 3,
-        "flush_token_id": blank + 4,
-        "vocab_size": blank + 5,
-        # Decode dispatch is a publisher declaration, never a runtime
-        # default (PORT-DEC-008). On the card path this translation IS
-        # the publisher, and it declares the qualified eager arm — the
-        # same value the offline publisher stamps into the served
-        # artifact.
-        "decode_dispatch_arm": "dense-eager",
-        "d_model": d_model,
-        "n_layers": int(encoder["num_hidden_layers"]),
-        "conv_kernel": int(encoder["conv_kernel_size"]),
-        "att_context_left": int(encoder["sliding_window"]) - 1,
-        "att_context_right": lookahead,
-        "num_lookahead_tokens": lookahead,
-        "n_mels": int(encoder["num_mel_bins"]),
-        "torch_dtype": str(card.pop("dtype", card.pop("torch_dtype", "float32"))),
-    }
-    if "decoder_hidden_size" in card:
-        translated["pred_hidden"] = int(card.pop("decoder_hidden_size"))
-    if "num_decoder_layers" in card:
-        translated["pred_rnn_layers"] = int(card.pop("num_decoder_layers"))
-    # Retained card facts ride through as plain attributes; keys this
-    # port reinterprets were popped above so they cannot collide.
-    card.pop("model_type", None)
-    # The card describes the architecture as encoder-decoder; this
-    # port's serving schema deliberately does not. The model runs its
-    # encoder inside its own forward with model-local attention, so
-    # vLLM's encoder-decoder input path (which requires a decoder start
-    # token the tokenizer does not define) must stay off — GPU launch
-    # 2026-08-04 failed on exactly this rider ("Cannot find decoder
-    # start token id or <BOS>").
-    card.pop("is_encoder_decoder", None)
-    translated.update(card)
-    return translated
-
-
-class NemotronCardServingConfig(NemotronASRConfig):
-    """Serve the public HF card directly (PORT-WGT-004, card path).
-
-    Registered with vLLM's config registry for ``nemotron3_5_asr`` so
-    every process that builds a ``ModelConfig`` from the public
-    checkpoint sees this port's canonical fields. A dict carrying
-    ``encoder_config`` is the card shape and is translated; a dict
-    already in the served schema (a round-trip of this class's own
-    ``to_dict``) passes through unchanged.
-    """
-
-    model_type = CARD_MODEL_TYPE
-
-    def __init__(self, **kwargs: Any) -> None:
-        if "encoder_config" in kwargs:
-            requested = kwargs.pop("num_lookahead_tokens", None)
-            kwargs = translate_card_config(kwargs, num_lookahead_tokens=requested)
-        super().__init__(**kwargs)
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):  # type: ignore[override]
-        loaded = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
-        config = loaded[0] if isinstance(loaded, tuple) else loaded
-        ensure_prompt_dictionary(config, pretrained_model_name_or_path)
-        return loaded
-
-    @classmethod
-    def from_dict(cls, config_dict, **kwargs):
-        # vLLM registers this class with AutoConfig and loads checkpoints
-        # through ``AutoConfig.from_pretrained``, which dispatches here —
-        # never through ``from_pretrained`` above. AutoConfig forwards the
-        # checkpoint path as ``name_or_path``, so the sidecar hydration
-        # must also fire on this path.
-        loaded = super().from_dict(config_dict, **kwargs)
-        config = loaded[0] if isinstance(loaded, tuple) else loaded
-        if config.name_or_path:
-            ensure_prompt_dictionary(config, config.name_or_path)
-        return loaded
 
 
 def ensure_prompt_dictionary(config: PreTrainedConfig, model_path: object) -> None:

@@ -17,6 +17,7 @@ by the replay-echo guard (PORT-DEC-005/007).
 """
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ import torch
 from torch import nn
 
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import SupportsTranscription
 from vllm.model_executor.layers.state import PersistentStateLayerBase
 from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
     ENVELOPE_HEADER_SLOTS,
@@ -63,12 +65,16 @@ from vllm_nemotron_asr_streaming.nemotron_asr.lid import (
     PromptConditioner,
     resolve_prompt_index,
 )
+from vllm_nemotron_asr_streaming.locales import (
+    supported_languages as _supported_languages,
+)
 from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
     CADENCES,
-    author_emission_manifest,
+    REALTIME_MAX_TOKENS,
 )
 from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
     ObservedRow,
+    file_envelope_header,
     PlanContextSlot,
     SessionRegistry,
     prepare_plan_context,
@@ -108,17 +114,14 @@ _WIN_LENGTH = 400
 
 
 def _served_geometry_ids(hf_config: Any) -> tuple[int, ...]:
-    declared = getattr(
-        hf_config,
-        "supported_num_lookahead_tokens",
-        None,
+    """Geometry indices of the served lookahead set, the one definition the
+    factory, the realtime hook and the model share."""
+    from vllm_nemotron_asr_streaming.lookahead import (
+        geometry_index,
+        served_lookaheads,
     )
-    supported = None if declared is None else {int(value) for value in declared}
-    geometries = tuple(
-        index
-        for index, (_label, (_left, right)) in enumerate(CADENCES.items())
-        if supported is None or right in supported
-    )
+
+    geometries = tuple(geometry_index(right) for right in served_lookaheads(hf_config))
     if not geometries:
         raise ValueError("served configuration declares no supported encoder geometry")
     return geometries
@@ -308,21 +311,26 @@ __all__ = [
     info=NemotronASRProcessingInfo,
     dummy_inputs=NemotronASRDummyInputsBuilder,
 )
-class NemotronASRForRNNT(nn.Module):
+# @spec REG-TASK-001, FILE-IF-001
+class NemotronASRForRNNT(nn.Module, SupportsTranscription):
     """Engine-facing cache-aware RNN-T over one aggregate state page."""
 
     supports_multimodal = True
     requires_raw_input_tokens = True
     supports_realtime = True
     supports_transcription_only = False
+    supports_segment_timestamp = False
+    supports_diarized_transcription = False
     supports_persistent_state = True
     is_attention_free = True
-    realtime_max_tokens = max(
-        geometry["max_emission_tokens"]
-        for geometry in author_emission_manifest(None)["per_geometry"].values()
-    )
+    # @spec FILE-IF-002
+    supported_languages = _supported_languages()
+    # @spec REG-CARD-016
+    realtime_max_tokens = REALTIME_MAX_TOKENS
     realtime_input_tokens = 1
-    num_logits = 13_092
+    # The logit width is the served configuration's ``vocab_size``, set in
+    # ``__init__`` (REG-CARD-015).
+    num_logits: int
 
     def __init__(self, *, vllm_config: Any = None, prefix: str = "") -> None:
         """@spec PORT-PREC-009, PORT-PREC-010, PORT-PREC-013: bind startup policy."""
@@ -422,6 +430,7 @@ class NemotronASRForRNNT(nn.Module):
             hidden_size=hf_config.hidden_size,
             park_id=hf_config.eos_token_id,
             blank_id=self.core.blank_id,
+            continuation_id=int(hf_config.continuation_token_id),
         )
         native_burst_enabled = getattr(hf_config, "experimental_native_burst", False)
         if not isinstance(native_burst_enabled, bool):
@@ -616,10 +625,34 @@ class NemotronASRForRNNT(nn.Module):
         accepted_audio_budget_s: float | None = None,
         session_key: str | None = None,
     ) -> Any:
-        raise NotImplementedError(
-            "Nemotron ASR realtime buffering is not yet available in vLLM core"
+        """Pack core's realtime audio with the session packer (SESS-RT-001
+        to SESS-RT-003)."""
+        from vllm_nemotron_asr_streaming.session.packer import pack_realtime
+
+        async for prompt in pack_realtime(
+            audio_stream, input_stream, model_config.hf_config
+        ):
+            yield prompt
+
+    # @spec FILE-IF-003
+    @classmethod
+    def get_speech_to_text_config(cls, model_config: Any, task_type: Any) -> Any:
+        """Core never splits a file: no clip limit, no energy split window."""
+        from vllm.config.speech_to_text import SpeechToTextConfig
+
+        del model_config, task_type
+        return SpeechToTextConfig(
+            sample_rate=16000,
+            max_audio_clip_s=None,
+            min_energy_split_window_size=None,
         )
-        yield
+
+    # @spec FILE-IF-004, FILE-IF-005, FILE-PROMPT-001
+    @classmethod
+    def get_generation_prompt(cls, stt_params: Any) -> Any:
+        from vllm_nemotron_asr_streaming.transcription import build_file_prompt
+
+        return build_file_prompt(stt_params)
 
     def prepare_row_plan_context(
         self,
@@ -689,6 +722,7 @@ class NemotronASRForRNNT(nn.Module):
             num_geometries=len(CADENCES),
             now_ns=time.time_ns(),
             step=self._plan_step,
+            served_geometries=_served_geometry_ids(self.config),
         )
         self._plan_slot.stage(context)
         return context
@@ -730,6 +764,47 @@ class NemotronASRForRNNT(nn.Module):
             endpoint_mode, endpoint_threshold, endpoint_residue = (
                 self._endpoint_controls(request)
             )
+            file_row = projection.file_rows.get(request_id)
+            if file_row is not None:
+                # FILE-ROW-001: a FILE row's role and header come from the
+                # step plan, not from the request's multimodal feature.
+                plan = file_row.file_plan
+                assert plan is not None
+                if file_row.failed:
+                    # A malformed file item fails this row alone: a CHUNK
+                    # bound as non-CHUNK, which the transaction masks.
+                    rows.append(
+                        ObservedRow(
+                            request_id=request_id,
+                            block_id=int(binding.slot_id),
+                            scheduled_token_id=token,
+                            has_prior_state=not bool(binding.fresh),
+                            envelope_header=file_envelope_header(
+                                valid_samples=0,
+                                geometry_id=0,
+                                final_tail=False,
+                                prompt_index=0,
+                                chunk_sequence=0,
+                                now_ms=int(time.time() * 1000),
+                            ),
+                            is_file=True,
+                            file_advances=True,
+                            reject=True,
+                        )
+                    )
+                    continue
+                rows.append(
+                    ObservedRow(
+                        request_id=request_id,
+                        block_id=int(binding.slot_id),
+                        scheduled_token_id=token,
+                        has_prior_state=not bool(binding.fresh),
+                        envelope_header=file_row.header,
+                        is_file=True,
+                        file_advances=plan.advances_audio,
+                    )
+                )
+                continue
             rows.append(
                 ObservedRow(
                     request_id=request_id,
@@ -899,7 +974,21 @@ class NemotronASRForRNNT(nn.Module):
         self._committed_progress = {}
         return progress
 
+    # @spec FILE-PROMPT-004
     def embed_multimodal(self, **kwargs: Any) -> Any:
+        header = kwargs.get("file_header")
+        if header is not None or "samples" in kwargs:
+            # A complete-file item: one placeholder row per item. The samples
+            # stay on the host (the model state takes them into the request's
+            # buffer) and are never read here; the stream carrier-width check
+            # does not apply.
+            count = len(header if header is not None else kwargs["samples"])
+            device = next(self.parameters()).device
+            hidden = int(self.config.hidden_size)
+            return [
+                torch.zeros(1, hidden, dtype=torch.float32, device=device)
+                for _ in range(count)
+            ]
         audios = kwargs.get("audio")
         if audios is None:
             raise ValueError("embed_multimodal expects an 'audio' item")
@@ -997,6 +1086,7 @@ class NemotronASRForRNNT(nn.Module):
         if state_batch is None:
             raise RuntimeError("MRv2 projection omitted bounded state views")
         pools = self._state_pools(persistent_state_projection)
+        self._write_file_envelopes(inputs_embeds, persistent_state_projection)
         commit_sink = state_batch.commit_sink(
             self._ensure_commit_sink(inputs_embeds.device)
         )
@@ -1050,12 +1140,34 @@ class NemotronASRForRNNT(nn.Module):
                 staging=self._ensure_host_staging(),
                 graph_covers_decode=graph_covers_decode,
                 native_burst_handoff=native_handoff,
+                file_carrier_id=int(self.config.file_carrier_token_id),
+                continuation_id=int(self.config.continuation_token_id),
+                geometry_order=persistent_state_projection.geometry_order,
             )
             return result
         except BaseException:
             if native_handoff is not None:
                 native_handoff.clear()
             raise
+
+    @staticmethod
+    def _write_file_envelopes(inputs_embeds: torch.Tensor, projection: Any) -> None:
+        """Write each advancing FILE row's chunk envelope (the stream unit's
+        header and samples) into its carrier row, so the row runs the
+        streaming transition (FILE-ROW-003, FILE-ROW-004)."""
+        for index, request_id in enumerate(projection.req_ids):
+            row = projection.file_rows.get(request_id)
+            if row is None or row.header is None:
+                continue
+            carrier = inputs_embeds[index]
+            carrier.zero_()
+            carrier[: len(row.header)] = torch.tensor(
+                row.header, dtype=carrier.dtype, device=carrier.device
+            )
+            if row.samples is not None:
+                count = int(row.samples.shape[0])
+                start = len(row.header)
+                carrier[start : start + count] = row.samples.to(carrier.dtype)
 
     def consume_batch_stats(self) -> list[tuple[str, int]] | None:
         from vllm_nemotron_asr_streaming.nemotron_asr.advance import (

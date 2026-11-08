@@ -1,83 +1,90 @@
 # vllm-nemotron-asr-streaming
 
-Staging out-of-tree plugin for cache-aware streaming Nemotron ASR on vLLM core. The work is aimed at a later fold into the offline plugin at [Sohaib-Ahmed21/vllm-nemotron-asr-plugin](https://github.com/Sohaib-Ahmed21/vllm-nemotron-asr-plugin). This repository does not commit to that repo.
+Out-of-tree plugin for cache-aware streaming Nemotron ASR on vLLM core. It serves the published
+[`nvidia/nemotron-3.5-asr-streaming-0.6b`](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
+card unmodified, for streaming sessions and for complete-file transcription. It targets a vLLM
+build with RFC 1 (the persistent-state primitive and stream admission, `AsyncLLM.generate(...,
+stream_admission=True)` and `wait_stream_retired`) and RFC 2 (the endpoint plugin lifecycle); a
+released vLLM does not provide the symbols it needs, and `register()` fails with a message saying so.
 
-**Gate A is not met.** This plugin has not been loaded inside a running engine, and it has not admitted audio, fed chunks, or retired a slot. Unit tests stub the engine. An editable install resolving the entry point is not that cycle. See [TODO.md](TODO.md).
+The design is in `docs/high-level-design.md` and `docs/intent/`; module names are in
+`docs/implementation-layout.md`.
 
 ## What is registered
 
-Distribution `vllm-nemotron-asr-streaming`, import package `vllm_nemotron_asr_streaming`.
-
-Entry point group `vllm.general_plugins`:
+Distribution `vllm-nemotron-asr-streaming`, import package `vllm_nemotron_asr_streaming`. Two entry
+points:
 
 ```toml
+[project.entry-points."vllm.general_plugins"]
 nemotron_asr_streaming = "vllm_nemotron_asr_streaming:register"
+
+[project.entry-points."vllm_riva_frontend.session_factories"]
+nemotron_asr_streaming = "vllm_nemotron_asr_streaming.session:create_session_factory"
 ```
 
-`register()` imports these symbols from the RFC12 tree and then registers one architecture:
+`register()` checks the client calls it uses (`AsyncLLM.generate(stream_admission=...)` and
+`AsyncLLM.wait_stream_retired`), then registers, without importing the model or touching a device:
 
-- `vllm.model_executor.layers.state.PersistentStateLayerBase`
-- `vllm.v1.engine.async_llm.AsyncLLM`
-- `vllm.v1.engine.core_client.EngineCoreClient.admit_stream_async`
-- `vllm.v1.kv_cache_interface.StateCompletion`
-- `vllm.v1.worker.gpu.model_states.resolve_model_state_cls` (the hook that calls `get_model_state_cls`)
+- the architecture `Nemotron3_5AsrStreamingForRNNT` (a lazy reference) and its model-configuration hook;
+- the config format `nemotron_asr_streaming`, which translates the Hub card;
+- the tokenizer mode `nemotron_asr_streaming` (and the renderer of the same name), which makes the
+  control tokens special and the park token the EOS.
 
-The registered architecture is `Nemotron3_5AsrStreamingForRNNT`. The lazy class is the ported `NemotronASRForRNNT` (`supports_persistent_state`, `get_model_state_cls`). `Nemotron3_5AsrStreamingConfig` is stored on `MODELS_CONFIG_MAP` under that same name and refuses an engine left on the RFC12 async-scheduling or prefix-caching defaults.
+The Hub card names the architecture `Nemotron3_5AsrForRNNT`, which is the offline plugin's key. This
+plugin never writes that key or its configuration hook, so both plugins can be installed together.
+When `VLLM_PLUGINS` is an allowlist, include `nemotron_asr_streaming`.
 
-The Hub config of [`nvidia/nemotron-3.5-asr-streaming-0.6b`](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) has `architectures: ["Nemotron3_5AsrForRNNT"]` and `model_type: "nemotron3_5_asr"`. That architecture string is the offline plugin's `ModelRegistry` key. `register()` never passes it to `register_model` and does not register the tokenizer or renderer key `nemotron3_5_asr`. A server started on the Hub repo id still resolves the offline class when that plugin is installed. `translate_card_config` writes `Nemotron3_5AsrStreamingForRNNT` into a translated config and requires an explicit `num_lookahead_tokens` from the card's supported set. It does not apply the card default `3` or the old source pin `13`.
+## Serve
 
-## API target
-
-Import target, not a release:
-
-| | |
-| --- | --- |
-| Repo | `pdtgct/vllm` |
-| Interface tree | `rfc12-integration` @ `4c1809692dfa46fcdd7a9891f69a997afa1dbb78`, tree `465f10ad65c7742fca01e25e3a1a0f58c4608094` |
-| RFC1 tip | branch `persistent-state-primitive-v2` @ `8b8327e2eece1df39eb6318eff4c9dc207b3ab61` |
-| Model source | branch `rfc1-5212-vllm` @ `43c0bed5bf877dc74de2e1494a3a542f497493de`, tree `vllm/models/nemotron_asr/` (19,941 Python lines), copied under `vllm_nemotron_asr_streaming/nemotron_asr/` |
-
-`pyproject.toml` does not depend on PyPI `vllm`. A released vLLM does not provide these symbols.
-
-Do not merge `rfc1-5212-vllm` onto the tip. Against `8b8327e2ee`, `git merge-tree` reports 20 paths changed on both sides, plus `vllm/v1/core/stream_admission.py` added on both sides. The model tree is not in that set. The port is file by file onto the tip symbols. The path list is in `vllm_nemotron_asr_streaming/refs.py`.
-
-## Session binding
-
-`vllm_nemotron_asr_streaming.session` accepts only `vllm.v1.engine.async_llm.AsyncLLM`. On this tree `admit_stream_async` is on the `EngineCoreClient` stored as `engine_core`.
-
-`open` calls `admit_stream_async` with an empty resumable request. `feed` and `flush` call `add_request_async` with `StreamAdmissionContext`. `finish` sends a non-resumable update with `input_closed=True`. `abort` calls `abort_requests_async`. `release` returns a `StateCompletion` only when `engine_core.wait_state_completion` exists; the RFC12 scheduler consumes that fence internally and does not forward it. The factory raises when `async_scheduling` is not `False` or prefix caching is on.
-
-```
-vllm serve <checkpoint-with-streaming-architecture> \
+<!-- @spec REG-ENG-007 -->
+```bash
+vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --dtype float32 \
     --enforce-eager \
     --no-async-scheduling \
-    --no-enable-prefix-caching
+    --no-enable-prefix-caching \
+    --config-format nemotron_asr_streaming \
+    --tokenizer-mode nemotron_asr_streaming \
+    --hf-overrides '{"supported_num_lookahead_tokens": [6, 13], "num_lookahead_tokens": 13}'
 ```
 
-Nothing in this package imports `vllm_omni`.
+- The persistent-state model needs synchronous scheduling, no prefix caching, a single device and an
+  eager outer runner (it runs its own captured graphs inside the step). Other settings it refuses
+  (speculative decoding, KV transfer, dual-batch overlap, sleep mode, the cumem allocator, hierarchical
+  sparse attention, any parallel size other than 1) fail at startup with a message naming each.
+- `num_lookahead_tokens` is required: the card has no default the plugin accepts. It sets the cadence for
+  complete files and for `/v1/realtime`, and must be in the served set.
+- `supported_num_lookahead_tokens` is the served set. It defaults to the card's own set (0, 3, 6, 13) and
+  accepts any of the implemented right contexts 0, 1, 3, 6 and 13. The reference deployment serves
+  `[6, 13]` with default 13.
+- Pass `--generation-config vllm` if the checkpoint's generation configuration or an
+  `--override-generation-config` sets a token limit; the startup error says when.
 
-## Install
+Support boundary:
 
-```bash
-pip install -e .
-```
+- Core's `/v1/realtime` is served directly, with no frontend. A unit core rejects ends that stream, as
+  core's contract says.
+- Complete-file transcription through core's `/v1/audio/transcriptions` is supported only with the Riva
+  frontend's guards (the file-size cap, and refusal of beam search and client completion limits). Without
+  that frontend it is unsupported.
+- The session factory, found through the second entry point, is for frontends.
 
-When `VLLM_PLUGINS` is an allowlist, include the entry-point name:
+## Evidence
 
-```bash
-export VLLM_PLUGINS=nemotron_asr_streaming
-```
+- Target engine: the merge of RFC 1 `persistent-state-primitive-v2` @ `574efbd8f6` and RFC 2
+  `endpoint-plugin-lifecycle` @ `6b1ce05706` on `pdtgct/vllm` (local integration commit `5194f13ebc`, not
+  yet published).
+- Achieved: CPU-tier tests (all passing; see `TODO.md` for the GPU round). The GPU tier has not been run.
+- Pending: installed-engine runs on an A40, file/stream equivalence, and mixed load.
 
-That name is separate from the offline plugin's `nemotron_asr` entry.
-
-## Tests
+## Install and test
 
 ```bash
 pip install -e '.[test]'
 pytest
 ```
 
-The default tests stub vLLM. They check identity, registration, lookahead selection, the F7 refusal, and the session calls against that stub. They do not start an engine.
-
-`tests/test_rfc12_register.py` calls `register()` against a checkout of `rfc12-integration` @ `4c180969`. It skips until the checkout imports. The command is in [TODO.md](TODO.md). A pass of that test still does not load the model or admit a stream.
+Tests are tiered: unmarked tests need only this package; `engine` tests need the RFC 1 + RFC 2 vLLM build
+on `PYTHONPATH`; `gpu` tests need an installed engine on CUDA; `card` tests need `NEMOTRON_CARD_DIR` set to
+a local copy of the published card, which is never committed.

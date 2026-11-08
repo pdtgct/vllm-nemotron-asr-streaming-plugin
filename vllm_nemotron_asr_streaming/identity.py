@@ -19,12 +19,19 @@ OFFLINE_ARCHITECTURE = "Nemotron3_5AsrForRNNT"
 # tokenizer mode and renderer key. This package does not register it.
 OFFLINE_MODEL_TYPE = "nemotron3_5_asr"
 
+# Name of the config format (``--config-format``) and the tokenizer mode
+# (``--tokenizer-mode``) this package registers.
+CONFIG_FORMAT = "nemotron_asr_streaming"
+TOKENIZER_MODE = "nemotron_asr_streaming"
+
 ARCHITECTURE = "Nemotron3_5AsrStreamingForRNNT"
 LAZY_MODEL = "vllm_nemotron_asr_streaming.model:Nemotron3_5AsrStreamingForRNNT"
 
 __all__ = [
     "ARCHITECTURE",
+    "CONFIG_FORMAT",
     "LAZY_MODEL",
     "OFFLINE_ARCHITECTURE",
     "OFFLINE_MODEL_TYPE",
+    "TOKENIZER_MODE",
 ]

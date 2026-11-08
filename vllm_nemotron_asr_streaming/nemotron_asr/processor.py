@@ -50,6 +50,44 @@ from vllm.multimodal.processing.processor import (
 #: route never serves this).
 _DUMMY_SAMPLES = 16_000
 
+#: The ``mm_processor_kwargs`` key (and the multimodal field) that carries a
+#: complete file's header: geometry index, locale row and sample count.
+FILE_HEADER_KEY = "file_header"
+
+
+def validate_file_header(
+    header: object, sample_counts: Sequence[int], num_prompts: int | None = None
+) -> np.ndarray:
+    """Check a file header at input processing, so a malformed request is a
+    ``ValueError`` (a 400) and never reaches the worker step.
+
+    The header is ``(geometry index, locale row, sample count)``.
+    """
+    from vllm_nemotron_asr_streaming.nemotron_asr.manifests import CADENCES
+
+    try:
+        values = np.asarray(header, dtype=np.int64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"file_header must be integers, got {header!r}") from exc
+    if values.shape != (3,):
+        raise ValueError(f"file_header must have 3 values, got shape {values.shape}")
+    geometry, row, count = (int(v) for v in values)
+    if not 0 <= geometry < len(CADENCES):
+        raise ValueError(
+            f"file_header geometry {geometry} is not in [0, {len(CADENCES)})"
+        )
+    if row < 0 or (num_prompts is not None and row >= num_prompts):
+        raise ValueError(
+            f"file_header locale row {row} is outside the locale table "
+            f"(0 <= row < {num_prompts})"
+        )
+    if len(sample_counts) != 1 or count != int(sample_counts[0]):
+        raise ValueError(
+            f"file_header sample count {count} disagrees with the audio item "
+            f"({list(sample_counts)} samples)"
+        )
+    return values
+
 
 class NemotronASRProcessingInfo(BaseProcessingInfo):
     """Processing metadata: one audio item per streaming prompt."""
@@ -88,6 +126,10 @@ class NemotronASRMultiModalProcessor(
 ):
     """Raw-audio passthrough + single carrier placeholder.
 
+    A stream unit carries its audio envelope as the ``audio`` field; a
+    complete file carries ``samples`` and ``file_header`` instead
+    (FILE-PROMPT-003).
+
     No HF processor: ``_apply_hf_processor_main`` builds the field batch from
     the raw chunk directly (the model's ``embed_multimodal`` owns the
     mel front-end). The realtime prompt carries exactly one placeholder
@@ -119,16 +161,45 @@ class NemotronASRMultiModalProcessor(
         # via _encode_nested_tensors, which only handles torch tensors
         # (it recurses into an ndarray and chokes on the scalar leaves).
         arrays = [torch.as_tensor(np.asarray(a, dtype=np.float32)) for a in audios]
+        header = hf_kwargs.get(FILE_HEADER_KEY)
+        if header is not None:
+            # A complete-file prompt: the samples and the file header travel
+            # as two host-resident fields; the model state takes them into a
+            # request-owned buffer at the request's first schedule.
+            values = torch.as_tensor(
+                validate_file_header(
+                    header,
+                    [a.shape[0] for a in arrays],
+                    int(self.info.get_hf_config().num_prompts),
+                ),
+                dtype=torch.int64,
+            )
+            return BatchFeature(
+                {
+                    **passthrough_data,
+                    "samples": arrays,
+                    FILE_HEADER_KEY: [values for _ in arrays],
+                }
+            )
         return BatchFeature({**passthrough_data, "audio": arrays})
 
+    # @spec FILE-PROMPT-003
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        # One batched field named ``audio`` — the key ``embed_multimodal``
-        # reads (``kwargs.get("audio")``).
-        return {"audio": MultiModalFieldConfig.batched("audio")}
+        # A stream unit: one batched field named ``audio`` — the key
+        # ``embed_multimodal`` reads (``kwargs.get("audio")``). A complete
+        # file: ``samples`` and ``file_header``, both kept on the host so
+        # core's batching never moves the file to the device.
+        fields: dict[str, MultiModalFieldConfig] = {}
+        if "audio" in hf_inputs:
+            fields["audio"] = MultiModalFieldConfig.batched("audio")
+        for name in ("samples", FILE_HEADER_KEY):
+            if name in hf_inputs:
+                fields[name] = MultiModalFieldConfig.batched("audio", keep_on_cpu=True)
+        return fields
 
     def _get_prompt_updates(
         self,

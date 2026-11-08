@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -74,6 +74,46 @@ _DEADLINE_BUDGET_NS_BY_GEOMETRY: tuple[int, ...] = tuple(
     round(samples / _SAMPLES_PER_MS * 1_000_000)
     for samples in RAW_SAMPLES_PER_CHUNK.values()
 )
+
+
+#: Ready deadline of a FILE row's chunk: far beyond any stream deadline, so a
+#: FILE row never makes its geometry's bucket more urgent (FILE-ROW-001,
+#: FILE-ENG-004). An absolute nanosecond stamp, comparable with the stream
+#: deadlines it is ordered against.
+FILE_READY_DEADLINE_NS = 1 << 62
+
+
+def file_envelope_header(
+    *,
+    valid_samples: int,
+    geometry_id: int,
+    final_tail: bool,
+    prompt_index: int,
+    chunk_sequence: int,
+    now_ms: int,
+) -> tuple[float, ...]:
+    """The CHUNK header a FILE row's chunk carries: the same seven values a
+    stream unit carries, so the file runs the streaming transition."""
+    header = [0.0] * ENVELOPE_HEADER_SLOTS
+    header[ENV_VERSION] = float(ENVELOPE_VERSION)
+    header[ENV_VALID_SAMPLES] = float(valid_samples)
+    header[ENV_GEOMETRY_ID] = float(geometry_id)
+    header[ENV_FINAL_TAIL] = 1.0 if final_tail else 0.0
+    header[ENV_PROMPT_INDEX] = float(prompt_index)
+    header[ENV_CHUNK_SEQUENCE] = float(chunk_sequence)
+    header[ENV_ADMISSION_MS_MOD] = float(int(now_ms) % ADMISSION_EPOCH_MODULUS_MS)
+    return tuple(header)
+
+
+def stream_order_key(
+    header: Sequence[float], *, now_ns: int
+) -> tuple[int, int]:
+    """``(geometry index, ready deadline in ns)`` of a stream CHUNK header,
+    for ordering the step's chunk groups."""
+    geometry = int(header[ENV_GEOMETRY_ID])
+    return geometry, _reconstruct_deadline_ns(
+        int(header[ENV_ADMISSION_MS_MOD]), now_ns=now_ns, geometry=geometry
+    )
 
 
 def resolve_row_envelope_header(
@@ -167,6 +207,15 @@ def _reconstruct_deadline_ns(
     return admission_ns + _DEADLINE_BUDGET_NS_BY_GEOMETRY[geometry]
 
 
+def _row_deadline_ns(
+    row: ObservedRow, admission_ms_mod: int, *, now_ns: int, geometry: int
+) -> int:
+    """A CHUNK row's ready deadline; a FILE row has none (it sorts last)."""
+    if row.is_file:
+        return FILE_READY_DEADLINE_NS
+    return _reconstruct_deadline_ns(admission_ms_mod, now_ns=now_ns, geometry=geometry)
+
+
 @dataclass(frozen=True)
 class ObservedRow:
     """One scheduled model row as the runner hook sees it, host-side.
@@ -186,6 +235,16 @@ class ObservedRow:
     endpoint_mode: int = 0
     endpoint_threshold_frames: int = 0
     endpoint_residue_frames: int = 0
+    is_file: bool = False
+    file_advances: bool = False
+    #: Bind the row as non-CHUNK so the transaction fails it alone.
+    reject: bool = False
+
+    def advances_chunk(self, placeholder_id: int) -> bool:
+        """Whether the row's role this step is a CHUNK (host authority)."""
+        if self.is_file:
+            return self.file_advances
+        return self.scheduled_token_id == placeholder_id
 
 
 @dataclass(frozen=True)
@@ -212,6 +271,9 @@ class PlanContext:
     endpoint_mode: torch.Tensor
     endpoint_threshold_frames: torch.Tensor
     endpoint_residue_frames: torch.Tensor
+    is_file: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, dtype=torch.bool)
+    )
 
 
 @dataclass
@@ -446,6 +508,7 @@ class SessionRegistry:
             )
         return geometry, prompt, admission_ms_mod
 
+    # @spec SESS-MODEL-001, SESS-MODEL-002
     def bind_rows(
         self,
         rows: Sequence[ObservedRow],
@@ -455,6 +518,7 @@ class SessionRegistry:
         num_geometries: int,
         now_ns: int,
         resident_request_ids: Sequence[str] | None = None,
+        served_geometries: Collection[int] | None = None,
     ) -> tuple[PreparedRowBinding, ...]:
         """Mint one binding per observed row, atomically per step.
 
@@ -472,6 +536,14 @@ class SessionRegistry:
         so it must be directly comparable to the frontend process's
         wall clock (the same cross-process basis vLLM's own scheduler
         uses for ``Request.arrival_time``).
+
+        ``served_geometries``: the served geometry set. A CHUNK row whose
+        first unit names a geometry outside it, or whose later unit names a
+        geometry other than the one its stream started with, is registered
+        (so the lease stays valid) but bound as a non-CHUNK row: the
+        transaction's role cross-check then fails that row alone, ending its
+        request with an error instead of running an unserved geometry
+        (SESS-MODEL-001, SESS-MODEL-002).
         """
         if now_ns <= 0:
             raise ValueError("now_ns must be a positive wall-clock nanosecond stamp")
@@ -514,7 +586,7 @@ class SessionRegistry:
                     f"request {row.request_id!r} appears twice in one step's row plan"
                 )
             seen.add(row.request_id)
-            is_chunk = row.scheduled_token_id == placeholder_id
+            is_chunk = row.advances_chunk(placeholder_id)
             if not is_chunk and row.envelope_header is not None:
                 raise ValueError(
                     f"non-CHUNK row {row.request_id!r} carries a scheduled envelope"
@@ -547,6 +619,11 @@ class SessionRegistry:
                 )
                 new_sessions[row.request_id] = session
                 new_blocks[row.block_id] = row.request_id
+                # SESS-MODEL-002: the first unit fixes the stream's geometry;
+                # one outside the served set fails the row.
+                unserved = row.reject or (
+                    served_geometries is not None and geometry not in served_geometries
+                )
                 bindings.append(
                     PreparedRowBinding(
                         request_id=row.request_id,
@@ -556,11 +633,11 @@ class SessionRegistry:
                         prompt_index=prompt,
                         prior_prompt_index=prompt,
                         allow_prompt_transition=False,
-                        is_chunk=True,
-                        ready_deadline_ns=_reconstruct_deadline_ns(
-                            admission_ms_mod,
-                            now_ns=now_ns,
-                            geometry=geometry,
+                        is_chunk=not unserved,
+                        ready_deadline_ns=0
+                        if unserved
+                        else _row_deadline_ns(
+                            row, admission_ms_mod, now_ns=now_ns, geometry=geometry
                         ),
                     )
                 )
@@ -582,11 +659,30 @@ class SessionRegistry:
                     "previous CHUNK"
                 )
             if is_chunk:
-                _, prompt, admission_ms_mod = self._parse_chunk_header(
+                header_geometry, prompt, admission_ms_mod = self._parse_chunk_header(
                     row,
                     num_prompts=num_prompts,
                     num_geometries=num_geometries,
                 )
+                if row.reject or header_geometry != session.geometry_id:
+                    # SESS-MODEL-001: a stream's geometry is fixed by its
+                    # first unit; a later unit for another geometry fails the
+                    # row (bound as non-CHUNK, so the role cross-check masks
+                    # it and its state is left untouched).
+                    bindings.append(
+                        PreparedRowBinding(
+                            request_id=row.request_id,
+                            block_id=row.block_id,
+                            admission_generation=session.generation,
+                            geometry_id=session.geometry_id,
+                            prompt_index=session.prompt_index,
+                            prior_prompt_index=session.prompt_index,
+                            allow_prompt_transition=False,
+                            is_chunk=False,
+                            ready_deadline_ns=0,
+                        )
+                    )
+                    continue
                 prior = session.prompt_index
                 # Provisional only: resolve_status publishes it after a
                 # clean transaction status, or clears it on failure.
@@ -607,7 +703,8 @@ class SessionRegistry:
                         # the admitted prompt (device-side
                         # ROW_STATUS_GEOMETRY already cross-checks the
                         # envelope against this same host authority).
-                        ready_deadline_ns=_reconstruct_deadline_ns(
+                        ready_deadline_ns=_row_deadline_ns(
+                            row,
                             admission_ms_mod,
                             now_ns=now_ns,
                             geometry=session.geometry_id,
@@ -648,6 +745,7 @@ def prepare_plan_context(
     num_geometries: int,
     now_ns: int,
     step: int,
+    served_geometries: Collection[int] | None = None,
 ) -> PlanContext:
     """One hook invocation: prune, mint bindings, build the columns."""
     bindings = registry.bind_rows(
@@ -657,6 +755,7 @@ def prepare_plan_context(
         num_geometries=num_geometries,
         now_ns=now_ns,
         resident_request_ids=resident_request_ids,
+        served_geometries=served_geometries,
     )
     return PlanContext(
         step=step,
@@ -689,6 +788,7 @@ def prepare_plan_context(
             [row.endpoint_residue_frames for row in rows],
             dtype=torch.int64,
         ),
+        is_file=torch.tensor([row.is_file for row in rows], dtype=torch.bool),
     )
 
 
@@ -766,4 +866,5 @@ def build_row_plan(
         endpoint_mode=context.endpoint_mode,
         endpoint_threshold_frames=context.endpoint_threshold_frames,
         endpoint_residue_frames=context.endpoint_residue_frames,
+        is_file=context.is_file,
     )

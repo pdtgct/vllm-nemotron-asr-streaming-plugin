@@ -401,6 +401,13 @@ class RowPlan:
     first newly minted CHUNK after a valid locale update replace the old
     persisted prompt; REPLAY/FLUSH can never authorize that transition.
 
+    ``is_file``: empty (no FILE rows) or ``(num_decodes + num_prefills,)``
+    bool, the HOST authority for whole-file rows (FILE-ROW-001). A FILE row
+    is a CHUNK row (``is_chunk``) when it advances a chunk or its final tail
+    this step, and otherwise a drain or end row. Its scheduled token is the
+    previously emitted token, not the stream placeholder, so the device
+    cross-checks below follow its own rules.
+
     All plan tensors are HOST-side (CPU) scheduler/registry authority:
     structural preflight validates them without any device
     synchronization, and the transaction uploads validated indices
@@ -432,6 +439,9 @@ class RowPlan:
     endpoint_residue_frames: torch.Tensor = field(
         default_factory=lambda: torch.zeros(0, dtype=torch.int64)
     )
+    is_file: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, dtype=torch.bool)
+    )
 
 
 @dataclass
@@ -453,6 +463,9 @@ class EmissionContext:
     per-row status (transition bits already folded in for CHUNK
     rows). The adapter trusts it and never recomputes protocol logic:
     any nonzero row emits park and keeps its scratch untouched.
+    ``file_rows``: optional ``(N,)`` bool, the FILE rows; a clean FILE
+    CHUNK row whose burst is empty emits the continuation token instead of
+    park (the request must not end before its final tail).
     """
 
     roles: torch.Tensor
@@ -462,6 +475,7 @@ class EmissionContext:
     book: torch.Tensor
     prompt_index: torch.Tensor
     row_status: torch.Tensor
+    file_rows: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -801,6 +815,7 @@ def make_mrv1_adapter(
     hidden_size: int,
     park_id: int,
     blank_id: int,
+    continuation_id: int | None = None,
 ) -> EmissionAdapter:
     """Build the MRV1 emission adapter (the correctness fallback,
     PORT-DEC-010's burst adapter arrives behind the same seam).
@@ -868,7 +883,17 @@ def make_mrv1_adapter(
             )
             has = blen > 0
             first = burst[:, 0].long() if k else torch.zeros_like(blen)
-            decision_c = torch.where(has, first, torch.full_like(blen, park_id))
+            empty_decision = torch.full_like(blen, park_id)
+            if continuation_id is not None and context.file_rows is not None:
+                # A FILE row that advanced audio but queued nothing emits the
+                # continuation token: every step emits one token, and park
+                # would end the request.
+                empty_decision = torch.where(
+                    context.file_rows.index_select(0, chunk_rows),
+                    torch.full_like(blen, continuation_id),
+                    empty_decision,
+                )
+            decision_c = torch.where(has, first, empty_decision)
             old_b = book_out.index_select(0, chunk_rows)
             new_b = old_b.clone()
             dt = new_b.dtype
@@ -955,6 +980,7 @@ def _mrv1_projection_invariant_rows(
     park_id: int,
     blank_id: int,
     eou_token_id: int | None = None,
+    continuation_id: int | None = None,
 ) -> torch.Tensor:
     """Validate MRV1 output and queue/book transitions exactly on device.
 
@@ -979,6 +1005,8 @@ def _mrv1_projection_invariant_rows(
     legal = (decision == park_id) | ((decision >= 0) & (decision < blank_id))
     if eou_token_id is not None:
         legal |= decision == eou_token_id
+    if continuation_id is not None:
+        legal |= decision == continuation_id
     bad = (~integral) | (~legal)
     if rows.shape[1] > 1:
         bad |= (rows[:, 1:] != 0).any(dim=1)
@@ -1060,11 +1088,14 @@ def _mrv1_projection_invariant_rows(
             first = result.token_ids[:, 0].long()
         else:
             first = torch.zeros_like(lengths)
-        expected_decision = torch.where(
-            has,
-            first,
-            torch.full_like(first, park_id),
-        )
+        empty_decision = torch.full_like(first, park_id)
+        if continuation_id is not None and context.file_rows is not None:
+            empty_decision = torch.where(
+                context.file_rows.index_select(0, chunk_rows),
+                torch.full_like(first, continuation_id),
+                empty_decision,
+            )
+        expected_decision = torch.where(has, first, empty_decision)
         old_book = context.book.index_select(0, chunk_rows)
         chunk_bad = (
             (chunk_decision.long() != expected_decision)
@@ -1648,6 +1679,7 @@ class HostStaging:
     _arena: torch.Tensor = field(init=False, repr=False)
     _book_init: torch.Tensor = field(init=False, repr=False)
     _is_chunk_buf: torch.Tensor = field(init=False, repr=False)
+    _is_file_buf: torch.Tensor = field(init=False, repr=False)
     _bucket_arena: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -1667,6 +1699,11 @@ class HostStaging:
             (self.capacity, 7), dtype=torch.int64, pin_memory=pin
         )
         self._is_chunk_buf = torch.empty(
+            (self.capacity,), dtype=torch.bool, pin_memory=pin
+        )
+        # FILE-row role vector: its own buffer, never ``is_chunk``'s, whose
+        # transfer may still be outstanding.
+        self._is_file_buf = torch.empty(
             (self.capacity,), dtype=torch.bool, pin_memory=pin
         )
         # One dedicated bucket-position buffer PER GEOMETRY: each
@@ -1703,6 +1740,8 @@ class HostStaging:
             buf = self._book_init[:n]
         elif slot_name == "is_chunk":
             buf = self._is_chunk_buf[:n]
+        elif slot_name == "is_file":
+            buf = self._is_file_buf[:n]
         else:
             try:
                 row = self._INT64_SLOTS.index(slot_name)
@@ -1831,6 +1870,13 @@ def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Ten
             raise ValueError(
                 f"plan.{name} must be empty or CPU int64 shaped ({n_real},)"
             )
+    if plan.is_file.numel() and (
+        plan.is_file.device.type != "cpu"
+        or plan.is_file.dtype != torch.bool
+        or plan.is_file.dim() != 1
+        or plan.is_file.shape[0] != n_real
+    ):
+        raise ValueError(f"plan.is_file must be empty or CPU bool shaped ({n_real},)")
     live = plan.live_block_ids
     if live.device.type != "cpu" or live.dtype != torch.int64 or live.dim() != 1:
         raise ValueError("plan.live_block_ids must be rank-one CPU int64")
@@ -2566,6 +2612,9 @@ def advance_model_rows(
     memory_profile: bool = False,
     staging: HostStaging | None = None,
     native_burst_handoff: Any | None = None,
+    file_carrier_id: int | None = None,
+    continuation_id: int | None = None,
+    geometry_order: Sequence[int] | None = None,
 ) -> torch.Tensor:
     """The ONE shared outer transaction (PORT-ADV-003).
 
@@ -2628,6 +2677,20 @@ def advance_model_rows(
     race a single shared bucket slot would carry; it falls back to
     ``_h2d`` only when ``staging`` is ``None``.
 
+    FILE rows (``plan.is_file``, FILE-ROW-001 to FILE-ROW-005): a FILE row
+    that advances audio is a CHUNK row whose envelope the model wrote into
+    its carrier row; its scheduled token is the previously emitted token, so
+    the host-role cross-check accepts the file-carrier token (first step) or
+    the continuation token when no echo is pending, and an armed echo is
+    validated like a REPLAY row's. A drain step is a REPLAY row and the end
+    step a FLUSH row. ``file_carrier_id`` and ``continuation_id`` are
+    required when any row is a FILE row; ``continuation_id`` is what a clean
+    FILE CHUNK row with an empty burst emits.
+
+    ``geometry_order``: the step planner's order of chunk groups by
+    geometry index (FILE-ENG-004). Buckets run in that order; a geometry it
+    does not list runs after the listed ones, by earliest deadline.
+
     Returns:
         The runner's row output as projected by ``adapter`` (e.g. the
         ``(N, H)`` decision-carrier for MRV1).
@@ -2677,6 +2740,17 @@ def advance_model_rows(
         plan, int(input_ids.shape[0]), int(inputs_embeds.shape[0])
     )
     has_chunk = bool(plan.is_chunk.any())
+    is_file_cpu = (
+        plan.is_file
+        if plan.is_file.numel()
+        else torch.zeros(n_real, dtype=torch.bool)
+    )
+    has_file = bool(is_file_cpu.any())
+    if has_file and (file_carrier_id is None or continuation_id is None):
+        raise ValueError(
+            "FILE rows require file_carrier_id and continuation_id "
+            "(FILE-ROW-003)"
+        )
     if graph_covers_decode and has_chunk and plan.execution_tier <= 0:
         raise ValueError(
             "regional graph decode requires a positive RowPlan execution tier"
@@ -2818,7 +2892,10 @@ def advance_model_rows(
         if int(positions.numel()):
             deadline = int(plan.ready_deadline_ns.index_select(0, positions).min())
             unresolved.append((geometry, positions, deadline, int(positions[0])))
-    unresolved.sort(key=lambda item: (item[2], item[3]))
+    order_rank = {int(g): i for i, g in enumerate(geometry_order or ())}
+    unresolved.sort(
+        key=lambda item: (order_rank.get(item[0], len(order_rank)), item[2], item[0])
+    )
     ready = len(unresolved)
     bucket_pos: list[tuple[int, torch.Tensor, ResolvedDecode]] = []
     bucket_transitions: dict[int, Callable[..., ChunkBucketResult]] = {}
@@ -2931,6 +3008,7 @@ def advance_model_rows(
 
     # ---- device role/protocol/invariant composition ----
     is_chunk_dev = _stage("is_chunk", plan.is_chunk)
+    is_file_dev = _stage("is_file", is_file_cpu) if has_file else None
     plan_geom_dev = _stage("geometry", plan.geometry_id)
     admitted_prompt_dev = _stage("admitted_prompt", plan.prompt_index)
     prior_prompt_dev = _stage(
@@ -3017,15 +3095,35 @@ def advance_model_rows(
         ),
     )
     status = torch.zeros(n_real, dtype=torch.int32, device=device)
-    status |= (is_chunk_dev != (ids_dev == placeholder_id)).to(
-        torch.int32
-    ) * ROW_STATUS_ROLE_MISMATCH
-    status |= ((~is_chunk_dev) & pending & (ids_dev != expected)).to(
+    if is_file_dev is None:
+        stream_role_bad = is_chunk_dev != (ids_dev == placeholder_id)
+        echo_checked = ~is_chunk_dev
+        not_drained = is_chunk_dev & (pending | (remaining > 0))
+        file_role_bad = None
+    else:
+        # A FILE row's scheduled token is the token it emitted last (the
+        # file carrier on its first step), never the stream placeholder.
+        # Its CHUNK steps follow a drained queue whose last label's echo may
+        # still be armed, which the echo check validates and the chunk then
+        # replaces.
+        assert file_carrier_id is not None and continuation_id is not None
+        stream_role_bad = (~is_file_dev) & (is_chunk_dev != (ids_dev == placeholder_id))
+        file_role_bad = (
+            is_file_dev
+            & is_chunk_dev
+            & (~pending)
+            & (ids_dev != file_carrier_id)
+            & (ids_dev != continuation_id)
+        ) | (is_file_dev & (ids_dev == placeholder_id))
+        echo_checked = (~is_chunk_dev) | is_file_dev
+        not_drained = is_chunk_dev & (((~is_file_dev) & pending) | (remaining > 0))
+    status |= stream_role_bad.to(torch.int32) * ROW_STATUS_ROLE_MISMATCH
+    if file_role_bad is not None:
+        status |= file_role_bad.to(torch.int32) * ROW_STATUS_ROLE_MISMATCH
+    status |= (echo_checked & pending & (ids_dev != expected)).to(
         torch.int32
     ) * ROW_STATUS_ECHO_MISMATCH
-    status |= (is_chunk_dev & (pending | (remaining > 0))).to(
-        torch.int32
-    ) * ROW_STATUS_QUEUE_NOT_DRAINED
+    status |= not_drained.to(torch.int32) * ROW_STATUS_QUEUE_NOT_DRAINED
     # The AR park echo: under async scheduling the engine's in-flight
     # frame legally feeds an emitted park token back as the next input
     # (the label twin of this row is ROLE_REPLAY, armed at commit). A
@@ -3325,6 +3423,7 @@ def advance_model_rows(
         book=book,
         prompt_index=admitted_prompt_dev,
         row_status=status,
+        file_rows=is_file_dev,
     )
     # The adapter is an extension seam, not transaction authority. Give it
     # independent writable snapshots and retain ``merged``/``context`` as the
@@ -3343,6 +3442,7 @@ def advance_model_rows(
         book=context.book.clone(),
         prompt_index=context.prompt_index.clone(),
         row_status=context.row_status.clone(),
+        file_rows=context.file_rows.clone() if context.file_rows is not None else None,
     )
     projection = adapter(adapter_result, adapter_context)
 
@@ -3528,6 +3628,7 @@ def advance_model_rows(
         park_id=park_id,
         blank_id=blank,
         eou_token_id=eou_token_id if endpoint_enabled else None,
+        continuation_id=continuation_id if has_file else None,
     )
     status |= projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
     native_stage: Callable[[], None] | None = None

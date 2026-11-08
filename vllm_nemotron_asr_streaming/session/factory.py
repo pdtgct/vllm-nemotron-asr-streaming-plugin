@@ -1,276 +1,576 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Session factory bound to core ``AsyncLLM``.
+"""Session factory over vLLM's admitted-stream client path.
 
-Admission is ``EngineCoreClient.admit_stream_async``. ``AsyncLLM`` holds
-that client on ``engine_core``. Updates go through
-``add_request_async`` with ``StreamAdmissionContext``. Abort goes
-through ``abort_requests_async``.
+A session is one ``generate(..., stream_admission=True)`` task on the engine
+client, owned by the factory's session table from before it starts until its
+slot has retired, or until the factory is torn down. The factory and its leases
+satisfy the ``SessionFactory`` and ``SessionLease`` protocols structurally; this
+package never imports a frontend.
 
-``StateCompletion`` is applied inside ``StateScheduler`` and is not a
-field on the ``AsyncLLM`` output path in ``rfc12-integration``.
-``release`` returns one only when the engine core exposes
-``wait_state_completion``. It does not construct a fence object.
-
-This module imports vLLM core only.
+Importing this module imports vLLM, which ``vllm_nemotron_asr_streaming.session``
+does not do until a factory is created.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import inspect
+import logging
 import time
+import uuid
+from collections.abc import Callable, Iterator
 from typing import Any
 
-from vllm.v1.engine.async_llm import AsyncLLM
-from vllm.v1.kv_cache_interface import StateCompletion
+import numpy as np
+from vllm.engine.protocol import StreamingInput
+from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.engine import StreamAdmissionError
+from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_nemotron_asr_streaming.engine_flags import persistent_state_config_errors
+from vllm_nemotron_asr_streaming.identity import ARCHITECTURE
+from vllm_nemotron_asr_streaming.locales import default_locale
+from vllm_nemotron_asr_streaming.lookahead import (
+    GEOMETRIES,
+    served_lookaheads,
+)
 
+from .errors import SessionFailed, SessionRefused
+from .packer import Packer, PackerCapacityError, Unit, wall_clock_ms
 
-class StreamAdmissionError(RuntimeError):
-    """``admit_stream_async`` refused the request."""
+logger = logging.getLogger(__name__)
 
-    def __init__(self, result: Any) -> None:
-        self.result = result
-        reason = getattr(result, "reason", None)
-        request_id = getattr(result, "request_id", None)
-        super().__init__(
-            f"stream admission refused for {request_id!r}: {reason!r}"
-        )
+#: Retained transcript limit per session, in UTF-8 bytes.
+TRANSCRIPT_LIMIT_BYTES = 1 << 20
 
+OPEN, FLUSHED, FAILED, ABORTED, RELEASED = (
+    "open",
+    "flushed",
+    "failed",
+    "aborted",
+    "released",
+)
+#: Calls allowed per state. ``finish`` in ``aborted``/``released`` and
+#: ``release`` in ``released`` are accepted and return without effect.
+ALLOWED: dict[str, frozenset[str]] = {
+    OPEN: frozenset({"feed", "update_locale", "flush", "abort"}),
+    FLUSHED: frozenset({"finish", "release"}),
+    FAILED: frozenset({"abort", "finish", "release"}),
+    ABORTED: frozenset({"release", "finish"}),
+    RELEASED: frozenset({"release", "finish"}),
+}
 
-def _engine_core_admit(llm: AsyncLLM):
-    if not isinstance(llm, AsyncLLM):
-        raise TypeError(
-            "streaming sessions bind only to "
-            "vllm.v1.engine.async_llm.AsyncLLM"
-        )
-    engine_core = getattr(llm, "engine_core", None)
-    admit = getattr(engine_core, "admit_stream_async", None)
-    if not callable(admit):
-        raise TypeError(
-            "AsyncLLM.engine_core.admit_stream_async is missing. "
-            "This package targets pdtgct/vllm rfc12-integration at "
-            "4c180969 (tree 465f10ad65), not a released vLLM."
-        )
-    return admit
-
-
-def _require_persistent_state_engine(llm: AsyncLLM) -> None:
-    vllm_config = getattr(llm, "vllm_config", None)
-    if vllm_config is None:
-        raise TypeError(
-            "AsyncLLM.vllm_config is required so the session can refuse "
-            "RFC12's async-scheduling and prefix-caching defaults"
-        )
-    errors = persistent_state_config_errors(vllm_config)
-    if errors:
-        raise ValueError(
-            "Nemotron3_5AsrStreamingForRNNT persistent state refuses: "
-            + "; ".join(errors)
-        )
+PENDING, ACCEPTED, REFUSED = "pending", "accepted", "refused"
 
 
-def _sampling_params() -> Any:
-    from vllm.sampling_params import SamplingParams
+# @spec SESS-ENG-001
+def _sampling_params() -> SamplingParams:
+    from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
+        REALTIME_MAX_TOKENS,
+    )
 
-    # n=1, no stop strings, cumulative output. Temperature 0 keeps the
-    # request on the greedy path the RNN-T replay expects.
-    return SamplingParams(n=1, temperature=0.0, max_tokens=1, stop=None)
-
-
-def _engine_request(
-    request_id: str,
-    *,
-    arrival_time: float,
-    prompt_token_ids: list[int],
-    mm_features: list[Any] | None,
-    resumable: bool,
-    input_closed: bool,
-    stream_admission: bool,
-) -> Any:
-    from vllm.v1.engine import EngineCoreRequest, StreamAdmissionContext
-
-    return EngineCoreRequest(
-        request_id=request_id,
-        prompt_token_ids=list(prompt_token_ids),
-        mm_features=mm_features,
-        sampling_params=_sampling_params(),
-        pooling_params=None,
-        arrival_time=arrival_time,
-        lora_request=None,
-        cache_salt=None,
-        data_parallel_rank=None,
-        resumable=resumable,
-        stream_admission=(
-            StreamAdmissionContext(input_closed=input_closed)
-            if stream_admission
-            else None
-        ),
+    return SamplingParams(
+        n=1,
+        temperature=0,
+        max_tokens=REALTIME_MAX_TOKENS,
+        output_kind=RequestOutputKind.DELTA,
+        skip_special_tokens=True,
     )
 
 
-class StreamingSession:
-    """One admitted stream. Construction does not admit a request."""
+def _retrieve(task: asyncio.Task) -> None:
+    """Done-callback: retrieve a task's exception so it is never reported
+    as unretrieved."""
+    if not task.cancelled():
+        task.exception()
+
+
+# @spec SESS-FAC-005
+class SessionLease:
+    """One session: the lease a frontend holds, and the factory's record."""
 
     def __init__(
         self,
-        llm: AsyncLLM,
-        request_id: str,
-        *,
-        admission_payload: Any,
-        flush_token_id: int | None = None,
+        factory: StreamingSessionFactory,
+        caller_id: str,
+        packer: Packer,
+        locale: str,
     ) -> None:
-        if not isinstance(request_id, str) or not request_id:
-            raise ValueError("request_id must be a non-empty string")
-        self._admit_stream_async = _engine_core_admit(llm)
-        self._llm = llm
-        self.request_id = request_id
-        self._admission_payload = admission_payload
-        self._flush_token_id = flush_token_id
+        self._factory = factory
+        self.caller_id = caller_id
+        #: Admission state of the factory's record (SESS-OWN-001).
+        self.admission = PENDING
+        self.state = OPEN
+        self.failure: str | None = None
+        self.task: asyncio.Task | None = None
+        self.started = False
+        self.cleanup_task: asyncio.Task | None = None
+        self.locale = locale
+        self._packer = packer
+        self._loop = asyncio.get_running_loop()
+        self._admitted: asyncio.Future[bool] = self._loop.create_future()
+        self._units: asyncio.Queue[Unit | None] = asyncio.Queue()
+        self._yielded = 0
+        self._position = -1
+        self._outcome: asyncio.Future[tuple[str, str]] | None = None
+        self._busy = False
+        self._active = False
         self._input_closed = False
-        self._aborted = False
+        self._text = ""
+        self._text_bytes = 0
+        self._finished = False
+        self._input_exhausted = False
+        #: The terminal output was observed after the input generator ended.
+        self._finished_after_close = False
+        self._finish_reason: str | None = None
 
-    async def feed(
-        self,
-        token_ids: list[int],
-        *,
-        mm_features: list[Any] | None = None,
-        input_closed: bool = False,
-    ) -> None:
-        """Push the next input. Positions are relative to ``token_ids``.
+    # ------------------------------------------------------------ the task
 
-        A resumable update with no tokens is an ``empty_update`` on the
-        RFC12 scheduler. Closing input with an empty token list uses
-        ``finish`` (a non-resumable update) instead.
-        """
-        if self._input_closed or self._aborted:
-            raise RuntimeError(f"session {self.request_id!r} is closed")
-        if not token_ids and not input_closed:
-            raise ValueError("feed() requires at least one token id")
-        request = _engine_request(
-            self.request_id,
-            arrival_time=time.time(),
-            prompt_token_ids=list(token_ids),
-            mm_features=mm_features,
-            resumable=True,
-            input_closed=input_closed,
-            stream_admission=True,
-        )
-        await self._llm.engine_core.add_request_async(request)
-        if input_closed:
+    # @spec SESS-ENG-008
+    async def _inputs(self):
+        """The input generator: one unit at a time, only on request."""
+        self.admission = ACCEPTED
+        if not self._admitted.done():
+            self._admitted.set_result(True)
+        while True:
+            unit = await self._units.get()
+            if unit is None:
+                self._input_exhausted = True
+                return
+            self._position = self._yielded
+            self._yielded += 1
+            yield StreamingInput(prompt=unit.prompt)
+
+    async def _run(self) -> None:
+        self.started = True
+        try:
+            async for output in self._factory._engine.generate(
+                self._inputs(),
+                _sampling_params(),
+                self.caller_id,
+                stream_admission=True,
+            ):
+                self._on_output(output)
+        except StreamAdmissionError:
+            self.admission = REFUSED
+            self._factory._drop(self)
+            raise
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        _retrieve(task)
+        if not self._admitted.done():
+            self._admitted.set_result(False)
+        self._on_stream_end()
+
+    # @spec SESS-TXT-003
+    def _on_output(self, output: Any) -> None:
+        rejection = getattr(output, "stream_rejection", None)
+        if rejection is not None:
+            if rejection.input_index == self._position:
+                self._resolve(("rejected", rejection.reason))
+            return
+        completion = output.outputs[0] if output.outputs else None
+        if completion is not None:
+            if completion.text and not self._append_text(completion.text):
+                return
+            ids = completion.token_ids
+            if ids and ids[-1] == self._factory._park_token_id:
+                self._resolve(("parked", ""))
+        if output.finished:
+            self._finished = True
+            self._finished_after_close = self._input_exhausted
+            self._finish_reason = completion.finish_reason if completion else None
+
+    def _resolve(self, outcome: tuple[str, str]) -> None:
+        if self._outcome is not None and not self._outcome.done():
+            self._outcome.set_result(outcome)
+
+    # @spec SESS-TXT-001, SESS-TXT-004
+    def _append_text(self, text: str) -> bool:
+        size = len(text.encode())
+        if self._text_bytes + size > TRANSCRIPT_LIMIT_BYTES:
+            self._fail("output_capacity")
+            self._resolve(("overflow", ""))
+            return False
+        self._text_bytes += size
+        self._text += text
+        return True
+
+    # ------------------------------------------------------------- failure
+
+    # @spec SESS-LEASE-004, SESS-LEASE-005, SESS-LEASE-007
+    def _fail(self, reason: str) -> None:
+        if self.state == OPEN:
+            self.state = FAILED
+            self.failure = reason
+
+    def _failed(self, reason: str) -> SessionFailed:
+        self._fail(reason)
+        return SessionFailed(reason)
+
+    def _end_reason(self, *, idle: bool) -> str:
+        task = self.task
+        assert task is not None and task.done()
+        if task.cancelled():
+            return "cancelled"
+        error = task.exception()
+        if isinstance(error, EngineDeadError):
+            return "engine_dead"
+        if error is None and idle and self._finish_reason == "abort":
+            return "expired"
+        return "abnormal_end"
+
+    # @spec SESS-EXP-001
+    def _on_stream_end(self) -> None:
+        """The task ended: fail an idle open lease; a running call reports it."""
+        if self.state == OPEN and not self._active and not self._input_closed:
+            self._fail(self._end_reason(idle=True))
+
+    # -------------------------------------------------------- call checking
+
+    @contextlib.contextmanager
+    # @spec SESS-LEASE-001, SESS-LEASE-002, SESS-LEASE-003, SESS-LEASE-006
+    def _call(self, name: str) -> Iterator[None]:
+        """Serialization, closed factory, then state (SESS-LEASE-006)."""
+        if self._busy:
+            raise RuntimeError(f"a call is already running on session {self.caller_id}")
+        if self._factory.closed:
+            raise SessionFailed("cancelled", "the session factory is closed")
+        if name not in ALLOWED[self.state]:
+            if self.state == FAILED:
+                raise SessionFailed(self.failure or "abnormal_end")
+            raise SessionFailed("state", f"{name} is not allowed in state {self.state}")
+        self._busy = True
+        try:
+            yield
+        finally:
+            self._busy = False
+
+    @contextlib.contextmanager
+    def _io(self) -> Iterator[None]:
+        """A feed or flush: a cancellation breaks the lease (SESS-LEASE-004)."""
+        self._active = True
+        try:
+            yield
+        except asyncio.CancelledError:
+            self._fail("cancelled")
+            raise
+        finally:
+            self._active = False
+            assert self.task is not None
+            if self.task.done():
+                self._on_stream_end()
+
+    # --------------------------------------------------------- unit sending
+
+    # @spec SESS-ENG-002, SESS-ENG-003, SESS-ENG-004, SESS-ENG-005
+    # @spec SESS-ENG-006, SESS-ENG-007, SESS-ENG-009
+    async def _send(self, unit: Unit) -> None:
+        """Send one unit and await its outcome, resending as the rejection
+        reason allows."""
+        task = self.task
+        assert task is not None
+        pause = self._factory._backoff_initial_s
+        cache_misses = 0
+        while True:
+            if task.done():
+                raise self._failed(self._end_reason(idle=False))
+            self._outcome = self._loop.create_future()
+            self._units.put_nowait(unit)
+            await asyncio.wait(
+                {self._outcome, task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not self._outcome.done():
+                raise self._failed(self._end_reason(idle=False))
+            kind, reason = self._outcome.result()
+            self._outcome = None
+            if kind == "parked":
+                return
+            if kind == "overflow":
+                raise SessionFailed("output_capacity")
+            if reason == "engine_paused":
+                await asyncio.sleep(pause)
+                pause = min(pause * 2, self._factory._backoff_max_s)
+            elif reason == "mm_cache_miss" and cache_misses == 0:
+                cache_misses = 1
+            else:
+                raise self._failed("rejected_input")
+
+    # ----------------------------------------------------------- lease API
+
+    # @spec SESS-IN-001, SESS-IN-002, SESS-IN-003, SESS-IN-004
+    async def feed(self, samples: np.ndarray, *, on_accepted: Callable[[int], Any]):
+        with self._call("feed"):
+            if (
+                not isinstance(samples, np.ndarray)
+                or samples.dtype != np.float32
+                or samples.ndim != 1
+                or not np.isfinite(samples).all()
+            ):
+                raise ValueError(
+                    "samples must be a finite one-dimensional float32 array"
+                )
+            with self._io():
+                try:
+                    units = self._packer.append(samples)
+                except PackerCapacityError as error:
+                    self._fail("input_capacity")
+                    raise SessionFailed("input_capacity", str(error)) from error
+                on_accepted(len(samples))
+                texts = []
+                for unit in units:
+                    before = self._text_bytes
+                    await self._send(unit)
+                    if self._text_bytes != before:
+                        texts.append(self._text)
+                return texts
+
+    # @spec SESS-LOC-001, SESS-LOC-002, SESS-LOC-003
+    async def update_locale(self, locale: str) -> None:
+        with self._call("update_locale"):
+            row = self._factory._locale_table.get(locale)
+            if row is None:
+                raise SessionRefused("locale", f"locale {locale!r} is not served")
+            self._packer.set_locale_row(row)
+            self.locale = locale
+
+    # @spec SESS-FLUSH-001, SESS-FLUSH-002, SESS-FLUSH-003
+    async def flush(self) -> str:
+        with self._call("flush"), self._io():
+            try:
+                tail = self._packer.close()
+            except PackerCapacityError as error:
+                self._fail("input_capacity")
+                raise SessionFailed("input_capacity", str(error)) from error
+            await self._send(tail)
             self._input_closed = True
+            self._units.put_nowait(None)
+            task = self.task
+            assert task is not None
+            await asyncio.wait({task})
+            if (
+                not task.cancelled()
+                and task.exception() is None
+                and self._finished
+                and self._finished_after_close
+                and self._finish_reason == "stop"
+            ):
+                self.state = FLUSHED
+                return self._text
+            raise self._failed(self._end_reason(idle=False))
 
-    async def flush(self) -> None:
-        """Send the served ``flush_token_id`` without closing the slot.
-
-        The source config mints that id as ``blank + 4``. The forward
-        path does not branch on the id; the session still sends it as
-        the flush control token.
-        """
-        if self._flush_token_id is None:
-            raise ValueError(
-                "flush() requires flush_token_id from the served config "
-                "(blank_token_id + 4)"
-            )
-        await self.feed([self._flush_token_id])
-
+    # @spec SESS-FIN-001
     async def finish(self) -> None:
-        """Close input with a non-resumable update and leave the slot draining.
+        with self._call("finish"):
+            if self.state in (ABORTED, RELEASED):
+                return
+            assert self.task is not None
+            await asyncio.wait({self.task})
 
-        A resumable empty update is rejected as ``empty_update`` before
-        ``input_closed`` is applied. ``resumable=False`` closes input.
-        """
-        if self._aborted:
-            raise RuntimeError(f"session {self.request_id!r} is aborted")
-        if self._input_closed:
-            return
-        request = _engine_request(
-            self.request_id,
-            arrival_time=time.time(),
-            prompt_token_ids=[],
-            mm_features=None,
-            resumable=False,
-            input_closed=True,
-            stream_admission=True,
-        )
-        await self._llm.engine_core.add_request_async(request)
-        self._input_closed = True
-
-    async def release(self) -> StateCompletion:
-        """Return the fence object that lets the slot be reused.
-
-        RFC12 applies ``StateCompletion`` inside the scheduler and does
-        not put it on ``AsyncLLM`` outputs. This waits on
-        ``engine_core.wait_state_completion`` when that method exists.
-        """
-        if not self._input_closed and not self._aborted:
-            raise RuntimeError("release() follows finish() or abort()")
-        waiter = getattr(self._llm.engine_core, "wait_state_completion", None)
-        if not callable(waiter):
-            raise RuntimeError(
-                "StateCompletion is consumed by StateScheduler on "
-                "rfc12-integration@4c180969 and is not forwarded to "
-                "AsyncLLM. release() will not invent a fence object."
-            )
-        completion = await waiter(self.request_id)
-        if not isinstance(completion, StateCompletion):
-            raise TypeError(
-                "wait_state_completion must return StateCompletion, "
-                f"got {type(completion).__name__}"
-            )
-        return completion
-
+    # @spec SESS-ABORT-001
     async def abort(self) -> None:
-        """Abort the request id. The id is not reused for a new session."""
-        if self._aborted:
-            return
-        await self._llm.engine_core.abort_requests_async([self.request_id])
-        self._aborted = True
-        self._input_closed = True
+        with self._call("abort"):
+            assert self.task is not None
+            self._input_closed = True
+            self.task.cancel()
+            await asyncio.wait({self.task})
+            self.state = ABORTED
+
+    # @spec SESS-REL-001, SESS-REL-002, SESS-REL-003
+    async def release(self) -> None:
+        with self._call("release"):
+            if self.state == RELEASED:
+                return
+            factory = self._factory
+            try:
+                await factory._engine.wait_stream_retired(self.caller_id)
+            except asyncio.CancelledError:
+                factory._start_cleanup(self)
+                raise
+            except EngineDeadError:
+                factory._drop(self)
+                if self.failure == "engine_dead":
+                    self.state = RELEASED
+                    return
+                raise SessionFailed("engine_dead") from None
+            except (StreamAdmissionError, ValueError):
+                pass
+            except Exception:
+                factory._drop(self)
+                raise
+            if self.task is not None and not self.task.done():
+                # Keep the generate task owned until it has ended.
+                factory._start_cleanup(self)
+            else:
+                factory._drop(self)
+            self.state = RELEASED
+
+    # @spec SESS-TEAR-001
+    def teardown(self) -> None:
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
 
 
 class StreamingSessionFactory:
-    """Binds a core ``AsyncLLM`` and admits sessions through it."""
+    """Opens sessions on an engine client and owns them until retirement."""
 
-    def __init__(self, llm: AsyncLLM) -> None:
-        self._admit_stream_async = _engine_core_admit(llm)
-        _require_persistent_state_engine(llm)
-        self._llm = llm
-        self._admissions: dict[str, Any] = {}
-
-    async def open(
+    # @spec SESS-FAC-004, SESS-OWN-001, SESS-OWN-005
+    def __init__(
         self,
-        request_id: str,
+        engine_client: Any,
+        hf_config: Any,
         *,
-        flush_token_id: int | None = None,
-        arrival_time: float | None = None,
-    ) -> StreamingSession:
-        """Admit an empty resumable request under ``request_id``.
+        backoff_initial_s: float = 0.05,
+        backoff_max_s: float = 1.0,
+    ) -> None:
+        self._engine = engine_client
+        self._hf = hf_config
+        self._backoff_initial_s = backoff_initial_s
+        self._backoff_max_s = backoff_max_s
+        self._locale_table: dict[str, int] = dict(hf_config.prompt_dictionary)
+        self._park_token_id: int = hf_config.eos_token_id
+        self._carrier_token_id: int = hf_config.audio_chunk_token_id
+        self._geometry_by_label = {
+            label: (right, index)
+            for right, label, index in GEOMETRIES
+            if right in set(served_lookaheads(hf_config))
+        }
+        self.served_cadences: frozenset[str] = frozenset(self._geometry_by_label)
+        self.locales: frozenset[str] = frozenset(self._locale_table)
+        self.default_locale: str | None = default_locale(self._locale_table)
+        self.sessions: dict[str, SessionLease] = {}
+        self.closed = False
+        self._cleanup_tasks: set[asyncio.Task] = set()
+        self._faults: list[BaseException] = []
 
-        The id is caller-supplied. ``admit_stream`` does not go through
-        the input processor, so the engine adds no random suffix. A
-        second ``open`` of the same id resends the original payload,
-        which is the retry rule: same bytes, deadline unchanged.
-        """
-        if not isinstance(request_id, str) or not request_id:
-            raise ValueError("request_id must be a non-empty string")
-        payload = self._admissions.get(request_id)
-        if payload is None:
-            payload = _engine_request(
-                request_id,
-                arrival_time=time.time() if arrival_time is None else arrival_time,
-                prompt_token_ids=[],
-                mm_features=None,
-                resumable=True,
-                input_closed=False,
-                stream_admission=False,
-            )
-            self._admissions[request_id] = payload
-        result = await self._admit_stream_async(payload)
-        if not getattr(result, "accepted", False):
-            raise StreamAdmissionError(result)
-        return StreamingSession(
-            self._llm,
-            request_id,
-            admission_payload=payload,
-            flush_token_id=flush_token_id,
+    # @spec SESS-OPEN-001, SESS-OPEN-002, SESS-OPEN-003, SESS-OPEN-004
+    # @spec SESS-OPEN-005, SESS-OPEN-006, SESS-OWN-006
+    async def open(self, *, cadence: str, locale: str) -> SessionLease:
+        if self.closed:
+            raise SessionFailed("cancelled", "the session factory is closed")
+        if cadence not in self._geometry_by_label:
+            raise SessionRefused("cadence", f"cadence {cadence!r} is not served")
+        if locale not in self._locale_table:
+            raise SessionRefused("locale", f"locale {locale!r} is not served")
+        right_context, geometry_index = self._geometry_by_label[cadence]
+        caller_id = str(uuid.uuid4())
+        lease = SessionLease(
+            self,
+            caller_id,
+            Packer(
+                right_context=right_context,
+                geometry_index=geometry_index,
+                locale_row=self._locale_table[locale],
+                carrier_token_id=self._carrier_token_id,
+                clock_ms=wall_clock_ms,
+            ),
+            locale,
         )
+        self.sessions.setdefault(caller_id, lease)
+        task = asyncio.ensure_future(lease._run())
+        lease.task = task
+        task.add_done_callback(lease._on_task_done)
+        try:
+            await asyncio.wait({lease._admitted})
+        except asyncio.CancelledError:
+            task.cancel()
+            self._abandon(lease)
+            raise
+        if lease._admitted.result():
+            return lease
+        # The task ended before the input generator was first read.
+        if lease.admission == REFUSED:
+            error = task.exception()
+            assert isinstance(error, StreamAdmissionError)
+            raise SessionRefused(error.result.reason, str(error)) from error
+        self._abandon(lease)
+        reason = lease._end_reason(idle=False)
+        raise SessionFailed(reason, f"the stream ended before admission: {reason}")
+
+    def _drop(self, lease: SessionLease) -> None:
+        if self.sessions.get(lease.caller_id) is lease:
+            del self.sessions[lease.caller_id]
+
+    def _abandon(self, lease: SessionLease) -> None:
+        """The owner is gone: cancel the task and hand the session to cleanup,
+        unless the task never started or the factory is closed."""
+        if lease.task is not None and not lease.task.done():
+            lease.task.cancel()
+        if self.closed or not lease.started:
+            self._drop(lease)
+        else:
+            self._start_cleanup(lease)
+
+    # @spec SESS-OWN-002, SESS-OWN-003
+    def _start_cleanup(self, lease: SessionLease) -> None:
+        if lease.admission == REFUSED:
+            self._drop(lease)
+            return
+        if self.closed or lease.cleanup_task is not None:
+            return
+        task = asyncio.ensure_future(self._cleanup(lease))
+        lease.cleanup_task = task
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+        task.add_done_callback(_retrieve)
+
+    # @spec SESS-OWN-002, SESS-OWN-008
+    async def _cleanup(self, lease: SessionLease) -> None:
+        try:
+            await self._engine.wait_stream_retired(lease.caller_id)
+        except (StreamAdmissionError, ValueError):
+            pass
+        except Exception as error:
+            logger.warning(
+                "retirement wait for session %s failed: %r", lease.caller_id, error
+            )
+            self._faults.append(error)
+        task = lease.task
+        if task is not None and not task.done():
+            # Ownership lasts until the generate task has ended too.
+            await asyncio.wait({task})
+        self._drop(lease)
+
+    # @spec SESS-OWN-004
+    async def drain(self, deadline: float) -> list[BaseException]:
+        pending = [t for t in self._cleanup_tasks if not t.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=max(0.0, deadline - time.monotonic()))
+        faults, self._faults = self._faults, []
+        return faults
+
+    # @spec SESS-OWN-005, SESS-OWN-006, SESS-OWN-007
+    def teardown_all(self) -> set[asyncio.Task]:
+        self.closed = True
+        tasks = set(self._cleanup_tasks)
+        for lease in self.sessions.values():
+            if lease.task is not None:
+                tasks.add(lease.task)
+        for task in tasks:
+            task.cancel()
+            if task.done():
+                _retrieve(task)
+            else:
+                task.add_done_callback(_retrieve)
+        return tasks
+
+
+# @spec SESS-FAC-002, SESS-FAC-003
+def create_session_factory(engine_client: Any, model_config: Any):
+    """The factory for the served model, or ``None`` for another model."""
+    architecture = (
+        getattr(model_config, "architecture", None)
+        or (list(model_config.architectures)[0])
+    )
+    if architecture != ARCHITECTURE:
+        return None
+    generate = getattr(engine_client, "generate", None)
+    if not callable(generate):
+        raise TypeError("the engine client has no generate()")
+    if "stream_admission" not in inspect.signature(generate).parameters:
+        raise TypeError(
+            "the engine client's generate() does not accept stream_admission"
+        )
+    if not callable(getattr(engine_client, "wait_stream_retired", None)):
+        raise TypeError("the engine client has no wait_stream_retired()")
+    return StreamingSessionFactory(engine_client, model_config.hf_config)

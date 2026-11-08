@@ -17,3 +17,11 @@ live under `docs/intent/<component>/`.
 
 - Mode: Full
 - Version: 1.3.0
+
+## LID Tooling
+
+- Spec prefixes owned here: `REG`, `SESS`, `FILE` (`docs/intent/*/*-specs.md`).
+- The vendored model package under `vllm_nemotron_asr_streaming/nemotron_asr/` carries
+  `@spec PORT-…` annotations inherited from its source. They are provenance, not this repository's
+  specs; coherence checks ignore IDs outside the owned prefixes.
+- Test tiers and the run command are in `tests/conftest.py` and `README.md`.

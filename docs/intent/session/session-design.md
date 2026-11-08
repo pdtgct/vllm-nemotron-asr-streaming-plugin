@@ -245,12 +245,16 @@ deferred until per-utterance finals are designed with the frontend, since a poli
 report segments to the frontend changes nothing it can use. Segment boundaries from EOU tokens are
 part of that later design.
 
-## Current source
+## Implementation notes
 
-The vendored session module differs from this design: it calls `engine_core` directly, accepts
-caller-chosen reusable IDs, samples with `max_tokens=1`, sends a flush control token, has no
-output consumption, and waits for a completion object the engine does not provide. The model's
-`buffer_realtime_audio` raises `NotImplementedError`. Both are rewritten from this design.
+- **Ownership until both ends.** A session record stays owned by the factory until its
+  `generate()` task has ended and its retirement outcome is known; cancelling a real `generate()`
+  can itself await the engine's abort, so retirement alone does not release ownership.
+- **Close before success.** `flush` accepts a terminal output as success only when it is observed
+  after the input generator is exhausted; a terminal output that arrives earlier is an abnormal
+  end.
+- **Layout.** The session package imports neither vLLM nor the model at import time; the packer
+  and `pack_realtime` are pure NumPy, so one implementation serves the factory and core realtime.
 
 ## Decisions & Alternatives
 

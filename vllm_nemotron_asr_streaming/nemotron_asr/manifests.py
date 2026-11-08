@@ -157,6 +157,19 @@ SESSION_LIMITS: dict[str, int] = {
 }
 
 
+def max_emission_tokens(right_context: int) -> int:
+    """The per-unit token bound of a geometry: ``(right_context + 1)``
+    encoder frames of at most ``max_symbols_per_step`` labels each, one
+    optional EOU and the park token (PORT-INT-002)."""
+    return (right_context + 1) * SESSION_LIMITS["max_symbols_per_step"] + 2
+
+
+#: The one definition of the per-unit emission bound: the largest bound of
+#: any implemented geometry. The model class's ``realtime_max_tokens``, the
+#: session's ``max_tokens`` and the startup threshold all take this value.
+REALTIME_MAX_TOKENS: int = max(max_emission_tokens(right) for _, right in CADENCES.values())
+
+
 def canonical_json(obj: Any) -> str:
     """The canonical JSON serialization every manifest hash is over.
 
@@ -455,7 +468,7 @@ def author_emission_manifest(config: Any) -> dict[str, Any]:
             label: {
                 "max_valid_encoder_frames": right + 1,
                 "max_symbols_per_step": symbols,
-                "max_emission_tokens": (right + 1) * symbols + 2,
+                "max_emission_tokens": max_emission_tokens(right),
             }
             for label, (_, right) in CADENCES.items()
         },

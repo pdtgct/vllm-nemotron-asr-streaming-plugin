@@ -37,8 +37,8 @@ def served_config() -> Callable[..., Any]:
         native_burst: bool = False,
     ) -> Any:
         from support.card import card_config, processor_config
-        from vllm_nemotron_asr_streaming.card_parser import translate_card
 
+        from vllm_nemotron_asr_streaming.card_parser import translate_card
         from vllm_nemotron_asr_streaming.nemotron_asr.configuration_nemotron_asr import (  # noqa: E501
             NemotronASRConfig,
         )

@@ -243,16 +243,14 @@ is imported:
 
 Adding a dependency means adding it here and to the import-time check.
 
-## Current source
+## Implementation notes
 
-The vendored code differs from this design in ways the implementation changes: today's
-registration checks `StateCompletion` and `EngineCoreClient.admit_stream_async`, registers no
-parser or tokenizer mode, and has an empty model-config hook; the translation mints four control
-tokens with `vocab_size = blank + 5`, lets leftover card keys overwrite computed fields, falls back
-to the card's lookahead, needs the default lookahead while translating, and validates an override
-set against the card's set; the logit width is a
-constant; the engine-flag check has no eager-runner refusal and treats a missing parallel setting
-as a refusal.
+- **Renderer.** In the target engine a tokenizer mode also selects a renderer; `register()`
+  registers the standard Hugging Face renderer for `nemotron_asr_streaming`.
+- **One served-set source.** `lookahead.served_lookaheads` is the served set for the model's warmed
+  geometries, the session factory and `buffer_realtime_audio`.
+- **Precision.** The supported deployment runs at float32 (`--dtype float32`); the model's
+  precision check at load refuses any other dtype.
 
 ## Decisions & Alternatives
 

@@ -249,12 +249,13 @@ def validate_native_burst_config(
         )
     if hf_config is not None:
         from vllm_nemotron_asr_streaming.lookahead import (
+            served_lookaheads,
             validate_selected_lookahead,
         )
 
         validate_selected_lookahead(
             selected=getattr(hf_config, "att_context_right", None),
-            supported=getattr(hf_config, "supported_num_lookahead_tokens", None),
+            supported=served_lookaheads(hf_config) or None,
             require_160ms_profile=require_160ms_profile,
         )
 

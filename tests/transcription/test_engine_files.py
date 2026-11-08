@@ -395,14 +395,14 @@ def test_engine_stages_copies_and_encodes_at_most_one_chunk_per_file_step(
     from vllm.entrypoints.speech_to_text.transcription.protocol import (
         TranscriptionRequest,
     )
-    from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import (
-        FileAction,
-        FileHostBuffers,
-    )
 
     from vllm_nemotron_asr_streaming import register
     from vllm_nemotron_asr_streaming.model import Nemotron3_5AsrStreamingForRNNT
     from vllm_nemotron_asr_streaming.nemotron_asr import advance, file_rows
+    from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import (
+        FileAction,
+        FileHostBuffers,
+    )
     from vllm_nemotron_asr_streaming.nemotron_asr.model_state_v2 import (
         NemotronASRModelState,
     )

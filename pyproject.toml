@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-nemotron-asr-streaming"
 version = "0.0.1"
-description = "Staging out-of-tree plugin for cache-aware streaming Nemotron ASR on vLLM core. Not runnable yet."
+description = "Out-of-tree plugin for cache-aware streaming Nemotron ASR on vLLM core (RFC 1 + RFC 2 build)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -16,7 +16,11 @@ dependencies = []
 test = ["pytest>=8"]
 
 [project.entry-points."vllm.general_plugins"]
+# @spec REG-001
 nemotron_asr_streaming = "vllm_nemotron_asr_streaming:register"
+
+[project.entry-points."vllm_riva_frontend.session_factories"]
+nemotron_asr_streaming = "vllm_nemotron_asr_streaming.session:create_session_factory"
 
 [project.urls]
 Repository = "https://github.com/pdtgct/vllm-nemotron-asr-streaming-plugin"

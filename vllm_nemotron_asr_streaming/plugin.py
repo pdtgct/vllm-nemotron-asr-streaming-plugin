@@ -1,98 +1,112 @@
 # SPDX-License-Identifier: Apache-2.0
 """``vllm.general_plugins`` entry point.
 
-``register`` imports the RFC1 tip symbols and registers only the
-streaming architecture. It does not import the model module, so a
-process that has not initialized CUDA can still load the plugin.
+``register`` checks the client calls the plugin uses, then registers the
+streaming architecture, its model-configuration hook, the card parser and the
+tokenizer mode. It does not import the model module, initialize a device or
+load weights, so a process that has not initialized CUDA can still load the
+plugin. The model adapter's own dependencies are checked when the model class
+module is imported (``engine_flags.check_adapter_dependencies``).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any
+import inspect
 
 
-def _require_rfc1_tip(
-    *,
-    persistent_state_layer: Any,
-    async_llm: Any,
-    admit_stream_async: Any,
-    state_completion: Any,
-    resolve_model_state_cls: Callable[..., Any],
-) -> None:
-    """Fail plugin load when the RFC1 tip surface is absent."""
-    if not isinstance(persistent_state_layer, type):
-        raise RuntimeError(
-            "vllm.model_executor.layers.state.PersistentStateLayerBase "
-            "is not a class. This plugin targets the RFC1 tip, not a "
-            "released vLLM."
+def _require_client_path() -> None:
+    """Fail plugin load when the RFC 1 + RFC 2 client calls are absent."""
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    missing: list[str] = []
+    generate = getattr(AsyncLLM, "generate", None)
+    try:
+        has_admission = (
+            generate is not None
+            and "stream_admission" in inspect.signature(generate).parameters
         )
-    if not isinstance(async_llm, type):
+    except (TypeError, ValueError):
+        has_admission = False
+    if not has_admission:
+        missing.append("AsyncLLM.generate(stream_admission=...)")
+    if not hasattr(AsyncLLM, "wait_stream_retired"):
+        missing.append("AsyncLLM.wait_stream_retired")
+    if missing:
         raise RuntimeError(
-            "vllm.v1.engine.async_llm.AsyncLLM is not a class. "
-            "This plugin targets the RFC1 tip, not a released vLLM."
-        )
-    if not callable(admit_stream_async):
-        raise RuntimeError(
-            "EngineCoreClient.admit_stream_async is missing. "
-            "This plugin targets the RFC1 tip, not a released vLLM."
-        )
-    if not isinstance(state_completion, type):
-        raise RuntimeError(
-            "vllm.v1.kv_cache_interface.StateCompletion is not a class. "
-            "This plugin targets the RFC1 tip, not a released vLLM."
-        )
-    if not callable(resolve_model_state_cls):
-        raise RuntimeError(
-            "resolve_model_state_cls is missing. The streaming model "
-            "has to be discovered through get_model_state_cls."
+            "vllm-nemotron-asr-streaming requires an RFC 1 + RFC 2 vLLM build; "
+            "this build lacks " + ", ".join(missing)
         )
 
 
+# @spec REG-002, REG-003, REG-004, REG-005, REG-006, REG-007, REG-008, REG-009
 def register() -> None:
     """Register the streaming architecture with vLLM.
 
-    Safe to call more than once in one process. Never writes the
-    offline architecture key.
+    Safe to call more than once in one process. Never writes the offline
+    architecture key or its configuration hook.
     """
-    from vllm.model_executor.layers.state import PersistentStateLayerBase
+    _require_client_path()
+
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
-    from vllm.v1.engine.async_llm import AsyncLLM
-    from vllm.v1.engine.core_client import EngineCoreClient
-    from vllm.v1.kv_cache_interface import StateCompletion
-    from vllm.v1.worker.gpu.model_states import resolve_model_state_cls
+    from vllm.renderers.registry import RENDERER_REGISTRY
+    from vllm.tokenizers.registry import TokenizerRegistry
+    from vllm.transformers_utils import config as transformers_config
 
-    from .identity import ARCHITECTURE, LAZY_MODEL, OFFLINE_ARCHITECTURE
+    from .card_parser import NemotronAsrStreamingConfigParser
+    from .identity import (
+        ARCHITECTURE,
+        CONFIG_FORMAT,
+        LAZY_MODEL,
+        OFFLINE_ARCHITECTURE,
+        TOKENIZER_MODE,
+    )
     from .streaming_config import Nemotron3_5AsrStreamingConfig
 
-    _require_rfc1_tip(
-        persistent_state_layer=PersistentStateLayerBase,
-        async_llm=AsyncLLM,
-        admit_stream_async=getattr(EngineCoreClient, "admit_stream_async", None),
-        state_completion=StateCompletion,
-        resolve_model_state_cls=resolve_model_state_cls,
-    )
     if ARCHITECTURE == OFFLINE_ARCHITECTURE:
         raise RuntimeError(
-            "refusing to register the offline architecture "
-            f"{OFFLINE_ARCHITECTURE!r}"
+            f"refusing to register the offline architecture {OFFLINE_ARCHITECTURE!r}"
+        )
+    offline_model_before = ModelRegistry.models.get(OFFLINE_ARCHITECTURE)
+    offline_config_before = MODELS_CONFIG_MAP.get(OFFLINE_ARCHITECTURE)
+
+    module_name, _, class_name = LAZY_MODEL.partition(":")
+    registered = ModelRegistry.models.get(ARCHITECTURE)
+    if (
+        getattr(registered, "module_name", None) != module_name
+        or getattr(registered, "class_name", None) != class_name
+    ):
+        ModelRegistry.register_model(ARCHITECTURE, LAZY_MODEL)
+    MODELS_CONFIG_MAP[ARCHITECTURE] = Nemotron3_5AsrStreamingConfig
+
+    parsers = transformers_config._CONFIG_FORMAT_TO_CONFIG_PARSER
+    if parsers.get(CONFIG_FORMAT) is not NemotronAsrStreamingConfigParser:
+        transformers_config.register_config_parser(CONFIG_FORMAT)(
+            NemotronAsrStreamingConfigParser
         )
 
-    offline_before = ModelRegistry.models.get(OFFLINE_ARCHITECTURE)
-    config_before = MODELS_CONFIG_MAP.get(OFFLINE_ARCHITECTURE)
-    ModelRegistry.register_model(ARCHITECTURE, LAZY_MODEL)
-    MODELS_CONFIG_MAP[ARCHITECTURE] = Nemotron3_5AsrStreamingConfig
-    if MODELS_CONFIG_MAP.get(OFFLINE_ARCHITECTURE) != config_before:
+    tokenizer_target = (
+        "vllm_nemotron_asr_streaming.tokenizer_mode",
+        "NemotronAsrStreamingTokenizer",
+    )
+    if TokenizerRegistry.tokenizers.get(TOKENIZER_MODE) != tokenizer_target:
+        TokenizerRegistry.register(TOKENIZER_MODE, *tokenizer_target)
+
+    # In this core build the tokenizer mode also selects the renderer; the
+    # standard HF renderer serves token-id prompts with multimodal data.
+    renderer_target = ("vllm.renderers.hf", "HfRenderer")
+    if RENDERER_REGISTRY.renderers.get(TOKENIZER_MODE) != renderer_target:
+        RENDERER_REGISTRY.register(TOKENIZER_MODE, *renderer_target)
+
+    if ModelRegistry.models.get(OFFLINE_ARCHITECTURE) != offline_model_before:
         raise RuntimeError(
-            "streaming registration changed the offline config hook "
+            f"streaming registration changed the offline architecture "
             f"{OFFLINE_ARCHITECTURE!r}"
         )
-    if ModelRegistry.models.get(OFFLINE_ARCHITECTURE) != offline_before:
+    if MODELS_CONFIG_MAP.get(OFFLINE_ARCHITECTURE) != offline_config_before:
         raise RuntimeError(
-            "streaming registration changed the offline architecture "
+            f"streaming registration changed the offline config hook "
             f"{OFFLINE_ARCHITECTURE!r}"
         )
-    registered = ModelRegistry.models.get(ARCHITECTURE)
-    if registered is None:
+    if ModelRegistry.models.get(ARCHITECTURE) is None:
         raise RuntimeError(f"{ARCHITECTURE!r} was not registered")

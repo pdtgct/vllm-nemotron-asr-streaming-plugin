@@ -1,0 +1,39 @@
+vllm-nemotron-asr-streaming
+Copyright contributors to the vLLM project and to this repository.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Vendored source
+---------------
+The package vllm_nemotron_asr_streaming/nemotron_asr/ is derived from the
+streaming Nemotron ASR model in the vLLM fork at
+https://github.com/pdtgct/vllm, branch rfc1-5212-vllm, commit 43c0bed5bf,
+directory vllm/models/nemotron_asr/. That code is Apache-2.0 and its files
+keep their SPDX headers and contributor attribution ("Copyright contributors
+to the vLLM project").
+
+Changes made in this repository
+-------------------------------
+Every vendored module's imports were rewritten from vllm.models.nemotron_asr
+to vllm_nemotron_asr_streaming.nemotron_asr.
+
+The following vendored files carry further changes (see the git history):
+  nemotron_asr/advance.py                     complete-file rows; staging; group order
+  nemotron_asr/configuration_nemotron_asr.py  card translation moved to card_parser.py;
+                                              control-token fields; no parse-time lookahead
+  nemotron_asr/manifests.py                   single per-unit emission bound
+  nemotron_asr/model_state_v2.py              host buffers for complete files; step planning;
+                                              supported tasks; engine-setting re-check
+  nemotron_asr/nemotron_asr.py                speech-to-text interface; served-set checks;
+                                              logit width from the served configuration;
+                                              realtime hook
+  nemotron_asr/plan.py                        complete-file row role; served-geometry binding
+  nemotron_asr/processor.py                   keep-on-CPU fields for complete files
+
+New files written for this repository:
+  nemotron_asr/file_rows.py
+  and every module outside nemotron_asr/.
+
+The model weights and checkpoint card (nvidia/nemotron-3.5-asr-streaming-0.6b)
+are not part of this repository and are distributed by NVIDIA under their own
+license.

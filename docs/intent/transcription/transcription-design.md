@@ -225,12 +225,23 @@ the frontend, not by the model; without the frontend this route is unsupported f
   ties are broken by geometry index.
 - **Endpointing.** Disabled, as for streams on core.
 
-## Current source
+## Implementation notes
 
-The vendored model differs from this design: its row planner rejects a non-chunk row that carries
-a multimodal feature, header resolution assumes the stream carrier, `embed_multimodal` enforces the
-carrier width for every item, the processor declares no `keep_on_cpu` fields, and the class does
-not implement `SupportsTranscription`.
+- **Host view of the label queue.** The step rule needs each FILE row's queued-token count. After a
+  step in which a FILE row advanced audio, the model state reads the counts of those rows from the
+  device-resident label book in one batched copy; after a drain step the host already knows the
+  count. This is one small synchronous read per step that advances a file. The planned
+  replacement carries each row's remaining count in the per-step status the device already
+  returns, which removes the read.
+- **Where malformed file items are refused.** The processor checks a file item's header against
+  its samples (geometry index in range, locale row non-negative, sample count equal to the samples'
+  length), so a malformed request fails at input processing. The model state repeats the checks
+  and fails only that row if one gets through; it never fails the step.
+- **Device route.** File samples leave the host buffer only through `FileHostBuffers.stage` and
+  reach the device only through `file_rows.copy_chunk_to_device`; their encoder chunks run through
+  the same per-geometry chunk path as stream rows.
+- **Served geometries.** The model, the session factory and `buffer_realtime_audio` take the served
+  set from one function, `lookahead.served_lookaheads`.
 
 ## Decisions & Alternatives
 
