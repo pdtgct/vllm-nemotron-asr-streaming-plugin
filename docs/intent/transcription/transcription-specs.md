@@ -16,7 +16,7 @@ the frontend's `Recognize` through the same service) for this model.
 ## Language
 
 - [ ] **FILE-LANG-001**: When a file request names a language that is itself a key of the served locale table (for example `en`), `get_generation_prompt` shall use that locale.
-- [ ] **FILE-LANG-002**: When a file request names a language that is not a key of the served locale table, `get_generation_prompt` shall consider the locales whose language (the lowercase letters before the first `-` or uppercase letter, when there are two or three of them; `auto` has none) it is: if they all use one row, it shall use the first of them in sorted order; otherwise it shall use the locale that `language_locales` gives for the language, and if there is no entry, then it shall raise `ValueError` naming the language and the `language_locales` override.
+- [ ] **FILE-LANG-002**: When a file request names a language that is not a key of the served locale table, `get_generation_prompt` shall consider the locales whose language (the lowercase letters before the first `-` or uppercase letter, when there are two or three of them; `auto` has none) it is: if they all use one row, it shall use that row; otherwise it shall use the row of the locale that `language_locales` gives for the language, and if there is no entry, then it shall raise `ValueError` naming the language and the `language_locales` override.
 - [ ] **FILE-LANG-003**: If a file request names a language that has no locale in the served locale table, then `get_generation_prompt` shall raise `ValueError` naming the language.
 - [ ] **FILE-LANG-004**: When a file request names no language and no exact locale, `get_generation_prompt` shall use the locale `auto` if the served locale table has it, else the table's only locale; if neither exists, then it shall raise `ValueError`.
 - [ ] **FILE-LANG-005**: When a file request's `extra_args` (core's `vllm_xargs`) has `locale` naming a key of the served locale table, `get_generation_prompt` shall use that locale, ahead of FILE-LANG-001 to FILE-LANG-004.
@@ -24,7 +24,7 @@ the frontend's `Recognize` through the same service) for this model.
 
 ## File prompt
 
-- [ ] **FILE-PROMPT-001**: `get_generation_prompt` shall return a prompt of exactly one token, the file-carrier token (`blank + 4`), plus one audio item with the `keep_on_cpu` fields `samples` (the file's 16 kHz `float32` samples) and `file_header`.
+- [ ] **FILE-PROMPT-001**: `get_generation_prompt` shall return a prompt whose `prompt_token_ids` is exactly one token, the file-carrier token (`file_carrier_token_id`, `blank + 4`), whose `multi_modal_data` is one audio item holding the file's 16 kHz `float32` samples, and whose `mm_processor_kwargs` carries `file_header`; the model's processor shall turn them into the `keep_on_cpu` fields `samples` and `file_header`.
 - [ ] **FILE-PROMPT-002**: The `file_header` field shall be `int64` values: the geometry index (SESS-FAC-004's table) of the server's default lookahead, the locale's row in the locale table, and the number of samples.
 - [ ] **FILE-PROMPT-005**: `get_generation_prompt` shall give the audio item a random per-request multimodal UUID, so that two file requests with identical samples have distinct multimodal hashes.
 - [ ] **FILE-PROMPT-003**: The model's multimodal processor shall declare `samples` and `file_header` as `keep_on_cpu` fields.

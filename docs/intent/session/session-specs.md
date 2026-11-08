@@ -25,7 +25,7 @@ admitted stream; a lease is the handle `open` returns for it.
 - [ ] **SESS-LEASE-001**: The lease shall allow, in state `open`: `feed`, `update_locale`, `flush`, `abort`, `teardown`; in `flushed`: `finish`, `release`, `teardown`; in `failed`: `abort`, `finish`, `release`, `teardown`; in `aborted`: `release`, `teardown`; in `released`: `teardown`.
 - [ ] **SESS-LEASE-002**: If a lease call is not allowed in the lease's current state, then it shall raise `SessionFailed` with, in state `failed`, the reason of the failure that put the lease there, and in any other state `reason="state"`; except that `finish` after the `generate()` task has ended and `release` after `release` has returned shall return without effect.
 - [ ] **SESS-LEASE-003**: If a lease call other than `teardown` is made while another call on the same lease is still running, then the second call shall raise `RuntimeError` without changing the lease's state; `teardown` shall be accepted at any time.
-- [ ] **SESS-LEASE-004**: If `feed`, `update_locale` or `flush` is cancelled, then the lease shall enter `failed` with reason `cancelled`.
+- [ ] **SESS-LEASE-004**: If `feed` or `flush` is cancelled, then the lease shall enter `failed` with reason `cancelled`.
 - [ ] **SESS-LEASE-005**: When any session failure occurs on an open lease (a failed unit, an end of the stream while a unit is outstanding, an abnormal end, an idle abort, a dead engine, a transcript or input limit), the lease shall enter `failed` with that failure's reason, and the call that observed it, or the next call other than `abort`, `finish`, `release` and `teardown` if none was running, shall raise the corresponding `SessionFailed`.
 - [ ] **SESS-LEASE-006**: A lease call shall apply its checks in this order: serialization (SESS-LEASE-003), closed factory (SESS-OWN-006), state (SESS-LEASE-002).
 - [ ] **SESS-LEASE-007**: The cleanup calls `abort`, `finish`, `release` and `teardown` shall not raise a failure already reported through the lease.
@@ -49,7 +49,7 @@ admitted stream; a lease is the handle `open` returns for it.
 - [ ] **SESS-ENG-006**: If a session's unit is rejected with any reason other than `engine_paused` or `mm_cache_miss`, then the lease shall fail with `rejected_input`.
 - [ ] **SESS-ENG-007**: When the session resends a rejected unit, the resent unit shall be identical to the original, including its `chunk_sequence` and `admission_ms_mod`.
 - [ ] **SESS-ENG-008**: The session shall never set the engine's input numbering or build stream-admission contexts itself; ending the input generator shall be the session's only way to close the stream.
-- [ ] **SESS-ENG-009**: If the `generate()` task ends while `feed`, `update_locale` or `flush` awaits a unit's outcome, then the lease shall fail with `engine_dead` for `EngineDeadError`, and otherwise with `abnormal_end` (an `error` or `abort` finish, or any end without the unit's park token).
+- [ ] **SESS-ENG-009**: If the `generate()` task ends while `feed` or `flush` awaits a unit's outcome, then the lease shall fail with `engine_dead` for `EngineDeadError`, and otherwise with `abnormal_end` (an `error` or `abort` finish, or any end without the unit's park token).
 
 ## Locale
 
@@ -99,7 +99,7 @@ packer implementation.
 - [ ] **SESS-PACK-005**: The packer shall set `geometry_id` to the geometry's index in the implemented order (80, 160, 320, 560, 1120 ms) and `prompt_index` to the current locale's row in the locale table at the time the unit is packed.
 - [ ] **SESS-PACK-006**: The packer shall set `admission_ms_mod` to the wall-clock time, in epoch milliseconds modulo 2^24, at which the unit became complete (its last sample was appended, or the stream was closed, for the final tail).
 - [ ] **SESS-PACK-007**: Every header value the packer writes shall be a non-negative integer below 2^24.
-- [ ] **SESS-PACK-008**: If a unit would need a `chunk_sequence` of 2^24 or more, then the packer shall raise its capacity error instead of emitting the unit; the session factory shall report it as `SessionFailed(reason="input_capacity")`, and on core `/v1/realtime` it shall end the stream.
+- [ ] **SESS-PACK-008**: If a unit would need a `chunk_sequence` of 2^24 or more, then the packer shall raise its capacity error instead of emitting the unit; the session factory shall report it as `SessionFailed(reason="input_capacity")`, and on core `/v1/realtime` `buffer_realtime_audio` shall let the error propagate (ending the stream as failed, never with a normal close).
 
 ## Served-set enforcement in the model
 

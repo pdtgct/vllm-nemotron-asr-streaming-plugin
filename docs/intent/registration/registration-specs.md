@@ -24,7 +24,7 @@ Design: [registration-design.md](registration-design.md). Prefix `REG`.
 - [ ] **REG-CARD-003**: When the card parser receives a `config.json` whose `architectures` is `["Nemotron3_5AsrStreamingForRNNT"]` and that has no `encoder_config`, it shall use it unchanged as an already-translated configuration.
 - [ ] **REG-CARD-004**: If the card parser receives a `config.json` that is neither a Hub card nor an already-translated configuration, then it shall raise an error naming both accepted inputs.
 - [ ] **REG-CARD-005**: If a Hub card's `vocab_size` is not `blank_token_id + 1`, or its `encoder_config` has no `supported_num_lookahead_tokens`, then the card parser shall raise an error naming the field.
-- [ ] **REG-CARD-006**: When translating a Hub card, the card parser shall set the park token (`eos_token_id`), stream chunk-carrier, EOU, file-carrier and continuation token IDs to `blank + 1` through `blank + 5` in that order, `vocab_size` to `blank + 6`, and the model's logit width to `vocab_size`.
+- [ ] **REG-CARD-006**: When translating a Hub card, the card parser shall set `eos_token_id` (park), `audio_chunk_token_id` (stream chunk carrier), `eou_token_id`, `file_carrier_token_id` and `continuation_token_id` to `blank + 1` through `blank + 5` in that order, and `vocab_size` to `blank + 6`, which is also the model's logit width (the model has no separate logit-width field).
 - [ ] **REG-CARD-007**: When translating a Hub card, the card parser shall map the encoder fields `hidden_size`, `num_hidden_layers`, `conv_kernel_size`, `sliding_window` and `num_mel_bins` to `d_model`, `n_layers`, `conv_kernel`, `att_context_left = sliding_window − 1` and `n_mels`, raising if any is missing or not an integer; map `decoder_hidden_size` and `num_decoder_layers`, when present, to `pred_hidden` and `pred_rnn_layers`; raise if `prompt_intermediate_size` is present and not `2 × hidden_size`; and carry no other `encoder_config` field.
 - [ ] **REG-CARD-008**: When translating a Hub card, the card parser shall set `architectures` to `["Nemotron3_5AsrStreamingForRNNT"]`, record the card's `supported_num_lookahead_tokens` as `card_num_lookahead_tokens`, set `max_position_embeddings` to 2^24, set `decode_dispatch_arm` to `"dense-eager"`, and remove `model_type`, `is_encoder_decoder`, `default_prompt_id`, any top-level `sliding_window`, any top-level `supported_num_lookahead_tokens` and any default lookahead the card carries.
 - [ ] **REG-CARD-009**: For either accepted input, the card parser shall store the locale table `prompt_dictionary` from `processor_config.json` in the configuration and keep the card's `num_prompts`; if an already-translated configuration stores a table that differs from the file's, then it shall raise.
@@ -38,10 +38,10 @@ Design: [registration-design.md](registration-design.md). Prefix `REG`.
 
 ## Tokenizer mode
 
-- [ ] **REG-TOK-001**: When the tokenizer mode `nemotron_asr_streaming` loads a tokenizer, it shall load the card's tokenizer and append, as special tokens, a blank placeholder at ID `blank` followed by the five control tokens of REG-CARD-006 at IDs `blank + 1` to `blank + 5`.
-- [ ] **REG-TOK-002**: The tokenizer loaded by the tokenizer mode `nemotron_asr_streaming` shall report `eos_token_id == blank + 1` (the park token) and no other EOS token.
+- [ ] **REG-TOK-001**: When the tokenizer mode `nemotron_asr_streaming` loads a tokenizer, it shall load the card's tokenizer, keep any special tokens the card already has at IDs `blank` to `blank + 5` (the published card has `<pad>` at `blank` and `<blank>` at `blank + 1`), and append tokens for the remaining IDs up to `blank + 5`, so that every ID from `blank` to `blank + 5` is special in both senses core's detokenizers use: flagged special in the tokenizer backend, and listed in the tokenizer's `all_special_ids`.
+- [ ] **REG-TOK-002**: The tokenizer loaded by the tokenizer mode `nemotron_asr_streaming` shall set its EOS to the token at `blank + 1` (`eos_token_id == blank + 1`), replacing any EOS the card tokenizer declares, and shall report no other EOS token.
 - [ ] **REG-TOK-003**: If any token appended by the tokenizer mode `nemotron_asr_streaming` is assigned an ID other than its expected ID, then loading the tokenizer shall raise.
-- [ ] **REG-TOK-004**: The tokenizer mode `nemotron_asr_streaming` shall take `blank` from `blank_token_id` in the `config.json` beside the tokenizer; if that file has none, or the card tokenizer's vocabulary size differs from it, then loading the tokenizer shall raise.
+- [ ] **REG-TOK-004**: The tokenizer mode `nemotron_asr_streaming` shall take `blank` from `blank_token_id` in the `config.json` beside the tokenizer; if that file has none, the card tokenizer's base vocabulary size differs from it, or the card tokenizer has a token at an ID of `blank` or more that is not special or is above `blank + 5`, then loading the tokenizer shall raise.
 
 ## Lookahead selection and post-override validation
 
@@ -70,7 +70,7 @@ These checks run in `verify_and_update_model_config`, after core has applied eve
 - [ ] **REG-ENG-004**: If any of the tensor, pipeline, data, decode-context or prefill-context parallel sizes that the running vLLM build defines is other than 1, then `verify_and_update_config` shall refuse the configuration; a parallel setting the build does not define shall count as 1.
 - [ ] **REG-ENG-005**: If `enforce_eager` is not set, then `verify_and_update_config` shall refuse the configuration.
 - [ ] **REG-ENG-006**: When the model state is constructed, it shall re-check REG-ENG-001 to REG-ENG-005 against the final engine configuration and raise as in REG-VAL-003 if any fails.
-- [ ] **REG-ENG-007**: The README's serve command shall show every flag REG-ENG-001 to REG-ENG-005 require, including an explicit `--no-async-scheduling`, together with `--config-format nemotron_asr_streaming`, `--tokenizer-mode nemotron_asr_streaming` and the `num_lookahead_tokens` override.
+- [ ] **REG-ENG-007**: The README's serve command shall show every flag REG-ENG-001 to REG-ENG-005 require, including an explicit `--no-async-scheduling`, together with `--dtype float32` (the model's qualified precision),  `--config-format nemotron_asr_streaming`, `--tokenizer-mode nemotron_asr_streaming` and the `num_lookahead_tokens` override.
 
 ## Supported tasks
 

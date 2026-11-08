@@ -126,18 +126,25 @@ configuration derived from it carries only the park token as EOS and no length l
 
 ## Tokenizer mode
 
-The card's tokenizer holds the label pieces only. Core detokenizes every emitted token, and
-`skip_special_tokens` drops only tokens the tokenizer marks special. The tokenizer mode
-`nemotron_asr_streaming` (selected with `--tokenizer-mode nemotron_asr_streaming`) loads the card's
-tokenizer, takes `blank` from `blank_token_id` in the `config.json` beside the tokenizer (so
-`--tokenizer`, when given, must name the checkpoint, and an already-translated configuration keeps
-`blank_token_id`), failing if the card tokenizer's vocabulary size differs from it, and appends, in order, a blank placeholder at `blank` and the
-control tokens at
-`blank + 1 … blank + 5`, all special, and sets the park token `blank + 1` as the tokenizer's
-`eos_token_id`. Core takes a request's primary EOS from the tokenizer, and a persistent-state
-stream parks only on that EOS (any other stop ends the stream), so this binding is what lets a
-stream resume after each unit. Loading fails if any token lands at an unexpected ID or the
-tokenizer reports any other EOS.
+The card's tokenizer has a base vocabulary of the label pieces (IDs `0 … blank − 1`; some, such as
+the language tags, are special), and may already carry added special tokens at and after `blank`:
+the published card has `<pad>` at `blank` and `<blank>` at `blank + 1`. Core detokenizes every
+emitted token, and `skip_special_tokens` drops only tokens the tokenizer marks special.
+
+The tokenizer mode `nemotron_asr_streaming` (selected with `--tokenizer-mode nemotron_asr_streaming`)
+loads the card's tokenizer and takes `blank` from `blank_token_id` in the `config.json` beside the
+tokenizer (so `--tokenizer`, when given, must name the checkpoint, and an already-translated
+configuration keeps `blank_token_id`). It requires the base vocabulary size to equal `blank`, and
+every token the card already has at an ID of `blank` or more to be special and at most `blank + 5`.
+It keeps those tokens and appends special tokens for the remaining IDs up to `blank + 5`, so that
+IDs `blank … blank + 5` are the blank placeholder, park, stream chunk carrier, EOU, file carrier and
+continuation, all special in both senses core's detokenizers use: flagged special in the tokenizer
+backend (the fast incremental path) and listed in `all_special_ids` (the slow path). The published
+card's `<blank>` is flagged special but not listed, so the mode lists it. It sets the token at `blank + 1` as the tokenizer's EOS (`eos_token_id =
+blank + 1`), whatever its name. Core takes a request's primary EOS from the tokenizer, and a
+persistent-state stream parks only on that EOS (any other stop ends the stream), so this binding is
+what lets a stream resume after each unit. Loading fails if any of these conditions does not hold,
+if any token lands at an unexpected ID, or if the tokenizer reports any other EOS.
 
 ## Lookahead selection
 

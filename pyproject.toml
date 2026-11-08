@@ -28,6 +28,8 @@ include = ["vllm_nemotron_asr_streaming*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "--import-mode=importlib"
 
 [tool.ruff]
 line-length = 88

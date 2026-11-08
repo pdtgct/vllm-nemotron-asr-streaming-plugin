@@ -68,7 +68,7 @@ cumulative transcript strings, one per unit whose text changed. `flush` returns 
 cumulative transcript.
 
 **Time bounds.** Calls take no deadline argument; the caller bounds them by cancellation (for
-example `asyncio.timeout`). Cancelling `feed`, `update_locale` or `flush` while a unit may be in
+example `asyncio.timeout`). Cancelling `feed` or `flush` while a unit may be in
 flight leaves the session's position unknown, so the lease becomes **broken**: every later call
 except `abort`, `release`, `finish` and `teardown` raises `SessionFailed(reason="cancelled")`.
 
@@ -122,7 +122,7 @@ stream_admission=True)` running as a factory-owned task.
 | --- | --- |
 | `open(cadence, locale)` | Refuse a cadence not in `served_cadences` (`refused`, `cadence`) or a locale not in `locales` (`refused`, `locale`). Mint the caller ID, insert the session record, start the `generate()` task. Admission is signalled by the input generator's first read. Return the lease on that signal. If the task ends first: `StreamAdmissionError` → `refused` with its reason; `EngineDeadError` → `failed` (`engine_dead`); another exception or a normal end → `failed` (`abnormal_end`). |
 | cancellation of `open` | Cancel the `generate()` task and hand the session to the factory's cleanup (below), which owns it through the cancellation and the retirement-wait outcome. The record is removed at once only if the task never started. Once `open` has returned the lease, the caller owns cleanup. |
-| stream end while a unit is outstanding | If the `generate()` task ends while `feed`, `update_locale` or `flush` awaits a unit's outcome, the lease fails with `engine_dead` for `EngineDeadError`, otherwise `abnormal_end` (an `error` or `abort` finish, or any end without the unit's park). |
+| stream end while a unit is outstanding | If the `generate()` task ends while `feed` or `flush` awaits a unit's outcome, the lease fails with `engine_dead` for `EngineDeadError`, otherwise `abnormal_end` (an `error` or `abort` finish, or any end without the unit's park). |
 | `feed(samples, on_accepted)` | Append to the packer and call `on_accepted(len(samples))`. For each complete unit: send it, await its outcome, project it. Return the cumulative transcript after each unit whose text changed; with no complete unit, return `[]` at once. |
 | rejection of a unit | `engine_paused`: resend after a backoff (a factory parameter; default 50 ms, doubling to at most 1 s), until the caller cancels. `mm_cache_miss`: resend once. Any other reason, or a second `mm_cache_miss`: the lease fails with `rejected_input`. A resent unit keeps its `chunk_sequence` and timestamp. |
 | `update_locale(locale)` | Refuse a locale not in `locales` (`refused`, `locale`), leaving the lease open with its current locale; otherwise every unit packed after the call, including one built from samples already buffered and the final tail, uses the new locale. |

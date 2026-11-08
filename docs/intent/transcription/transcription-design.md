@@ -49,7 +49,7 @@ files are not served in that mode. Core itself refuses
 
 Core decodes the upload to mono 16 kHz float32 within its own limits
 (`VLLM_MAX_AUDIO_CLIP_FILESIZE_MB`, `VLLM_MAX_AUDIO_DECODE_DURATION_S`,
-`VLLM_MAX_AUDIO_DECODE_BYTES`), sets `max_tokens` to `max_model_len` (no client or generation-config
+`VLLM_MAX_AUDIO_DECODE_BYTES`), sets `max_tokens` to `max_model_len` minus the prompt length (no client or generation-config
 limit is present in the supported deployment), and returns the request's output text with special
 tokens skipped.
 
@@ -68,8 +68,8 @@ optional `language_locales` mapping:
   table has aliases: several locale names may share a row.
 - A language that is itself a locale of the table (`en`, `de`) maps to that locale; the card's own
   processor accepts bare codes the same way.
-- Otherwise, a language whose locales all use one row maps to that row's locale (the first of its
-  names in sorted order).
+- Otherwise, a language whose locales all use one row maps to that row (the prompt carries only the
+  row, so which alias names it does not matter).
 - Otherwise (its locales use several rows, as `zh-CN` and `zh-TW` do) the language maps to the locale
   named for it in `language_locales`, given as `--hf-overrides '{"language_locales": {"zh": "zh-CN"}}'`;
   core applies it to the served configuration, and post-override validation checks every entry
@@ -81,8 +81,10 @@ optional `language_locales` mapping:
 
 ## File prompt
 
-The prompt is exactly one token, the **file-carrier token**, plus one audio item with two
-`keep_on_cpu` fields, so core's batching never moves the file to the device:
+The prompt is exactly one token, the **file-carrier token**, with the file's samples as its one
+audio item (`multi_modal_data`) and the header in `mm_processor_kwargs`, the standard channels of
+a vLLM prompt. The model's processor turns them into two `keep_on_cpu` fields, so core's batching
+never moves the file to the device:
 - `samples`: the file's 16 kHz float32 samples;
 - `file_header`: int64 values: geometry (the server's default lookahead), locale row and sample
   count.
