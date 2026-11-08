@@ -163,8 +163,9 @@ the leaf designs cite them where they depend on them.
   partial text through core's transcription serving until core reports those endings as failures
   for every model. That core fix is independent work; this plugin does not depend on it.
 - **Whole-file serving needs the frontend's guards.** The supported configuration runs the
-  frontend, which caps files in flight, refuses beam search and client completion limits, and
-  refuses to start under a generation-config `max_tokens`. Without it, core's transcription route
+  frontend, which caps files in flight and refuses beam search and client completion limits; the
+  model itself refuses to start under a generation-config token limit or foreign EOS. Without the
+  frontend, core's transcription route
   for this model is unsupported, and the README says so.
 - **Distribution.** The vendored model modules keep their SPDX headers and contributor
   attribution. The repository carries `LICENSE` (Apache-2.0) and a `NOTICE` naming the source
