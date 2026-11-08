@@ -106,6 +106,7 @@ class SessionLease:
         self.task: asyncio.Task | None = None
         self.started = False
         self.cleanup_task: asyncio.Task | None = None
+        self.holder_task: asyncio.Task | None = None
         self.locale = locale
         self._packer = packer
         self._loop = asyncio.get_running_loop()
@@ -502,8 +503,11 @@ class StreamingSessionFactory:
         and a tracked task until the generate task ends, so ``teardown_all`` still
         finds it."""
         task = lease.task
+        # A closed factory has already taken the task in ``teardown_all``.
         if task is None or task.done() or self.closed:
             self._drop(lease)
+            return
+        if lease.holder_task is not None:
             return
 
         async def hold() -> None:
@@ -511,6 +515,7 @@ class StreamingSessionFactory:
             self._drop(lease)
 
         holder = asyncio.ensure_future(hold())
+        lease.holder_task = holder
         self._cleanup_tasks.add(holder)
         holder.add_done_callback(self._cleanup_tasks.discard)
         holder.add_done_callback(_retrieve)

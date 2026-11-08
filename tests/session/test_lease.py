@@ -238,11 +238,11 @@ ALLOWED = {
     "open": {"feed", "update_locale", "flush", "abort"},
     "flushed": {"finish", "release"},
     "failed": {"abort", "finish", "release"},
-    "aborted": {"release"},
+    "aborted": {"finish", "release"},
     "released": set(),
 }
 #: Calls that return without effect rather than raising (SESS-LEASE-002).
-NO_EFFECT = {("aborted", "finish"), ("released", "finish"), ("released", "release")}
+NO_EFFECT = {("released", "finish"), ("released", "release")}
 STATE_CASES = [
     (state, call)
     for state in ALLOWED
@@ -803,6 +803,23 @@ def test_failed_release_after_a_cancelled_abort_keeps_the_task_owned(build, erro
         assert isinstance(release, RuntimeError)
     assert kept
     assert ended
+
+
+# @spec SESS-ABORT-002
+def test_repeated_failed_releases_keep_one_holder(build):
+    async def scenario():
+        engine = FakeEngine(retire=[RuntimeError("x") for _ in range(3)])
+        gate = slow_cancel(engine)
+        engine, factory, lease = await opened(build, engine)
+        await cancel_abort(lease)
+        for _ in range(3):
+            assert isinstance(await raised(lease.release()), RuntimeError)
+        holders = len(factory._cleanup_tasks)
+        gate.set()
+        await wait_until(lambda: lease.caller_id not in factory.sessions)
+        return holders
+
+    assert run(scenario()) == 1
 
 
 # @spec SESS-REL-001
