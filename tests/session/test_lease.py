@@ -698,6 +698,32 @@ def test_abort_cancels_the_task_awaits_it_and_aborts_the_lease(build):
     assert release is None
 
 
+# @spec SESS-ABORT-002
+def test_cancelled_abort_still_aborts_the_lease_and_allows_release(build):
+    async def scenario():
+        engine, factory, lease = await opened(build)
+        call = asyncio.ensure_future(lease.abort())
+        await asyncio.sleep(0)  # abort has cancelled the task and awaits its end
+        assert not call.done()
+        call.cancel()
+        try:
+            await call
+        except asyncio.CancelledError as error:
+            cancelled = error
+        else:
+            cancelled = None
+        state = lease.state
+        release = await raised(asyncio.wait_for(lease.release(), 1))
+        return engine, factory, lease, cancelled, state, release
+
+    engine, factory, lease, cancelled, state, release = run(scenario())
+    assert isinstance(cancelled, asyncio.CancelledError)
+    assert state == "aborted"
+    assert release is None
+    assert lease.state == "released"
+    assert engine.aborted == [engine.generate_calls[0].request_id]
+
+
 # @spec SESS-REL-001
 def test_release_waits_for_retirement_of_its_caller_id(build):
     async def scenario():

@@ -79,7 +79,7 @@ except `abort`, `release`, `finish` and `teardown` raises `SessionFailed(reason=
 | `open` | `open` returns | `feed`, `update_locale`, `flush`, `abort`, `teardown` |
 | `flushed` | `flush` succeeds | `finish`, `release`, `teardown` |
 | `failed` | any failure, or a cancelled call | `abort`, `finish`, `release`, `teardown` |
-| `aborted` | `abort` | `release`, `teardown` |
+| `aborted` | `abort` is called, even if that call is then cancelled | `release`, `teardown` |
 | `released` | `release` returns | `teardown` |
 
 A lease call checks, in order:
@@ -128,7 +128,7 @@ stream_admission=True)` running as a factory-owned task.
 | `update_locale(locale)` | Refuse a locale not in `locales` (`refused`, `locale`), leaving the lease open with its current locale; otherwise every unit packed after the call, including one built from samples already buffered and the final tail, uses the new locale. |
 | `flush()` | Pack and send the final-tail unit, await its outcome, end the input generator, and await the stream's end. Success only for a normal close: `finished=True`, finish reason `stop`, after our close; returns the final cumulative transcript. Any other end fails the lease: a rejected final tail (`rejected_input`); an `error` or `abort` finish (preemption, a failed state step, a rejected close, which core turns into an abort) or any other end (`abnormal_end`); a dead engine (`engine_dead`); cancellation (`cancelled`). |
 | `finish()` | Await the `generate()` task's single end. |
-| `abort()` | Cancel the `generate()` task (the engine client then aborts the request) and await it, bounded by the caller. |
+| `abort()` | Cancel the `generate()` task (the engine client then aborts the request), move the lease to `aborted`, and await the task, bounded by the caller. The lease is `aborted` before the wait, so a caller whose bound cancels `abort` can still call `release`, which keeps the session owned until the task ends. |
 | `release()` | Await `wait_stream_retired(caller_id)`, bounded by the caller, and resolve it as in Factory ownership. `EngineDeadError` removes the record and fails `release` with `engine_dead`, a cleanup fault the frontend escalates, unless the lease already failed with `engine_dead`; then `release` removes the record and returns. A timeout hands the session to the factory's cleanup. |
 | `teardown()` | Cancel the `generate()` task; no awaits and no direct engine calls. |
 

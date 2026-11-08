@@ -367,14 +367,17 @@ class SessionLease:
             assert self.task is not None
             await asyncio.wait({self.task})
 
-    # @spec SESS-ABORT-001
+    # @spec SESS-ABORT-001, SESS-ABORT-002
     async def abort(self) -> None:
         with self._call("abort"):
             assert self.task is not None
             self._input_closed = True
             self.task.cancel()
-            await asyncio.wait({self.task})
+            # The cancellation stands even if this call is cancelled while it
+            # waits, so the lease is aborted before the wait and `release` stays
+            # allowed; `release` keeps the task owned until it has ended.
             self.state = ABORTED
+            await asyncio.wait({self.task})
 
     # @spec SESS-REL-001, SESS-REL-002, SESS-REL-003
     async def release(self) -> None:
