@@ -30,8 +30,8 @@ decoder state in an RFC 1 state slot, so the same transition serves:
 - live streams: core's native `/v1/realtime`, and the frontend's gRPC `StreamingRecognize` and NIM
   WebSocket through the session factory (section 2);
 - complete files: core's `POST /v1/audio/transcriptions` and the frontend's gRPC `Recognize`, via
-  `SupportsTranscription`. A file is walked on its own state slot in bounded steps of at most `k`
-  cadence chunks, so no file length is limited by the model and whole-file work per step is
+  `SupportsTranscription`. A file is walked on its own state slot in bounded steps of at most one
+  cadence chunk, so no file length is limited by the model and whole-file work per step is
   bounded; its effect on stream latency is measured by the mixed-load goal, not assumed.
 
 ### 2. A session factory for protocol frontends
@@ -41,8 +41,10 @@ factory through the entry-point group `vllm_riva_frontend.session_factories` and
 structural protocol: open a session at a cadence and locale, feed audio, flush for the final
 transcript, abort, and release once the slot has retired. The factory owns every engine-facing
 task it starts, so a frontend's drain and stop can reason about them. The factory uses the RFC 1
-client path (`AsyncLLM.generate(..., stream_admission=True)`, `wait_stream_retired`), the same
-path core's `/v1/realtime` uses. The reference consumer is
+client path (`AsyncLLM.generate(..., stream_admission=True)`, `wait_stream_retired`), which
+reports rejected inputs without ending the stream and tells the caller when a slot has retired.
+Core's `/v1/realtime` drives the model as a streaming request without stream admission, so there a
+rejected input ends the stream. The reference consumer is
 [`pdtgct/vllm-riva-frontend`](https://github.com/pdtgct/vllm-riva-frontend).
 
 ### 3. One packer for audio
@@ -125,7 +127,7 @@ Components, each a leaf design under `docs/intent/`:
 | --- | --- |
 | `registration` | the `vllm.general_plugins` entry point, the architecture key, the config parser (`--config-format nemotron_asr_streaming`) and post-override validation, engine-flag refusals, the enumerated model-adapter dependencies |
 | `session` | the session factory and lease on the RFC 1 client path, the packer and its use by `buffer_realtime_audio`, transcript projection, the error contract |
-| `transcription` | `SupportsTranscription`, the token budget in `get_generation_prompt`, and the model seams it adds: the whole-file row role, the request-owned host buffer and its cleanup on slot release, the continuation token, at most `k` chunks per step |
+| `transcription` | `SupportsTranscription`, the token budget in `get_generation_prompt`, and the model seams it adds: the whole-file row role, the request-owned host buffer and its cleanup when the request ends, the continuation token, at most one chunk per step |
 
 The acoustic internals under `vllm_nemotron_asr_streaming/nemotron_asr/` (encoder, RNN-T decoder,
 the CHUNK / FLUSH / EOU transition, precision policy) are documented by their module docstrings;
@@ -144,8 +146,9 @@ the leaf designs cite them where they depend on them.
   enumerated, permitted set kept in the `registration` design.
 - **A served set of lookaheads.** The implementation's five geometries (80, 160, 320, 560 and
   1120 ms; right context 0, 1, 3, 6 and 13 frames) share one state layout, so the per-slot state
-  page is the same at every lookahead. The checkpoint's card declares lookaheads 0, 3, 6 and 13;
-  serving is restricted to the declared supported set. A server declares the set it serves
+  page is the same at every lookahead. The checkpoint's card declares lookaheads 0, 3, 6 and 13,
+  and a server serves that set unless the deployment overrides it; an override may also add the
+  implemented 160 ms geometry (lookahead 1), which the card does not declare. A server declares the set it serves
   (`supported_num_lookahead_tokens`), warms execution for each, and each stream chooses its cadence
   from that set when it is admitted and keeps it for the stream's life. A cadence outside the
   served set is refused at admission. Whole files run at the server's default cadence (the
@@ -174,7 +177,7 @@ the leaf designs cite them where they depend on them.
 | Where model source evolves | This repository. The model was vendored from `pdtgct/vllm` branch `rfc1-5212-vllm` @ `43c0bed5bf`, recorded in `NOTICE`; all later model changes land here, and that branch's copy is superseded | Keep the core branch as source and carry a downstream patch set: every change made twice, on a branch outside any proposal. No vendored copy: needs a vLLM build carrying the model in-tree, which RFC 1 and RFC 2 do not propose |
 | Architecture key | `Nemotron3_5AsrStreamingForRNNT`, selected through a registered config parser; the Hub card's `Nemotron3_5AsrForRNNT` stays the offline plugin's key | Register the card's key: zero-configuration serving, but it would override the offline plugin when both are installed and remove whole-file service from released-vLLM users. Consolidation onto one key is planned with the offline plugin's author (below) |
 | Relationship to the offline plugin | Independent package now; planned merge with the offline plugin into one package under the card's key, choosing the implementation at startup by whether the engine provides the RFC 1 primitive | Replace the offline implementation outright: breaks released-vLLM users until RFC 1 ships. Keep two packages permanently: users must choose between two packages for one model |
-| Complete files | This model's own stateful path (`SupportsTranscription`), at most `k` chunks per step | A full-file forward pass: stalls the batch and is bounded by encoder positions. Delegating files to the offline plugin: a second implementation on the same server and the same ~400 s bound |
+| Complete files | This model's own stateful path (`SupportsTranscription`), at most one chunk per step | A full-file forward pass: stalls the batch and is bounded by encoder positions. Delegating files to the offline plugin: a second implementation on the same server and the same ~400 s bound |
 | Frontend coupling | Structural protocol plus an entry-point group owned by the frontend; neither package imports the other | A shared interface package: a third release to coordinate for a small protocol |
 
 ### Same model, two implementations
@@ -214,8 +217,7 @@ Acceptance is tiered; a claim names the tier it has met.
 
 Falsification signals: any whole-file transcript that differs from streaming under matched
 conditions; any request reported complete without EOS after the final flush; a slot or host buffer
-that outlives its request's release; a stream refused while the active limit has room because
-files are queued inside the engine.
+that outlives its request's release; more files in flight than the frontend's file cap.
 
 ## References
 
