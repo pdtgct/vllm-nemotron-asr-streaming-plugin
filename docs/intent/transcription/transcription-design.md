@@ -39,8 +39,8 @@ The model class adds `SupportsTranscription` with:
 - `get_generation_prompt(stt_params)`: refuses unsupported requests, maps the language, checks the
   budget and builds the file prompt.
 
-`get_generation_prompt` raises `ValueError` (core returns 400; `Recognize` returns
-`INVALID_ARGUMENT`) for: a task other than transcription, a text prompt, hotwords, a target
+`get_generation_prompt` raises `ValueError` (core returns 400; a frontend maps it to its own
+status codes) for: a task other than transcription, a text prompt, hotwords, a target
 language, an unmappable language, a budget over `max_model_len`, or a server running experimental
 native burst. Core also copies `vllm_xargs` into the request's sampling `extra_args`, which native
 burst refuses, and a native-burst row cannot run the one-token-per-step file cycle, so complete
@@ -173,7 +173,9 @@ produce at most `Q_g` tokens (at least one), plus one EOS:
 
 `B = 1 + (C + 1) × Q_g + 1`
 
-`get_generation_prompt` refuses the file when `B > max_model_len`. With `B ≤ max_model_len`, and
+`get_generation_prompt` refuses the file when `B > max_model_len`, with a message that begins
+with the fixed text `file exceeds max_model_len: ` so that a frontend can tell this refusal from
+the others and report it as a size limit (FILE-BUD-003). With `B ≤ max_model_len`, and
 no smaller completion limit (the frontend refuses client completion limits and a generation-config
 `max_tokens`), the request reaches EOS before core's length limit, so a `length` ending cannot
 occur. An abort or error can still end it earlier (Completion).

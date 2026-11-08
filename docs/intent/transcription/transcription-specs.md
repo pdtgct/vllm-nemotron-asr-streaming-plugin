@@ -62,6 +62,7 @@ With `Q = (r + 1) × 10 + 1` tokens at most per chunk or tail (labels plus an op
 worst-case budget is `B = 1 + (C + 1) × Q + 1`.
 
 - [x] **FILE-BUD-001**: If a file's worst-case budget `B` exceeds `max_model_len`, then `get_generation_prompt` shall raise `ValueError` stating the file's duration and the `max_model_len` it would need.
+- [x] **FILE-BUD-003**: The `ValueError` of FILE-BUD-001 shall begin with the fixed text `file exceeds max_model_len: `, so that a frontend can identify the refusal without parsing the rest of the message.
 - [ ] **FILE-BUD-002**: When a file's worst-case budget `B` is at most `max_model_len`, no completion limit below `max_model_len` applies, and the request is not aborted and does not fail, the request shall end with EOS and never with finish reason `length`.
 
 ## Engine interaction

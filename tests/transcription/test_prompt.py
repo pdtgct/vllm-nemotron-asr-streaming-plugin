@@ -179,7 +179,7 @@ def test_budget_formula(right_context):
         assert file_token_budget(n, right_context) == budget(n, right_context)
 
 
-# @spec FILE-BUD-001
+# @spec FILE-BUD-001, FILE-BUD-003
 @pytest.mark.engine
 @pytest.mark.parametrize("right_context", [0, 6, 13])
 def test_file_over_budget_is_refused(model_cls, stt_params, right_context):
@@ -197,6 +197,7 @@ def test_file_over_budget_is_refused(model_cls, stt_params, right_context):
             )
         )
     message = str(err.value)
+    assert message.startswith("file exceeds max_model_len: ")  # FILE-BUD-003
     assert str(needed) in message
     assert "max_model_len" in message
     seconds = n / 16000

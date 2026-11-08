@@ -47,7 +47,7 @@ def file_token_budget(num_samples: int, right_context: int) -> int:
 
 # @spec FILE-IF-004, FILE-IF-005, FILE-LANG-001, FILE-LANG-002, FILE-LANG-003
 # @spec FILE-LANG-004, FILE-LANG-005, FILE-LANG-006, FILE-PROMPT-001
-# @spec FILE-PROMPT-002, FILE-PROMPT-005, FILE-BUD-001, REG-CARD-015
+# @spec FILE-PROMPT-002, FILE-PROMPT-005, FILE-BUD-001, FILE-BUD-003, REG-CARD-015
 def build_file_prompt(stt_params: Any) -> dict[str, Any]:
     """Build the prompt of a complete-file request, or raise ``ValueError``."""
     if stt_params.task_type != "transcribe":
@@ -93,6 +93,7 @@ def build_file_prompt(stt_params: Any) -> dict[str, Any]:
     max_model_len = int(model_config.max_model_len)
     if budget > max_model_len:
         raise ValueError(
+            "file exceeds max_model_len: "
             f"the file is {count / 16000:.1f} s long and needs max_model_len "
             f">= {budget} tokens at the {right_context}-frame right context, "
             f"but max_model_len is {max_model_len}"
