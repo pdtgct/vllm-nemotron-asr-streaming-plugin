@@ -90,8 +90,8 @@ A lease call checks, in order:
    `SessionFailed(reason="cancelled")`.
 3. **State.** A call not allowed in the current state raises `SessionFailed`: in `failed`, with the
    reason of the failure that put the lease there (for example `cancelled` or `expired`); in any
-   other state, with `reason="state"`. `finish` once the `generate()` task has ended, and `release`
-   once it has returned, return without effect.
+   other state, with `reason="state"`. `finish` awaits the end of the `generate()` task, which in `aborted`
+   may still be ending after its cancellation; `release` after it has returned returns without effect.
 
 The cleanup calls `abort`, `finish`, `release` and `teardown` never raise a failure already
 reported through the lease. `finish` returns `None` once the task has ended, retrieving and not

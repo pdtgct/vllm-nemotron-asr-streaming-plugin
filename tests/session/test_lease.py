@@ -724,6 +724,87 @@ def test_cancelled_abort_still_aborts_the_lease_and_allows_release(build):
     assert engine.aborted == [engine.generate_calls[0].request_id]
 
 
+def slow_cancel(engine) -> asyncio.Event:
+    """Make the session's generate() task end only after the returned event is
+    set once it has been cancelled."""
+    gate = asyncio.Event()
+    original = engine.generate
+
+    async def generate(*args, **kwargs):
+        stream = original(*args, **kwargs)
+        try:
+            async for item in stream:
+                yield item
+        except asyncio.CancelledError:
+            await gate.wait()
+            raise
+        finally:
+            await stream.aclose()
+
+    engine.generate = generate
+    return gate
+
+
+async def cancel_abort(lease) -> None:
+    call = asyncio.ensure_future(lease.abort())
+    await asyncio.sleep(0)
+    assert not call.done()
+    call.cancel()
+    try:
+        await call
+    except asyncio.CancelledError:
+        pass
+
+
+# @spec SESS-ABORT-002, SESS-FIN-001
+def test_finish_after_a_cancelled_abort_awaits_the_task(build):
+    async def scenario():
+        engine = FakeEngine()
+        gate = slow_cancel(engine)
+        engine, _, lease = await opened(build, engine)
+        await cancel_abort(lease)
+        finish = asyncio.ensure_future(lease.finish())
+        await asyncio.sleep(0.05)
+        waited = not finish.done()
+        gate.set()
+        await asyncio.wait_for(finish, 1)
+        return waited, lease
+
+    waited, lease = run(scenario())
+    assert waited
+    assert lease.task.done()
+    assert lease.state == "aborted"
+
+
+# @spec SESS-ABORT-002, SESS-REL-002
+@pytest.mark.parametrize("error", ["engine_dead", "other"])
+def test_failed_release_after_a_cancelled_abort_keeps_the_task_owned(build, error):
+    from vllm.v1.engine.exceptions import EngineDeadError
+
+    async def scenario():
+        raised_by_wait = (
+            EngineDeadError() if error == "engine_dead" else RuntimeError("x")
+        )
+        engine = FakeEngine(retire=[raised_by_wait])
+        gate = slow_cancel(engine)
+        engine, factory, lease = await opened(build, engine)
+        await cancel_abort(lease)
+        release = await raised(lease.release())
+        # The record stays while the task runs, so teardown_all() still finds it.
+        kept = lease.caller_id in factory.sessions and not lease.task.done()
+        gate.set()
+        await wait_until(lambda: lease.caller_id not in factory.sessions)
+        return release, kept, lease.task.done()
+
+    release, kept, ended = run(scenario())
+    if error == "engine_dead":
+        failure(release, "engine_dead")
+    else:
+        assert isinstance(release, RuntimeError)
+    assert kept
+    assert ended
+
+
 # @spec SESS-REL-001
 def test_release_waits_for_retirement_of_its_caller_id(build):
     async def scenario():

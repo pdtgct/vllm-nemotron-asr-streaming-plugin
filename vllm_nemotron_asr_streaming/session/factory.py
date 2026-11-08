@@ -50,8 +50,9 @@ OPEN, FLUSHED, FAILED, ABORTED, RELEASED = (
     "aborted",
     "released",
 )
-#: Calls allowed per state. ``finish`` in ``aborted``/``released`` and
-#: ``release`` in ``released`` are accepted and return without effect.
+#: Calls allowed per state. ``finish`` in ``released`` and ``release`` in
+#: ``released`` return without effect; ``finish`` in ``aborted`` awaits the
+#: cancelled task's end.
 ALLOWED: dict[str, frozenset[str]] = {
     OPEN: frozenset({"feed", "update_locale", "flush", "abort"}),
     FLUSHED: frozenset({"finish", "release"}),
@@ -362,8 +363,9 @@ class SessionLease:
     # @spec SESS-FIN-001
     async def finish(self) -> None:
         with self._call("finish"):
-            if self.state in (ABORTED, RELEASED):
+            if self.state == RELEASED:
                 return
+            # In ``aborted`` the cancelled task may still be ending.
             assert self.task is not None
             await asyncio.wait({self.task})
 
@@ -391,7 +393,7 @@ class SessionLease:
                 factory._start_cleanup(self)
                 raise
             except EngineDeadError:
-                factory._drop(self)
+                factory._hold_until_ended(self)
                 if self.failure == "engine_dead":
                     self.state = RELEASED
                     return
@@ -399,7 +401,7 @@ class SessionLease:
             except (StreamAdmissionError, ValueError):
                 pass
             except Exception:
-                factory._drop(self)
+                factory._hold_until_ended(self)
                 raise
             if self.task is not None and not self.task.done():
                 # Keep the generate task owned until it has ended.
@@ -493,6 +495,25 @@ class StreamingSessionFactory:
     def _drop(self, lease: SessionLease) -> None:
         if self.sessions.get(lease.caller_id) is lease:
             del self.sessions[lease.caller_id]
+
+    # @spec SESS-ABORT-002
+    def _hold_until_ended(self, lease: SessionLease) -> None:
+        """Remove the record now if the task has ended; otherwise keep the record
+        and a tracked task until the generate task ends, so ``teardown_all`` still
+        finds it."""
+        task = lease.task
+        if task is None or task.done() or self.closed:
+            self._drop(lease)
+            return
+
+        async def hold() -> None:
+            await asyncio.wait({task})
+            self._drop(lease)
+
+        holder = asyncio.ensure_future(hold())
+        self._cleanup_tasks.add(holder)
+        holder.add_done_callback(self._cleanup_tasks.discard)
+        holder.add_done_callback(_retrieve)
 
     def _abandon(self, lease: SessionLease) -> None:
         """The owner is gone: cancel the task and hand the session to cleanup,
