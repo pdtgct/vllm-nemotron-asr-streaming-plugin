@@ -27,9 +27,13 @@ Guiding principles:
 The model class adds `SupportsTranscription` with:
 - `supports_transcription_only = False` (the model also serves `realtime`);
 - `supports_segment_timestamp = False` and `supports_diarized_transcription = False`;
-- `supported_languages`: a static class table of the ISO 639-1 languages of the checkpoints this
-  plugin supports (core validates it when the class is defined); per-request support is decided
-  against the served configuration (Language);
+- `supported_languages`: a static class table of the two-letter languages of the supported
+  checkpoint's locale table that core's language map (Whisper's `LANGUAGES`) contains. Core refuses
+  the class at definition time if the table names any other code, and refuses a request language
+  outside its map before the model sees it; a code in the map but not in the table passes core with
+  a warning and the model refuses it (Language). The checkpoint's other languages (for example
+  Norwegian Bokmål `nb`, Zulu `zu`, and the three-letter `nah`) are reachable only by
+  exact locale with no `language`;
 - `get_speech_to_text_config(model_config, task_type)`: `sample_rate = 16000`,
   `max_audio_clip_s = None` and `min_energy_split_window_size = None`, so core never splits a file;
 - `get_generation_prompt(stt_params)`: refuses unsupported requests, maps the language, checks the
@@ -37,7 +41,10 @@ The model class adds `SupportsTranscription` with:
 
 `get_generation_prompt` raises `ValueError` (core returns 400; `Recognize` returns
 `INVALID_ARGUMENT`) for: a task other than transcription, a text prompt, hotwords, a target
-language, an unmappable language, or a budget over `max_model_len`. Core itself refuses
+language, an unmappable language, a budget over `max_model_len`, or a server running experimental
+native burst. Core also copies `vllm_xargs` into the request's sampling `extra_args`, which native
+burst refuses, and a native-burst row cannot run the one-token-per-step file cycle, so complete
+files are not served in that mode. Core itself refuses
 `verbose_json` and timestamps for this model (it declares no segment timestamps).
 
 Core decodes the upload to mono 16 kHz float32 within its own limits
@@ -52,13 +59,22 @@ Core's `validate_language` accepts any code in the class table (and other known 
 warning), so `get_generation_prompt` makes the binding decision against the served configuration,
 `stt_params.model_config.hf_config`, which holds the locale table (`prompt_dictionary`) and the
 optional `language_locales` mapping:
-- A locale `ll` or `ll-RR` belongs to ISO 639-1 language `ll`.
-- A language with exactly one locale maps to it.
-- A language with several locales (for example `en-US`, `en-GB`) maps to the locale named for it in
-  `language_locales`, given as `--hf-overrides '{"language_locales": {"en": "en-US"}}'`; core
-  applies it to the served configuration, and post-override validation checks every entry (see the
-  `registration` design). Without an entry, that language is refused, and startup logs the unmapped
-  languages.
+- **Exact locale.** A request may name a locale of the table in `vllm_xargs` as `{"locale": "en-GB"}`
+  (core passes `vllm_xargs` to the model as `stt_params.extra_args`). It takes precedence over
+  language mapping; an unknown locale is refused, and a `language` also given must be that
+  locale's language. This is how a frontend whose clients name locales (Riva `Recognize`) keeps the
+  client's locale.
+- A locale's language is the lowercase letters before the first `-` or uppercase letter, when there are two or three of them; `auto` has none (`en-US`, `enGB` and `en` are `en`; `haw-US` is `haw`). The
+  table has aliases: several locale names may share a row.
+- A language that is itself a locale of the table (`en`, `de`) maps to that locale; the card's own
+  processor accepts bare codes the same way.
+- Otherwise, a language whose locales all use one row maps to that row's locale (the first of its
+  names in sorted order).
+- Otherwise (its locales use several rows, as `zh-CN` and `zh-TW` do) the language maps to the locale
+  named for it in `language_locales`, given as `--hf-overrides '{"language_locales": {"zh": "zh-CN"}}'`;
+  core applies it to the served configuration, and post-override validation checks every entry
+  (see the `registration` design). Without an entry, that language is refused, and startup logs the
+  unmapped languages.
 - A language with no locale is refused.
 - No language: the `auto` locale when the table has it, else the table's only locale, else the
   request is refused.
@@ -170,8 +186,15 @@ memory, but core preallocates token history for `max_num_seqs × max_model_len` 
 
 A file's **label sequence** is the sequence of emitted token IDs below `blank` (the park, EOU,
 continuation and other control tokens excluded). For a file request that ends with EOS, it equals
-the label sequence of a session that is fed the same samples at the same geometry and locale, with
+the label sequence of a session that is fed the same samples at the same geometry and locale (with
+no `update_locale`), with
 the same precision settings and endpointing disabled on both, and then flushed successfully.
+
+## Streaming responses
+
+With `stream=true`, core sends each non-empty text delta as an event; continuation and other special
+tokens produce no text, so the stream carries only label text before it finishes. Core's terminal
+events (the finish event, optional usage, and `[DONE]`) are sent as for any model.
 
 ## Completion
 
@@ -186,10 +209,18 @@ the frontend, not by the model; without the frontend this route is unsupported f
 - **Step cost.** A FILE row contributes at most one encoder chunk per step, the same as a stream
   row, so the encoder's captured populations (up to `max_num_seqs` rows) and the profiled step
   memory need no change.
-- **Admission.** A file request is an ordinary request: it takes a state slot at first schedule
-  and, while queued, counts against the engine's active-request limit, where it can delay or refuse
-  streams. The frontend's file cap limits how many files are in flight; it does not reserve
-  capacity for streams.
+- **Mixed steps.** One step may hold FILE rows and stream rows. The model groups chunk rows by
+  geometry, and a FILE row advances in the group for its geometry alongside stream rows of the
+  same geometry.
+- **Admission.** A file request is an ordinary request: it waits in core's queue until a state slot
+  is free, takes it at first schedule, and counts against the engine's active-request limit, where
+  it can delay or refuse streams. The frontend's file cap bounds file admission without reserving
+  capacity for streams: a finished file's slot is held until it retires, so the next file can be
+  admitted while it is still occupied.
+- **Step order.** Within a step, chunk groups (one per geometry) run in order of urgency: a group's
+  urgency is the earliest unit deadline among its stream rows; FILE rows, which have no deadlines,
+  add nothing to it; groups holding only FILE rows run after every group with a stream row, and
+  ties are broken by geometry index.
 - **Endpointing.** Disabled, as for streams on core.
 
 ## Current source
@@ -211,7 +242,7 @@ not implement `SupportsTranscription`.
 | Silence | A continuation token | Emitting nothing; the park/EOS token | Every step emits a token; EOS would end the request |
 | Distinguishing file rows | A dedicated file-carrier prompt token | The stream carrier with a different field | Row roles come from the scheduled token |
 | Budget | Worst case, checked before submission | A typical-output bound | Only the worst case makes a `length` ending impossible |
-| Regional languages | Explicit `language_locales` mapping | Picking a default region | A guessed region changes transcripts silently |
+| Regional languages | Explicit `language_locales` mapping, and an exact locale in `vllm_xargs` | Picking a default region | A guessed region changes transcripts silently; a client that names a locale must get that locale |
 
 ## Open Questions & Future Decisions
 

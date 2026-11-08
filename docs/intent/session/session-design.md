@@ -35,7 +35,9 @@ the protocol is structural.
   `wait_stream_retired` (typed against `EngineClient` where the engine declares them there, and
   otherwise requiring `AsyncLLM`);
 - otherwise returns a `SessionFactory`. `served_cadences` is the set of cadence labels of the
-  served lookaheads, and `locales` the model's locale table keys.
+  served lookaheads, `locales` the model's locale table keys, and `default_locale` the locale for a
+  stream whose client names none: `auto` when the table has it, else the table's only locale, else
+  `None` (the client must name one).
 
 ## Protocol
 
@@ -43,6 +45,7 @@ the protocol is structural.
 class SessionFactory(Protocol):
     served_cadences: frozenset[str]
     locales: frozenset[str]
+    default_locale: str | None
     async def open(self, *, cadence: str, locale: str) -> SessionLease: ...
     async def drain(self, deadline: float) -> list[BaseException]: ...
     def teardown_all(self) -> set[asyncio.Task]: ...

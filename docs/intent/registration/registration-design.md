@@ -65,9 +65,11 @@ inputs:
 Anything else raises, naming the expected inputs. For both inputs the parser stores the locale
 table from `processor_config.json` in the configuration as `prompt_dictionary` (an already-translated
 configuration that stores its own table must agree with the file), and both pass the same schema
-check: the control-token layout, `eos_token_id` and `vocab_size`; a non-empty locale table whose row
-indices are exactly `0 … num_prompts − 1`; and a non-empty `card_num_lookahead_tokens` drawn from
-the five implemented right contexts. Post-override validation repeats this check on the final
+check: the control-token layout, `eos_token_id` and `vocab_size`; a positive integer `num_prompts`
+(the size of the model's prompt embedding table) that `processor_config.json` repeats; a non-empty
+locale table whose values are integer rows in `0 … num_prompts − 1`, where several locale names may
+share a row (aliases such as `en` and `en-US`) and some rows may be unused; and a non-empty
+`card_num_lookahead_tokens` drawn from the five implemented right contexts. Post-override validation repeats this check on the final
 configuration, since overrides can change any of these fields.
 
 The returned `PretrainedConfig` is an instance of the model's configuration class
@@ -96,13 +98,22 @@ Translation of a card:
   `decoder_hidden_size` → `pred_hidden` and `num_decoder_layers` → `pred_rnn_layers` when present;
   refuses a `prompt_intermediate_size` other than `2 × hidden_size`; carries no other encoder
   field; writes the streaming architecture key; and drops `model_type` and `is_encoder_decoder`;
-- sets `num_prompts` to the size of the locale table; a missing or invalid table raises;
+- keeps the card's `num_prompts` (the prompt embedding table has that many rows, which can exceed
+  the number of distinct rows the locale table uses);
 - sets `max_position_embeddings` to 2^24. The model has no positional limit; this value only lifts
   core's derived context ceiling, so the deployment's `max_model_len` is the effective bound;
-- records the card's lookahead set as `card_num_lookahead_tokens`, drops any default lookahead and
+- records the card's lookahead set as `card_num_lookahead_tokens`, drops `default_prompt_id` (the
+  default locale is the rule in the `session` and `transcription` designs), drops any default
+  lookahead and
   any top-level `supported_num_lookahead_tokens` the card carries, and declares
   `decode_dispatch_arm = "dense-eager"`, the decoder dispatch the model requires a configuration to
   declare.
+
+Every component (the session, the packer, the file prompt and the model) takes control-token IDs
+from the served configuration, never from constants. The per-unit emission bound
+`realtime_max_tokens` (142 for the implemented geometries) has one definition, in the geometry
+manifest module, which the model class attribute, the session's `max_tokens` and post-override
+validation all use.
 
 Values the translation computes (control-token IDs, `eos_token_id`, vocabulary, logit width,
 architecture) win over any same-named card key. Post-override validation refuses a final
@@ -118,7 +129,10 @@ configuration derived from it carries only the park token as EOS and no length l
 The card's tokenizer holds the label pieces only. Core detokenizes every emitted token, and
 `skip_special_tokens` drops only tokens the tokenizer marks special. The tokenizer mode
 `nemotron_asr_streaming` (selected with `--tokenizer-mode nemotron_asr_streaming`) loads the card's
-tokenizer and appends, in order, a blank placeholder at `blank` and the control tokens at
+tokenizer, takes `blank` from `blank_token_id` in the `config.json` beside the tokenizer (so
+`--tokenizer`, when given, must name the checkpoint, and an already-translated configuration keeps
+`blank_token_id`), failing if the card tokenizer's vocabulary size differs from it, and appends, in order, a blank placeholder at `blank` and the
+control tokens at
 `blank + 1 … blank + 5`, all special, and sets the park token `blank + 1` as the tokenizer's
 `eos_token_id`. Core takes a request's primary EOS from the tokenizer, and a persistent-state
 stream parks only on that EOS (any other stop ends the stream), so this binding is what lets a
@@ -156,9 +170,10 @@ The configuration hook runs twice during startup:
   sets `att_context_right`, and checks: the default lookahead is present and served; every served
   value is one of the five right contexts; native burst; the
   control-token layout, `eos_token_id` and `vocab_size` equal the computed values;
-  `language_locales`, when given, maps ISO 639-1 languages to locales of that language in the
-  locale table; and `max_model_len ≥ 1 + realtime_max_tokens` (the smallest context in which one
-  stream unit fits). It repeats the parser's schema check, and checks generation defaults in two places, because core
+  `language_locales`, when given, maps language codes to locales of that language in the locale
+  table (a locale's language is the lowercase letters before the first `-` or uppercase letter,
+  when there are two or three of them; `auto` has none); and
+  `max_model_len ≥ 1 + realtime_max_tokens` (the smallest context in which one stream unit fits). It repeats the parser's schema check, and checks generation defaults in two places, because core
 reads them in two places. Request EOS and stop tokens come from
 `model_config.try_get_generation_config()`, which loads the checkpoint's `generation_config.json`
 under both `--generation-config auto` and `vllm` (a directory selects another file): any `eos_token_id` there must be the park token alone, because
@@ -167,8 +182,8 @@ core turns any other EOS into a stop token that ends a stream at its first park;
 Default sampling limits come from `model_config.get_diff_sampling_param()`, which also merges
 `--override-generation-config`: it must contain no `max_tokens`; the remedy is
 `--generation-config vllm` and no token-limit override. It logs each language
-  that has several locales and no `language_locales` entry, which complete-file transcription will
-  refuse.
+  that complete-file transcription cannot map (several distinct rows, no locale named for the
+  language itself, and no `language_locales` entry).
 - `verify_and_update_config(vllm_config)` runs once while the engine configuration is resolved and
   refuses the engine settings below. Settings that core resolves only later are re-checked when the
   model state is constructed.
@@ -241,7 +256,7 @@ as a refusal.
 | Control tokens in the tokenizer | A registered tokenizer mode that appends them as special tokens, with park as the tokenizer's EOS | Publishing a modified tokenizer; leaving them unknown | Core detokenizes every token; unknown IDs break detokenization and unmarked ones appear in text; the card must stay usable unmodified |
 | Context ceiling | Translation sets `max_position_embeddings` to 2^24 | Requiring `VLLM_ALLOW_LONG_MAX_MODEL_LEN` | The model has no positional limit; long files need a context far above the card's 32,768 |
 | Override of the served set | Replaces the card's set; values limited to the five geometries | Union with the card's set; any value | Replacement lets a deployment narrow the warmed set; values without a geometry cannot run |
-| Load-time checks | Client calls in `register()`; adapter symbols at model import | All checks in `register()` | Worker symbols belong to the worker; the API server, which runs `register()` and the session factory, does not import the model class modules; the parser's configuration module and engine modules pulled in by the public client and configuration APIs are allowed |
+| Load-time checks | Client calls in `register()`; adapter symbols at model import | All checks in `register()` | `register()` and the session factory do not import the model class modules, so loading the plugin stays cheap; core's speech-to-text serving imports the model class in the API server when it starts, so importing it initializes no device and loads no weights |
 | `generate` task | Not advertised (model-state override) | Advertise for compatibility | The model emits transcript labels, not text generation |
 
 ## Open Questions & Future Decisions

@@ -10,7 +10,7 @@ admitted stream; a lease is the handle `open` returns for it.
 - [ ] **SESS-FAC-001**: The distribution shall expose an entry point in the group `vllm_riva_frontend.session_factories`, named `nemotron_asr_streaming`, with the value `vllm_nemotron_asr_streaming.session:create_session_factory`.
 - [ ] **SESS-FAC-002**: When the served architecture is not `Nemotron3_5AsrStreamingForRNNT`, `create_session_factory(engine_client, model_config)` shall return `None`.
 - [ ] **SESS-FAC-003**: If the engine client given to `create_session_factory` has no `generate` accepting `stream_admission` or no `wait_stream_retired`, then `create_session_factory` shall raise an error naming the missing call.
-- [ ] **SESS-FAC-004**: The session factory's `served_cadences` shall be the cadence labels (for example `560ms`) of exactly the served lookahead set, and its `locales` shall be exactly the keys of the served locale table.
+- [ ] **SESS-FAC-004**: The session factory's `served_cadences` shall be the cadence labels of exactly the served lookahead set, using the one table right context 0, 1, 3, 6, 13 ↔ label `80ms`, `160ms`, `320ms`, `560ms`, `1120ms` ↔ geometry index 0 to 4; its `locales` shall be exactly the keys of the served locale table; and its `default_locale` shall be `auto` when the table has it, else the table's only locale, else `None`.
 - [ ] **SESS-FAC-005**: The plugin shall not import the frontend package, and the session factory and lease shall satisfy the protocol in the session design (§Protocol) structurally.
 
 ## Audio input to `feed`
@@ -109,7 +109,7 @@ packer implementation.
 ## Core `/v1/realtime`
 
 - [ ] **SESS-RT-001**: The model's `buffer_realtime_audio(audio_stream, input_stream, model_config)` shall pack the audio from `audio_stream` with the session packer at the server's default lookahead and yield one prompt per unit, followed by the final-tail unit when `audio_stream` ends.
-- [ ] **SESS-RT-002**: The model's `buffer_realtime_audio` shall use the locale `auto` when the locale table has it, else the table's only locale; if the table has several locales and no `auto`, then it shall raise `ValueError` naming the locales.
+- [ ] **SESS-RT-002**: The model's `buffer_realtime_audio` shall use the same default locale as SESS-FAC-004's `default_locale`; if that is `None`, then it shall raise `ValueError` naming the locales.
 - [ ] **SESS-RT-003**: The model's `buffer_realtime_audio` shall drain `input_stream` for the life of the connection without using its contents.
 
 ## Transcript projection
