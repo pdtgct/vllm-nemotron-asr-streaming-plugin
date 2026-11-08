@@ -46,6 +46,7 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --no-enable-prefix-caching \
     --config-format nemotron_asr_streaming \
     --tokenizer-mode nemotron_asr_streaming \
+    --max-model-len 76800 \
     --hf-overrides '{"supported_num_lookahead_tokens": [6, 13], "num_lookahead_tokens": 13}'
 ```
 
@@ -58,6 +59,11 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
 - `supported_num_lookahead_tokens` is the served set. It defaults to the card's own set (0, 3, 6, 13) and
   accepts any of the implemented right contexts 0, 1, 3, 6 and 13. The reference deployment serves
   `[6, 13]` with default 13.
+- `--max-model-len` bounds complete files: a file of `N` samples needs `1 + (C + 1) × Q + 1` tokens,
+  with `C = floor(N / s)`, `s = 1280 × (r + 1)` samples per chunk and `Q = 10 × (r + 1) + 1` at the
+  default lookahead `r`. 76,800 admits files up to 600 s (core's default decode limit) at either served
+  cadence; streams need only 143. It costs no KV memory; core preallocates token history for
+  `max_num_seqs × max_model_len` tokens.
 - Pass `--generation-config vllm` if the checkpoint's generation configuration or an
   `--override-generation-config` sets a token limit; the startup error says when.
 
@@ -73,8 +79,7 @@ Support boundary:
 ## Evidence
 
 - Target engine: the merge of RFC 1 `persistent-state-primitive-v2` @ `574efbd8f6` and RFC 2
-  `endpoint-plugin-lifecycle` @ `6b1ce05706` on `pdtgct/vllm` (local integration commit `5194f13ebc`, not
-  yet published).
+  `endpoint-plugin-lifecycle` @ `6b1ce05706` on `pdtgct/vllm` (merged as branch `rfc12-integration-v2` @ `5194f13ebc`).
 - Achieved: CPU-tier tests (all passing; see `TODO.md` for the GPU round). The GPU tier has not been run.
 - Pending: installed-engine runs on an A40, file/stream equivalence, and mixed load.
 
