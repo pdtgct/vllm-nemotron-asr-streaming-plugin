@@ -78,8 +78,8 @@ Support boundary:
 
 ## Evidence
 
-- Target engine: the merge of RFC 1 `persistent-state-primitive-v2` @ `574efbd8f6` and RFC 2
-  `endpoint-plugin-lifecycle` @ `6b1ce05706` on `pdtgct/vllm` (merged as branch `rfc12-integration-v2` @ `5194f13ebc`).
+- Target engine: the merge of RFC 1 `persistent-state-primitive-v2` @ `c384f178cd` and RFC 2
+  `endpoint-plugin-lifecycle` @ `6b1ce05706` on `pdtgct/vllm` (merged as branch `rfc12-integration-v2` @ `c7cf80ac45`).
 - Achieved: CPU-tier tests (all passing; see `TODO.md` for the GPU round). The GPU tier has not been run.
 - Pending: installed-engine runs on an A40, file/stream equivalence, and mixed load.
 
