@@ -80,8 +80,18 @@ Support boundary:
 
 - Target engine: the merge of RFC 1 `persistent-state-primitive-v2` @ `c384f178cd` and RFC 2
   `endpoint-plugin-lifecycle` @ `6b1ce05706` on `pdtgct/vllm` (merged as branch `rfc12-integration-v2` @ `c7cf80ac45`).
-- Achieved: CPU-tier tests (all passing; see `TODO.md` for the GPU round). The GPU tier has not been run.
-- Pending: installed-engine runs on an A40, file/stream equivalence, and mixed load.
+- Achieved, tier 1 (CPU conformance): the CPU-tier tests pass.
+- Achieved, tier 2 (installed-engine cycle), on one A40 with the Riva frontend at `782dec8`: this
+  repository's GPU tier passes, and unmodified Riva clients complete streaming, `Recognize`, Realtime
+  WebSocket and file-route requests, for one session and for eight concurrent sessions.
+- Partly achieved, tier 3 (equivalence), same A40: on eight public clips from 20 s to 428 s, the core
+  transcription route (sent with `language`) and `Recognize` return identical transcripts, and the
+  whole-file transcript equals a session at the 1120 ms file cadence. The comparison with the offline
+  plugin has not been run on these clips.
+- Not met, tier 4 (mixed load): with one 293 s file request in flight, eight concurrent streams' p95
+  final latency rose from 0.55 s to 3.64 s, with no preemptions. Run file traffic on a separate server,
+  or keep files short, until this is fixed.
+- These are exploratory measurements on one GPU, not a qualification run.
 
 ## Install and test
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-nemotron-asr-streaming"
-version = "0.0.1"
+version = "0.1.0b1"
 description = "Out-of-tree plugin for cache-aware streaming Nemotron ASR on vLLM core (RFC 1 + RFC 2 build)."
 readme = "README.md"
 requires-python = ">=3.11"
