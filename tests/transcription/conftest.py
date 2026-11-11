@@ -68,7 +68,7 @@ def stt_params(served_config) -> Callable[..., Any]:
         samples: np.ndarray | None = None,
         language: str | None = None,
         extra_args: dict | None = None,
-        max_model_len: int = 100_000,
+        max_model_len: int = 2_048,
         task_type: str = "transcribe",
         request_prompt: str = "",
         hotwords: str | None = None,
@@ -279,3 +279,45 @@ def make_step() -> Callable[..., Any]:
         return {STATE_LAYER: StateSlotHandle("epoch", slot, generation)}
 
     return SimpleNamespace(new_request=new_request, step=step, handle=handle)
+
+
+@pytest.fixture
+def guarded(stt_params) -> Callable[..., Any]:
+    """A real core ``SpeechToTextParams`` that carries the request guards'
+    two fields, ``use_beam_search`` (default ``False``) and
+    ``max_completion_tokens`` (default ``None``).
+
+    The fields come from the pending core change; the installed core has
+    neither. When it does, its own fields are set; when it does not, a
+    subclass of the real class adds exactly these two with the change's
+    defaults. ``stt_params`` arguments pass through.
+    """
+    import dataclasses
+
+    def make(
+        *, use_beam_search: bool = False, max_completion_tokens: Any = None, **kwargs
+    ) -> Any:
+        base = stt_params(**kwargs)
+        names = {f.name for f in dataclasses.fields(base)}
+        if {"use_beam_search", "max_completion_tokens"} <= names:
+            return dataclasses.replace(
+                base,
+                use_beam_search=use_beam_search,
+                max_completion_tokens=max_completion_tokens,
+            )
+        cls = dataclasses.make_dataclass(
+            "SpeechToTextParamsWithGuards",
+            [
+                ("use_beam_search", bool, False),
+                ("max_completion_tokens", Any, None),
+            ],
+            bases=(type(base),),
+        )
+        values = {f.name: getattr(base, f.name) for f in dataclasses.fields(base)}
+        return cls(
+            **values,
+            use_beam_search=use_beam_search,
+            max_completion_tokens=max_completion_tokens,
+        )
+
+    return make

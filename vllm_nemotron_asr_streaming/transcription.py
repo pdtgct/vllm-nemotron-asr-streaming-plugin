@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Complete-file transcription: the prompt and token budget of a file request.
+"""Complete-file transcription: the prompt of a file request.
 
 Core sends a file as one ordinary request. ``build_file_prompt`` refuses what
-the model does not serve, binds the request's language to a row of the served
-locale table, checks the worst-case token budget and returns a prompt of one
-file-carrier token with the file's samples as its audio item. Importing this
-module imports no vLLM.
+the model does not serve (including beam search and client completion limits,
+which do not apply to audio transcription), binds the request's language to a
+row of the served locale table and returns a prompt of one file-carrier token
+with the file's samples as its audio item. The model imposes no limit on a
+file's length. Importing this module imports no vLLM.
 """
 
 from __future__ import annotations
@@ -16,38 +17,13 @@ from typing import Any
 import numpy as np
 
 from vllm_nemotron_asr_streaming.locales import resolve_file_locale
-from vllm_nemotron_asr_streaming.lookahead import cadence_label, geometry_index
-from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
-    RAW_SAMPLES_PER_CHUNK,
-    SESSION_LIMITS,
-)
-
-
-def file_chunk_samples(right_context: int) -> int:
-    """Samples per regular chunk of a geometry (``s``), from the manifest."""
-    return RAW_SAMPLES_PER_CHUNK[cadence_label(right_context)]
-
-
-def file_queue_bound(right_context: int) -> int:
-    """The most tokens one chunk or tail queues (``Q``): labels, at most
-    ``max_symbols_per_step`` per encoder frame, plus an optional EOU."""
-    return (right_context + 1) * SESSION_LIMITS["max_symbols_per_step"] + 1
-
-
-# @spec FILE-BUD-001
-def file_token_budget(num_samples: int, right_context: int) -> int:
-    """The worst-case tokens a file request emits, counting the prompt token.
-
-    ``B = 1 + (C + 1) * Q + 1``: the prompt token, each of the ``C`` regular
-    chunks and the tail at their bound ``Q``, and the end token.
-    """
-    chunks = int(num_samples) // file_chunk_samples(right_context)
-    return 1 + (chunks + 1) * file_queue_bound(right_context) + 1
+from vllm_nemotron_asr_streaming.lookahead import geometry_index
 
 
 # @spec FILE-IF-004, FILE-IF-005, FILE-LANG-001, FILE-LANG-002, FILE-LANG-003
 # @spec FILE-LANG-004, FILE-LANG-005, FILE-LANG-006, FILE-PROMPT-001
-# @spec FILE-PROMPT-002, FILE-PROMPT-005, FILE-BUD-001, FILE-BUD-003, REG-CARD-015
+# @spec FILE-PROMPT-002, FILE-PROMPT-005, FILE-GRD-001, FILE-GRD-002
+# @spec FILE-GRD-003, FILE-GRD-004, FILE-GRD-005, FILE-GRD-006, REG-CARD-015
 def build_file_prompt(stt_params: Any) -> dict[str, Any]:
     """Build the prompt of a complete-file request, or raise ``ValueError``."""
     if stt_params.task_type != "transcribe":
@@ -70,6 +46,17 @@ def build_file_prompt(stt_params: Any) -> dict[str, Any]:
             "complete-file transcription is not served in native-burst mode: "
             "a native-burst row cannot run the one-token-per-step file cycle"
         )
+    # The two guard fields come from a core change that may not be present; an
+    # absent attribute and ``None`` both mean "not given" (FILE-GRD-005).
+    if getattr(stt_params, "use_beam_search", False):
+        raise ValueError(
+            "use_beam_search does not apply to audio transcription with this model"
+        )
+    if getattr(stt_params, "max_completion_tokens", None) is not None:
+        raise ValueError(
+            "max_completion_tokens does not apply to audio transcription with "
+            "this model"
+        )
 
     extra_args = stt_params.extra_args or {}
     exact = extra_args.get("locale")
@@ -88,16 +75,6 @@ def build_file_prompt(stt_params: Any) -> dict[str, Any]:
     geometry = geometry_index(right_context)
     samples = np.ascontiguousarray(stt_params.audio, dtype=np.float32).reshape(-1)
     count = int(samples.shape[0])
-
-    budget = file_token_budget(count, right_context)
-    max_model_len = int(model_config.max_model_len)
-    if budget > max_model_len:
-        raise ValueError(
-            "file exceeds max_model_len: "
-            f"the file is {count / 16000:.1f} s long and needs max_model_len "
-            f">= {budget} tokens at the {right_context}-frame right context, "
-            f"but max_model_len is {max_model_len}"
-        )
 
     return {
         "prompt_token_ids": [int(hf_config.file_carrier_token_id)],

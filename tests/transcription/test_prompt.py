@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FILE-PROMPT, FILE-BUD-001, FILE-ROW-008: the prompt a file request becomes."""
+"""FILE-PROMPT, FILE-GRD-006, FILE-ROW-008: the prompt a file request becomes."""
 
 from __future__ import annotations
 
@@ -18,11 +18,6 @@ def chunk_samples(rc: int) -> int:
 def queue_bound(rc: int) -> int:
     """Q = (r + 1) * 10 + 1, the design's per-chunk emission bound."""
     return (rc + 1) * 10 + 1
-
-
-def budget(n: int, rc: int) -> int:
-    """B = 1 + (C + 1) * Q + 1, written out from the design."""
-    return 1 + (n // chunk_samples(rc) + 1) * queue_bound(rc) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -159,51 +154,30 @@ def test_identical_samples_hash_differently(model_cls, stt_params):
 
 
 # ---------------------------------------------------------------------------
-# FILE-BUD-001: the token budget
+# FILE-GRD-006: no refusal on a file's length (FILE-BUD-001 and 003 are retired)
 
 
-# @spec FILE-BUD-001
-def test_design_worked_example():
-    from vllm_nemotron_asr_streaming.transcription import file_token_budget
-
-    assert file_token_budget(57_600_000, 6) == 456_461
-
-
-# @spec FILE-BUD-001
-@pytest.mark.parametrize("right_context", RIGHT_CONTEXTS)
-def test_budget_formula(right_context):
-    from vllm_nemotron_asr_streaming.transcription import file_token_budget
-
-    s = chunk_samples(right_context)
-    for n in (0, 1, s - 1, s, s + 1, 7 * s, 7 * s + 5, 3_600 * 16_000):
-        assert file_token_budget(n, right_context) == budget(n, right_context)
-
-
-# @spec FILE-BUD-001, FILE-BUD-003
+# @spec FILE-GRD-006
 @pytest.mark.engine
 @pytest.mark.parametrize("right_context", [0, 6, 13])
-def test_file_over_budget_is_refused(model_cls, stt_params, right_context):
+def test_no_file_is_refused_for_its_length(model_cls, stt_params, right_context):
+    # the retired worst-case check refused this file at max_model_len = 100:
+    # its worst case is far above 100 tokens. The model now imposes no
+    # input-length limit; core's actual-token stop is the only bound.
     s = chunk_samples(right_context)
-    n = 40 * s + 17
-    needed = budget(n, right_context)
-    # exactly the budget fits
-    model_cls.get_generation_prompt(
-        stt_params(n_samples=n, right_context=right_context, max_model_len=needed)
-    )
-    with pytest.raises(ValueError) as err:
-        model_cls.get_generation_prompt(
-            stt_params(
-                n_samples=n, right_context=right_context, max_model_len=needed - 1
-            )
+    for n in (0, 1, s, 40 * s + 17, 3_600 * 16_000):
+        prompt = model_cls.get_generation_prompt(
+            stt_params(n_samples=n, right_context=right_context, max_model_len=100)
         )
-    message = str(err.value)
-    assert message.startswith("file exceeds max_model_len: ")  # FILE-BUD-003
-    assert str(needed) in message
-    assert "max_model_len" in message
-    seconds = n / 16000
-    assert any(
-        f in message for f in (f"{seconds:.1f}", f"{seconds:.0f}", f"{seconds:g}")
-    )
+        assert len(prompt["prompt_token_ids"]) == 1
+        assert prompt["mm_processor_kwargs"]["file_header"][2] == n
+
+
+# @spec FILE-GRD-006
+def test_the_worst_case_budget_check_is_gone():
+    import vllm_nemotron_asr_streaming.transcription as transcription
+
+    assert not hasattr(transcription, "file_token_budget")
 
 
 # ---------------------------------------------------------------------------

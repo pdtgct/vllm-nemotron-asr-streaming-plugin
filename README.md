@@ -59,11 +59,14 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
 - `supported_num_lookahead_tokens` is the served set. It defaults to the card's own set (0, 3, 6, 13) and
   accepts any of the implemented right contexts 0, 1, 3, 6 and 13. The reference deployment serves
   `[6, 13]` with default 13.
-- `--max-model-len` bounds complete files: a file of `N` samples needs `1 + (C + 1) × Q + 1` tokens,
-  with `C = floor(N / s)`, `s = 1280 × (r + 1)` samples per chunk and `Q = 10 × (r + 1) + 1` at the
-  default lookahead `r`. 76,800 admits files up to 600 s (core's default decode limit) at either served
-  cadence; streams need only 143. It costs no KV memory; core preallocates token history for
-  `max_num_seqs × max_model_len` tokens.
+- The model imposes no limit on a file's length. Each engine step advances a file by one chunk and
+  emits one token, so a file's token count grows with its length, and core stops a request when it
+  reaches `--max-model-len` tokens. Size `--max-model-len` for the longest file you serve: a file of
+  `N` samples emits at most `1 + (C + 1) × Q + 1` tokens, with `C = floor(N / s)`,
+  `s = 1280 × (r + 1)` samples per chunk and `Q = 10 × (r + 1) + 1` at the default lookahead `r`
+  (typical output is far smaller). 76,800 covers files up to 600 s (core's default decode limit) at
+  either served cadence; streams need only 143. Each token costs about 4 bytes per slot of token
+  history (`max_num_seqs × max_model_len` tokens) and no KV memory.
 - Pass `--generation-config vllm` if the checkpoint's generation configuration or an
   `--override-generation-config` sets a token limit; the startup error says when.
 
@@ -71,16 +74,32 @@ Support boundary:
 
 - Core's `/v1/realtime` is served directly, with no frontend. A unit core rejects ends that stream, as
   core's contract says.
-- Complete-file transcription through core's `/v1/audio/transcriptions` is supported only with the Riva
-  frontend's guards (the file-size cap, and refusal of beam search and client completion limits). Without
-  that frontend it is unsupported.
+- Complete-file transcription through core's `/v1/audio/transcriptions` is served directly, with no
+  frontend. Limits of the route today:
+  - Core's upload and decode caps are the operator's settings, not the model's: raise
+    `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` (default 25), `VLLM_MAX_AUDIO_DECODE_DURATION_S` (default 600 s)
+    and `VLLM_MAX_AUDIO_DECODE_BYTES` (default 256 MiB) for long files.
+  - Requests queued in core hold their decoded audio in the API server with no bound; `max_num_seqs`
+    bounds only the files actively scheduled. Put a cap in front of the server if clients are not
+    trusted.
+  - The model refuses `use_beam_search` and `max_completion_tokens` as options that do not apply to
+    audio transcription, but only on a vLLM core that passes those two request fields to the model
+    (a small pending core change). On a core without it they are not refused: a client's
+    `max_completion_tokens` ends the file early with `length`, and beam search issues up to
+    `n × max_model_len` engine requests per upload. Do not expose the route to untrusted clients
+    until your core has the change.
+  - On a core without the pending change that reports a `length` ending caused by the server's limit
+    (the request reaching `--max-model-len`) as an error, a file that reaches the limit returns
+    partial text with HTTP 200.
 - The session factory, found through the second entry point, is for frontends.
 
 ## Evidence
 
 - Target engine: the merge of RFC 1 `persistent-state-primitive-v2` @ `c384f178cd` and RFC 2
   `endpoint-plugin-lifecycle` @ `6b1ce05706` on `pdtgct/vllm` (merged as branch `rfc12-integration-v2` @ `c7cf80ac45`).
-- Achieved, tier 1 (CPU conformance): the CPU-tier tests pass.
+- Achieved, tier 1 (CPU conformance): the CPU-tier tests pass, including the request guards of the
+  transcription route (run against a core `SpeechToTextParams` that carries the two pending fields).
+  The frontend-free file route has not been run at tier 2 (installed engine).
 - Achieved, tier 2 (installed-engine cycle), on one A40 with the Riva frontend at `782dec8`: this
   repository's GPU tier passes, and unmodified Riva clients complete streaming, `Recognize`, Realtime
   WebSocket and file-route requests, for one session and for eight concurrent sessions.

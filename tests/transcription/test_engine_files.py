@@ -537,19 +537,19 @@ def test_engine_stages_copies_and_encodes_at_most_one_chunk_per_file_step(
 # FILE-BUD, FILE-ENG
 
 
-# @spec FILE-BUD-002
-def test_worst_case_budget_file_ends_with_eos_not_length(run, engine):
-    # the longest file whose worst-case budget fits max_model_len
-    from vllm_nemotron_asr_streaming.transcription import file_token_budget
-
-    n = CHUNK * 220
-    while file_token_budget(n + CHUNK, RIGHT_CONTEXT) <= MAX_MODEL_LEN:
-        n += CHUNK
-    assert file_token_budget(n, RIGHT_CONTEXT) <= MAX_MODEL_LEN
-    audio = np.random.default_rng(3).standard_normal(n).astype(np.float32) * 0.2
+# @spec FILE-BUD-002, FILE-GRD-006
+def test_file_past_the_old_worst_case_bound_ends_with_eos_not_length(run, engine):
+    # Silence queues no labels, so a file emits one token per chunk: about
+    # MAX_MODEL_LEN / 2 tokens here, well inside core's actual-token stop, yet
+    # far above the length the retired worst-case check admitted (about
+    # MAX_MODEL_LEN / 71 chunks at this geometry). The model refuses no file
+    # for its length; the request ends with EOS, not ``length``.
+    n = CHUNK * (MAX_MODEL_LEN // 2)
+    audio = np.zeros(n, dtype=np.float32)
     result = run(transcribe_file(engine, audio))
     assert result.finish_reason == "stop"
     assert result.token_ids[-1] == blank_of(engine) + 1
+    assert len(result.token_ids) < MAX_MODEL_LEN
 
 
 # @spec FILE-ENG-002

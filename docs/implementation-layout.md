@@ -17,7 +17,7 @@ changing the tests that use it.
 | `lookahead` | `GEOMETRIES` (right context, label, geometry index): (0, `80ms`, 0), (1, `160ms`, 1), (3, `320ms`, 2), (6, `560ms`, 3), (13, `1120ms`, 4); `cadence_label`, `geometry_index`, `right_context_for_label`, `served_lookaheads(hf_config)`, `default_lookahead(hf_config)` |
 | `locales` | `locale_language(name)`, `default_locale(table)`, `resolve_file_locale(table, *, language, exact_locale, language_locales)`, `supported_languages()` |
 | `engine_flags` | `persistent_state_config_errors(vllm_config) -> list[str]` |
-| `transcription` | `file_token_budget(num_samples, right_context) -> int`; `build_file_prompt(stt_params) -> dict` |
+| `transcription` | `build_file_prompt(stt_params) -> dict` |
 | `model` | `Nemotron3_5AsrStreamingForRNNT` (`get_generation_prompt`, `get_speech_to_text_config`, `supported_languages`, `buffer_realtime_audio`, `realtime_max_tokens`, `get_model_state_cls`) |
 
 Served-configuration fields for the control tokens: `eos_token_id` (park), `audio_chunk_token_id`,
