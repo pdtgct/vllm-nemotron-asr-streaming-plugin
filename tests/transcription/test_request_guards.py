@@ -5,9 +5,9 @@ transcription with this model, and the model imposes no length limit.
 The two request fields, ``use_beam_search`` and ``max_completion_tokens``,
 come from the pending core change to ``SpeechToTextParams``; the ``guarded``
 fixture builds a real core ``SpeechToTextParams`` that carries them (a
-subclass adding exactly those two fields with the change's defaults, while the
-installed core lacks them). The plain ``stt_params`` fixture, whose class has
-no such fields, exercises FILE-GRD-005.
+subclass adding exactly those two fields with the change's defaults when the
+installed core lacks them). The ``unguarded`` fixture, whose class has no such
+fields on either core, exercises FILE-GRD-005.
 """
 
 from __future__ import annotations
@@ -59,8 +59,8 @@ def test_absent_fields_are_not_refused(build, guarded):
 
 
 # @spec FILE-GRD-003, FILE-GRD-005
-def test_a_params_class_without_the_fields_is_not_refused(build, stt_params):
-    params = stt_params()
+def test_a_params_class_without_the_fields_is_not_refused(build, unguarded):
+    params = unguarded()
     assert not hasattr(params, "use_beam_search")
     assert not hasattr(params, "max_completion_tokens")
     assert len(build(params)["prompt_token_ids"]) == 1

@@ -321,3 +321,32 @@ def guarded(stt_params) -> Callable[..., Any]:
         )
 
     return make
+
+
+@pytest.fixture
+def unguarded(stt_params) -> Callable[..., Any]:
+    """A ``SpeechToTextParams`` stand-in whose class has neither
+    ``use_beam_search`` nor ``max_completion_tokens``, as on a core without
+    the request-field change.
+
+    When the installed core lacks the fields, this is the real class. When
+    it has them, a dataclass with the real class's other fields stands in.
+    ``stt_params`` arguments pass through.
+    """
+    import dataclasses
+
+    guard_fields = {"use_beam_search", "max_completion_tokens"}
+
+    def make(**kwargs) -> Any:
+        base = stt_params(**kwargs)
+        fields = dataclasses.fields(base)
+        if not guard_fields & {f.name for f in fields}:
+            return base
+        kept = [f for f in fields if f.name not in guard_fields]
+        cls = dataclasses.make_dataclass(
+            "SpeechToTextParamsWithoutGuards",
+            [(f.name, f.type) for f in kept],
+        )
+        return cls(**{f.name: getattr(base, f.name) for f in kept})
+
+    return make
