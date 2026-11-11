@@ -36,22 +36,115 @@ The model class adds `SupportsTranscription` with:
   exact locale with no `language`;
 - `get_speech_to_text_config(model_config, task_type)`: `sample_rate = 16000`,
   `max_audio_clip_s = None` and `min_energy_split_window_size = None`, so core never splits a file;
-- `get_generation_prompt(stt_params)`: refuses unsupported requests, maps the language, checks the
-  budget and builds the file prompt.
+- `get_generation_prompt(stt_params)`: refuses unsupported requests (including beam search and
+  completion limits, Request guards), maps the language, checks the budget and builds the file
+  prompt.
 
 `get_generation_prompt` raises `ValueError` (core returns 400; a frontend maps it to its own
 status codes) for: a task other than transcription, a text prompt, hotwords, a target
-language, an unmappable language, a budget over `max_model_len`, or a server running experimental
-native burst. Core also copies `vllm_xargs` into the request's sampling `extra_args`, which native
+language, an unmappable language, beam search, a completion limit below the file's budget, a budget over `max_model_len`,
+or a server running experimental native burst. Core also copies `vllm_xargs` into the request's sampling `extra_args`, which native
 burst refuses, and a native-burst row cannot run the one-token-per-step file cycle, so complete
 files are not served in that mode. Core itself refuses
 `verbose_json` and timestamps for this model (it declares no segment timestamps).
 
-Core decodes the upload to mono 16 kHz float32 within its own limits
-(`VLLM_MAX_AUDIO_CLIP_FILESIZE_MB`, `VLLM_MAX_AUDIO_DECODE_DURATION_S`,
+Core reads the upload under its own size cap and decodes it to mono 16 kHz float32 within its
+other limits (`VLLM_MAX_AUDIO_CLIP_FILESIZE_MB`, `VLLM_MAX_AUDIO_DECODE_DURATION_S`,
 `VLLM_MAX_AUDIO_DECODE_BYTES`), sets `max_tokens` to `max_model_len` minus the prompt length (no client or generation-config
 limit is present in the supported deployment), and returns the request's output text with special
 tokens skipped.
+
+## Request guards
+
+Where a refusal can live. The model sees a file request at three points, and only the first
+refuses it cleanly:
+- **`get_generation_prompt`** runs in core's front end before the sampling parameters exist
+  (`speech_to_text/base/serving.py` `_preprocess_speech_to_text`, which calls it at line 308; the
+  parameters are built after it, at lines 519-533). A `ValueError` raised there is returned to
+  the client as HTTP 400 (`serve/exception_handling/register.py:36` with
+  `error_response.py:80-82`), the engine never sees the request, and nothing in the engine
+  changes state.
+- **The model state's `add_request`** sees the engine's `SamplingParams` but runs inside the
+  engine step (`vllm/v1/worker/gpu/model_runner.py:1377`, no handler): an exception there ends
+  the engine, so it is not a refusal point. Failing the row through the state transaction instead
+  ends that request with finish reason `error`, and core's non-streaming transcription path never
+  reads the finish reason (`base/serving.py` lines 601-690), so the client would receive HTTP 200
+  with empty or partial text. Neither is acceptable.
+- **Logits-processor `validate_params`** sees only `SamplingParams`, needs the operator to list the
+  processor, and cannot tell a file request from a stream.
+
+So the guards belong in `get_generation_prompt`, which is the only point that is both a clean 400
+and self-contained. At the pinned core (vLLM PR #65544 head `de2722ca2a`), the parameters it
+receives are `SpeechToTextParams` (`vllm/config/speech_to_text.py:17-61`), built by
+`build_stt_params` (`transcription/protocol.py:190-200`), and they carry neither
+`use_beam_search` nor `max_completion_tokens`. **This needs a small core change:** two optional
+fields on `SpeechToTextParams`, `use_beam_search: bool = False` and
+`max_completion_tokens: int | None = None`, filled by `build_stt_params` of the transcription (and
+translation) request. The class docstring already provides for adding fields without changing the
+`get_generation_prompt` signature. The guards activate when the fields are present; against a core
+without them, `getattr` finds neither and the model behaves as before (the gap is then the one
+the README documents).
+
+What reaches the model, by core request field:
+- Beam search and a completion limit are text-decoding options. They do not apply to audio
+  transcription with this model, so the refusal says so and does not present them as missing
+  capacity. A completion limit is refused whatever its value rather than compared with the
+  budget: a token count here counts engine steps, not words, so a client cannot choose a
+  meaningful value, `max_completion_tokens` is not part of the audio-transcription API this
+  route mimics, and a worst-case comparison would refuse the generous limits clients send for
+  short files. Messages begin `<field> does not apply to audio transcription with this model`.
+- `use_beam_search` (any `n`, including 1). Core then runs its beam-search loop
+  (`speech_to_text/base/serving.py:526-528, 560`; `generate/beam_search/online.py:33-140`): each
+  step is an engine request for the same file prompt with `max_tokens=1` and logprobs, so a file
+  would advance one token and end with `length`, silently truncated. Refused with `ValueError`
+  as above. With `stream=true`, core already refuses beam search
+  itself (`serving.py:437-440`).
+- `max_completion_tokens` becomes `SamplingParams.max_tokens` through core's `get_max_tokens`
+  (`serve/utils/api_utils.py:234-271`), the minimum of the model's remaining length and the client
+  limit, and would end a file early with `length`. Refused whatever its value.
+- Sampling-shaping fields (`temperature`, `top_p`, `top_k`, `min_p`, `seed`, penalties,
+  `watermarking`): not refused. Every token is forced by the model's logits
+  (`forced_logits_rows`), so they cannot change the transcript; they are ignored.
+  *Test phase must confirm that a repetition or presence penalty cannot move the forced
+  choice.*
+- `n`, `length_penalty`, `include_stop_str_in_output` without beam search: core does not forward
+  them (`transcription/protocol.py:240-290`); nothing to refuse.
+- `vllm_xargs`: only `locale` is read (Language); other keys are ignored on the non-native-burst
+  path and refused in native-burst mode (FILE-IF-005).
+- File size and length: the model imposes none (Input length). Core caps the upload bytes
+  (`speech_to_text/base/utils.py:16-56`, route `transcription/api_router.py:49`, default 25 MB,
+  `vllm/envs.py:83`) and the decode (`VLLM_MAX_AUDIO_DECODE_DURATION_S` 600 s,
+  `VLLM_MAX_AUDIO_DECODE_BYTES` 256 MiB, `envs.py:84-85`, applied at `base/serving.py:126-127,
+  182-183`). These are the operator's upload and server settings, not model limits.
+- A generation-config `max_tokens` is the deployment's concern and is refused at startup
+  (`streaming_config.py`).
+
+Realtime (`/v1/realtime`) never calls `get_generation_prompt` and is unaffected.
+
+## Input length
+
+A streaming model can in principle process input of any length, and the model state holds a
+constant amount per file (one state slot plus the host buffer). Three things bound a file today:
+- **Token count (core constraint).** A file emits one token per engine step, so its request grows
+  with its length. Core stops a request at `max_model_len` tokens (`v1/core/sched/utils.py:115`,
+  finish `length`), caps `max_tokens` at `max_model_len` minus the prompt
+  (`serve/utils/api_utils.py:252`), and sizes the sampled-token history at
+  `max_num_reqs × max_model_len` (`v1/worker/gpu/states.py:38`). The plugin's refusal
+  (FILE-BUD-001) only reports this limit before submission; it adds none. Raising `max_model_len`
+  costs about 4 bytes per token per slot and no KV memory.
+- **Upload and decode (core settings).** Core reads the upload into bytes and decodes the whole
+  file to float32 under the limits above, then carries every sample in the request's
+  `multi_modal_data`.
+- **Host buffer (plugin choice).** The request-owned buffer holds the whole file (64,000 bytes
+  per second). It could be replaced by chunked intake only after the core items change.
+
+Making length unbounded cannot be done by the plugin alone: while the route issues one request
+for the whole file, steps and tokens grow with length, and `k > 1` chunks per step (FILE-DEF-002)
+only multiplies the limit. It needs one of two core changes: the transcription route feeds the
+file as a resumable stream in segments (as the realtime route does with its bounded units), or a
+model-state request is exempted from the `max_model_len` stop with a bounded token history. Not
+designed here; recorded as FILE-DEF-003. Until then the deployment sets `max_model_len` for the
+longest file it accepts.
 
 ## Language
 
@@ -173,11 +266,11 @@ produce at most `Q_g` tokens (at least one), plus one EOS:
 
 `B = 1 + (C + 1) × Q_g + 1`
 
-`get_generation_prompt` refuses the file when `B > max_model_len`, with a message that begins
+`get_generation_prompt` refuses the file when `B > max_model_len` (the core constraint of Input length), with a message that begins
 with the fixed text `file exceeds max_model_len: ` so that a frontend can tell this refusal from
 the others and report it as a size limit (FILE-BUD-003). With `B ≤ max_model_len`, and
-no smaller completion limit (the frontend refuses client completion limits and a generation-config
-`max_tokens`), the request reaches EOS before core's length limit, so a `length` ending cannot
+no smaller completion limit (Request guards refuse a client limit below `B − 1`; startup refuses a
+generation-config `max_tokens`), the request reaches EOS before core's length limit, so a `length` ending cannot
 occur. An abort or error can still end it earlier (Completion).
 
 At 560 ms (`s = 8,960`, `Q = 71`), one hour is `N = 57,600,000` samples: `C = 6,428`, a tail of
@@ -205,8 +298,8 @@ events (the finish event, optional usage, and `[DONE]`) are sent as for any mode
 A file's transcript is complete only when its request finishes with EOS after the final tail. Core's
 serving returns the text for any ending, so an `error` or `abort` ending (for example a preempted
 slot, whose queued labels are lost) still returns partial text until core treats those endings as
-failures, which is independent core work. Beam search and client completion limits are refused by
-the frontend, not by the model; without the frontend this route is unsupported for this model.
+failures, which is independent core work. Beam search and client completion limits below the budget are refused by the model before
+submission (Request guards), so neither can truncate a transcript.
 
 ## Engine interaction
 
@@ -256,10 +349,16 @@ the frontend, not by the model; without the frontend this route is unsupported f
 | Repeated uploads | A random per-request multimodal UUID | A nonce in the header; disabling the multimodal cache | Core hashes items by their UUID, so no header field is needed, and the server's cache settings stay untouched |
 | Silence | A continuation token | Emitting nothing; the park/EOS token | Every step emits a token; EOS would end the request |
 | Distinguishing file rows | A dedicated file-carrier prompt token | The stream carrier with a different field | Row roles come from the scheduled token |
+| Where to refuse beam search and short completion limits | `get_generation_prompt`, with two request fields added to `SpeechToTextParams` | The model state's `add_request`; row failure; a logits processor | `add_request` cannot raise without ending the engine; row failure becomes HTTP 200 with partial text; a logits processor cannot see the prompt |
+| Completion limit above the budget | Accepted | Refusing every client limit | A limit that is never reached cannot truncate; clients routinely send a generous one |
 | Budget | Worst case, checked before submission | A typical-output bound | Only the worst case makes a `length` ending impossible |
 | Regional languages | Explicit `language_locales` mapping, and an exact locale in `vllm_xargs` | Picking a default region | A guessed region changes transcripts silently; a client that names a locale must get that locale |
 
 ## Open Questions & Future Decisions
+
+### Open
+1. The two `SpeechToTextParams` fields are a core change not yet in the pinned core; it must ride
+   the core pull request that carries the model hooks, or be proposed upstream separately.
 
 ### Deferred
 1. A request-chosen cadence (for example through `vllm_xargs`), if deployments need one.

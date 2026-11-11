@@ -13,6 +13,24 @@ the frontend's `Recognize` through the same service) for this model.
 - [x] **FILE-IF-004**: If a file request's task is not transcription, or it carries a text prompt, hotwords or a target language, then `get_generation_prompt` shall raise `ValueError` naming the unsupported field.
 - [x] **FILE-IF-005**: If the served configuration has `experimental_native_burst` true, then `get_generation_prompt` shall raise `ValueError` stating that complete-file transcription is not served in native-burst mode.
 
+## Request guards
+
+Beam search and a completion limit are text-decoding options. They do not apply to audio
+transcription with this model, which decodes by a fixed transducer rule, not by searching or
+sampling text, and whose token count is an internal step count, not a transcript length. A file
+request that sets them is refused as not applicable, not as unsupported capacity.
+
+Core hands `get_generation_prompt` a `SpeechToTextParams`; for these specs it carries
+`use_beam_search` (bool, default false) and `max_completion_tokens` (int or none, default none),
+copied from the request.
+
+- [ ] **FILE-GRD-001**: If a file request's `use_beam_search` is true, whatever its `n`, then `get_generation_prompt` shall raise `ValueError` whose message begins with `use_beam_search does not apply to audio transcription with this model`.
+- [ ] **FILE-GRD-002**: If a file request's `max_completion_tokens` is present, whatever its value, then `get_generation_prompt` shall raise `ValueError` whose message begins with `max_completion_tokens does not apply to audio transcription with this model`.
+- [ ] **FILE-GRD-003**: When `use_beam_search` is false and `max_completion_tokens` is absent, `get_generation_prompt` shall not refuse the request on those fields, and the sampling-shaping fields (`temperature`, `top_p`, `top_k`, `min_p`, `seed`, penalties, `watermarking`) shall not change the emitted tokens.
+- [ ] **FILE-GRD-004**: The guards of FILE-GRD-001 and FILE-GRD-002 shall run before the audio is staged or the prompt is built, and a refusal shall leave the engine, the state slots and the host buffers untouched.
+- [ ] **FILE-GRD-005**: Where the `SpeechToTextParams` it receives has no `use_beam_search` or `max_completion_tokens` field, `get_generation_prompt` shall treat the missing field as false or absent.
+- [ ] **FILE-GRD-006**: The model shall impose no limit on a file's input length and no file-size cap. `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` and core's decode limits are the operator's upload and server settings. The only length-dependent refusal is the deployment's `max_model_len` token budget (FILE-BUD-001), which is a core constraint, not a model limit (see the `transcription` design, Input length).
+
 ## Language
 
 - [x] **FILE-LANG-001**: When a file request names a language that is itself a key of the served locale table (for example `en`), `get_generation_prompt` shall use that locale.
@@ -63,7 +81,7 @@ worst-case budget is `B = 1 + (C + 1) × Q + 1`.
 
 - [x] **FILE-BUD-001**: If a file's worst-case budget `B` exceeds `max_model_len`, then `get_generation_prompt` shall raise `ValueError` stating the file's duration and the `max_model_len` it would need.
 - [x] **FILE-BUD-003**: The `ValueError` of FILE-BUD-001 shall begin with the fixed text `file exceeds max_model_len: `, so that a frontend can identify the refusal without parsing the rest of the message.
-- [ ] **FILE-BUD-002**: When a file's worst-case budget `B` is at most `max_model_len`, no completion limit below `max_model_len` applies, and the request is not aborted and does not fail, the request shall end with EOS and never with finish reason `length`.
+- [ ] **FILE-BUD-002**: When a file's worst-case budget `B` is at most `max_model_len`, no client completion limit was given (FILE-GRD-002 refuses any) and the deployment sets no generation-config `max_tokens`, and the request is not aborted and does not fail, the request shall end with EOS and never with finish reason `length`.
 
 ## Engine interaction
 
@@ -77,4 +95,5 @@ worst-case budget is `B = 1 + (C + 1) × Q + 1`.
 ## Deferred
 
 - [D] **FILE-DEF-001**: Where a request-chosen cadence for file requests is introduced, `get_generation_prompt` shall accept a served cadence from the request instead of the default lookahead.
+- [D] **FILE-DEF-003**: Where core lets a model-state request run past `max_model_len` or the transcription route feeds a file as a resumable stream, a file of any length shall be transcribed, and FILE-BUD-001 shall no longer apply. (Needs core; see the `transcription` design, Input length.)
 - [D] **FILE-DEF-002**: Where measured file latency requires it, a FILE row shall advance up to `k > 1` chunks per step.

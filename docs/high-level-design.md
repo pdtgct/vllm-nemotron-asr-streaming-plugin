@@ -162,11 +162,13 @@ the leaf designs cite them where they depend on them.
   the budget check; an `error` or `abort` ending (for example a preempted slot) can still return
   partial text through core's transcription serving until core reports those endings as failures
   for every model. That core fix is independent work; this plugin does not depend on it.
-- **Whole-file serving needs the frontend's guards.** The supported configuration runs the
-  frontend, which caps files in flight and refuses beam search and client completion limits; the
-  model itself refuses to start under a generation-config token limit or foreign EOS. Without the
-  frontend, core's transcription route
-  for this model is unsupported, and the README says so.
+- **Whole-file serving is self-contained on core's route.** The model imposes no input-length or
+  file-size limit; core's upload and decode settings belong to the operator, and `max_model_len`
+  bounds a file only through core's token stop (see the `transcription` design, Input length). The
+  model refuses beam search and any client completion limit as options that do not apply to audio
+  transcription, from the request fields core hands to `get_generation_prompt` (Request guards),
+  and refuses to start under a generation-config token limit or foreign EOS. A frontend may add its
+  own limits, such as a cap on files in flight, but the route is supported without one.
 - **Distribution.** The vendored model modules keep their SPDX headers and contributor
   attribution. The repository carries `LICENSE` (Apache-2.0) and a `NOTICE` naming the source
   repository, branch and commit of the vendored code and listing the files changed here.
