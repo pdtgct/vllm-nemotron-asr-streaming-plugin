@@ -3,7 +3,9 @@
 Design: [transcription-design.md](transcription-design.md). Prefix `FILE`.
 
 A file request is core's complete-file transcription request (`POST /v1/audio/transcriptions`, or
-the frontend's `Recognize` through the same service) for this model.
+the frontend's `Recognize` through the same service) for this model. The translation route shares
+the same base serving and `SpeechToTextParams`; its requests reach `get_generation_prompt` too and
+are covered where stated.
 
 ## Interface
 
@@ -24,12 +26,16 @@ Core hands `get_generation_prompt` a `SpeechToTextParams`; for these specs it ca
 `use_beam_search` (bool, default false) and `max_completion_tokens` (int or none, default none),
 copied from the request.
 
+A guard field is *present* when its value is not `None` (and, for `use_beam_search`, true).
+
 - [ ] **FILE-GRD-001**: If a file request's `use_beam_search` is true, whatever its `n`, then `get_generation_prompt` shall raise `ValueError` whose message begins with `use_beam_search does not apply to audio transcription with this model`.
-- [ ] **FILE-GRD-002**: If a file request's `max_completion_tokens` is present, whatever its value, then `get_generation_prompt` shall raise `ValueError` whose message begins with `max_completion_tokens does not apply to audio transcription with this model`.
-- [ ] **FILE-GRD-003**: When `use_beam_search` is false and `max_completion_tokens` is absent, `get_generation_prompt` shall not refuse the request on those fields, and the sampling-shaping fields (`temperature`, `top_p`, `top_k`, `min_p`, `seed`, penalties, `watermarking`) shall not change the emitted tokens.
-- [ ] **FILE-GRD-004**: The guards of FILE-GRD-001 and FILE-GRD-002 shall run before the audio is staged or the prompt is built, and a refusal shall leave the engine, the state slots and the host buffers untouched.
-- [ ] **FILE-GRD-005**: Where the `SpeechToTextParams` it receives has no `use_beam_search` or `max_completion_tokens` field, `get_generation_prompt` shall treat the missing field as false or absent.
-- [ ] **FILE-GRD-006**: The model shall impose no limit on a file's input length and no file-size cap. `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` and core's decode limits are the operator's upload and server settings. The only length-dependent refusal is the deployment's `max_model_len` token budget (FILE-BUD-001), which is a core constraint, not a model limit (see the `transcription` design, Input length).
+- [ ] **FILE-GRD-002**: If a file request's `max_completion_tokens` is present (not `None`), including `0`, a negative number and any generous value, then `get_generation_prompt` shall raise `ValueError` whose message begins with `max_completion_tokens does not apply to audio transcription with this model`.
+- [ ] **FILE-GRD-003**: When `use_beam_search` is false and `max_completion_tokens` is `None` or the attribute is missing, `get_generation_prompt` shall not refuse the request on those fields.
+- [ ] **FILE-GRD-004**: When more than one refusal applies, `get_generation_prompt` shall evaluate them in this order and raise the first: FILE-IF-004, FILE-IF-005, FILE-GRD-001, FILE-GRD-002, the language refusals (FILE-LANG), then FILE-BUD-001; it shall do so before the audio is staged or the prompt is built.
+- [ ] **FILE-GRD-005**: Where the `SpeechToTextParams` it receives has no `use_beam_search` or `max_completion_tokens` attribute, `get_generation_prompt` shall treat the missing field as false or `None`.
+- [ ] **FILE-GRD-006**: The model shall impose no limit on a file's input length and no file-size cap; `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` and core's decode limits are the operator's upload and server settings. The one length-dependent refusal, FILE-BUD-001, is a temporary model-side admission policy (see the `transcription` design, Input length and Open) whose retention is undecided.
+- [ ] **FILE-GRD-007**: The sampling-shaping fields (`temperature`, `top_p`, `top_k`, `min_p`, `seed`, `watermarking`, and the repetition, frequency and presence penalties) shall not change the tokens a file request emits. (To be verified by test; if a penalty can, the design refuses that field.)
+- [ ] **FILE-GRD-008**: A refusal under FILE-GRD-001 or FILE-GRD-002 shall reach the client as HTTP 400 in a JSON error body, before any event stream starts and before the request is submitted to the engine, and shall leave no state slot, host buffer or other state attributable to the request. Where core refuses first with its own message (beam search with `stream=true`; `srt`, `vtt`, `verbose_json`, `diarized_json`, or a streamed non-text format), the model's message prefixes need not apply.
 
 ## Language
 

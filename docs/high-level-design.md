@@ -162,13 +162,16 @@ the leaf designs cite them where they depend on them.
   the budget check; an `error` or `abort` ending (for example a preempted slot) can still return
   partial text through core's transcription serving until core reports those endings as failures
   for every model. That core fix is independent work; this plugin does not depend on it.
-- **Whole-file serving is self-contained on core's route.** The model imposes no input-length or
-  file-size limit; core's upload and decode settings belong to the operator, and `max_model_len`
-  bounds a file only through core's token stop (see the `transcription` design, Input length). The
-  model refuses beam search and any client completion limit as options that do not apply to audio
-  transcription, from the request fields core hands to `get_generation_prompt` (Request guards),
-  and refuses to start under a generation-config token limit or foreign EOS. A frontend may add its
-  own limits, such as a cap on files in flight, but the route is supported without one.
+- **Whole-file serving is self-contained on core's route, once core carries two request fields.**
+  The model imposes no file-size limit; core's upload and decode settings belong to the operator.
+  The model refuses beam search and any client completion limit as options that do not apply to
+  audio transcription, from `use_beam_search` and `max_completion_tokens` on
+  `SpeechToTextParams` (Request guards). No core has those fields yet
+  (`vllm/config/speech_to_text.py:17-54`); a small separate upstream core change is settled, and
+  until it lands the guards are inactive and the README states the limits. The token-budget refusal
+  (FILE-BUD-001) is a temporary model-side limit awaiting a decision. The model also refuses to
+  start under a generation-config token limit or foreign EOS. Without a frontend, files in flight
+  are bounded only by `max_num_seqs`.
 - **Distribution.** The vendored model modules keep their SPDX headers and contributor
   attribution. The repository carries `LICENSE` (Apache-2.0) and a `NOTICE` naming the source
   repository, branch and commit of the vendored code and listing the files changed here.
@@ -220,7 +223,7 @@ Acceptance is tiered; a claim names the tier it has met.
 
 Falsification signals: any whole-file transcript that differs from streaming under matched
 conditions; any request reported complete without EOS after the final flush; a slot or host buffer
-that outlives its request's release; more files in flight than the frontend's file cap.
+that outlives its request's release; more files in flight than the deployment's cap (`max_num_seqs`, or a frontend's, if one runs).
 
 ## References
 
