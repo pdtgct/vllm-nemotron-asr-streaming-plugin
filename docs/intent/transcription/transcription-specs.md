@@ -31,9 +31,9 @@ A guard field is *present* when its value is not `None` (and, for `use_beam_sear
 - [ ] **FILE-GRD-001**: If a file request's `use_beam_search` is true, whatever its `n`, then `get_generation_prompt` shall raise `ValueError` whose message begins with `use_beam_search does not apply to audio transcription with this model`.
 - [ ] **FILE-GRD-002**: If a file request's `max_completion_tokens` is present (not `None`), including `0`, a negative number and any generous value, then `get_generation_prompt` shall raise `ValueError` whose message begins with `max_completion_tokens does not apply to audio transcription with this model`.
 - [ ] **FILE-GRD-003**: When `use_beam_search` is false and `max_completion_tokens` is `None` or the attribute is missing, `get_generation_prompt` shall not refuse the request on those fields.
-- [ ] **FILE-GRD-004**: When more than one refusal applies, `get_generation_prompt` shall evaluate them in this order and raise the first: FILE-IF-004, FILE-IF-005, FILE-GRD-001, FILE-GRD-002, the language refusals (FILE-LANG), then FILE-BUD-001; it shall do so before the audio is staged or the prompt is built.
+- [ ] **FILE-GRD-004**: When more than one refusal applies, `get_generation_prompt` shall evaluate them in this order and raise the first: FILE-IF-004, FILE-IF-005, FILE-GRD-001, FILE-GRD-002, then the language refusals (FILE-LANG); it shall do so before the audio is staged or the prompt is built.
 - [ ] **FILE-GRD-005**: Where the `SpeechToTextParams` it receives has no `use_beam_search` or `max_completion_tokens` attribute, `get_generation_prompt` shall treat the missing field as false or `None`.
-- [ ] **FILE-GRD-006**: The model shall impose no limit on a file's input length and no file-size cap; `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` and core's decode limits are the operator's upload and server settings. The one length-dependent refusal, FILE-BUD-001, is a temporary model-side admission policy (see the `transcription` design, Input length and Open) whose retention is undecided.
+- [ ] **FILE-GRD-006**: The model shall impose no limit on a file's input length and no file-size cap. `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` and core's decode limits are the operator's upload and server settings, and the only length bound is core's actual-token `max_model_len` stop, which the operator sizes (about 4 bytes per token per slot, no KV memory).
 - [ ] **FILE-GRD-007**: The sampling-shaping fields (`temperature`, `top_p`, `top_k`, `min_p`, `seed`, `watermarking`, and the repetition, frequency and presence penalties) shall not change the tokens a file request emits. (To be verified by test; if a penalty can, the design refuses that field.)
 - [ ] **FILE-GRD-008**: A refusal under FILE-GRD-001 or FILE-GRD-002 shall reach the client as HTTP 400 in a JSON error body, before any event stream starts and before the request is submitted to the engine, and shall leave no state slot, host buffer or other state attributable to the request. Where core refuses first with its own message (beam search with `stream=true`; `srt`, `vtt`, `verbose_json`, `diarized_json`, or a streamed non-text format), the model's message prefixes need not apply.
 
@@ -80,14 +80,16 @@ size `s = 1280 × (r + 1)` samples; then `C = floor(N / s)` and `T = N − C × 
 
 - [x] **FILE-TOK-001**: The continuation token (`blank + 5`) shall be marked special in the served tokenizer and shall not be an EOS or stop token; the park token (`blank + 1`) shall be the only EOS or stop token a file request carries.
 
-## Token budget
+## Token count
 
-With `Q = (r + 1) × 10 + 1` tokens at most per chunk or tail (labels plus an optional EOU), the
-worst-case budget is `B = 1 + (C + 1) × Q + 1`.
+With `Q = (r + 1) × 10 + 1` tokens at most per chunk or tail (labels plus an optional EOU), a file
+can emit at most `B = 1 + (C + 1) × Q + 1` tokens. `B` is an upper bound for sizing `max_model_len`,
+not an admission limit. Core stops a request at its actual token count reaching `max_model_len`.
 
-- [x] **FILE-BUD-001**: If a file's worst-case budget `B` exceeds `max_model_len`, then `get_generation_prompt` shall raise `ValueError` stating the file's duration and the `max_model_len` it would need.
-- [x] **FILE-BUD-003**: The `ValueError` of FILE-BUD-001 shall begin with the fixed text `file exceeds max_model_len: `, so that a frontend can identify the refusal without parsing the rest of the message.
-- [ ] **FILE-BUD-002**: When a file's worst-case budget `B` is at most `max_model_len`, no client completion limit was given (FILE-GRD-002 refuses any) and the deployment sets no generation-config `max_tokens`, and the request is not aborted and does not fail, the request shall end with EOS and never with finish reason `length`.
+- [R] **FILE-BUD-001** (retired, Pete 2026-11-11): the worst-case admission refusal is dropped because the model imposes no input-length limit; the only bound is core's actual-token `max_model_len` stop.
+- [R] **FILE-BUD-003** (retired with FILE-BUD-001): its fixed message prefix has no refusal to identify.
+- [ ] **FILE-BUD-002**: When a file's actual token count stays below `max_model_len`, no client completion limit was given (FILE-GRD-002 refuses any) and the deployment sets no generation-config `max_tokens`, and the request is not aborted and does not fail, the request shall end with EOS and never with finish reason `length`; the model shall not refuse a file on its duration or sample count.
+- [ ] **FILE-BUD-004**: Where core reports a request that ends with finish reason `length`, `error` or `abort` as an error on the transcription and translation routes, a file whose actual token count reaches `max_model_len` shall be reported to the client as an error and not as HTTP 200 with partial text. (Depends on the core change, part (b); on a core without it, such a file returns partial text with HTTP 200.)
 
 ## Engine interaction
 
@@ -101,5 +103,5 @@ worst-case budget is `B = 1 + (C + 1) × Q + 1`.
 ## Deferred
 
 - [D] **FILE-DEF-001**: Where a request-chosen cadence for file requests is introduced, `get_generation_prompt` shall accept a served cadence from the request instead of the default lookahead.
-- [D] **FILE-DEF-003**: Where core lets a model-state request run past `max_model_len` or the transcription route feeds a file as a resumable stream, a file of any length shall be transcribed, and FILE-BUD-001 shall no longer apply. (Needs core; see the `transcription` design, Input length.)
+- [D] **FILE-DEF-003**: Where core lets a model-state request run past `max_model_len` or the transcription route feeds a file as a resumable stream, a file of any length shall be transcribed. (Needs core; see the `transcription` design, Input length.)
 - [D] **FILE-DEF-002**: Where measured file latency requires it, a FILE row shall advance up to `k > 1` chunks per step.

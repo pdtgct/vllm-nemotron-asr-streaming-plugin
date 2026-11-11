@@ -127,7 +127,7 @@ Components, each a leaf design under `docs/intent/`:
 | --- | --- |
 | `registration` | the `vllm.general_plugins` entry point, the architecture key, the config parser (`--config-format nemotron_asr_streaming`) and post-override validation, engine-flag refusals, the enumerated model-adapter dependencies |
 | `session` | the session factory and lease on the RFC 1 client path, the packer and its use by `buffer_realtime_audio`, transcript projection, the error contract |
-| `transcription` | `SupportsTranscription`, the token budget in `get_generation_prompt`, and the model seams it adds: the whole-file row role, the request-owned host buffer and its cleanup when the request ends, the continuation token, at most one chunk per step |
+| `transcription` | `SupportsTranscription`, the request guards in `get_generation_prompt`, and the model seams it adds: the whole-file row role, the request-owned host buffer and its cleanup when the request ends, the continuation token, at most one chunk per step |
 
 The acoustic internals under `vllm_nemotron_asr_streaming/nemotron_asr/` (encoder, RNN-T decoder,
 the CHUNK / FLUSH / EOU transition, precision policy) are documented by their module docstrings;
@@ -158,18 +158,21 @@ the leaf designs cite them where they depend on them.
   it. The experimental native-burst mode requires the configured lookahead to be 1 (160 ms); it
   does not restrict the served set to that cadence.
 - **Completeness.** A transcript is reported complete only after EOS following the final flush.
-  A stream that ends any other way fails. For whole files, a `length` ending is unreachable by
-  the budget check; an `error` or `abort` ending (for example a preempted slot) can still return
-  partial text through core's transcription serving until core reports those endings as failures
-  for every model. That core fix is independent work; this plugin does not depend on it.
+  A stream that ends any other way fails. A whole file whose actual token count
+  reaches `max_model_len` ends with `length`; an `error` or `abort` ending (for example a preempted slot) can still return
+  partial text through core's transcription serving until core reports those endings as errors.
+  That is part (b) of the small upstream core change (below); this plugin does not depend on it.
 - **Whole-file serving is self-contained on core's route, once core carries two request fields.**
   The model imposes no file-size limit; core's upload and decode settings belong to the operator.
   The model refuses beam search and any client completion limit as options that do not apply to
   audio transcription, from `use_beam_search` and `max_completion_tokens` on
   `SpeechToTextParams` (Request guards). No core has those fields yet
   (`vllm/config/speech_to_text.py:17-54`); a small separate upstream core change is settled, and
-  until it lands the guards are inactive and the README states the limits. The token-budget refusal
-  (FILE-BUD-001) is a temporary model-side limit awaiting a decision. The model also refuses to
+  until it lands the guards are inactive and the README states the limits. The model drops its worst-case
+  admission check: the only length bound is core's actual-token `max_model_len` stop, which the
+  operator sizes, and the same core pull request makes `length`, `error` and `abort` endings errors
+  on the transcription routes; on a core without that part a file past `max_model_len` returns
+  partial text with HTTP 200. The model also refuses to
   start under a generation-config token limit or foreign EOS. Without a frontend, files in flight
   are bounded only by `max_num_seqs`.
 - **Distribution.** The vendored model modules keep their SPDX headers and contributor

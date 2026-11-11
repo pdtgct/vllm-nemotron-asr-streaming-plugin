@@ -19,8 +19,9 @@ Guiding principles:
   cadence, so its transcript can equal that stream's transcript of the same audio.
 - **A file costs about what a stream costs per step.** Each engine step advances a file by at most
   one cadence chunk and emits one token.
-- **Complete or refused.** A file whose token budget cannot fit is refused before submission; a
-  file is reported complete only when its request ends with EOS after its final tail.
+- **Complete or an error.** The model refuses no file for its length; a file is reported complete
+  only when its request ends with EOS after its final tail, and one that core stops at
+  `max_model_len` is an error where core reports it (Input length).
 
 ## Interface
 
@@ -42,7 +43,7 @@ The model class adds `SupportsTranscription` with:
 
 `get_generation_prompt` raises `ValueError` (core returns 400; a frontend maps it to its own
 status codes) for: a task other than transcription, a text prompt, hotwords, a target
-language, an unmappable language, beam search, any client completion limit, a token budget over `max_model_len`,
+language, an unmappable language, beam search, or any client completion limit,
 or a server running experimental native burst. Core also copies `vllm_xargs` into the request's sampling `extra_args`, which native
 burst refuses, and a native-burst row cannot run the one-token-per-step file cycle, so complete
 files are not served in that mode. Core itself refuses
@@ -94,7 +95,7 @@ What reaches the model, by core request field:
   capacity. A completion limit is refused whatever its value rather than compared with the
   budget: a token count here counts engine steps, not words, so a client cannot choose a
   meaningful value, `max_completion_tokens` is not part of the audio-transcription API this
-  route mimics, and a worst-case comparison would refuse the generous limits clients send for
+  route mimics, and a comparison with a bound would refuse the generous limits clients send for
   short files. Messages begin `<field> does not apply to audio transcription with this model`.
 - `use_beam_search` (any `n`, including 1). Core then runs its beam-search loop
   (`speech_to_text/base/serving.py:526-528, 560`): up to `max_tokens` passes
@@ -131,7 +132,7 @@ Semantics of the guards:
 - Both set: beam search is reported first.
 - Order inside `get_generation_prompt`: task, text prompt, hotwords and target language
   (FILE-IF-004), native burst (FILE-IF-005), beam search, completion limit, language, token
-  budget (FILE-BUD-001), then the prompt. A translation request with beam search is therefore
+  then the prompt. A translation request with beam search is therefore
   refused as a wrong task.
 - Behaviour: HTTP 400, returned as JSON before any event stream starts and before engine
   submission; the refusal leaves no slot, host buffer or other state attributable to the request.
@@ -147,19 +148,23 @@ Realtime (`/v1/realtime`) never calls `get_generation_prompt` and is unaffected.
 ## Input length
 
 A streaming model can in principle process input of any length, and the model state holds a
-constant amount per file (one state slot plus the host buffer). Four things bound a file today:
+constant amount per file (one state slot plus the host buffer). Three things bound a file today:
 - **Token count (core constraint).** A file emits one token per engine step, so its request grows
   with its length. Core stops a request at `max_model_len` tokens (`v1/core/sched/utils.py:115`,
   finish `length`), caps `max_tokens` at `max_model_len` minus the prompt
   (`serve/utils/api_utils.py:253`), and sizes the sampled-token history at
   `max_num_reqs × max_model_len` (`v1/worker/gpu/states.py:38`). Core's stop counts actual
   tokens. Raising `max_model_len` costs about 4 bytes per token per slot and no KV memory.
-- **Token-budget refusal (plugin policy, temporary).** FILE-BUD-001 is the model's own admission
-  limit, not a core limit. It refuses on the worst case of `Q_g = 71` tokens per chunk at 560 ms
-  (141 at the larger geometries), so it refuses files at roughly 1/71 of the length core's
-  actual-token stop would allow. It exists because a `length` ending returns HTTP 200 with partial
-  text (`base/serving.py:601-690`). It conflicts with the ruling that the model imposes no input
-  length limit, and whether to keep, relax or drop it awaits that decision (Open).
+- **No model-side admission check.** The worst-case refusal of earlier drafts (FILE-BUD-001, 71
+  tokens per chunk at 560 ms, about 1/71 of what core's actual-token stop allows) is retired (Pete,
+  2026-11-11). The model imposes no input-length limit; the operator sizes `max_model_len`.
+- **How core reports the stop.** Today a request that ends with `length`, `error` or `abort`
+  returns HTTP 200 with partial text (`base/serving.py:601-690`). The small upstream core pull
+  request therefore has two parts: (a) `use_beam_search` and `max_completion_tokens` on
+  `SpeechToTextParams`; (b) on the transcription and translation routes, a request ending with
+  finish reason `length`, `error` or `abort` is reported to the client as an error. On a core
+  without (b), a file whose real token count passes `max_model_len` returns partial text with
+  HTTP 200, and the README limits say so (FILE-BUD-004).
 - **Upload and decode (core settings).** Core reads the upload into bytes and decodes the whole
   file to float32 under the limits above, then carries every sample in the request's
   `multi_modal_data`.
@@ -172,7 +177,7 @@ only multiplies the limit. It needs one of two core changes: the transcription r
 file as a resumable stream in segments (as the realtime route does with its bounded units), or a
 model-state request is exempted from the `max_model_len` stop with a bounded token history. Not
 designed here; recorded as FILE-DEF-003. Until then the deployment sets `max_model_len` for the
-longest file it accepts.
+longest file it accepts, using the upper bound of the Token count section.
 
 ## Language
 
@@ -287,23 +292,22 @@ it does not end the request, and core's `skip_special_tokens` drops it from the 
 `vocab_size = blank + 6`. The tokenizer mode (see the `registration` design) marks all of them
 special.
 
-## Token budget
+## Token count
 
 Every step emits one token, and core counts the prompt token too. Each regular chunk and the tail
 produce at most `Q_g` tokens (at least one), plus one EOS:
 
 `B = 1 + (C + 1) × Q_g + 1`
 
-`get_generation_prompt` refuses the file when `B > max_model_len` (a temporary model-side
-admission limit, Input length), with a message that begins with the fixed text
-`file exceeds max_model_len: ` so that a frontend can tell this refusal from the others and report
-it as a token-budget refusal (FILE-BUD-003). With `B ≤ max_model_len`, and no completion limit
-(Request guards refuse every client limit; startup refuses a generation-config `max_tokens`), the request reaches EOS before core's length limit, so a `length` ending cannot
-occur. An abort or error can still end it earlier (Completion).
+`get_generation_prompt` does not check `B` against `max_model_len` (FILE-BUD-001 and 003 are retired):
+the bound is pessimistic, and core's stop counts actual tokens. A file whose actual count stays
+below `max_model_len`, with no completion limit (Request guards refuse every client limit; startup
+refuses a generation-config `max_tokens`), reaches EOS before core's length limit. An abort or
+error can still end it earlier (Completion).
 
 At 560 ms (`s = 8,960`, `Q = 71`), one hour is `N = 57,600,000` samples: `C = 6,428`, a tail of
 5,120 samples, and `B = 456,461`. Typical output is a small fraction of that. A deployment sets
-`max_model_len` for the longest file it accepts; for this attention-free model it costs no KV
+`max_model_len` for the longest file it accepts, using `B` as a safe upper bound; for this attention-free model it costs no KV
 memory, but core preallocates token history for `max_num_seqs × max_model_len` tokens (about
 4 bytes each).
 
@@ -326,7 +330,7 @@ events (the finish event, optional usage, and `[DONE]`) are sent as for any mode
 A file's transcript is complete only when its request finishes with EOS after the final tail. Core's
 serving returns the text for any ending, so an `error` or `abort` ending (for example a preempted
 slot, whose queued labels are lost) still returns partial text until core treats those endings as
-failures, which is independent core work. Beam search and every client completion limit are refused by the model before
+failures, which is part (b) of the small upstream core change (Input length). Beam search and every client completion limit are refused by the model before
 submission (Request guards), so neither can truncate a transcript.
 
 ## Engine interaction
@@ -378,17 +382,16 @@ submission (Request guards), so neither can truncate a transcript.
 | Silence | A continuation token | Emitting nothing; the park/EOS token | Every step emits a token; EOS would end the request |
 | Distinguishing file rows | A dedicated file-carrier prompt token | The stream carrier with a different field | Row roles come from the scheduled token |
 | Where to refuse beam search and completion limits | `get_generation_prompt`, with two request fields added to `SpeechToTextParams` | The model state's `add_request`; row failure; a logits processor | `add_request` cannot raise without ending the engine; row failure becomes HTTP 200 with partial text; a logits processor cannot see the prompt |
-| Budget | Worst case, checked before submission | A typical-output bound | Only the worst case makes a `length` ending impossible |
+| Budget | No admission check; `B` is sizing guidance only (Pete, 2026-11-11) | Worst-case refusal (FILE-BUD-001, retired); a typical-output bound | The model imposes no input-length limit; core's actual-token stop is the bound, and reporting it as an error is core work (Open 1) |
 | Regional languages | Explicit `language_locales` mapping, and an exact locale in `vllm_xargs` | Picking a default region | A guessed region changes transcripts silently; a client that names a locale must get that locale |
 
 ## Open Questions & Future Decisions
 
 ### Open
-1. **FILE-BUD-001 keep, relax or drop.** Pete decides. It conflicts with the no-input-length
-   ruling (Input length); dropping it needs a replacement for the `length` ending returning HTTP
-   200 with partial text, which is core work, or the unbounded-length change (FILE-DEF-003).
-2. The two `SpeechToTextParams` fields are settled to go in a small separate upstream core pull
-   request; the guards stay inactive until it lands.
+1. The small upstream core pull request (settled): (a) `use_beam_search` and
+   `max_completion_tokens` on `SpeechToTextParams`; (b) `length`, `error` and `abort` endings
+   reported as errors on the transcription and translation routes. The guards stay inactive until
+   (a) lands; the over-length behaviour is partial text with HTTP 200 until (b) lands.
 
 ### Deferred
 1. A request-chosen cadence (for example through `vllm_xargs`), if deployments need one.
