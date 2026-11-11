@@ -18,7 +18,7 @@ Two proposals to vLLM core supply the missing pieces:
   so a protocol frontend such as a Riva-compatible gRPC API can run inside `vllm serve`.
 
 This plugin is the model on top of those primitives. It lets one `vllm serve` process serve this
-checkpoint as live streams and as complete files of any length, through every API surface, with no
+checkpoint as live streams and as complete files, with no model-side length limit (core's `max_model_len` bounds a file until streamed file intake lands), through every API surface, with no
 model code in vLLM itself.
 
 ## Approach
@@ -158,10 +158,12 @@ the leaf designs cite them where they depend on them.
   it. The experimental native-burst mode requires the configured lookahead to be 1 (160 ms); it
   does not restrict the served set to that cadence.
 - **Completeness.** A transcript is reported complete only after EOS following the final flush.
-  A stream that ends any other way fails. A whole file whose actual token count
-  reaches `max_model_len` ends with `length`; an `error` or `abort` ending (for example a preempted slot) can still return
-  partial text through core's transcription serving until core reports those endings as errors.
-  That is part (b) of the small upstream core change (below); this plugin does not depend on it.
+  A stream that ends any other way fails. A whole file whose request ends with `length` because
+  it reached `max_model_len`, or with `error` or `abort` (for example a preempted slot), can still
+  return partial text with HTTP 200 through core's transcription serving until core reports those
+  endings as errors. That is part (b) of the small upstream core change (below), which reports a
+  server-caused `length`, `error` or `abort` as an error (non-streaming: an error response;
+  streaming: a terminal error event); this plugin does not depend on it.
 - **Whole-file serving is self-contained on core's route, once core carries two request fields.**
   The model imposes no file-size limit; core's upload and decode settings belong to the operator.
   The model refuses beam search and any client completion limit as options that do not apply to
@@ -170,11 +172,14 @@ the leaf designs cite them where they depend on them.
   (`vllm/config/speech_to_text.py:17-54`); a small separate upstream core change is settled, and
   until it lands the guards are inactive and the README states the limits. The model drops its worst-case
   admission check: the only length bound is core's actual-token `max_model_len` stop, which the
-  operator sizes, and the same core pull request makes `length`, `error` and `abort` endings errors
-  on the transcription routes; on a core without that part a file past `max_model_len` returns
-  partial text with HTTP 200. The model also refuses to
-  start under a generation-config token limit or foreign EOS. Without a frontend, files in flight
-  are bounded only by `max_num_seqs`.
+  operator sizes, and the same core pull request makes a server-caused `length`, `error` or `abort` ending an
+  error on the transcription routes; on a core without that part a file that reaches
+  `max_model_len` returns partial text with HTTP 200. On a core without part (a), beam search
+  issues about `max_model_len` engine requests per upload, so the route is not to be exposed to
+  untrusted clients until (a) lands. The model also refuses to
+  start under a generation-config token limit or foreign EOS. Without a frontend, `max_num_seqs`
+  bounds the files actively scheduled, not uploads: queued requests hold their decoded audio in
+  the API server with no bound.
 - **Distribution.** The vendored model modules keep their SPDX headers and contributor
   attribution. The repository carries `LICENSE` (Apache-2.0) and a `NOTICE` naming the source
   repository, branch and commit of the vendored code and listing the files changed here.
@@ -226,7 +231,7 @@ Acceptance is tiered; a claim names the tier it has met.
 
 Falsification signals: any whole-file transcript that differs from streaming under matched
 conditions; any request reported complete without EOS after the final flush; a slot or host buffer
-that outlives its request's release; more files in flight than the deployment's cap (`max_num_seqs`, or a frontend's, if one runs).
+that outlives its request's release; more files actively scheduled than `max_num_seqs`, or than a frontend's file cap if one runs.
 
 ## References
 
