@@ -173,9 +173,9 @@ the leaf designs cite them where they depend on them.
   until it lands the guards are inactive and the README states the limits. The model drops its worst-case
   admission check: the only length bound is core's actual-token `max_model_len` stop, which the
   operator sizes, and the same core pull request makes a server-caused `length`, `error` or `abort` ending an
-  error on the transcription routes; on a core without that part a file that reaches
-  `max_model_len` returns partial text with HTTP 200. On a core without part (a), beam search
-  issues about `max_model_len` engine requests per upload, so the route is not to be exposed to
+  error on the transcription routes; on a core without that part a file that ends with a
+  server-caused `length` returns partial text with HTTP 200. On a core without part (a), beam search
+  issues up to `n × max_model_len` engine requests (one per beam per pass) per upload, so the route is not to be exposed to
   untrusted clients until (a) lands. The model also refuses to
   start under a generation-config token limit or foreign EOS. Without a frontend, `max_num_seqs`
   bounds the files actively scheduled, not uploads: queued requests hold their decoded audio in

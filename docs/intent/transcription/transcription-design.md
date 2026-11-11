@@ -101,7 +101,7 @@ What reaches the model, by core request field:
   (`generate/beam_search/online.py:93-110`), each a new engine request with the prompt plus the
   beam's tokens and the same multimodal hashes (`generate/beam_search/utils.py:56-63`) and
   `max_tokens=1`. On a core without the fields (nothing refuses it) this restarts the file on every
-  pass, can issue about `max_model_len` engine requests per upload, and ties up the server; it
+  pass, can issue up to `n × max_model_len` engine requests (one per beam per pass) per upload, and ties up the server; it
   yields no usable transcript. Refused as above. Core itself refuses beam search first when
   `stream=true` (`serving.py:437-440`).
 - `max_completion_tokens` becomes `SamplingParams.max_tokens` through core's `get_max_tokens`
@@ -150,7 +150,7 @@ Realtime (`/v1/realtime`) never calls `get_generation_prompt` and is unaffected.
 
 A streaming model can in principle process input of any length, and the model state holds a
 constant amount of device state per file (one state slot); the host buffer grows with duration.
-Five things bound or size a file today:
+Five things bound a file or set its cost today:
 - **Token count (core constraint).** A file emits one token per engine step, so its request grows
   with its length. Core passes `max_tokens = max_model_len` for a non-beam request
   (`serve/utils/api_utils.py:253`), stops the request when `num_tokens ≥ max_model_len`
@@ -186,7 +186,7 @@ only multiplies the limit. It needs one of two core changes: the transcription r
 file as a resumable stream in segments (as the realtime route does with its bounded units), or a
 model-state request is exempted from the `max_model_len` stop with a bounded token history. Not
 designed here; recorded as FILE-DEF-003. Until then the deployment sets `max_model_len` for the
-longest file it accepts (until then files are bounded by core's `max_model_len`), using the upper bound of the Token count section.
+longest file it accepts, using the upper bound of the Token count section.
 
 ## Language
 
