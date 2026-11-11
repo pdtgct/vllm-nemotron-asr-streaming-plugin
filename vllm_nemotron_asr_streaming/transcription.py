@@ -2,8 +2,7 @@
 """Complete-file transcription: the prompt of a file request.
 
 Core sends a file as one ordinary request. ``build_file_prompt`` refuses what
-the model does not serve (including beam search and client completion limits,
-which do not apply to audio transcription), binds the request's language to a
+the model does not serve (including beam search and client completion limits), binds the request's language to a
 row of the served locale table and returns a prompt of one file-carrier token
 with the file's samples as its audio item. The model imposes no limit on a
 file's length. Importing this module imports no vLLM.
@@ -50,12 +49,11 @@ def build_file_prompt(stt_params: Any) -> dict[str, Any]:
     # absent attribute and ``None`` both mean "not given" (FILE-GRD-005).
     if getattr(stt_params, "use_beam_search", False):
         raise ValueError(
-            "use_beam_search does not apply to audio transcription with this model"
+            "use_beam_search is not supported for this model"
         )
     if getattr(stt_params, "max_completion_tokens", None) is not None:
         raise ValueError(
-            "max_completion_tokens does not apply to audio transcription with "
-            "this model"
+            "max_completion_tokens is not supported for this model"
         )
 
     extra_args = stt_params.extra_args or {}

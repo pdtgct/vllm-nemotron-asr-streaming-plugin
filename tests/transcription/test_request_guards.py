@@ -17,8 +17,8 @@ import pytest
 
 pytest.importorskip("vllm.config.speech_to_text")
 
-BEAM = "use_beam_search does not apply to audio transcription with this model"
-LIMIT = "max_completion_tokens does not apply to audio transcription with this model"
+BEAM = "use_beam_search is not supported for this model"
+LIMIT = "max_completion_tokens is not supported for this model"
 
 
 @pytest.fixture
@@ -150,5 +150,5 @@ def test_a_very_long_file_is_not_refused_for_its_length(build, guarded):
     "fields", [{"use_beam_search": True}, {"max_completion_tokens": 9}]
 )
 def test_the_model_class_applies_the_guards(model_cls, guarded, fields):
-    with pytest.raises(ValueError, match="does not apply to audio transcription"):
+    with pytest.raises(ValueError, match="is not supported for this model"):
         model_cls.get_generation_prompt(guarded(**fields))

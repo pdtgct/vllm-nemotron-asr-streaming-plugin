@@ -95,7 +95,7 @@ What reaches the model, by core request field:
   budget: a token count here counts engine steps, not words, so a client cannot choose a
   meaningful value, `max_completion_tokens` is not part of the audio-transcription API this
   route mimics, and a comparison with a bound would refuse the generous limits clients send for
-  short files. Messages begin `<field> does not apply to audio transcription with this model`.
+  short files. Messages use vLLM's usual form, `<field> is not supported for this model`, which leaves other models free to support the field.
 - `use_beam_search` (any `n`, including 1). Core then runs its beam-search loop
   (`speech_to_text/base/serving.py:526-528, 560`): up to `max_tokens` passes
   (`generate/beam_search/online.py:93-110`), each a new engine request with the prompt plus the

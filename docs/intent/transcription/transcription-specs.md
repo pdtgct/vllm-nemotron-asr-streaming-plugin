@@ -20,7 +20,8 @@ are covered where stated.
 Beam search and a completion limit are text-decoding options. They do not apply to audio
 transcription with this model, which decodes by a fixed transducer rule, not by searching or
 sampling text, and whose token count is an internal step count, not a transcript length. A file
-request that sets them is refused as not applicable, not as unsupported capacity.
+request that sets them is refused with vLLM's usual message, `<field> is not supported for this
+model`, which leaves other models free to support the field.
 
 Core hands `get_generation_prompt` a `SpeechToTextParams`; for these specs it carries
 `use_beam_search` (bool, default false) and `max_completion_tokens` (int or none, default none),
@@ -28,8 +29,8 @@ copied from the request.
 
 A guard field is *present* when its value is not `None` (and, for `use_beam_search`, true).
 
-- [x] **FILE-GRD-001**: If a file request's `use_beam_search` is true, whatever its `n`, then `get_generation_prompt` shall raise `ValueError` whose message begins with `use_beam_search does not apply to audio transcription with this model`.
-- [x] **FILE-GRD-002**: If a file request's `max_completion_tokens` is present (not `None`), including `0`, a negative number and any generous value, then `get_generation_prompt` shall raise `ValueError` whose message begins with `max_completion_tokens does not apply to audio transcription with this model`.
+- [x] **FILE-GRD-001**: If a file request's `use_beam_search` is true, whatever its `n`, then `get_generation_prompt` shall raise `ValueError` whose message begins with `use_beam_search is not supported for this model`.
+- [x] **FILE-GRD-002**: If a file request's `max_completion_tokens` is present (not `None`), including `0`, a negative number and any generous value, then `get_generation_prompt` shall raise `ValueError` whose message begins with `max_completion_tokens is not supported for this model`.
 - [x] **FILE-GRD-003**: When `use_beam_search` is false and `max_completion_tokens` is `None`, `get_generation_prompt` shall not refuse the request on those fields.
 - [x] **FILE-GRD-004**: When more than one refusal applies, `get_generation_prompt` shall evaluate them in this order and raise the first: FILE-IF-004, FILE-IF-005, FILE-GRD-001, FILE-GRD-002, then the language refusals (FILE-LANG); it shall do so before the audio is staged or the prompt is built.
 - [x] **FILE-GRD-005**: Where the `SpeechToTextParams` it receives has no `use_beam_search` or `max_completion_tokens` attribute, `get_generation_prompt` shall treat the missing field as false or `None` (FILE-GRD-003 then applies).
