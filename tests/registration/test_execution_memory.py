@@ -34,6 +34,7 @@ REG-STATE-002..005 do not mask them; the REG-STATE contract tests do not.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import gc
 import inspect
 import re
@@ -195,12 +196,23 @@ def trapped_pool(env):
     return trap
 
 
-def stream(env, req_id: str, *, geometry: int | None = None, sequence: int = 0):
+def stream(
+    env,
+    req_id: str,
+    *,
+    geometry: int | None = None,
+    sequence: int = 0,
+    final: bool = True,
+):
     geometry = env.max_geometry if geometry is None else geometry
     return h.new_request(
         req_id,
         int(env.config.audio_chunk_token_id),
-        audio=h.stream_envelope(env.config, geometry=geometry, sequence=sequence),
+        audio=h.stream_envelope(
+            env.config, geometry=geometry, sequence=sequence, final=final
+        ),
+        # each unit is its own multimodal item (its own encoder cache entry)
+        identifier=f"uuid-{req_id}-{sequence}",
     )
 
 
@@ -829,6 +841,29 @@ def cached_step(env, cached, computed, *, new=(), handles):
     )
 
 
+def assert_commits_clean(env, *, steps: int):
+    """Every row of every real step so far committed: status zero, none failed."""
+    log = env.runner.commit_log
+    assert len(log) == steps, log
+    for statuses, failed in log:
+        assert not failed, log
+        assert all(status == 0 for status in statuses.values()), log
+
+
+def drain_to_park(env, ids, handles, *, watch: str = "s1", limit: int = 300):
+    """Cached steps, each fed the token the model emitted on the previous one,
+    until the ``watch`` row's decision is the park token (a legal park); returns
+    the next ``num_computed_tokens``."""
+    eos = int(env.config.eos_token_id)
+    position = 1
+    while env.runner._sampled[watch] != eos:
+        assert position < limit, "the turn never reached the park token"
+        out = cached_step(env, ids, {r: position for r in ids}, handles=handles)
+        env.runner.real_step(out)
+        position += 1
+    return position
+
+
 # @spec REG-STATE-008
 @pytest.mark.parametrize("kind", ["stream", "file", "mixed"])
 def test_consecutive_cached_steps_run_on_core_scheduler_output(build, kind):
@@ -849,29 +884,82 @@ def test_consecutive_cached_steps_run_on_core_scheduler_output(build, kind):
         env.runner.real_step(out)
         # a token the sampler produced on the device, never a carrier
         assert env.state._scheduled_tokens == {r: (SAMPLED_TOKEN,) for r in ids}
+        assert_commits_clean(env, steps=step_no + 1)
 
 
 # @spec REG-STATE-008
 def test_session_turn_arrives_as_a_new_request_between_cached_steps(build):
     """A later stream unit is a new request delivery (core resets its computed
-    tokens); it is a CHUNK again while a file row beside it keeps decoding."""
+    tokens) once the preceding turn drained to EOS; it is a CHUNK again while a
+    file row beside it keeps decoding."""
     env = build()
     env.runner.profile_run(core_embeds=False)
     pool(env)
     handles = {"s1": 1, "f1": 2}
     env.runner.real_step(
-        h.scheduler_output(new=(stream(env, "s1"), file(env, "f1")), handles=handles)
+        h.scheduler_output(
+            new=(stream(env, "s1", final=False), file(env, "f1", 60000)),
+            handles=handles,
+        )
     )
-    env.runner.real_step(
-        cached_step(env, ["s1", "f1"], {"s1": 1, "f1": 1}, handles=handles)
-    )
+    # The turn's own sampled tokens are fed back until the stream row parks.
+    position = drain_to_park(env, ["s1", "f1"], handles)
+    steps = position
+    assert_commits_clean(env, steps=steps)
+    file_before = dataclasses.replace(env.state._file_progress["f1"])
     env.runner.real_step(
         cached_step(
-            env, ["f1"], {"f1": 2}, new=[stream(env, "s1", sequence=1)], handles=handles
+            env,
+            ["f1"],
+            {"f1": position},
+            new=[stream(env, "s1", sequence=1)],
+            handles=handles,
         )
     )
     chunk = int(env.config.audio_chunk_token_id)
     assert env.state._scheduled_tokens == {"s1": (chunk,), "f1": (SAMPLED_TOKEN,)}
+    assert_commits_clean(env, steps=steps + 1)
+    assert "f1" not in env.state._failed_files
+    assert env.state._file_progress["f1"] != file_before, "the file row stalled"
+
+
+def prompted(req_id: str, prompt: list[int]):
+    return dataclasses.replace(
+        h.new_request(req_id, prompt[0]),
+        prompt_token_ids=list(prompt),
+        prefill_token_ids=list(prompt),
+    )
+
+
+# @spec REG-STATE-008
+def test_cached_row_reads_a_real_prompt_token(build):
+    """A two-token prompt delivered with one token scheduled: the cached step at
+    one computed token takes the prompt's second token, not a sampled marker."""
+    env = build()
+    first, second = 7, 9
+    assert {first, second}.isdisjoint(
+        {int(env.config.file_carrier_token_id), int(env.config.audio_chunk_token_id)}
+    )
+    new = h.scheduler_output(new=(prompted("r1", [first, second]),), encoder_inputs={})
+    env.state.prepare_step(new, dummy_run=False, is_profile=False)
+    assert env.state._scheduled_tokens == {"r1": (first,)}
+    cached = cached_step(env, ["r1"], {"r1": 1}, handles={"r1": 1})
+    env.state.prepare_step(cached, dummy_run=False, is_profile=False)
+    assert env.state._scheduled_tokens == {"r1": (second,)}
+
+
+# @spec REG-STATE-008
+def test_cached_window_crossing_the_end_of_the_prompt_is_refused(build):
+    env = build()
+    new = h.scheduler_output(new=(prompted("r1", [7, 9]),), encoder_inputs={})
+    env.state.prepare_step(new, dummy_run=False, is_profile=False)
+    cached = cached_step(env, ["r1"], {"r1": 1}, handles={"r1": 1})
+    cached.num_scheduled_tokens["r1"] = 2
+    cached.total_num_scheduled_tokens = 2
+    error = h.call_with(
+        env.state.prepare_step, cached, dummy_run=False, is_profile=False
+    )
+    assert isinstance(error, ValueError) and "r1" in str(error), error
 
 
 # @spec REG-STATE-008
@@ -1151,13 +1239,19 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph_cpu(b
     spy = pool(env)
 
     def step():
-        return h.scheduler_output(new=(stream(env, "s1"),), handles={"s1": 1})
+        # the session's second unit, delivered once the first drained to park
+        return h.scheduler_output(
+            new=(stream(env, "s1", sequence=1),), handles={"s1": 1}
+        )
 
     replays = len(env.graphs.replays)
-    env.runner.real_step(step())
+    env.runner.real_step(
+        h.scheduler_output(new=(stream(env, "s1", final=False),), handles={"s1": 1})
+    )
     new = env.graphs.replays[replays:]
     assert new, "the prepared step replayed no graph"
     wrapper_ref, descriptor = new[-1]
+    drain_to_park(env, ["s1"], {"s1": 1})
     entry = wrapper_ref().concrete_cudagraph_entries[descriptor]
     graph, entry.cudagraph = entry.cudagraph, None
     captures, replays = len(env.graphs.captures), len(env.graphs.replays)
@@ -1171,6 +1265,9 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph_cpu(b
     entry.cudagraph = graph
     env.runner.real_step(step())
     assert len(env.graphs.replays) > replays, "the restored step did not replay"
+    # every step that committed (the refused one raised before committing) was clean
+    assert all(not failed for _, failed in env.runner.commit_log)
+    assert all(v == 0 for st, _ in env.runner.commit_log for v in st.values())
 
 
 @pytest.mark.gpu

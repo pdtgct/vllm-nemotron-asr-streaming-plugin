@@ -75,8 +75,6 @@ import torch
 #: The model's state layer name for ``prefix="nemotron"`` (``f"{prefix}.state"``).
 STATE_LAYER = "nemotron.state"
 EPOCH = "epoch-1"
-#: A token the runner sampled: a transcript label, never a carrier.
-SAMPLED_LABEL = 1
 
 #: Encoder fields of the runnable synthetic card.
 RUNNABLE_ENCODER = {
@@ -614,9 +612,15 @@ def _layer(slot: int | tuple[int, int]) -> dict[str, Any]:
 
 
 def stream_envelope(
-    config: Any, *, geometry: int = 3, prompt: int = 0, sequence: int = 0
+    config: Any,
+    *,
+    geometry: int = 3,
+    prompt: int = 0,
+    sequence: int = 0,
+    final: bool = True,
 ) -> torch.Tensor:
-    """One stream unit's carrier row (SESS-PACK-001): header then samples."""
+    """One stream unit's carrier row (SESS-PACK-001): header then samples.
+    ``final`` marks the session's last unit (its final tail)."""
     from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
         CADENCES,
         RAW_SAMPLES_PER_CHUNK,
@@ -624,7 +628,7 @@ def stream_envelope(
 
     samples = RAW_SAMPLES_PER_CHUNK[tuple(CADENCES)[geometry]]
     row = torch.zeros(7 + samples, dtype=torch.float32)
-    row[:7] = torch.tensor([2, samples, geometry, 0, prompt, sequence, 1])
+    row[:7] = torch.tensor([2, samples, geometry, 0, prompt, sequence, int(final)])
     row[7:] = torch.from_numpy(
         np.random.default_rng(sequence).standard_normal(samples).astype(np.float32)
         * 0.1
@@ -639,6 +643,7 @@ def new_request(
     audio: torch.Tensor | None = None,
     samples: np.ndarray | None = None,
     header: list[int] | None = None,
+    identifier: str | None = None,
 ) -> Any:
     """``NewRequestData`` for a stream unit (``audio``: its envelope row) or a
     complete file (``samples`` and its 3-value ``header``)."""
@@ -669,7 +674,7 @@ def new_request(
             MultiModalFeatureSpec(
                 data=MultiModalKwargsItem(items),
                 modality="audio",
-                identifier=f"uuid-{req_id}",
+                identifier=identifier or f"uuid-{req_id}",
                 mm_position=PlaceholderRange(offset=0, length=1),
             )
         )
@@ -786,6 +791,19 @@ class Runner:
         self.bindings: Any = None
         self.req_states = StepRequestStates()
         self._prompts: dict[str, list[int]] = {}
+        # The token the model emitted for each request on its previous step:
+        # core's runner feeds it back as the request's next input.
+        self._sampled: dict[str, int] = {}
+        #: ``(statuses, failed)`` of every real step's commit, in order.
+        self.commit_log: list[tuple[dict[str, int], set[str]]] = []
+        collect = model.collect_commit_status
+
+        def recording_collect() -> Any:
+            result = collect()
+            self.commit_log.append((dict(result[0]), set(result[1])))
+            return result
+
+        model.collect_commit_status = recording_collect
 
     # -- state slots ---------------------------------------------------------
 
@@ -976,7 +994,10 @@ class Runner:
         self._phase("forward")
         hidden = self._forward(batch, embeds, kwargs, attn_metadata)
         self._phase("sample")
-        state.compute_sample_logits(hidden[batch.logits_indices])
+        logits = state.compute_sample_logits(hidden[batch.logits_indices])
+        # the forced logits decide the token: argmax is what the sampler draws
+        for req_id, token in zip(batch.req_ids, logits.argmax(dim=-1).tolist()):
+            self._sampled[req_id] = int(token)
         state.postprocess_state(
             batch.idx_mapping,
             torch.ones(batch.num_reqs, dtype=torch.int32, device=state.device),
@@ -1004,12 +1025,15 @@ class Runner:
         tokens = [r.prefill_token_ids[0] for r in output.scheduled_new_reqs]
         for r in output.scheduled_new_reqs:
             self._prompts[r.req_id] = list(r.prefill_token_ids)
+            self._sampled.pop(r.req_id, None)
         cached = output.scheduled_cached_reqs
         for req_id, position in zip(cached.req_ids, cached.num_computed_tokens):
             # A prompt token if the request's prompt reaches this position,
-            # else the runner's own sampled token (a label, never a carrier).
+            # else the token the model emitted on this request's previous step.
             prompt = self._prompts[req_id]
-            tokens.append(prompt[position] if position < len(prompt) else SAMPLED_LABEL)
+            tokens.append(
+                prompt[position] if position < len(prompt) else self._sampled[req_id]
+            )
         batch.input_ids[:n] = torch.tensor(tokens)
         index = np.array(
             [self.req_states.req_id_to_index[r] for r in req_ids], dtype=np.intp
