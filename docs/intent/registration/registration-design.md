@@ -246,15 +246,19 @@ memory, so the model prepares its execution on core's profiling step:
   worker failed, discards partial execution state and raises, so startup fails; the next attempt
   is a fresh worker.
 - **Serving guard.** Before a serving step uses graphed execution, the model checks that every
-  expected graph entry is captured, not merely that preparation ran, and raises otherwise rather
+  expected graph entry is captured in its graph wrapper (the wrapper's entry holds a graph), not
+only listed in the model's inventory and not merely that preparation ran, and raises otherwise rather
   than capturing during serving, where the memory is not budgeted. This also covers a core that
   clears graph wrappers after its profiling run: at these heads core clears registered graph
-  wrappers only when it profiles its own graph memory, which it skips with `cudagraph_mode` `NONE`.
+  wrappers only when it profiles its own graph memory, which it skips under `enforce_eager` (mode
+  `NONE` and no encoder graph manager).
 - **Budget.** Core measures the profile only when it computes the budget itself. When the operator
   sets `kv_cache_memory_bytes`, core still runs the profiling step, so preparation happens, but
   takes the given budget as is; the operator then leaves room for the model's execution memory.
-  Core's elastic expert-parallel scale-up path skips profiling, and cannot apply: the plugin
-  refuses any data-parallel size other than 1. The pool is `max_num_seqs + 1` pages unless the
+  Core's elastic expert-parallel scale-up launch (an environment setting) skips profiling and is
+  not supported: the plugin refuses any data-parallel size other than 1, and the serving guard
+  stops a step that reaches serving unprepared. Core's no-KV-cache path also skips profiling, and
+  cannot apply, because the model declares a state layer. The pool is `max_num_seqs + 1` pages unless the
   operator overrides the block count.
 - **Graph runtime.** Graph capture uses core's graph-capture context, forward context and the
   platform's static graph wrapper. At these heads core has no capture-enabled switch (removed with
@@ -325,8 +329,9 @@ is imported:
 
 The graph-runtime rows are imported when graphed execution is configured, and the batch-invariant
 row when that mode is; the import-time check covers the rest. vLLM's model-registration, config
-parser, tokenizer and renderer registries, multimodal processing and `SupportsTranscription`
-interfaces, which every out-of-tree model uses, are outside this table. Adding a dependency means
+parser, tokenizer and renderer registries, model configuration hooks (`VerifyAndUpdateConfig`,
+`MODELS_CONFIG_MAP`), speech-to-text configuration, multimodal processing, `SupportsTranscription`,
+logging and Hub file helpers, which out-of-tree models use, are outside this table. Adding a dependency means
 adding it here and to the import-time check.
 
 ## Implementation notes
