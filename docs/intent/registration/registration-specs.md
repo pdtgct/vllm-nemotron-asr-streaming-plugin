@@ -104,7 +104,7 @@ These checks run in `verify_and_update_model_config`, after core has applied eve
 
 - [ ] **REG-DOC-001**: The README shall define stage 1 as upstream vLLM `main` with vllm#67374, #67375, #67144 and #67151, and stage 2 as stage 1 plus RFC 2 (#65546, #67294) and a frontend endpoint plugin.
 - [ ] **REG-DOC-002**: Every README acceptance claim shall name the tier it met and the build and source revisions it was met on, and shall mark evidence from earlier builds as historical.
-- [ ] **REG-DOC-003**: The README shall state that on a core without vllm#67151 the request guards are inactive and beam search issues up to `max_model_len` engine requests per upload, and that on a core without vllm#67144 and #67151 a file that ends with a server-caused `length`, `error` or `abort` returns partial text with HTTP 200.
+- [ ] **REG-DOC-003**: The README shall state that on a core without vllm#67151 the request guards are inactive, beam search can issue up to `n × max_model_len` engine requests per upload (one per beam per pass), and the transcription route must not be exposed to untrusted clients on such a core; that on a core without vllm#67144 a file ending in `error` or `abort` returns partial text with HTTP 200; and that on a core without vllm#67151 a file ending in a server-caused `length` does.
 
 ## Supported tasks
 

@@ -404,8 +404,8 @@ submission (Request guards), so neither can truncate a transcript.
    (the two request fields and server-caused `length` endings), and both are in the stage 1 build.
    Until they merge, the README states the behaviour on a core without them: guards inactive, and
    partial text with HTTP 200 for these endings.
-2. For the README limits: on a core without vllm#67151, beam search issues about `max_model_len`
-   engine requests per upload (Request guards), so the route is not to be exposed to untrusted
+2. For the README limits: on a core without vllm#67151, beam search can issue up to
+   `n × max_model_len` engine requests per upload, one per beam per pass (Request guards), so the route is not to be exposed to untrusted
    clients on such a core.
 
 ### Deferred

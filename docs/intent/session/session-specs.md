@@ -36,7 +36,7 @@ admitted stream; a lease is the handle `open` returns for it.
 - [x] **SESS-OPEN-002**: When `open` is called with a served cadence and locale, it shall mint a fresh `uuid4` caller ID, insert the session record in the factory's session table, and only then start the `generate(..., stream_admission=True)` task.
 - [x] **SESS-OPEN-003**: When the input generator of a session's `generate()` task is first read, `open` shall return the lease in state `open`.
 - [ ] **SESS-OPEN-004**: If the `generate()` task raises `StreamAdmissionError` before its input generator is first read, then `open` shall raise `SessionRefused` with the `reason` of that error's `StreamAdmissionResult` (`capacity`, `active_limit`, `engine_paused` or `request_id_in_use`), a result that has only `accepted`, `request_id` and `reason`.
-- [ ] **SESS-OPEN-005**: Session test doubles shall build admission results with the target core's three-field `StreamAdmissionResult` (`accepted`, `request_id`, `reason`), without a status field.
+- [ ] **SESS-OPEN-007**: Session test doubles shall build admission results with the target core's three-field `StreamAdmissionResult` (`accepted`, `request_id`, `reason`), without a status field.
 - [x] **SESS-OPEN-005**: If the `generate()` task raises `EngineDeadError` before its input generator is first read, then `open` shall raise `SessionFailed(reason="engine_dead")`; if it raises any other exception or ends normally before that read, then `open` shall raise `SessionFailed(reason="abnormal_end")`.
 - [x] **SESS-OPEN-006**: If `open` is cancelled before it returns, then it shall cancel the session's `generate()` task; if the task never started, it shall remove the session record and start no cleanup task, and otherwise it shall hand the session to exactly one factory cleanup task (SESS-OWN-003).
 
@@ -74,7 +74,7 @@ admitted stream; a lease is the handle `open` returns for it.
 
 ## Factory ownership
 
-- [x] **SESS-OWN-001**: The factory shall keep one session record per session, keyed by caller ID, with admission state `pending` until the input generator's first read (`accepted`) or a `StreamAdmissionError` from the task (`refused`); a task cancelled or failed before either shall leave the state `pending`.
+- [ ] **SESS-OWN-001**: The factory shall keep one session record per session, keyed by caller ID, with admission state `pending` until the input generator's first read (`accepted`) or a `StreamAdmissionError` from the task (`refused`); a task cancelled or failed before either shall leave the state `pending`.
 - [ ] **SESS-OWN-002**: For every session record whose admission state is not `refused`, the factory's cleanup shall await `wait_stream_retired` and remove the record when it returns or raises `StreamAdmissionError`, `ValueError` or `EngineDeadError`; a `refused` record shall be removed at once.
 - [x] **SESS-OWN-008**: When a factory cleanup task's retirement wait raises `EngineDeadError` or any exception other than `StreamAdmissionError` and `ValueError`, the factory shall log it and record it as a cleanup fault.
 - [x] **SESS-OWN-003**: When a session's owner is gone (a cancelled or failed `open`, a cancelled `release`), the factory shall start exactly one tracked cleanup task for it that runs SESS-OWN-002 with no deadline of its own.
