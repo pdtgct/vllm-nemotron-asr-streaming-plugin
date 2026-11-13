@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -62,6 +63,10 @@ def installed_batch_invariant_mode(
         if _install_failure is not None:
             raise _install_failure
         if _installed is None:
+            # @spec REG-015: the batch-invariant module is a dependency only
+            # when vLLM's batch-invariant mode is configured.
+            if not bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))):
+                return MODE_OFF
             from vllm.model_executor.determinism import batch_invariant
 
             try:

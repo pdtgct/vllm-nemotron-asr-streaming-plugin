@@ -15,7 +15,11 @@ from vllm_nemotron_asr_streaming.nemotron_asr.state_profile import (
     project_nemotron_state_pools,
 )
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, StateSlotHandle
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    PersistentStateSpec,
+    StateSlotHandle,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.state_slots import StateSlotBindings, StateSlotRows
@@ -88,13 +92,19 @@ class _FileProgress:
 
 
 class _ResidentCommitSink:
-    def __init__(self, sink: Any, access: StateSlotRows):
+    def __init__(
+        self, sink: Any, access: StateSlotRows, request_ids: tuple[str, ...]
+    ):
         self.sink = sink
         self.access = access
+        self.request_ids = request_ids
 
+    # @spec REG-STATE-004, REG-STATE-006
     def reserve(self, plan: Any) -> Any:
-        self.access.validate_current()
-        if tuple(b.request_id for b in plan.bindings) != self.access.request_ids:
+        # Core refuses this read outside the live step, and the commit then
+        # writes no state.
+        self.access.component_pools
+        if tuple(b.request_id for b in plan.bindings) != self.request_ids:
             raise ValueError("commit row order differs from resident bindings")
         if tuple(b.block_id for b in plan.bindings) != self.access.slot_indices_cpu:
             raise ValueError("commit slots differ from resident bindings")
@@ -104,22 +114,25 @@ class _ResidentCommitSink:
 class StateBatch:
     """Zero-copy resident pools with a step-scoped pre-commit guard."""
 
+    # @spec REG-STATE-003, REG-STATE-005
     def __init__(
         self,
         slots: StateSlotBindings,
         layer: str,
         bindings: tuple[RowBinding, ...],
+        spec: PersistentStateSpec,
         n_layers: int,
     ):
+        self.request_ids = tuple(b.request_id for b in bindings)
         self.access = slots.bind_rows(
-            layer,
-            tuple(b.request_id for b in bindings),
-            tuple(b.handle for b in bindings),
+            layer, self.request_ids, tuple(b.handle for b in bindings)
         )
-        self.pools = project_nemotron_state_pools(self.access, n_layers=n_layers)
+        self.pools = project_nemotron_state_pools(
+            self.access.component_pools, spec, n_layers=n_layers
+        )
 
     def commit_sink(self, sink: Any) -> _ResidentCommitSink:
-        return _ResidentCommitSink(sink, self.access)
+        return _ResidentCommitSink(sink, self.access, self.request_ids)
 
 
 class NemotronASRModelState(ModelState):
@@ -130,7 +143,9 @@ class NemotronASRModelState(ModelState):
         super().__init__(*args, **kwargs)
         # The final engine configuration may differ from what the
         # configuration hook saw: check it again before any state exists.
-        check_engine_config(self.vllm_config, "the Nemotron streaming model state")
+        check_engine_config(
+            self.vllm_config, "the Nemotron streaming model state", resolved=True
+        )
         self.file_buffers = FileHostBuffers()
         self._file_progress: dict[str, _FileProgress] = {}
         self._failed_files: set[str] = set()
@@ -159,9 +174,13 @@ class NemotronASRModelState(ModelState):
         # All resident writes run on the runner stream. Inner graphs also replay
         # there; no auxiliary state-writing stream is created by this consumer.
 
+    # @spec REG-MEM-001, REG-STATE-002, REG-STATE-007
     def prepare_step(
         self, scheduler_output: SchedulerOutput, *, dummy_run: bool, is_profile: bool
     ) -> None:
+        # Only a dummy step that is also a profiling step is a profiling
+        # dummy step; the model's forward prepares execution on it. The
+        # record is replaced on every step and prepares nothing here.
         self._dummy_run = dummy_run
         self._is_profile = is_profile
         self._snapshot = None
@@ -169,9 +188,10 @@ class NemotronASRModelState(ModelState):
         self._features = None
         self._scheduled_tokens = {}
         self._epoch = getattr(self, "_epoch", 0) + 1
-        if is_profile and not dummy_run:
-            raise ValueError("profile execution requires a dummy run")
         if dummy_run:
+            # Core skips its state-slot bookkeeping on dummy steps: nothing of
+            # an earlier step is kept for them to read.
+            self._scheduler_output = None
             return
         cached = scheduler_output.scheduled_cached_reqs
         if len(cached.req_ids) != len(cached.new_token_ids):
@@ -399,7 +419,12 @@ class NemotronASRModelState(ModelState):
 
         return Sampler(sampler, handoff), None
 
-    def dummy_inputs_embeds(self, num_tokens: int) -> torch.Tensor:
+    # @spec REG-MS-002
+    def dummy_inputs_embeds(
+        self, num_tokens: int, input_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        # The dummy forward reads no embedding values, so randomized
+        # ``input_ids`` need not be embedded.
         return self.encoder_runner.inputs_embeds[:num_tokens]
 
     def prepare_inputs_embeds(
@@ -445,13 +470,21 @@ class NemotronASRModelState(ModelState):
             if any(int(n) != 1 for n in input_batch.num_scheduled_tokens):
                 raise ValueError("every streaming row must be single-token")
             layer = self.model._persistent_state_layer.prefix
+            # @spec REG-STATE-002: handles come from the scheduler output;
+            # rows are bound here, inside the live step.
+            assert self._scheduler_output is not None
+            handles = self._scheduler_output.state_slot_handles or {}
             bindings = tuple(
                 RowBinding(req_id, handle, self._initialized.get(req_id) != handle)
                 for req_id in req_ids
-                for handle in (self.state_slots.get_handle(req_id, layer),)
+                for handle in (handles[req_id][layer],)
             )
             batch = StateBatch(
-                self.state_slots, layer, bindings, int(self.model.config.n_layers)
+                self.state_slots,
+                layer,
+                bindings,
+                self.model._state_spec,
+                int(self.model.config.n_layers),
             )
             token_rows = [self._scheduled_tokens.get(req_id, ()) for req_id in req_ids]
             if any(len(tokens) != 1 for tokens in token_rows):

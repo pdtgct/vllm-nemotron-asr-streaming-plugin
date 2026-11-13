@@ -2,8 +2,9 @@
 """Test tiers.
 
 * unmarked: CPU tests needing only this package and its pure-Python modules.
-* ``engine``: CPU tests that import the RFC 1 + RFC 2 vLLM build (the
-  integration tree on ``PYTHONPATH``). Skipped when it does not import.
+* ``engine``: CPU tests that import the stage 1 vLLM build (upstream ``main`` with
+  vllm#67374, #67375, #67144 and #67151 on ``PYTHONPATH``). Skipped when it does not
+  import.
 * ``gpu``: installed-engine tests on a CUDA device (``vllm serve`` with the
   plugin installed). Skipped without CUDA.
 * ``card``: tests against a local copy of the published Hub card, named by
@@ -46,7 +47,7 @@ CUDA = _cuda_available()
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    config.addinivalue_line("markers", "engine: needs the RFC 1 + RFC 2 vLLM build")
+    config.addinivalue_line("markers", "engine: needs the stage 1 vLLM build")
     config.addinivalue_line("markers", "gpu: needs an installed engine on CUDA")
     config.addinivalue_line("markers", "card: needs NEMOTRON_CARD_DIR")
 
@@ -58,7 +59,7 @@ def pytest_collection_modifyitems(
     for item in items:
         if "engine" in item.keywords and not ENGINE:
             item.add_marker(
-                pytest.mark.skip(reason="RFC 1 + RFC 2 vLLM not importable")
+                pytest.mark.skip(reason="stage 1 vLLM build not importable")
             )
         if "gpu" in item.keywords and not CUDA:
             item.add_marker(pytest.mark.skip(reason="no CUDA device"))

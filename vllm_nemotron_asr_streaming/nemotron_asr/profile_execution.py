@@ -135,7 +135,8 @@ def build_profile_invocation(
         device,
     )
     pools = project_nemotron_state_pools(
-        storage,
+        storage.views,
+        storage.spec,
         n_layers=int(config.n_layers),
     )
     block_ids = torch.arange(1, rows + 1, dtype=torch.int64)

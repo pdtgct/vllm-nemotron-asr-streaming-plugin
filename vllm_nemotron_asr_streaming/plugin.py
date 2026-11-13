@@ -15,7 +15,7 @@ import inspect
 
 
 def _require_client_path() -> None:
-    """Fail plugin load when the RFC 1 + RFC 2 client calls are absent."""
+    """Fail plugin load when the RFC 1 stream-admission client calls are absent."""
     from vllm.v1.engine.async_llm import AsyncLLM
 
     missing: list[str] = []
@@ -33,7 +33,8 @@ def _require_client_path() -> None:
         missing.append("AsyncLLM.wait_stream_retired")
     if missing:
         raise RuntimeError(
-            "vllm-nemotron-asr-streaming requires an RFC 1 + RFC 2 vLLM build; "
+            "vllm-nemotron-asr-streaming requires a vLLM build with RFC 1 "
+            "stream admission (vllm#67375 on #67374); "
             "this build lacks " + ", ".join(missing)
         )
 

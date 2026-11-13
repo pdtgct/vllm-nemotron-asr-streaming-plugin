@@ -24,7 +24,11 @@ from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
     advance_chunk_bucket,
 )
 from vllm_nemotron_asr_streaming.nemotron_asr.batch_invariance import execution_mode
-from vllm_nemotron_asr_streaming.nemotron_asr.decode_graph import GraphRuntime, platform_graph_runtime
+from vllm_nemotron_asr_streaming.nemotron_asr.decode_graph import (
+    GraphRuntime,
+    platform_graph_runtime,
+    wrapper_holds_graph,
+)
 from vllm_nemotron_asr_streaming.nemotron_asr.encoder_execution import _tensor_signature
 from vllm_nemotron_asr_streaming.nemotron_asr.manifests import CADENCES
 from vllm_nemotron_asr_streaming.nemotron_asr.rnnt import decode_dense_masked_frames
@@ -194,22 +198,20 @@ def capture_chunk_bucket(
     expected_outputs = tuple(tensor.clone() for tensor in call(runtime.eager_mode))
     expected_state = tuple(tensor.clone() for tensor in _state_tensors(static_state))
     runtime.synchronize(env.device)
-    runtime.set_capture_enabled(True)
-    try:
-        with runtime.capture_context(env.device):
-            stage(sources)
-            call(runtime.graph_mode)
+    # @spec REG-MEM-007: capture through core's graph-capture context; core has
+    # no capture-enabled switch at this build.
+    with runtime.capture_context(env.device):
         stage(sources)
-        actual = call(runtime.graph_mode)
-        for actual_tensor, expected in zip(
-            (*actual, *_state_tensors(static_state)),
-            (*expected_outputs, *expected_state),
-            strict=True,
-        ):
-            torch.testing.assert_close(actual_tensor, expected, atol=0, rtol=0)
-        runtime.synchronize(env.device)
-    finally:
-        runtime.set_capture_enabled(False)
+        call(runtime.graph_mode)
+    stage(sources)
+    actual = call(runtime.graph_mode)
+    for actual_tensor, expected in zip(
+        (*actual, *_state_tensors(static_state)),
+        (*expected_outputs, *expected_state),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual_tensor, expected, atol=0, rtol=0)
+    runtime.synchronize(env.device)
 
     @torch.inference_mode()
     def transition(
@@ -280,6 +282,7 @@ def capture_chunk_bucket(
 
     frozen_capacity = queue_capacity
     transition.replay_count = 0
+    transition.holds_graph = lambda: wrapper_holds_graph(wrapper, descriptor)
     return transition
 
 

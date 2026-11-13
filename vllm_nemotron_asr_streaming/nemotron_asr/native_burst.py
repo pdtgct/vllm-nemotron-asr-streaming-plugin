@@ -215,6 +215,7 @@ class NativeBurstSampler:
         )
 
 
+# @spec REG-ENG-008
 def validate_native_burst_config(
     config: Any,
     *,
@@ -232,7 +233,8 @@ def validate_native_burst_config(
         config.scheduler_config.async_scheduling is not False
         or config.speculative_config is not None
         or any(
-            getattr(parallel, name, None) != 1
+            # A setting the running build does not define counts as 1.
+            getattr(parallel, name, 1) != 1
             for name in (
                 "pipeline_parallel_size",
                 "tensor_parallel_size",
@@ -241,7 +243,7 @@ def validate_native_burst_config(
                 "prefill_context_parallel_size",
             )
         )
-        or bool(getattr(parallel, "enable_expert_parallel", True))
+        or bool(getattr(parallel, "enable_expert_parallel", False))
         or bool(config.model_config.logits_processors)
     ):
         raise ValueError(

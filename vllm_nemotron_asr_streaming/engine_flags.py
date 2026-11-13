@@ -12,9 +12,7 @@ Serve with the settings explicit (see the README), for example::
 
     vllm serve <checkpoint> \\
         --dtype float32 \\
-        --enforce-eager \\
-        --no-async-scheduling \\
-        --no-enable-prefix-caching
+        --enforce-eager
 
 Importing this module imports no vLLM.
 """
@@ -39,7 +37,12 @@ PARALLEL_SIZES_MUST_BE_ONE: tuple[str, ...] = (
 ADAPTER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "vllm.config.compilation": ("CUDAGraphMode",),
     "vllm.v1.core.sched.output": ("NewRequestData", "SchedulerOutput"),
-    "vllm.v1.kv_cache_interface": ("KVCacheConfig", "StateSlotHandle"),
+    "vllm.v1.kv_cache_interface": (
+        "KVCacheConfig",
+        "StateSlotHandle",
+        "PersistentStateSpec",
+        "PersistentStateDescriptor",
+    ),
     "vllm.v1.worker.gpu.input_batch": ("InputBatch",),
     "vllm.v1.worker.gpu.model_states.interface": ("ModelState",),
     "vllm.v1.worker.gpu.state_slots": ("StateSlotBindings", "StateSlotRows"),
@@ -48,16 +51,21 @@ ADAPTER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "vllm.model_executor.layers.state": ("PersistentStateLayerBase",),
     "vllm.multimodal": ("MULTIMODAL_REGISTRY",),
     "vllm.v1.attention.backends.utils": ("NULL_BLOCK_ID",),
+    "vllm.v1.worker.gpu.sample.output": ("SamplerOutput",),
+    "vllm.utils.torch_utils": ("direct_register_custom_op",),
 }
 
 
 # @spec REG-ENG-001, REG-ENG-002, REG-ENG-003, REG-ENG-004, REG-ENG-005
-def persistent_state_config_errors(vllm_config: Any) -> list[str]:
+def persistent_state_config_errors(
+    vllm_config: Any, *, resolved: bool = False
+) -> list[str]:
     """Return human-readable refusals for a persistent-state engine.
 
-    ``async_scheduling`` has to be ``False``: an unset value (``None``) is a
-    refusal, because core resolves it to ``True`` when the executor supports
-    asynchronous scheduling.
+    ``async_scheduling`` of ``True`` is refused. An unset value (``None``) is
+    accepted before core resolves the option (``resolved=False``: it resolves
+    to ``False`` for a model that declares persistent state); once the engine
+    configuration is final (``resolved=True``) only ``False`` is accepted.
     """
     errors: list[str] = []
     scheduler = vllm_config.scheduler_config
@@ -65,11 +73,11 @@ def persistent_state_config_errors(vllm_config: Any) -> list[str]:
     parallel = vllm_config.parallel_config
     model = vllm_config.model_config
     attention = getattr(vllm_config, "attention_config", None)
-    if getattr(scheduler, "async_scheduling", None) is not False:
+    async_scheduling = getattr(scheduler, "async_scheduling", None)
+    if async_scheduling is True or (resolved and async_scheduling is not False):
         errors.append(
             "async scheduling must be False "
-            "(an unset value resolves to True; "
-            "pass async_scheduling=False or --no-async-scheduling)"
+            "(pass async_scheduling=False or --no-async-scheduling)"
         )
     if getattr(cache, "enable_prefix_caching", None):
         errors.append(
@@ -88,6 +96,13 @@ def persistent_state_config_errors(vllm_config: Any) -> list[str]:
         errors.append("CuMem must be off")
     if getattr(attention, "hisparse_config", None) is not None:
         errors.append("HiSparse (hierarchical sparse attention) must be off")
+    if getattr(parallel, "enable_fault_tolerance", False):
+        # Core's kernel warm-up then runs synthetic real steps that carry no
+        # state-slot handles (pass no --fault-tolerance-config).
+        errors.append(
+            "fault tolerance must be off "
+            "(--fault-tolerance-config enables it; remove it)"
+        )
     for name in PARALLEL_SIZES_MUST_BE_ONE:
         if getattr(parallel, name, 1) != 1:
             errors.append(f"{name} must be 1")
@@ -100,18 +115,22 @@ def persistent_state_config_errors(vllm_config: Any) -> list[str]:
     return errors
 
 
-def engine_config_refusal(vllm_config: Any, subject: str) -> str | None:
+def engine_config_refusal(
+    vllm_config: Any, subject: str, *, resolved: bool = False
+) -> str | None:
     """Return one message listing every refused engine setting, or ``None``."""
-    errors = persistent_state_config_errors(vllm_config)
+    errors = persistent_state_config_errors(vllm_config, resolved=resolved)
     if not errors:
         return None
     return f"{subject} refuses this engine configuration: " + "; ".join(errors)
 
 
 # @spec REG-ENG-006, REG-VAL-003
-def check_engine_config(vllm_config: Any, subject: str) -> None:
+def check_engine_config(
+    vllm_config: Any, subject: str, *, resolved: bool = False
+) -> None:
     """Raise one ``ValueError`` listing every refused engine setting."""
-    message = engine_config_refusal(vllm_config, subject)
+    message = engine_config_refusal(vllm_config, subject, resolved=resolved)
     if message is not None:
         raise ValueError(message)
 
@@ -139,6 +158,6 @@ def check_adapter_dependencies() -> None:
     if missing:
         raise ImportError(
             "the installed vLLM lacks adapter dependencies of "
-            "vllm-nemotron-asr-streaming (an RFC 1 + RFC 2 build is "
-            "required): " + "; ".join(missing)
+            "vllm-nemotron-asr-streaming (a vLLM build with RFC 1 stream "
+            "admission, vllm#67375 on #67374, is required): " + "; ".join(missing)
         )

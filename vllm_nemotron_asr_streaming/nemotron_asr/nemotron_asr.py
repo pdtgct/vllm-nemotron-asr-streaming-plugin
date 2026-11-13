@@ -52,6 +52,7 @@ from vllm_nemotron_asr_streaming.nemotron_asr.convert import (
 from vllm_nemotron_asr_streaming.nemotron_asr.decode_dispatch import (
     SYNC_FREE_ARMS,
 )
+from vllm_nemotron_asr_streaming.nemotron_asr import decode_graph
 from vllm_nemotron_asr_streaming.nemotron_asr.encoder import (
     FastConformerEncoder,
 )
@@ -418,8 +419,9 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         )
         if policy is not FP32_BRINGUP:
             apply_policy_dtypes(self.core)
+        self._state_spec = build_nemotron_persistent_state_spec(hf_config)
         self._persistent_state_layer = PersistentStateLayerBase(
-            build_nemotron_persistent_state_spec(hf_config),
+            self._state_spec,
             prefix=f"{prefix}.state" if prefix else "state",
             vllm_config=vllm_config,
         )
@@ -453,6 +455,14 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             )
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         served_geometry_ids = _served_geometry_ids(hf_config)
+        # @spec REG-014: the graph-runtime dependencies are needed only when
+        # graphed execution is configured; name any that is missing now,
+        # before weights load.
+        if (
+            getattr(hf_config, "decode_dispatch_arm", None) == "dense-graphed"
+            or getattr(hf_config, "chunk_bucket_graph_populations", ())
+        ):
+            decode_graph.platform_graph_runtime()
         self._encoder_execution = build_encoder_execution(
             self.core,
             hf_config,
@@ -855,62 +865,94 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         if set(binding.captured_keys) != expected:
             raise RuntimeError("decoder execution inventory is incomplete")
 
-    # @spec PORT-STATE-003, PORT-PERF-009, PORT-PERF-011
-    @torch.inference_mode()
-    def prepare_execution_memory(self) -> None:
-        """Retain execution inventory and profile its transient headroom before state
-        allocation."""
-        from vllm_nemotron_asr_streaming.nemotron_asr.profile_execution import (
-            run_persistent_state_profile,
-            warmup_static_encoder_execution,
+    def _graphs_present(self) -> bool:
+        """Whether every captured graph entry of every wrapper holds a graph."""
+        binding = self._decode_graph_binding
+        return self._encoder_execution.graphs_present and (
+            binding is None or binding.graphs_present
         )
 
+    def _require_execution_ready(self) -> None:
+        """Readiness of the whole inventory, including that every captured
+        graph entry still holds its graph, without creating allocations."""
+        self._require_execution_inventory_ready()
+        if not self._graphs_present():
+            raise RuntimeError(
+                "a captured execution graph entry holds no graph; the model "
+                "never captures while serving"
+            )
+
+    # @spec REG-MEM-002, REG-MEM-003, REG-MEM-004, REG-MEM-005, REG-MEM-008
+    def _profile_dummy_step(self, device: torch.device) -> None:
+        """The model's one preparation of its execution memory, run by the
+        forward of a profiling dummy step (core's memory profile).
+
+        The first such step of a worker prepares; a failure discards the
+        partial state, marks the worker failed and raises, and every later
+        profiling step then raises without preparing. Later profiling steps of
+        a prepared worker (kernel warm-up after the state pool exists) only
+        verify readiness: no capture, no profile transaction, no state read.
+        """
         if self._execution_memory_failed:
             raise RuntimeError(
                 "execution memory preparation failed; a fresh worker is required"
             )
         if self._execution_memory_prepared:
-            self._require_execution_inventory_ready()
+            self._require_execution_ready()
             return
         try:
-            parameter = next(self.core.encoder.parameters())
-            device = parameter.device
-            warmup_static_encoder_execution(self, device=device)
-            if self._decode_graph_binding is not None:
-                self._decode_graph_binding.warmup(
-                    device, self.core.policy.dtype_for("activations")
-                )
-            chunk_binding = getattr(self, "_chunk_bucket_binding", None)
-            if chunk_binding is not None:
-                chunk_binding.warmup(device)
-            self._require_execution_inventory_ready()
-            # All retained graph buffers must coexist with this temporary
-            # transaction so the profiler sees their combined high-water mark.
-            if chunk_binding is not None:
-                for geometry, population in sorted(
-                    self._encoder_execution._chunk_graph_cells
-                ):
-                    run_persistent_state_profile(
-                        self,
-                        num_rows=population,
-                        device=device,
-                        geometry_id=geometry,
-                        ready_domain=True,
-                    )
-            run_persistent_state_profile(
-                self,
-                num_rows=self._max_num_seqs,
-                device=device,
-                geometry_id=max(_served_geometry_ids(self.config)),
-                ready_domain=True,
-            )
-            self._require_execution_inventory_ready()
+            self._prepare_execution_memory(device)
         except Exception:
             self._execution_memory_failed = True
-            if getattr(self, "_chunk_bucket_binding", None) is not None:
-                self._encoder_execution._discard()
+            self._encoder_execution._discard()
+            if self._decode_graph_binding is not None:
+                self._decode_graph_binding.discard()
             raise
         self._execution_memory_prepared = True
+
+    # @spec PORT-STATE-003, PORT-PERF-009, PORT-PERF-011
+    @torch.inference_mode()
+    def _prepare_execution_memory(self, device: torch.device) -> None:
+        """Retain execution inventory and profile its transient headroom.
+
+        Profiling uses model-owned scratch state built from the model's
+        ``PersistentStateSpec``; it reads no state-slot bindings or pool.
+        """
+        from vllm_nemotron_asr_streaming.nemotron_asr.profile_execution import (
+            run_persistent_state_profile,
+            warmup_static_encoder_execution,
+        )
+
+        warmup_static_encoder_execution(self, device=device)
+        if self._decode_graph_binding is not None:
+            self._decode_graph_binding.warmup(
+                device, self.core.policy.dtype_for("activations")
+            )
+        chunk_binding = getattr(self, "_chunk_bucket_binding", None)
+        if chunk_binding is not None:
+            chunk_binding.warmup(device)
+        self._require_execution_ready()
+        # All retained graph buffers must coexist with this temporary
+        # transaction so the profiler sees their combined high-water mark.
+        if chunk_binding is not None:
+            for geometry, population in sorted(
+                self._encoder_execution._chunk_graph_cells
+            ):
+                run_persistent_state_profile(
+                    self,
+                    num_rows=population,
+                    device=device,
+                    geometry_id=geometry,
+                    ready_domain=True,
+                )
+        run_persistent_state_profile(
+            self,
+            num_rows=self._max_num_seqs,
+            device=device,
+            geometry_id=max(_served_geometry_ids(self.config)),
+            ready_domain=True,
+        )
+        self._require_execution_ready()
 
     def execution_profile_receipt(self) -> dict[str, Any]:
         """Report the resolved execution arms and startup coverage."""
@@ -1066,21 +1108,26 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         ):
             if not persistent_state_projection.dummy_run:
                 raise RuntimeError("no-page-I/O projection must be a dummy invocation")
+            # @spec REG-MEM-001, REG-MEM-002, REG-MEM-003, REG-MEM-009, REG-MEM-010
             if persistent_state_projection.is_profile:
-                from vllm_nemotron_asr_streaming.nemotron_asr.profile_execution import (
-                    run_persistent_state_profile,
-                )
-
-                run_persistent_state_profile(
-                    self,
-                    num_rows=len(persistent_state_projection.req_ids),
-                    device=inputs_embeds.device,
-                )
+                self._profile_dummy_step(inputs_embeds.device)
             return torch.zeros_like(inputs_embeds)
         if input_ids is None:
             raise RuntimeError("Nemotron forward requires raw ids")
         if persistent_state_projection is None:
             raise ValueError("Nemotron forward requires an MRv2 state projection")
+        # @spec REG-MEM-011, REG-MEM-006: a real step runs only on a worker
+        # whose preparation succeeded, and never captures while serving.
+        if not self._execution_memory_prepared:
+            raise RuntimeError(
+                "execution memory was not prepared on this worker (preparation "
+                "runs on core's profiling step and never lazily while serving)"
+            )
+        if not self._graphs_present():
+            raise RuntimeError(
+                "a captured execution graph entry holds no graph; refusing the "
+                "step rather than capturing while serving"
+            )
         context = self._stage_v2_projection(persistent_state_projection)
         state_batch = persistent_state_projection.state_batch
         if state_batch is None:

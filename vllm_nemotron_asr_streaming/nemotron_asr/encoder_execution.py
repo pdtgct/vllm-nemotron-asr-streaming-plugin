@@ -32,6 +32,7 @@ from vllm_nemotron_asr_streaming.nemotron_asr.batch_invariance import (
 from vllm_nemotron_asr_streaming.nemotron_asr.decode_graph import (
     GraphRuntime,
     platform_graph_runtime,
+    wrapper_holds_graph,
 )
 from vllm_nemotron_asr_streaming.nemotron_asr.encoder import (
     StreamingCaches,
@@ -752,6 +753,14 @@ class ResolvedEncoderExecution:
             )
         return self._sealed and not self._failed
 
+    @property
+    def graphs_present(self) -> bool:
+        """Whether every published graph entry's wrapper holds its graph."""
+        return all(
+            wrapper_holds_graph(entry.wrapper, entry.descriptor)
+            for entry in self._graph_entries.values()
+        ) and all(entry.holds_graph() for entry in self._chunk_graph_entries.values())
+
     def graph_key(self, kind: str, cell: tuple[int, int]) -> tuple[Any, ...]:
         """@spec PORT-PREC-019, PORT-PREC-025: preserve the off-mode cell tuple."""
         return self._batch_invariant_mode.graph_key(kind, cell)
@@ -1449,21 +1458,16 @@ class ResolvedEncoderExecution:
 
             stage = "capture"
             cell = None
-            runtime.set_capture_enabled(True)
-            try:
-                with torch.inference_mode(), runtime.capture_context(device):
-                    for cell in cells:
-                        entry = self._pending_graph_entries[
-                            self.graph_key("cuda", cell)
-                        ]
-                        self._capture_graph_entry(entry)
-                        self._record_memory_diagnostic(
-                            device, stage="after-capture", key=cell
-                        )
-                    cell = None
-                    runtime.synchronize(device)
-            finally:
-                runtime.set_capture_enabled(False)
+            # @spec REG-MEM-007: capture through core's graph-capture context.
+            with torch.inference_mode(), runtime.capture_context(device):
+                for cell in cells:
+                    entry = self._pending_graph_entries[self.graph_key("cuda", cell)]
+                    self._capture_graph_entry(entry)
+                    self._record_memory_diagnostic(
+                        device, stage="after-capture", key=cell
+                    )
+                cell = None
+                runtime.synchronize(device)
             self._assert_model_state()
             self._graph_entries = dict(self._pending_graph_entries)
             self._pending_graph_entries.clear()

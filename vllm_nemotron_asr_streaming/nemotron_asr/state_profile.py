@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 import torch
 
@@ -86,26 +86,19 @@ def build_nemotron_persistent_state_spec(config: Any) -> PersistentStateSpec:
     return PersistentStateSpec(
         descriptors=descriptors,
         page_size_bytes=offset,
-        state_name="nemotron.cache_aware_streaming",
+        block_size=1,
     )
 
 
-class ComponentPools(Protocol):
-    @property
-    def spec(self) -> PersistentStateSpec: ...
-
-    @property
-    def views(self) -> Mapping[str, torch.Tensor]: ...
-
-
 def _adjacent_matrix(
-    storage: ComponentPools,
+    views: Mapping[str, torch.Tensor],
+    spec: PersistentStateSpec,
     names: tuple[str, ...],
 ) -> torch.Tensor:
     """Project adjacent scalar descriptors as one write-through matrix."""
     if not names:
         raise ValueError("adjacent view requires at least one descriptor")
-    descriptors = {item.name: item for item in storage.spec.descriptors}
+    descriptors = {item.name: item for item in spec.descriptors}
     selected = [descriptors[name] for name in names]
     dtype = selected[0].dtype
     if any(item.dtype != dtype or item.shape != (1,) for item in selected):
@@ -117,11 +110,11 @@ def _adjacent_matrix(
             raise ValueError("adjacent matrix fields are not contiguous")
         expected += item.size_bytes
     element_size = selected[0].element_size_bytes
-    first = storage.views[names[0]]
+    first = views[names[0]]
     return torch.as_strided(
         first,
         size=(first.shape[0], len(selected)),
-        stride=(storage.spec.page_size_bytes // element_size, 1),
+        stride=(spec.page_size_bytes // element_size, 1),
     )
 
 
@@ -143,13 +136,19 @@ class NemotronStatePools:
     endpoint_book: torch.Tensor
 
 
+# @spec REG-STATE-005
 def project_nemotron_state_pools(
-    storage: ComponentPools,
+    views: Mapping[str, torch.Tensor],
+    spec: PersistentStateSpec,
     *,
     n_layers: int,
 ) -> NemotronStatePools:
-    """Return named zero-copy views over the one aggregate allocation."""
-    views = storage.views
+    """Return named zero-copy views over the one aggregate allocation.
+
+    ``views`` is the component pools (one tensor per descriptor, one row per
+    slot) and ``spec`` the layout they follow; nothing else of the state rows
+    is used.
+    """
     channels = tuple(
         views[f"encoder.layers.{index}.window.channel"] for index in range(n_layers)
     )
@@ -160,7 +159,8 @@ def project_nemotron_state_pools(
         views[f"encoder.layers.{index}.window.valid"] for index in range(n_layers)
     )
     replay_book = _adjacent_matrix(
-        storage,
+        views,
+        spec,
         (
             "decode.layers.0.replay.book.queue_head",
             "decode.layers.0.replay.book.queue_length",
@@ -172,7 +172,8 @@ def project_nemotron_state_pools(
         ),
     )
     frontend_counters = _adjacent_matrix(
-        storage,
+        views,
+        spec,
         (
             "frontend.counters.total_valid_samples",
             "frontend.counters.committed_mel_frames",
@@ -185,7 +186,8 @@ def project_nemotron_state_pools(
         ),
     )
     endpoint_book = _adjacent_matrix(
-        storage,
+        views,
+        spec,
         (
             "endpoint.book.history_length",
             "endpoint.book.history_head",
