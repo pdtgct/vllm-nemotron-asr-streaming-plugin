@@ -242,7 +242,8 @@ memory, so the model prepares its execution on core's profiling step:
   forward on that step is the only place that prepares execution. On the first profiling forward
   it warms and captures the execution inventory, checks the inventory is complete (every served
   geometry and batch tier), and then, with every captured graph retained, runs the profile
-  transaction at its maximum shape so the measurement includes the transient peak. It returns
+  transaction at its maximum shape (`max_num_seqs` rows at the largest served geometry, and each
+  configured CHUNK cell) so the measurement includes the transient peak. It returns
   the dummy output core expects. The earlier forward-time profile of an unprepared encoder is
   retired: it cannot run once the inventory is sealed.
 - **Dummy output.** Core indexes the profiling step's forward output by its logits indices, computes
@@ -361,7 +362,7 @@ parser, tokenizer and renderer registries, model configuration hooks (`VerifyAnd
 `MODELS_CONFIG_MAP`), speech-to-text configuration, multimodal processing, `SupportsTranscription`,
 logging and Hub file helpers, which out-of-tree models use, are outside this table, as is the public
 client surface that the session and `register()` use (`AsyncLLM`, `StreamingInput`, `SamplingParams`,
-`StreamAdmissionError`, `EngineDeadError`; see the HLD's Engine surface constraint). Adding a dependency means
+`RequestOutputKind`, `StreamAdmissionError`, `EngineDeadError`; see the HLD's Engine surface constraint). Adding a dependency means
 adding it here and to the import-time check.
 
 ## Implementation notes
