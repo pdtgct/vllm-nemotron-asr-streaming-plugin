@@ -1311,24 +1311,25 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
     runner.profile_run(core_embeds=False)
     assert any(kind == "capture" for _, _, kind in calls), "nothing was captured"
     bindings = runner.bind_pool(h.real_bindings(h.model_spec(model), device="cuda"))
+    # the helpers of the CPU test, over this runner
+    env = SimpleNamespace(
+        runner=runner, config=model.config, max_geometry=3, model=model
+    )
 
     def step():
+        # the session's second unit, delivered once the first drained to park
         return h.scheduler_output(
-            new=(
-                h.new_request(
-                    "s1",
-                    int(model.config.audio_chunk_token_id),
-                    audio=h.stream_envelope(model.config, geometry=3),
-                ),
-            ),
-            handles={"s1": 1},
+            new=(stream(env, "s1", sequence=1),), handles={"s1": 1}
         )
 
     mark = len(calls)
-    runner.real_step(step())
+    runner.real_step(
+        h.scheduler_output(new=(stream(env, "s1", final=False),), handles={"s1": 1})
+    )
     replayed = [(w, d) for w, d, kind in calls[mark:] if kind == "replay"]
     assert replayed, "the prepared serving step replayed no graph"
     wrapper, descriptor = replayed[-1]
+    drain_to_park(env, ["s1"], {"s1": 1})
     entry = wrapper.concrete_cudagraph_entries[descriptor]
     graph, entry.cudagraph = entry.cudagraph, None
     mark = len(calls)
@@ -1340,4 +1341,12 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
     assert torch.equal(before, h.pool_tensor(bindings)), "the refused step wrote state"
     entry.cudagraph = graph
     runner.real_step(step())
-    assert any(kind == "replay" for _, _, kind in calls[mark:])
+    assert any(kind == "replay" for _, _, kind in calls[mark:]), (
+        "the restored step did not replay"
+    )
+    # every step that committed (the refused one raised before committing) was clean
+    assert runner.commit_log, "no step committed"
+    assert all(not failed for _, failed in runner.commit_log), runner.commit_log
+    assert all(v == 0 for st, _ in runner.commit_log for v in st.values()), (
+        runner.commit_log
+    )
