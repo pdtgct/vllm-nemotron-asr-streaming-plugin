@@ -16,6 +16,9 @@ profile transaction and the row transaction (scatter and commit included).
 The card is ``write_runnable_card``: the synthetic card with an encoder wide
 enough (1024, two layers) for the streaming transition to run on CPU.
 
+Steps run under ``torch.inference_mode()``, as core's ``execute_model``,
+``_dummy_run`` and ``_dummy_sampler_run`` do.
+
 Omissions from core's step, by design of a CPU harness:
 
 * Block tables, slot mappings and attention groups: the model declares no
@@ -34,7 +37,8 @@ Omissions from core's step, by design of a CPU harness:
 Seams the doubles rely on (call-time lookups in the plugin):
 
 * ``profile_execution.run_persistent_state_profile`` (``ProfileSpy`` wraps it
-  and calls through);
+  and calls through, and the tests read its ``num_rows`` and ``geometry_id``
+  keyword arguments to identify the transaction's shape);
 * ``advance.advance_model_rows`` (``AdvanceSpy`` wraps it and calls through);
 * ``decode_graph.platform_graph_runtime``, also bound by name in
   ``chunk_bucket_graph`` and ``encoder_execution`` (``FakeGraphRuntime``
@@ -55,6 +59,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import weakref
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -401,7 +406,8 @@ class FakeGraphWrapper:
     ``concrete_cudagraph_entries`` keyed by batch descriptor; under a forward
     context whose mode is the wrapper's runtime mode, an entry without a
     graph is captured, and one with a graph is replayed. Capture and replay
-    run the runnable eagerly and are logged."""
+    run the runnable eagerly and are logged. The runtime holds wrappers and
+    graphs only weakly, so a discarded inventory can be observed as gone."""
 
     def __init__(self, runtime: FakeGraphRuntime, runnable, vllm_config, runtime_mode):
         from vllm.compilation.cuda_graph import CUDAGraphEntry
@@ -411,7 +417,7 @@ class FakeGraphWrapper:
         self.runnable = runnable
         self.runtime_mode = runtime_mode
         self.concrete_cudagraph_entries: dict[Any, Any] = {}
-        runtime.wrappers.append(self)
+        runtime.wrappers.append(weakref.ref(self))
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         from vllm.config import CUDAGraphMode
@@ -430,19 +436,22 @@ class FakeGraphWrapper:
         entry = self.concrete_cudagraph_entries.setdefault(
             descriptor, self._entry_cls(batch_descriptor=descriptor)
         )
+        runtime = self._runtime
         if entry.cudagraph is None:
-            runtime = self._runtime
             index = len(runtime.captures)
             runtime.events.append(("capture", descriptor))
-            runtime.captures.append((self, descriptor))
+            runtime.captures.append((weakref.ref(self), descriptor))
             if runtime.fail_capture == index:
                 raise RuntimeError(f"capture {index} failed")
             output = self.runnable(*args, **kwargs)
             if runtime.skip_capture != index:
-                entry.cudagraph = FakeGraph()
+                graph = FakeGraph()
+                runtime.graphs.append(weakref.ref(graph))
+                entry.cudagraph = graph
             entry.output = output
             return output
-        self._runtime.events.append(("replay", descriptor))
+        runtime.events.append(("replay", descriptor))
+        runtime.replays.append((weakref.ref(self), descriptor))
         return self.runnable(*args, **kwargs)
 
 
@@ -452,14 +461,19 @@ class FakeGraphRuntime:
 
     def __init__(self, events: Events | None = None) -> None:
         self.events = events if events is not None else Events()
-        self.wrappers: list[FakeGraphWrapper] = []
-        #: ``(wrapper, descriptor)`` of every capture attempt, in order.
-        self.captures: list[tuple[Any, Any]] = []
+        #: Weak references to every wrapper built and every graph stored.
+        self.wrappers: list[weakref.ref] = []
+        self.graphs: list[weakref.ref] = []
+        #: ``(wrapper ref, descriptor)`` of every capture attempt / replay.
+        self.captures: list[tuple[weakref.ref, Any]] = []
+        self.replays: list[tuple[weakref.ref, Any]] = []
         #: Index of the capture attempt that raises / that stores no graph.
         self.fail_capture: int | None = None
         self.skip_capture: int | None = None
-        #: Raised by the eager warm-up call (forward context in mode NONE).
-        self.fail_eager: BaseException | None = None
+        #: Index of the eager warm-up call (forward context in mode NONE
+        #: entered through the runtime) that raises.
+        self.fail_eager: int | None = None
+        self.eager_calls = 0
 
     def build(self) -> Any:
         from vllm.config import CUDAGraphMode
@@ -477,11 +491,12 @@ class FakeGraphRuntime:
             yield
 
         def forward_context(*args, **kwargs):
-            if (
-                runtime.fail_eager is not None
-                and kwargs.get("cudagraph_runtime_mode") == CUDAGraphMode.NONE
-            ):
-                raise runtime.fail_eager
+            if kwargs.get("cudagraph_runtime_mode") == CUDAGraphMode.NONE:
+                index = runtime.eager_calls
+                runtime.eager_calls += 1
+                runtime.events.append(("eager", kwargs.get("batch_descriptor")))
+                if runtime.fail_eager == index:
+                    raise RuntimeError(f"eager warm-up {index} failed")
             return set_forward_context(*args, **kwargs)
 
         values = {
@@ -516,13 +531,19 @@ class FakeGraphRuntime:
         return self
 
     def captured(self) -> list[tuple[Any, Any]]:
-        """``(wrapper, descriptor)`` of every entry that holds a graph."""
+        """``(wrapper, descriptor)`` of every entry of a live wrapper that
+        holds a graph."""
         return [
             (w, d)
-            for w in self.wrappers
+            for ref in self.wrappers
+            if (w := ref()) is not None
             for d, e in w.concrete_cudagraph_entries.items()
             if e.cudagraph is not None
         ]
+
+    def live_graphs(self) -> int:
+        """Graphs still reachable from anything (call ``gc.collect()`` first)."""
+        return sum(ref() is not None for ref in self.graphs)
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +784,7 @@ class Runner:
 
     # -- dummy steps --------------------------------------------------------
 
+    @torch.inference_mode()
     def dummy_step(
         self,
         *,
@@ -782,11 +804,23 @@ class Runner:
         state = self.state
         num_tokens = num_tokens or state.max_num_tokens
         num_reqs = min(num_tokens, state.max_num_reqs)
+        # core distributes the remainder so no request exceeds
+        # ceil(num_tokens / num_reqs) tokens
+        per_request = [
+            num_tokens // num_reqs + (i >= num_reqs - num_tokens % num_reqs)
+            for i in range(num_reqs)
+        ]
+        assert sum(per_request) == num_tokens
         output = SchedulerOutput.make_empty()
         output.total_num_scheduled_tokens = num_tokens
-        output.num_scheduled_tokens = {f"_dummy_req_{i}": 1 for i in range(num_reqs)}
+        output.num_scheduled_tokens = {
+            f"_dummy_req_{i}": n for i, n in enumerate(per_request)
+        }
         state.prepare_step(output, dummy_run=True, is_profile=is_profile)
         batch = dummy_batch(state, num_reqs, num_tokens, is_padding=not is_profile)
+        assert batch.num_reqs == len(output.num_scheduled_tokens)
+        assert batch.num_tokens == output.total_num_scheduled_tokens
+        assert list(batch.num_scheduled_tokens) == per_request
         if randomize_inputs:
             batch.input_ids.random_(0, int(self.model.config.vocab_size))
         attn_metadata = self._attn(batch) if attn else None
@@ -806,6 +840,7 @@ class Runner:
     def profile_run(self, **kwargs: Any) -> tuple[Any, torch.Tensor, Any]:
         return self.dummy_step(is_profile=True, **kwargs)
 
+    @torch.inference_mode()
     def dummy_sampler_run(self, sampler: Any, hidden: torch.Tensor) -> Any:
         """``_dummy_sampler_run``, including the warm-up-parameter pass core
         runs on GPU platforms."""
@@ -826,15 +861,21 @@ class Runner:
 
     # -- real steps ---------------------------------------------------------
 
-    def _remove_request(self, req_id: str) -> None:
+    def _remove_request(self, req_id: str) -> bool:
+        """core's ``_remove_request``: the model state first; the encoder cache
+        only for a request the runner knows."""
         self.state.remove_request(req_id)
+        if req_id not in self.req_states.req_id_to_index:
+            return False
         self.req_states.remove(req_id)
         self.state.encoder_cache.remove_request(req_id)
+        return True
 
     def _phase(self, name: str) -> None:
         if isinstance(self.bindings, BindingsSpy):
             object.__setattr__(self.bindings, "phase", name)
 
+    @torch.inference_mode()
     def real_step(self, output: Any, computed: dict[str, int] | None = None) -> Any:
         """``execute_model`` then ``sample_tokens``'s state hooks, for a real
         step; returns ``(hidden, completion)``."""
@@ -868,8 +909,9 @@ class Runner:
             return None, self._finish(EMPTY_MODEL_RUNNER_OUTPUT)
         batch = self._real_batch(output, computed)
         self._phase("prepare_inputs")
-        attn_metadata = self._attn(batch)
+        # core: preprocess_state runs before model_state.prepare_attn
         state.preprocess_state(batch, (), None, None)
+        attn_metadata = self._attn(batch)
         embeds = state.prepare_inputs_embeds(
             output.scheduled_encoder_inputs, batch, self.req_states
         )

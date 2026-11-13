@@ -188,7 +188,14 @@ class Scanner:
     variable iterates, and is reported as unresolved otherwise), and string
     constants naming an importable ``vllm`` module (as an import target,
     with the identifier that follows it in a tuple, or the names of a dict
-    value)."""
+    value). Also: ``__import__`` reached through ``builtins`` (imported or
+    aliased), importer functions rebound by assignment (``load =
+    importlib.import_module``), ``getattr(alias, "X")`` on a module alias, and
+    every string constant ``vllm(.name)+`` whose longest importable prefix is
+    a ``vllm`` submodule, read as ``(module, remainder)`` (so qualnames such
+    as ``resolve_obj_by_qualname`` targets and ``sys.modules`` keys count; a
+    label like ``"vllm.matmul_kernel_persistent"``, with no submodule prefix,
+    does not)."""
 
     def __init__(self, source: str) -> None:
         self.tree = ast.parse(source)
@@ -196,6 +203,7 @@ class Scanner:
         self.aliases: dict[str, str] = {}  # local name -> vllm module path
         self.importers: set[str] = {"__import__"}
         self.importlib_aliases: set[str] = set()
+        self.builtins_aliases: set[str] = set()
         self.tables = {
             target.id: node.value
             for node in self.tree.body
@@ -209,9 +217,42 @@ class Scanner:
     def scan(self) -> list[tuple[int, str, str | None]]:
         for node in ast.walk(self.tree):
             self._imports(node)
+        for _ in range(2):  # rebinding chains of length two
+            for node in ast.walk(self.tree):
+                self._rebinds(node)
         for node in ast.walk(self.tree):
             self._uses(node)
         return self.found
+
+    def _is_importer(self, func: list[str]) -> bool:
+        return (
+            (len(func) == 1 and func[0] in self.importers)
+            or (
+                len(func) == 2
+                and func[0] in self.importlib_aliases
+                and func[1] == "import_module"
+            )
+            or (
+                len(func) == 2
+                and func[0] in self.builtins_aliases
+                and func[1] == "__import__"
+            )
+        )
+
+    def _rebinds(self, node: ast.AST) -> None:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            value = _dotted(node.value) or []
+            name = node.targets[0].id
+            if value and self._is_importer(value):
+                self.importers.add(name)
+            elif len(value) == 1 and value[0] in self.aliases:
+                self.aliases[name] = self.aliases[value[0]]
+            elif len(value) == 1 and value[0] in self.importlib_aliases:
+                self.importlib_aliases.add(name)
 
     def _add(self, line: int, module: str, name: str | None) -> None:
         if name is not None and _is_module(f"{module}.{name}"):
@@ -223,6 +264,8 @@ class Scanner:
             for alias in node.names:
                 if alias.name == "importlib":
                     self.importlib_aliases.add(alias.asname or "importlib")
+                if alias.name == "builtins":
+                    self.builtins_aliases.add(alias.asname or "builtins")
                 if alias.name == "vllm" or alias.name.startswith("vllm."):
                     if alias.asname:
                         self.aliases[alias.asname] = alias.name
@@ -233,6 +276,10 @@ class Scanner:
             if node.module == "importlib":
                 for alias in node.names:
                     if alias.name == "import_module":
+                        self.importers.add(alias.asname or alias.name)
+            if node.module == "builtins":
+                for alias in node.names:
+                    if alias.name == "__import__":
                         self.importers.add(alias.asname or alias.name)
             if node.module == "vllm" or node.module.startswith("vllm."):
                 for alias in node.names:
@@ -258,14 +305,32 @@ class Scanner:
                         continue
                     self.found.append((node.lineno, path, member))
                     break
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and re.fullmatch(r"vllm(\.\w+)+", node.value)
+        ):
+            parts = node.value.split(".")
+            for k in range(len(parts), 1, -1):
+                prefix = ".".join(parts[:k])
+                if _is_module(prefix):
+                    rest = parts[k] if k < len(parts) else None
+                    self.found.append((node.lineno, prefix, rest))
+                    break
         if isinstance(node, ast.Call):
             func = _dotted(node.func) or []
-            is_import = (len(func) == 1 and func[0] in self.importers) or (
-                len(func) == 2
-                and func[0] in self.importlib_aliases
-                and func[1] == "import_module"
-            )
-            if is_import and node.args:
+            if (
+                func == ["getattr"]
+                and len(node.args) >= 2
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in self.aliases
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                self._add(
+                    node.lineno, self.aliases[node.args[0].id], node.args[1].value
+                )
+            if self._is_importer(func) and node.args:
                 for target in self._import_targets(node.args[0]):
                     if target is None:
                         self.found.append(
@@ -449,6 +514,40 @@ SELF_TEST_CASES = {
         True,
     ),
     "string-target": ("TARGET = ('vllm.v1.outputs', 'ModelRunnerOutput')\n", True),
+    "builtins-import-alias": (
+        "from builtins import __import__ as load\n"
+        "def f():\n    return load('vllm.v1.outputs')\n",
+        True,
+    ),
+    "builtins-module-import": (
+        "import builtins\n"
+        "def f():\n    return builtins.__import__('vllm.v1.outputs')\n",
+        True,
+    ),
+    "rebound-import-module": (
+        "import importlib\nload = importlib.import_module\n"
+        "def f():\n    return load('vllm.v1.outputs')\n",
+        True,
+    ),
+    "qualname-string": (
+        "from vllm.utils.import_utils import resolve_obj_by_qualname\n"
+        "def f():\n"
+        "    return resolve_obj_by_qualname('vllm.v1.outputs.ModelRunnerOutput')\n",
+        True,
+    ),
+    "sys-modules-key": (
+        "import sys\ndef f():\n    return sys.modules['vllm.v1.outputs']\n",
+        True,
+    ),
+    "getattr-on-alias": (
+        "import vllm.v1.outputs as out\n"
+        "def f():\n    return getattr(out, 'ModelRunnerOutput')\n",
+        True,
+    ),
+    "kernel-label-string": (
+        "KERNEL = 'vllm.matmul_kernel_persistent'\n",
+        False,
+    ),
     "table-driven-dynamic": (
         "import importlib\n"
         "TABLE = {'vllm.v1.outputs': ('ModelRunnerOutput',)}\n"

@@ -695,22 +695,30 @@ def test_streaming_response_carries_only_label_text(server):
 # ---------------------------------------------------------------------------
 # FILE-GRD-007: sampling-shaping fields do not change a file's tokens
 
-SHAPING_FIELDS = {
-    "temperature": 0.9,
-    "top_p": 0.5,
-    "top_k": 3,
-    "min_p": 0.3,
-    "seed": 1234,
-    "watermarking": True,
-    "repetition_penalty": 1.5,
-    "frequency_penalty": 1.2,
-    "presence_penalty": 1.2,
+#: Each case: request fields, and the sampling-parameter values that must
+#: survive core's resolution. Core resets top_p / top_k / min_p at
+#: temperature 0, so those cases also set a nonzero temperature.
+SHAPING_CASES = {
+    "temperature": ({"temperature": 0.9}, {"temperature": 0.9}),
+    "top_p": ({"temperature": 1.0, "top_p": 0.5}, {"top_p": 0.5}),
+    "top_k": ({"temperature": 1.0, "top_k": 3}, {"top_k": 3}),
+    "min_p": ({"temperature": 1.0, "min_p": 0.3}, {"min_p": 0.3}),
+    "seed": ({"temperature": 1.0, "seed": 1234}, {"seed": 1234}),
+    "repetition_penalty": (
+        {"repetition_penalty": 1.5},
+        {"repetition_penalty": 1.5},
+    ),
+    "frequency_penalty": ({"frequency_penalty": 1.2}, {"frequency_penalty": 1.2}),
+    "presence_penalty": ({"presence_penalty": 1.2}, {"presence_penalty": 1.2}),
 }
 
 
-async def transcribe_file_with(engine, samples: np.ndarray, **fields: Any) -> list[int]:
+async def transcribe_file_with(
+    engine, samples: np.ndarray, expect: dict | None = None, **fields: Any
+) -> FileResult:
     """As ``transcribe_file``, with request fields set on the transcription
-    request before core turns it into sampling parameters."""
+    request before core turns it into sampling parameters; ``expect`` names
+    sampling-parameter values that must remain after that resolution."""
     from fastapi import UploadFile
     from vllm.config.speech_to_text import SpeechToTextConfig, SpeechToTextParams
     from vllm.entrypoints.speech_to_text.transcription.protocol import (
@@ -732,19 +740,60 @@ async def transcribe_file_with(engine, samples: np.ndarray, **fields: Any) -> li
     )
     max_tokens = engine.model_config.max_model_len - len(prompt["prompt_token_ids"])
     params = request.to_sampling_params(max_tokens)
-    tokens: list[int] = []
+    for name, value in (expect or {}).items():
+        assert getattr(params, name) == pytest.approx(value), (
+            f"{name} did not survive resolution: {getattr(params, name)!r}"
+        )
     final = None
     async for out in engine.generate(prompt, params, f"file-{uuid.uuid4().hex}"):
         final = out
     assert final is not None
-    tokens = list(final.outputs[0].token_ids)
-    return tokens
+    completion = final.outputs[0]
+    return FileResult(
+        completion.text, list(completion.token_ids), completion.finish_reason
+    )
 
 
-@pytest.mark.parametrize("field", list(SHAPING_FIELDS))
+def _assert_completed(engine, result: FileResult) -> None:
+    assert result.finish_reason == "stop", result.finish_reason
+    assert result.token_ids and result.token_ids[-1] == blank_of(engine) + 1
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        *SHAPING_CASES,
+        pytest.param(
+            "watermarking",
+            marks=pytest.mark.skip(
+                reason="unverified on GPU: the module's engine configures no "
+                "watermark, so enabled and disabled runs cannot differ; the CPU "
+                "check (test_sampling_invariance.py) covers an additive bias"
+            ),
+        ),
+    ],
+)
 # @spec FILE-GRD-007
-def test_sampling_shaping_fields_do_not_change_a_files_tokens(run, engine, field):
+def test_sampling_shaping_fields_do_not_change_a_files_tokens(run, engine, case):
     audio = load_audio(8.0)
     baseline = run(transcribe_file_with(engine, audio))
-    shaped = run(transcribe_file_with(engine, audio, **{field: SHAPING_FIELDS[field]}))
-    assert shaped == baseline
+    _assert_completed(engine, baseline)
+    fields, expect = SHAPING_CASES[case]
+    shaped = run(transcribe_file_with(engine, audio, expect=expect, **fields))
+    _assert_completed(engine, shaped)
+    assert shaped.token_ids == baseline.token_ids
+
+
+# @spec FILE-GRD-007
+def test_nonzero_temperature_alone_does_not_change_a_files_tokens(run, engine):
+    """Control for the cases that need temperature > 0 to keep their field."""
+    audio = load_audio(8.0)
+    baseline = run(transcribe_file_with(engine, audio))
+    hot = run(
+        transcribe_file_with(
+            engine, audio, expect={"temperature": 1.0}, temperature=1.0
+        )
+    )
+    _assert_completed(engine, baseline)
+    _assert_completed(engine, hot)
+    assert hot.token_ids == baseline.token_ids

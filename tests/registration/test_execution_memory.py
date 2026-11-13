@@ -15,8 +15,17 @@ capture graphs, so graphed arms run with ``FakeGraphRuntime``: core's forward
 context and batch descriptors, and a wrapper with core's entry contract whose
 capture is logged and can be made to fail or to store no graph.
 
-Readiness reads are logged by wrapping the inventories' readiness surfaces
-(encoder ``ready``, decoder ``captured_keys``, CHUNK ``ready``).
+Expected graph inventories are derived from the configuration alone
+(``expected_entries``), never from an observed run.
+
+Model-internal seams these tests read (beyond the harness's): the model
+state's step record (``_dummy_run`` / ``_is_profile``, REG-MEM-001, no public
+accessor), the model's state-layer spec (``_persistent_state_layer``), the
+profile scratch (``build_profile_invocation(...).storage.spec``), the encoder
+inventory's ``ready`` property (REG-MEM-003 inventory test) and, only while
+REG-MEM-002 is unimplemented, ``prepare_execution_memory`` (REG-MEM-006 CPU
+test). The GPU test reads no model attribute: it finds graph entries by
+instrumenting core's ``CUDAGraphWrapper.__call__``.
 
 Migration blockers are isolated per test (``legacy`` argument of ``build``):
 tests of REG-MEM-* run with the removed state-slot calls re-added so that
@@ -26,8 +35,10 @@ REG-STATE-002..005 do not mask them; the REG-STATE contract tests do not.
 from __future__ import annotations
 
 import ast
+import gc
 import inspect
 import re
+import traceback
 from types import SimpleNamespace
 
 import numpy as np
@@ -65,6 +76,8 @@ ARMS = {
         6,
         2,
     ),
+    # CHUNK buckets accept populations 1, 31 and 63 only; with two
+    # sequences the maximum shape (2 rows) differs from the CHUNK cell (1 row).
     "chunk": (
         {
             "decode_dispatch_arm": "dense-graphed",
@@ -73,7 +86,7 @@ ARMS = {
             "supported_num_lookahead_tokens": [1],
         },
         1,
-        1,
+        2,
     ),
 }
 GRAPHED = ("dense-graphed", "chunk")
@@ -83,14 +96,32 @@ def geometry_of(right_context: int) -> int:
     return LOOKAHEADS.index(right_context)
 
 
-def _log_reads(monkeypatch, events, cls, name, label):
-    original = getattr(cls, name)
+def batch_tiers(maximum: int) -> list[int]:
+    """The decoder's batch tiers for ``max_num_seqs`` (powers of two below the
+    maximum, then the maximum)."""
+    tiers, value = [], 1
+    while value < maximum:
+        tiers.append(value)
+        value *= 2
+    return [*tiers, maximum]
 
-    def read(self):
-        events.append(("ready", label))
-        return original.fget(self)
 
-    monkeypatch.setattr(cls, name, property(read))
+def expected_entries(env) -> int:
+    """Graph entries the configuration requires: each served geometry and
+    batch tier of a graphed decoder; each served geometry and population of a
+    graphed encoder, except the cells a CHUNK bucket owns; each CHUNK cell."""
+    overrides = env.overrides
+    count = 0
+    if overrides.get("decode_dispatch_arm") == "dense-graphed":
+        count += len(env.served_geometries) * len(batch_tiers(env.max_num_seqs))
+    if overrides.get("encoder_execution_arm") in ("dense-graphed", "eager-graphed"):
+        cells = {
+            (g, n)
+            for g in env.served_geometries
+            for n in range(1, env.max_num_seqs + 1)
+        }
+        count += len(cells - set(env.chunk_cells))
+    return count + len(env.chunk_cells)
 
 
 @pytest.fixture
@@ -102,16 +133,6 @@ def build(monkeypatch, tmp_path):
     nothing."""
 
     def make(arm="eager", legacy="all", overrides=None, **config):
-        from vllm_nemotron_asr_streaming.nemotron_asr.chunk_bucket_graph import (
-            ExactChunkGraphBinding,
-        )
-        from vllm_nemotron_asr_streaming.nemotron_asr.decode_graph import (
-            DenseGraphBinding,
-        )
-        from vllm_nemotron_asr_streaming.nemotron_asr.encoder_execution import (
-            ResolvedEncoderExecution,
-        )
-
         h.spec_without_state_name(monkeypatch)
         if legacy is not None:
             h.legacy_state_api(
@@ -123,9 +144,6 @@ def build(monkeypatch, tmp_path):
         profile = h.ProfileSpy(events).install(monkeypatch)
         advance = h.AdvanceSpy(events).install(monkeypatch)
         graphs = h.FakeGraphRuntime(events).install(monkeypatch)
-        _log_reads(monkeypatch, events, ResolvedEncoderExecution, "ready", "encoder")
-        _log_reads(monkeypatch, events, DenseGraphBinding, "captured_keys", "decoder")
-        _log_reads(monkeypatch, events, ExactChunkGraphBinding, "ready", "chunk")
         arm_overrides, right_context, max_num_seqs = ARMS[arm]
         merged = dict(arm_overrides) | dict(overrides or {})
         settings = {"right_context": right_context, "max_num_seqs": max_num_seqs}
@@ -148,8 +166,12 @@ def build(monkeypatch, tmp_path):
             graphs=graphs,
             max_num_seqs=settings["max_num_seqs"],
             max_geometry=geometry_of(max(served)),
+            served_geometries=sorted(geometry_of(r) for r in served),
+            overrides=merged,
             chunk_cells=[
-                (1, n) for n in merged.get("chunk_bucket_graph_populations", [])
+                (geometry_of(r), n)
+                for r in served
+                for n in merged.get("chunk_bucket_graph_populations", [])
             ],
         )
 
@@ -334,76 +356,93 @@ def test_dummy_inputs_embeds_is_called_as_core_calls_it_on_warm_up(build):
 # ===========================================================================
 
 
-def recorded(state) -> tuple[bool, bool]:
-    """The model state's record of the current step: ``(dummy_run,
-    is_profile)`` (current attribute names ``_dummy_run`` / ``_is_profile``)."""
-    return bool(state._dummy_run), bool(state._is_profile)
+def is_profiling_record(state) -> bool:
+    """Whether the model state classifies the current step as a profiling
+    dummy step. There is no public accessor; this reads the model state's
+    record (seam: today's ``_dummy_run`` and ``_is_profile``)."""
+    return bool(state._dummy_run) and bool(state._is_profile)
 
 
-# @spec REG-MEM-001
-def test_prepare_step_records_whether_the_step_is_a_profiling_dummy_step(build):
+COMBINATIONS = [(True, True), (True, False), (False, False), (False, True)]
+
+
+def _prepare(env, dummy_run: bool, is_profile: bool):
     from vllm.v1.core.sched.output import SchedulerOutput
 
+    output = SchedulerOutput.make_empty() if dummy_run else h.scheduler_output()
+    return h.call_with(
+        env.state.prepare_step, output, dummy_run=dummy_run, is_profile=is_profile
+    )
+
+
+@pytest.mark.parametrize("earlier", [None, (True, True)], ids=["fresh", "after"])
+@pytest.mark.parametrize("dummy_run,is_profile", COMBINATIONS)
+# @spec REG-MEM-001
+def test_prepare_step_records_whether_the_step_is_a_profiling_dummy_step(
+    build, earlier, dummy_run, is_profile
+):
+    """Every combination is recorded, and replaces an earlier profiling
+    record; only ``dummy_run`` and ``is_profile`` both true is profiling."""
     env = build()
     pool(env)
-    state = env.state
-    state.prepare_step(SchedulerOutput.make_empty(), dummy_run=True, is_profile=True)
-    assert recorded(state) == (True, True)
-    state.prepare_step(SchedulerOutput.make_empty(), dummy_run=True, is_profile=False)
-    assert recorded(state) == (True, False), "the profiling record was not replaced"
-    state.prepare_step(SchedulerOutput.make_empty(), dummy_run=True, is_profile=True)
-    state.prepare_step(
-        h.scheduler_output(finished=(), cleanup={}), dummy_run=False, is_profile=False
-    )
-    assert recorded(state) == (False, False), "a real step kept the profiling record"
+    if earlier is not None:
+        assert _prepare(env, *earlier) is None
+        assert is_profiling_record(env.state)
+    error = _prepare(env, dummy_run, is_profile)
+    assert error is None, repr(error)
+    assert is_profiling_record(env.state) is (dummy_run and is_profile)
     assert env.profile.calls == [] and env.graphs.captures == []
 
 
 @pytest.mark.parametrize("arm", list(ARMS))
 # @spec REG-MEM-002
 def test_first_profiling_forward_prepares_in_order_at_maximum_shape(build, arm):
+    """Warm-up and capture of the whole configured inventory, then every
+    required profile (maximum shape and each CHUNK cell) with every expected
+    graph retained, then the dummy output."""
     env = build(arm=arm)
-    retained = []
-    env.profile.before = lambda kw: retained.append(
-        (len(env.graphs.captured()), len(env.graphs.captures))
-    )
+    expected = expected_entries(env)
+    retained = {}
+    env.profile.before = lambda kw: retained.setdefault(
+        (kw.get("num_rows"), kw.get("geometry_id")), []
+    ).append(len(env.graphs.captured()))
     _, output, embeds = env.runner.profile_run(core_embeds=False)
     env.events.append(("returned", None))
     assert_dummy_output(output, embeds)
+    assert len(env.graphs.captures) == expected, (len(env.graphs.captures), expected)
+    assert len(env.graphs.captured()) == expected
     kinds = env.events.kinds()
-    assert max_shapes(env) <= profiled_shapes(env), env.profile.calls
     last_capture = max((i for i, k in enumerate(kinds) if k == "capture"), default=-1)
-    readiness = [i for i, k in enumerate(kinds) if k == "ready" and i > last_capture]
-    assert readiness, "no readiness check after warm-up and capture"
-    final = [
-        i
-        for i, (k, info) in enumerate(env.events)
-        if k == "profile"
-        and (info.get("num_rows"), info.get("geometry_id")) in max_shapes(env)
-        and i > readiness[0]
-    ]
-    assert final, "no maximum-shape profile transaction after the readiness check"
-    assert final[-1] < kinds.index("returned")
-    if arm in GRAPHED:
-        assert env.graphs.captured(), "graphed arm captured nothing"
-        assert all(have == tried for have, tried in retained[-len(final) :]), (
-            "a captured graph was not retained during the profile transaction"
+    for shape in max_shapes(env):
+        after = [
+            i
+            for i, (k, info) in enumerate(env.events)
+            if k == "profile"
+            and (info.get("num_rows"), info.get("geometry_id")) == shape
+            and i > last_capture
+        ]
+        assert after, f"no profile at {shape} after warm-up and capture"
+        assert after[-1] < kinds.index("returned")
+        assert retained[shape][-1] == expected, (
+            f"profile at {shape} ran without every expected graph retained"
         )
 
 
 @pytest.mark.parametrize("arm", GRAPHED)
 # @spec REG-MEM-002
 def test_first_profiling_forward_refuses_an_entry_left_without_a_graph(build, arm):
-    """Each expected graph entry, in turn, is left without a graph in its
-    wrapper during capture; preparation must notice and fail."""
-    clean = build(arm=arm)
-    clean.runner.profile_run(core_embeds=False)
-    attempts = len(clean.graphs.captures)
-    assert attempts, "the first profiling step captured nothing (no preparation)"
-    for index in range(attempts):
+    """Each expected graph entry (counted from the configuration), in turn, is
+    left without a graph in its wrapper during capture; preparation fails."""
+    probe = build(arm=arm)
+    expected = expected_entries(probe)
+    assert expected > 0
+    for index in range(expected):
         env = build(arm=arm)
         env.graphs.skip_capture = index
         error = h.call_with(env.runner.profile_run, core_embeds=False)
+        assert len(env.graphs.captures) > index, (
+            f"capture {index} was never attempted (no preparation)"
+        )
         assert error is not None, f"preparation accepted entry {index} without a graph"
 
 
@@ -426,12 +465,8 @@ def test_later_profiling_steps_after_the_pool_exists_check_and_return(build, arm
     profiles, captures = len(env.profile.calls), len(env.graphs.captures)
     trap = trapped_pool(env)
     for _ in range(3):
-        before = len(env.events)
         batch, output, embeds = env.runner.profile_run(
             randomize_inputs=True, attn=True, core_embeds=False
-        )
-        assert "ready" in h.Events(env.events[before:]).kinds(), (
-            "a later profiling step did not verify readiness"
         )
         assert_dummy_output(output, embeds)
     assert len(env.profile.calls) == profiles, "a later profiling step profiled"
@@ -474,8 +509,11 @@ def test_later_profiling_step_refuses_an_inventory_that_is_no_longer_ready(
 
 
 def _inject(env, where: str) -> None:
+    """Fail preparation part-way: the second eager warm-up call, the second
+    capture, a capture that stores no graph (readiness), or the profile
+    transaction (after every capture)."""
     if where == "warm-up":
-        env.graphs.fail_eager = RuntimeError("warm-up failed")
+        env.graphs.fail_eager = 1
     elif where == "capture":
         env.graphs.fail_capture = 1
     elif where == "readiness":
@@ -484,26 +522,45 @@ def _inject(env, where: str) -> None:
         env.profile.fail = RuntimeError("profile transaction failed")
 
 
+def _reached(env, where: str) -> bool:
+    """The injection point was reached after demonstrable partial
+    preparation (something was already warmed or captured)."""
+    captures = len(env.graphs.captures)
+    if where == "warm-up":
+        return env.graphs.eager_calls >= 2 and captures >= 1
+    if where == "capture":
+        return captures >= 2
+    if where == "readiness":
+        return captures == expected_entries(env)
+    return bool(env.profile.calls) and captures == expected_entries(env)
+
+
+def _attempts(env) -> int:
+    return env.graphs.eager_calls + len(env.graphs.captures) + len(env.profile.calls)
+
+
+@pytest.mark.parametrize("arm", GRAPHED)
 @pytest.mark.parametrize("where", ["warm-up", "capture", "readiness", "profile"])
 # @spec REG-MEM-004
-def test_failed_preparation_discards_its_state_and_stays_failed(build, where):
-    env = build(arm="dense-graphed")
+def test_failed_preparation_discards_its_state_and_stays_failed(build, arm, where):
+    env = build(arm=arm)
     _inject(env, where)
     first = h.call_with(env.runner.profile_run, core_embeds=False)
+    assert _reached(env, where), f"the {where} injection point was not reached"
     assert first is not None, f"preparation passed despite a {where} failure"
-    attempted = len(env.graphs.captures) + len(env.profile.calls)
-    assert attempted, "the first profiling step attempted no preparation"
-    binding = env.model._decode_graph_binding
-    assert binding.captured_keys == (), "partial execution state was kept"
-    for attr in ("fail_eager", "fail_capture", "skip_capture"):
-        setattr(env.graphs, attr, None)
+    traceback.clear_frames(first.__traceback__)
+    del first
+    gc.collect()
+    assert env.graphs.live_graphs() == 0, (
+        "a graph of the failed preparation is still referenced"
+    )
+    env.graphs.fail_eager = env.graphs.fail_capture = env.graphs.skip_capture = None
     env.profile.fail = None
+    attempts = _attempts(env)
     for _ in range(2):
         later = h.call_with(env.runner.profile_run, core_embeds=False)
         assert later is not None, "a profiling step after a failure passed"
-    assert len(env.graphs.captures) + len(env.profile.calls) == attempted, (
-        "a failed worker prepared again"
-    )
+    assert _attempts(env) == attempts, "a failed worker prepared again"
 
 
 # @spec REG-MEM-004
@@ -765,7 +822,8 @@ def test_rows_are_bound_with_the_steps_order_and_scheduler_handles(build, kind):
     """Contract test, no shim: over a complete step the bindings are used only
     through ``bind_rows`` (and ``fail_requests``), rows only through
     ``component_pools`` and ``slot_indices_cpu``."""
-    env = build(legacy=None)
+    # three requests in the mixed case: three sequences
+    env = build(legacy=None, max_num_seqs=3)
     env.runner.profile_run(core_embeds=False)
     spy = pool(env)
     new = (
@@ -799,54 +857,57 @@ def test_pool_projection_uses_only_component_pools_and_the_models_spec(build, ki
 
 
 def _commit(env, kind: str, *, stale: bool):
-    """A complete step through the production commit path; with ``stale``,
-    core begins another step after the rows were bound and before the row
-    transaction runs, so the commit-time re-read is refused."""
+    """A complete step through the production commit path. The pool is
+    snapshotted inside the row transaction's entry (after core's
+    ``begin_step`` bound the slots, which zeroes and initializes new pages,
+    and before the transaction runs). With ``stale``, core then begins
+    another step, so the commit-time re-read is refused."""
     env.runner.profile_run(core_embeds=False)
     spy = pool(env)
     output = rows_of(env, kind)
     slots = [1, 2] if kind == "mixed" else [1 if kind == "stream" else 2]
-    before = h.pool_tensor(spy).clone()
-    reads = []
-    if stale:
+    seen: dict = {}
 
-        def make_stale(kwargs):
-            reads.append(len(spy.row_reads))
+    def before(kwargs):
+        seen["pool"] = h.pool_tensor(spy).clone()
+        seen["reads"] = len(spy.row_reads)
+        if stale:
             h.core_bindings(spy).begin_step(h.scheduler_output(step_seq=99), None)
 
-        env.advance.before = make_stale
+    env.advance.before = before
     error = h.call_with(env.runner.real_step, output)
-    return spy, before, slots, error, reads
+    return spy, seen, slots, error
 
 
 @pytest.mark.parametrize("kind", ["file", "stream", "mixed"])
 # @spec REG-STATE-004, REG-STATE-006
 def test_commit_writes_the_bound_slots(build, kind):
-    """Control: a live step commits state into exactly its bound slots."""
+    """Control: a live step commits state into each bound slot and no other."""
     env = build(legacy="rows")
-    spy, before, slots, error, _ = _commit(env, kind, stale=False)
+    spy, seen, slots, error = _commit(env, kind, stale=False)
     assert error is None, repr(error)
-    after = h.pool_tensor(spy)
+    assert "pool" in seen, "the row transaction did not run"
+    before, after = seen["pool"], h.pool_tensor(spy)
     page = h.model_spec(env.model).page_size_bytes
     for slot in range(len(after) // page):
         changed = not torch.equal(
             before[slot * page : (slot + 1) * page],
             after[slot * page : (slot + 1) * page],
         )
-        assert changed is (slot in slots), f"slot {slot}"
+        assert changed is (slot in slots), f"slot {slot}: written={changed}"
 
 
 @pytest.mark.parametrize("kind", ["file", "stream", "mixed"])
 # @spec REG-STATE-004, REG-STATE-006
 def test_stale_commit_rereads_the_pools_and_writes_nothing(build, kind):
     env = build(legacy="rows")
-    spy, before, _, error, reads = _commit(env, kind, stale=True)
-    assert reads, "the row transaction did not run"
-    assert "component_pools" in spy.row_reads[reads[0] :], (
+    spy, seen, _, error = _commit(env, kind, stale=True)
+    assert "pool" in seen, "the row transaction did not run"
+    assert "component_pools" in spy.row_reads[seen["reads"] :], (
         "the commit did not re-read component_pools"
     )
     assert isinstance(error, ValueError) and STALE in str(error), repr(error)
-    assert torch.equal(before, h.pool_tensor(spy)), "a stale commit wrote state"
+    assert torch.equal(seen["pool"], h.pool_tensor(spy)), "a stale commit wrote state"
 
 
 # @spec REG-STATE-006
@@ -930,21 +991,80 @@ def test_graph_runtime_uses_cores_capture_context_forward_context_and_wrapper(
 # ===========================================================================
 
 
+def _prepare_graphed(env) -> None:
+    """Prepare through the first profiling step. While the model does not yet
+    prepare there (REG-MEM-002), call its current preparation directly
+    (seam: ``prepare_execution_memory``), so REG-MEM-006 is tested on its own."""
+    env.runner.profile_run(core_embeds=False)
+    if not env.graphs.captured():
+        env.model.prepare_execution_memory()
+
+
+def _frames(error) -> list[str]:
+    return [f.f_code.co_qualname for f, _ in traceback.walk_tb(error.__traceback__)]
+
+
+# @spec REG-MEM-006
+def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph_cpu(build):
+    """CPU, ``FakeGraphRuntime``: after a good real step that replayed a graph,
+    the entry it replayed loses its graph; the next step that needs it is
+    refused by the model before replaying or capturing, and writes no state."""
+    env = build(arm="dense-graphed")
+    _prepare_graphed(env)
+    spy = pool(env)
+    unit0 = h.scheduler_output(new=(stream(env, "s1"),), handles={"s1": 1})
+    env.runner.real_step(unit0)
+    assert env.graphs.replays, "the prepared step replayed no graph"
+    wrapper_ref, descriptor = env.graphs.replays[-1]
+    entry = wrapper_ref().concrete_cudagraph_entries[descriptor]
+    entry.cudagraph = None
+    captures = len(env.graphs.captures)
+    replays = len(env.graphs.replays)
+    before = h.pool_tensor(spy).clone()
+    unit1 = h.scheduler_output(
+        new=(stream(env, "s1", sequence=1),), handles={"s1": 1}, step_seq=2
+    )
+    error = h.call_with(env.runner.real_step, unit1)
+    assert error is not None, "the step ran without its graph"
+    assert len(env.graphs.captures) == captures, "serving attempted a capture"
+    assert len(env.graphs.replays) == replays, "serving replayed a graph"
+    assert entry.cudagraph is None
+    assert "FakeGraphWrapper.__call__" not in _frames(error), (
+        "the refusal did not come before the wrapper was invoked"
+    )
+    assert torch.equal(before, h.pool_tensor(spy)), "the refused step wrote state"
+
+
 @pytest.mark.gpu
 # @spec REG-MEM-002, REG-MEM-006
 def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
     monkeypatch, tmp_path
 ):
-    """On CUDA with the dense-graphed decoder and core's own graph runtime:
-    preparation captures every entry; a prepared serving step succeeds; then
-    exactly the entry the next step needs loses its graph, and that step is
-    refused before the row transaction runs and without capturing.
+    """CUDA, core's own graph runtime and static graph wrapper. Preparation
+    captures; a prepared serving step replays; the entry it replayed loses its
+    graph; the next step is refused before the wrapper is invoked, with zero
+    capture attempts across all wrappers and no state write.
 
-    The refusal is the model's own check, so the error must not be one of
-    the generic failures an unguarded replay or lookup would raise."""
+    Seam: the replayed entry is found by instrumenting core's
+    ``CUDAGraphWrapper.__call__`` (no model-internal attribute is read)."""
+    from vllm.compilation.cuda_graph import CUDAGraphWrapper
+    from vllm.forward_context import get_forward_context
+
     h.spec_without_state_name(monkeypatch)
     h.legacy_state_api(monkeypatch)
-    advance = h.AdvanceSpy().install(monkeypatch)
+    calls: list = []
+    original = CUDAGraphWrapper.__call__
+
+    def instrumented(self, *args, **kwargs):
+        context = get_forward_context()
+        descriptor = context.batch_descriptor
+        entry = self.concrete_cudagraph_entries.get(descriptor)
+        capturing = entry is None or entry.cudagraph is None
+        if context.cudagraph_runtime_mode == self.runtime_mode:
+            calls.append((self, descriptor, "capture" if capturing else "replay"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CUDAGraphWrapper, "__call__", instrumented)
     card = h.write_runnable_card(tmp_path / "card")
     vllm_config = h.build_vllm_config(
         card,
@@ -958,13 +1078,8 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
     state = h.build_model_state(vllm_config, model)
     runner = h.Runner(vllm_config, model, state)
     runner.profile_run(core_embeds=False)
-    binding = model._decode_graph_binding
-    entries = list(binding._entries.values())
-    assert entries and all(
-        e.wrapper.concrete_cudagraph_entries[e.descriptor].cudagraph is not None
-        for e in entries
-    )
-    runner.bind_pool(h.real_bindings(h.model_spec(model), device="cuda"))
+    assert any(kind == "capture" for _, _, kind in calls), "nothing was captured"
+    bindings = runner.bind_pool(h.real_bindings(h.model_spec(model), device="cuda"))
 
     def unit(sequence):
         return h.new_request(
@@ -974,20 +1089,18 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
         )
 
     runner.real_step(h.scheduler_output(new=(unit(0),), handles={"s1": 1}))
-    executed = len(advance.calls)
-    assert executed, "the prepared serving step did not run"
-    target = next(e for e in entries if e.tier == 1 and e.geometry == 3)
-    wrapper_entry = target.wrapper.concrete_cudagraph_entries[target.descriptor]
-    wrapper_entry.cudagraph = None
-    before = dict(target.wrapper.concrete_cudagraph_entries)
+    replayed = [(w, d) for w, d, kind in calls if kind == "replay"]
+    assert replayed, "the prepared serving step replayed no graph"
+    wrapper, descriptor = replayed[-1]
+    wrapper.concrete_cudagraph_entries[descriptor].cudagraph = None
+    attempts = len(calls)
+    before = h.pool_tensor(bindings).clone()
     error = h.call_with(
         runner.real_step,
         h.scheduler_output(new=(unit(1),), handles={"s1": 1}, step_seq=2),
     )
     assert error is not None, "the step ran without its graph"
-    assert not isinstance(error, (AttributeError, TypeError, KeyError, IndexError)), (
-        repr(error)
-    )
-    assert len(advance.calls) == executed, "the row transaction ran"
-    assert wrapper_entry.cudagraph is None, "serving captured a graph"
-    assert dict(target.wrapper.concrete_cudagraph_entries) == before
+    assert len(calls) == attempts, "a wrapper was invoked (capture or replay)"
+    assert "instrumented" not in _frames(error)
+    assert wrapper.concrete_cudagraph_entries[descriptor].cudagraph is None
+    assert torch.equal(before, h.pool_tensor(bindings)), "the refused step wrote state"
