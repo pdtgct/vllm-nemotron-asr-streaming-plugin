@@ -261,6 +261,16 @@ memory, so the model prepares its execution on core's profiling step:
   Model Runner V1), so the model's graph runtime has none; capture legality is the model's own
   ordering above.
 
+## Model-state interface
+
+Every `ModelState` method the model state overrides keeps the base signature at the target heads,
+because core's model runner calls them positionally; a test binds each override against the base
+signature. In particular the profiling path reaches the forward through
+`dummy_inputs_embeds(num_tokens, input_ids=None)`. The model state returns its pre-allocated
+embeddings buffer sliced to `num_tokens` in both cases: when core passes randomized `input_ids`
+the contents stay unused, because the model's dummy forward reads no embedding values and returns
+the dummy output.
+
 ## State-slot access
 
 - `prepare_step` reads only the scheduler output, including its state-slot handles; the bindings
