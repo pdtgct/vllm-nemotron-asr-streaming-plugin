@@ -38,7 +38,10 @@ Seams the doubles rely on (call-time lookups in the plugin):
 
 * ``profile_execution.run_persistent_state_profile`` (``ProfileSpy`` wraps it
   and calls through, and the tests read its ``num_rows`` and ``geometry_id``
-  keyword arguments to identify the transaction's shape);
+  keyword arguments to identify the transaction's shape, and its
+  ``ready_domain=True`` keyword to tell the final, readiness-gated profile
+  transaction from a warm-up invocation; see ``is_final`` in
+  ``tests/registration/test_execution_memory.py``);
 * ``advance.advance_model_rows`` (``AdvanceSpy`` wraps it and calls through);
 * ``decode_graph.platform_graph_runtime``, also bound by name in
   ``chunk_bucket_graph`` and ``encoder_execution`` (``FakeGraphRuntime``
