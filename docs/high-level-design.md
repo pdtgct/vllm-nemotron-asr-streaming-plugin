@@ -10,9 +10,11 @@ vLLM only as whole files, bounded by the encoder's position limit and `max_model
 live streams.
 
 Two proposals to vLLM core supply the missing pieces:
-- **RFC 1** ([vllm#65543](https://github.com/vllm-project/vllm/issues/65543), draft PR
-  [#65544](https://github.com/vllm-project/vllm/pull/65544)): a scheduler-owned persistent-state
-  primitive, with one state slot per request and resumable stream admission on `AsyncLLM`.
+- **RFC 1** ([vllm#65543](https://github.com/vllm-project/vllm/issues/65543)): a scheduler-owned
+  persistent-state primitive with one state slot per request
+  ([vllm#67374](https://github.com/vllm-project/vllm/pull/67374)), and resumable stream admission
+  on `AsyncLLM` ([vllm#67375](https://github.com/vllm-project/vllm/pull/67375), stacked on
+  #67374). The two PRs supersede the earlier single draft PR #65544.
 - **RFC 2** ([vllm#65545](https://github.com/vllm-project/vllm/issues/65545), draft PR
   [#65546](https://github.com/vllm-project/vllm/pull/65546)): lifecycle hooks for endpoint plugins,
   so a protocol frontend such as a Riva-compatible gRPC API can run inside `vllm serve`.
@@ -135,11 +137,23 @@ the leaf designs cite them where they depend on them.
 
 ### Constraints
 
-- **Engine.** The target engine is `rfc12-integration-v2`: a merge of RFC 1
-  (`persistent-state-primitive-v2` @ `574efbd8f6`) and RFC 2 (`endpoint-plugin-lifecycle` @
-  `6b1ce05706`) on `pdtgct/vllm`. The README records the integration commit each acceptance tier
-  was actually met on, and claims only the tiers met. Python `>=3.11,<3.15`. Synchronous scheduling, no prefix caching and eager execution
-  of the outer runner are required, and the plugin refuses to start otherwise.
+- **Engine.** The plugin targets the model API of the RFC 1 PRs #67374 and #67375 and no
+  earlier RFC 1 head; core keeps no compatibility interfaces for the superseded #65544 API. Two
+  builds of upstream vLLM `main` are targets:
+  - **Stage 1, the model alone** on core's `/v1/realtime` and `/v1/audio/transcriptions`:
+    #67374, #67375, and the speech-to-text PRs #67144 and #67151 (Whole-file serving, below).
+  - **Stage 2, with a frontend:** stage 1 plus RFC 2, #65546 and #67294.
+
+  The README records the commits each acceptance tier was actually met on, and claims only the
+  tiers met. Python `>=3.11,<3.15`. Synchronous scheduling, no prefix caching and eager execution
+  of the outer runner are required. An unset `async_scheduling` is accepted, because core resolves
+  it to off for a model that declares persistent state; the plugin refuses to start when any of
+  these is explicitly requested otherwise.
+- **Model-owned execution memory.** The model's own captured encoder and decoder graphs and
+  their buffers must exist before core sizes state slots and the KV cache, so that core's memory
+  profile counts them. The RFC 1 PRs provide no hook dedicated to this; the `registration` design
+  settles where in the model's lifecycle they are created, using only the permitted model-adapter
+  dependencies.
 - **Engine surface.** Session operations use only `AsyncLLM` / `EngineClient` public and
   RFC-proposed calls, never `engine_core` or scheduler internals. The model adapter's own
   dependencies (model-state interface, state-slot bindings, scheduler output types) are an
@@ -161,22 +175,21 @@ the leaf designs cite them where they depend on them.
   A stream that ends any other way fails. A whole file whose request ends with `length` because
   it reached `max_model_len`, or with `error` or `abort` (for example a preempted slot), can still
   return partial text with HTTP 200 through core's transcription serving until core reports those
-  endings as errors. That is part (b) of the small upstream core change (below), which reports a
-  server-caused `length`, `error` or `abort` as an error (non-streaming: an error response;
-  streaming: a terminal error event); this plugin does not depend on it.
+  endings as errors. #67144 reports an `error` or `abort` ending as an error (non-streaming: an
+  error response; streaming: a terminal error event); a `length` ending still returns partial
+  text with HTTP 200, so the operator sizes `max_model_len` for the longest file served. This
+  plugin depends on neither behaviour.
 - **Whole-file serving is self-contained on core's route, once core carries two request fields.**
   The model imposes no file-size limit; core's upload and decode settings belong to the operator.
   The model refuses beam search and any client completion limit as options that do not apply to
   audio transcription, from `use_beam_search` and `max_completion_tokens` on
-  `SpeechToTextParams` (Request guards). No core has those fields yet
-  (`vllm/config/speech_to_text.py:17-54`); a small separate upstream core change is settled, and
-  until it lands the guards are inactive and the README states the limits. The model drops its worst-case
-  admission check: the only length bound is core's actual-token `max_model_len` stop, which the
-  operator sizes, and the same core pull request makes a server-caused `length`, `error` or `abort` ending an
-  error on the transcription routes; on a core without that part a file that ends with a
-  server-caused `length` returns partial text with HTTP 200. On a core without part (a), beam search
-  issues up to `n × max_model_len` engine requests (one per beam per pass) per upload, so the route is not to be exposed to
-  untrusted clients until (a) lands. The model also refuses to
+  `SpeechToTextParams` (Request guards). #67151 adds those fields and is part of the stage 1
+  build; on a core without them the guards are inactive and the README states the limits. The
+  model drops its worst-case admission check: the only length bound is core's actual-token
+  `max_model_len` stop, which the operator sizes; a file that reaches it ends with `length` and
+  returns partial text with HTTP 200 (Completeness). On a core without #67151, beam search
+  issues up to `n × max_model_len` engine requests (one per beam per pass) per upload, so the
+  route is not to be exposed to untrusted clients on such a core. The model also refuses to
   start under a generation-config token limit or foreign EOS. Without a frontend, `max_num_seqs`
   bounds the files actively scheduled, not uploads: queued requests hold their decoded audio in
   the API server with no bound.
@@ -192,6 +205,7 @@ the leaf designs cite them where they depend on them.
 | Architecture key | `Nemotron3_5AsrStreamingForRNNT`, selected through a registered config parser; the Hub card's `Nemotron3_5AsrForRNNT` stays the offline plugin's key | Register the card's key: zero-configuration serving, but it would override the offline plugin when both are installed and remove whole-file service from released-vLLM users. Consolidation onto one key is planned with the offline plugin's author (below) |
 | Relationship to the offline plugin | Independent package now; planned merge with the offline plugin into one package under the card's key, choosing the implementation at startup by whether the engine provides the RFC 1 primitive | Replace the offline implementation outright: breaks released-vLLM users until RFC 1 ships. Keep two packages permanently: users must choose between two packages for one model |
 | Complete files | This model's own stateful path (`SupportsTranscription`), at most one chunk per step | A full-file forward pass: stalls the batch and is bounded by encoder positions. Delegating files to the offline plugin: a second implementation on the same server and the same ~400 s bound |
+| Core API | Only the model API of #67374 and #67375 (Pete, 2026-11-12); the plugin adapts to it | Ask core for compatibility interfaces with #65544's API: core would carry API that no proposal needs. Support both APIs in the plugin: two code paths for one model, and #65544 is superseded |
 | Frontend coupling | Structural protocol plus an entry-point group owned by the frontend; neither package imports the other | A shared interface package: a third release to coordinate for a small protocol |
 
 ### Same model, two implementations
@@ -235,8 +249,9 @@ that outlives its request's release; more files actively scheduled than `max_num
 
 ## References
 
-- RFC 1: [vllm#65543](https://github.com/vllm-project/vllm/issues/65543), PR [#65544](https://github.com/vllm-project/vllm/pull/65544)
-- RFC 2: [vllm#65545](https://github.com/vllm-project/vllm/issues/65545), PR [#65546](https://github.com/vllm-project/vllm/pull/65546)
+- RFC 1: [vllm#65543](https://github.com/vllm-project/vllm/issues/65543), PRs [#67374](https://github.com/vllm-project/vllm/pull/67374) (state lifetime) and [#67375](https://github.com/vllm-project/vllm/pull/67375) (stream admission); superseded draft [#65544](https://github.com/vllm-project/vllm/pull/65544)
+- Speech-to-text core PRs: [#67144](https://github.com/vllm-project/vllm/pull/67144) (fail `error` and `abort` endings), [#67151](https://github.com/vllm-project/vllm/pull/67151) (request fields)
+- RFC 2: [vllm#65545](https://github.com/vllm-project/vllm/issues/65545), PRs [#65546](https://github.com/vllm-project/vllm/pull/65546) and [#67294](https://github.com/vllm-project/vllm/pull/67294) (readiness and draining)
 - Model card: [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
 - Offline plugin: [Sohaib-Ahmed21/vllm-nemotron-asr-plugin](https://github.com/Sohaib-Ahmed21/vllm-nemotron-asr-plugin); its vLLM PR [vllm#59827](https://github.com/vllm-project/vllm/pull/59827)
 - Frontend: [pdtgct/vllm-riva-frontend](https://github.com/pdtgct/vllm-riva-frontend)
