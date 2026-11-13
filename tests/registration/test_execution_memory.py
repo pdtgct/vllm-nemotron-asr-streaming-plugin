@@ -248,6 +248,32 @@ def profiled_shapes(env, calls=None) -> set[tuple[int, int]]:
     }
 
 
+def shape_of(kwargs) -> tuple:
+    return (kwargs.get("num_rows"), kwargs.get("geometry_id"))
+
+
+def is_final(kwargs) -> bool:
+    """Whether a call of the profile function is the final, readiness-gated
+    profile transaction rather than a warm-up invocation. Seam: the
+    preparation path passes ``ready_domain=True`` to
+    ``run_persistent_state_profile`` for the final transaction (which then
+    runs against the sealed, ready inventory: ``profile_ready_cell``), while
+    warm-up (``warmup_static_encoder_execution``) and the retired
+    forward-time profile do not."""
+    return bool(kwargs.get("ready_domain"))
+
+
+def skip_evidence(env) -> bool:
+    """A selected entry was left without a graph: recorded at skip time, and
+    its wrapper is either gone (discarded) or still holds no graph."""
+    graphs = env.graphs
+    return (
+        graphs.skipped is not None
+        and graphs.skip_stored_nothing
+        and graphs.skipped_entry_has_graph() is not True
+    )
+
+
 def assert_bindings_valid(spy, output, since: int = 0):
     """Every ``bind_rows`` call of the step (from index ``since``) names the
     model's layer, requests of this step in the step's order, and their
@@ -406,10 +432,13 @@ def test_first_profiling_forward_prepares_in_order_at_maximum_shape(build, arm):
     graph retained, then the dummy output."""
     env = build(arm=arm)
     expected = expected_entries(env)
-    retained = {}
-    env.profile.before = lambda kw: retained.setdefault(
-        (kw.get("num_rows"), kw.get("geometry_id")), []
-    ).append(len(env.graphs.captured()))
+    retained: dict[tuple, list[int]] = {}
+
+    def record(kwargs):
+        if is_final(kwargs):
+            retained.setdefault(shape_of(kwargs), []).append(len(env.graphs.captured()))
+
+    env.profile.before = record
     _, output, embeds = env.runner.profile_run(core_embeds=False)
     env.events.append(("returned", None))
     assert_dummy_output(output, embeds)
@@ -418,33 +447,25 @@ def test_first_profiling_forward_prepares_in_order_at_maximum_shape(build, arm):
     kinds = env.events.kinds()
     last_capture = max((i for i, k in enumerate(kinds) if k == "capture"), default=-1)
     returned = kinds.index("returned")
-    # Each required profile (maximum shape and each CHUNK cell) runs after the
-    # last capture, with every expected graph retained, before the return.
-    # Executions at those shapes before the first capture are warm-up (the
-    # first step of REG-MEM-002, which warms before it captures); the spec
-    # does not forbid warming at the shapes it later profiles, so they are
-    # allowed. A required-shape call between captures is neither warm-up nor
-    # the profile transaction and is forbidden.
-    first_capture = kinds.index("capture") if "capture" in kinds else returned
-    seen_after: dict[tuple, int] = {}
-    profiles = [
-        (i, (info.get("num_rows"), info.get("geometry_id")))
+    # Warm-up invocations of the profile function may run anywhere. Every
+    # final transaction runs after capture is complete (the last capture),
+    # with every expected graph retained, at a required shape, and each
+    # required shape has one; none runs before capture is complete.
+    finals = [
+        (i, shape_of(info))
         for i, (k, info) in enumerate(env.events)
-        if k == "profile"
+        if k == "profile" and is_final(info)
     ]
-    for index, shape in profiles:
-        if shape not in max_shapes(env):
-            continue
-        assert index < first_capture or index > last_capture, (
-            f"a profile at {shape} ran while capture was incomplete"
+    for index, shape in finals:
+        assert index > last_capture, (
+            f"a final profile transaction at {shape} ran before capture completed"
         )
-        if index > last_capture:
-            seen_after[shape] = index
-    for shape in max_shapes(env):
-        assert shape in seen_after, f"no profile at {shape} after capture"
-        assert seen_after[shape] < returned
-        assert retained[shape][-1] == expected, (
-            f"profile at {shape} ran without every expected graph retained"
+        assert index < returned
+        assert shape in max_shapes(env), f"a final transaction at {shape}"
+    assert {shape for _, shape in finals} == max_shapes(env), finals
+    for shape, counts in retained.items():
+        assert all(n == expected for n in counts), (
+            f"a final transaction at {shape} ran without every expected graph"
         )
 
 
@@ -460,19 +481,17 @@ def test_first_profiling_forward_refuses_an_entry_left_without_a_graph(build, ar
         env = build(arm=arm)
         env.graphs.skip_capture = index
         error = h.call_with(env.runner.profile_run, core_embeds=False)
-        kinds = env.events.kinds()
         assert len(env.graphs.captures) > index, (
             f"capture {index} was never attempted (no preparation)"
         )
-        assert env.graphs.skipped_entry_has_graph() is False
+        assert skip_evidence(env), f"entry {index} was not left without a graph"
         assert error is not None, f"preparation accepted entry {index} without a graph"
-        # Readiness precedes the profile transaction, so no profile runs once
-        # capture has begun (warm-up executions before the first capture are
-        # allowed: they are not the profile transaction).
-        first_capture = kinds.index("capture")
-        assert "profile" not in kinds[first_capture:], (
-            f"a profile ran although entry {index} had no graph"
-        )
+        # Readiness gates the final transaction (the ordering rule above): no
+        # final transaction may run with an entry missing. Warm-up
+        # invocations are allowed.
+        assert not [
+            info for k, info in env.events if k == "profile" and is_final(info)
+        ], f"a final profile transaction ran although entry {index} had no graph"
 
 
 # @spec REG-MEM-002, REG-MEM-011
@@ -541,7 +560,8 @@ def _inject(env, where: str) -> None:
     """Fail preparation part-way, by condition rather than position: the first
     eager warm-up made after one has completed; the first capture made after
     one has completed; a selected entry that never holds a graph (readiness);
-    the first required profile made once every expected graph is captured."""
+    the first final profile transaction made once every expected graph is
+    captured."""
     if where == "warm-up":
         env.graphs.fail_eager_after = 1
     elif where == "capture":
@@ -552,10 +572,9 @@ def _inject(env, where: str) -> None:
         expected = expected_entries(env)
 
         def fail(kwargs):
-            shape = (kwargs.get("num_rows"), kwargs.get("geometry_id"))
             if (
                 not env.profile_failed
-                and shape in max_shapes(env)
+                and is_final(kwargs)
                 and len(env.graphs.captured()) >= expected
             ):
                 env.profile_failed = True
@@ -574,10 +593,7 @@ def _reached(env, where: str) -> bool:
     if where == "capture":
         return graphs.failed_capture is not None and graphs.captures_completed >= 1
     if where == "readiness":
-        return (
-            len(graphs.captures) >= expected_entries(env)
-            and graphs.skipped_entry_has_graph() is False
-        )
+        return graphs.captures_completed >= 1 and skip_evidence(env)
     return env.profile_failed
 
 
@@ -586,13 +602,17 @@ def _attempts(env) -> int:
 
 
 def _release(error: BaseException | None) -> None:
-    """Clear the frames of an exception and its whole cause/context chain."""
-    seen = set()
-    while error is not None and id(error) not in seen:
-        seen.add(id(error))
-        traceback.clear_frames(error.__traceback__)
-        error.__traceback__ = None
-        error = error.__cause__ or error.__context__
+    """Clear every traceback reachable from an exception through both
+    ``__cause__`` and ``__context__``."""
+    stack, seen = [error], set()
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        current.__traceback__ = None
+        stack.extend((current.__cause__, current.__context__))
 
 
 @pytest.mark.parametrize("arm", GRAPHED)
@@ -651,7 +671,8 @@ def test_preparation_reads_no_state_slot_bindings_or_pool(build, arm):
     trap = trapped_pool(env)
     pool_bytes = trap._target.views[h.STATE_LAYER]._tensor.clone()
     env.runner.profile_run(core_embeds=False)
-    assert max_shapes(env) <= profiled_shapes(env)
+    finals = [c for c in env.profile.calls if is_final(c)]
+    assert max_shapes(env) <= profiled_shapes(env, finals)
     assert trap.reads == []
     assert torch.equal(pool_bytes, trap._target.views[h.STATE_LAYER]._tensor)
 
@@ -682,6 +703,7 @@ def test_first_profiling_step_runs_no_forward_time_profile(build):
     env = build(max_num_seqs=3)
     env.runner.profile_run(num_tokens=1, core_embeds=False)
     assert profiled_shapes(env) == max_shapes(env), env.profile.calls
+    assert all(is_final(c) for c in env.profile.calls), env.profile.calls
 
 
 @pytest.mark.parametrize("prepared", [False, True], ids=["before", "after"])

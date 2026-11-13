@@ -457,6 +457,9 @@ class FakeGraphWrapper:
                 graph = FakeGraph()
                 runtime.graphs.append(weakref.ref(graph))
                 entry.cudagraph = graph
+            else:
+                # immutable evidence, independent of the wrapper's lifetime
+                runtime.skip_stored_nothing = True
             entry.output = output
             runtime.captures_completed += 1
             return output
@@ -483,6 +486,7 @@ class FakeGraphRuntime:
         self.skip_capture: int | None = None
         self.skipped: tuple[int, Any] | None = None
         self.skipped_ref: tuple[weakref.ref, Any] | None = None
+        self.skip_stored_nothing = False
         #: Fail the first capture attempted once ``fail_capture_after``
         #: captures have completed.
         self.fail_capture_after: int | None = None
