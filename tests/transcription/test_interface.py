@@ -92,6 +92,7 @@ def test_continuation_token_is_special_and_not_a_stop_token(card_dir):
     from vllm.entrypoints.speech_to_text.transcription.protocol import (
         TranscriptionRequest,
     )
+
     from vllm_nemotron_asr_streaming.tokenizer_mode import (
         NemotronAsrStreamingTokenizer,
     )

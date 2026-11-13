@@ -91,6 +91,7 @@ def with_geometry(prompt: Any, right_context: int, geometry: int, sequence: int)
     the session packer with the given ``chunk_sequence`` and the prompt's own
     locale row and carrier token."""
     from support.fake_engine import unit_of
+
     from vllm_nemotron_asr_streaming.session.packer import Packer
 
     template = unit_of(SimpleNamespace(prompt=prompt))

@@ -1,35 +1,65 @@
 # SPDX-License-Identifier: Apache-2.0
 """The real model and model state on CPU, driven as core's model runner drives
-them (``vllm/v1/worker/gpu/model_runner.py`` of the target core:
-``execute_model``, ``_dummy_run``, ``profile_run``, ``_dummy_sampler_run``).
+them at the stage 1 tree (``vllm/v1/worker/gpu/model_runner.py``:
+``execute_model``, ``_dummy_run``, ``profile_run``, ``_dummy_sampler_run``;
+``vllm/model_executor/warmup/kernel_warmup.py`` for later profiling steps).
 
-What is real: the configuration (card parser, post-override validation, the
-engine hook), the model class constructed without weights, its
-``ModelState``, core's ``EncoderCache`` / ``EncoderRunner``, core's
-``StateSlotBindings`` over a CPU pool, core's ``SchedulerOutput``,
-``NewRequestData``, ``InputBatch`` and ``StateSlotHandle``.
+Real: the configuration (card parser, post-override validation, the engine
+hook), the model class (constructed as core's loader does, frozen for
+inference, without loading weights), its ``ModelState``, core's
+``EncoderCache`` / ``EncoderRunner`` (so ``prepare_inputs_embeds`` runs the
+model's own multimodal embedding), core's ``StateSlotBindings`` over a CPU
+pool, ``SchedulerOutput``, ``NewRequestData``, ``InputBatch``,
+``StateSlotHandle``, ``set_forward_context`` and ``BatchDescriptor``, the
+profile transaction and the row transaction (scatter and commit included).
 
-What a test substitutes, and why:
+The card is ``write_runnable_card``: the synthetic card with an encoder wide
+enough (1024, two layers) for the streaming transition to run on CPU.
 
-* ``spec_without_state_name``: the model's state-layout builder still passes
-  the removed ``state_name`` argument (REG-STATE-001), which would stop model
-  construction before any other behaviour is reached. Tests of other specs
-  drop that argument; REG-STATE-001 is tested without it.
-* ``ProfileRecorder``: the profile transaction (``run_persistent_state_profile``)
-  cannot run the synthetic card's tiny encoder on CPU; tests record its calls
-  instead. It is the one plugin function the recorder replaces.
-* ``stub_advance``: the row transaction (``advance.advance_model_rows``) does
-  not run on CPU for the same reason; tests that run a real step past
-  readiness replace it with a stub returning a tensor like the input.
+Omissions from core's step, by design of a CPU harness:
+
+* Block tables, slot mappings and attention groups: the model declares no
+  attention layers, so ``prepare_attn`` receives empty tables and no groups,
+  and ``preprocess_state`` (a no-op for this model) receives none.
+* ``update_requests`` (cached-request bookkeeping in the runner's own
+  ``RequestState``), the LoRA, speculative, pooling, PP and KV-connector
+  branches, and core's ``Sampler`` (a GPU module): real steps call
+  ``compute_sample_logits`` but sample nothing; dummy sampling uses the
+  caller's recording sampler (``RecordingSampler``).
+* ``finish_step`` creates a CUDA event; on CPU it runs with an event double
+  (``_CpuEvent``), everything else in it is core's.
+* ``StepRequestStates`` stands in for the runner's ``RequestState``; the model
+  state reads only ``req_id_to_index``.
+
+Seams the doubles rely on (call-time lookups in the plugin):
+
+* ``profile_execution.run_persistent_state_profile`` (``ProfileSpy`` wraps it
+  and calls through);
+* ``advance.advance_model_rows`` (``AdvanceSpy`` wraps it and calls through);
+* ``decode_graph.platform_graph_runtime``, also bound by name in
+  ``chunk_bucket_graph`` and ``encoder_execution`` (``FakeGraphRuntime``
+  replaces it, since CPU cannot capture graphs).
+
+Migration-blocker isolation (each fixture is opt-in and scoped to a test):
+
+* ``spec_without_state_name``: drops the removed ``state_name`` argument the
+  layout builder still passes (REG-STATE-001), so model construction is
+  reachable.
+* ``legacy_state_api``: re-adds the removed ``StateSlotBindings.get_handle``,
+  ``StateSlotRows.spec`` / ``.views`` and ``StateSlotRows.validate_current``
+  on top of the target core's classes, each part separately, so a test of
+  another spec is not masked by REG-STATE-002..005.
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import numpy as np
 import torch
@@ -37,6 +67,24 @@ import torch
 #: The model's state layer name for ``prefix="nemotron"`` (``f"{prefix}.state"``).
 STATE_LAYER = "nemotron.state"
 EPOCH = "epoch-1"
+
+#: Encoder fields of the runnable synthetic card.
+RUNNABLE_ENCODER = {
+    "hidden_size": 1024,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 8,
+    "intermediate_size": 4096,
+}
+
+
+def write_runnable_card(path: Path) -> Path:
+    from support.card import card_config, write_card
+
+    config = card_config()
+    config["encoder_config"].update(RUNNABLE_ENCODER)
+    config["prompt_intermediate_size"] = 2 * RUNNABLE_ENCODER["hidden_size"]
+    return write_card(path, config=config)
 
 
 # ---------------------------------------------------------------------------
@@ -47,9 +95,10 @@ def build_vllm_config(
     card_dir: Path,
     *,
     right_context: int = 6,
-    max_num_seqs: int = 4,
+    max_num_seqs: int = 2,
     max_num_batched_tokens: int = 64,
     overrides: dict[str, Any] | None = None,
+    device: str = "cpu",
 ) -> Any:
     from vllm.config import (
         CacheConfig,
@@ -77,20 +126,19 @@ def build_vllm_config(
     )
     return VllmConfig(
         model_config=model_config,
-        device_config=DeviceConfig(device="cpu"),
+        device_config=DeviceConfig(device=device),
         cache_config=CacheConfig(enable_prefix_caching=False),
         scheduler_config=SchedulerConfig.default_factory(
             async_scheduling=False,
             max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_batched_tokens=max(max_num_batched_tokens, max_num_seqs),
             enable_chunked_prefill=True,
         ),
     )
 
 
 def spec_without_state_name(monkeypatch: Any) -> None:
-    """Let the model's state-layout builder construct on the target core
-    (see the module docstring)."""
+    """See the module docstring."""
     from vllm.v1.kv_cache_interface import PersistentStateSpec
 
     from vllm_nemotron_asr_streaming.nemotron_asr import state_profile
@@ -102,26 +150,66 @@ def spec_without_state_name(monkeypatch: Any) -> None:
     monkeypatch.setattr(state_profile, "PersistentStateSpec", build)
 
 
+def legacy_state_api(
+    monkeypatch: Any,
+    *,
+    get_handle: bool = True,
+    rows_layout: bool = True,
+    validate_current: bool = True,
+) -> None:
+    """See the module docstring. Each part is added only if the target core
+    lacks it."""
+    from vllm.v1.worker.gpu.state_slots import StateSlotBindings, StateSlotRows
+
+    if get_handle and not hasattr(StateSlotBindings, "get_handle"):
+
+        def _get_handle(self, request_id, layer):
+            if self._completion is None:
+                raise ValueError("No live state step is active")
+            return self._completion.handles[request_id][layer]
+
+        monkeypatch.setattr(StateSlotBindings, "get_handle", _get_handle, raising=False)
+    if rows_layout and not hasattr(StateSlotRows, "spec"):
+        monkeypatch.setattr(
+            StateSlotRows,
+            "spec",
+            property(lambda self: self._bindings.views[self.layer].spec),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            StateSlotRows,
+            "views",
+            property(lambda self: self.component_pools),
+            raising=False,
+        )
+    if validate_current and not hasattr(StateSlotRows, "validate_current"):
+        monkeypatch.setattr(
+            StateSlotRows,
+            "validate_current",
+            lambda self: self.component_pools and None,
+            raising=False,
+        )
+
+
 def build_model(vllm_config: Any) -> Any:
-    """The model class, constructed as core's loader does, without weights."""
     from vllm.config.vllm import set_current_vllm_config
 
     from vllm_nemotron_asr_streaming.model import Nemotron3_5AsrStreamingForRNNT
 
-    with set_current_vllm_config(vllm_config):
-        return Nemotron3_5AsrStreamingForRNNT(
+    device = torch.device(vllm_config.device_config.device)
+    with set_current_vllm_config(vllm_config), torch.device(device):
+        model = Nemotron3_5AsrStreamingForRNNT(
             vllm_config=vllm_config, prefix="nemotron"
         )
+    return model.to(device).requires_grad_(False).eval()
 
 
 def build_model_state(vllm_config: Any, model: Any) -> Any:
-    """The model's ``ModelState`` as core resolves and builds it, with an
-    encoder cache (the model is multimodal), so ``encoder_runner`` and its
-    pre-allocated ``inputs_embeds`` buffer exist."""
     from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 
+    device = torch.device(vllm_config.device_config.device)
     state_cls = type(model).get_model_state_cls()
-    return state_cls(vllm_config, model, EncoderCache(), torch.device("cpu"))
+    return state_cls(vllm_config, model, EncoderCache(), device)
 
 
 def model_spec(model: Any) -> Any:
@@ -130,46 +218,74 @@ def model_spec(model: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Recorders and traps
+# Spies, traps and fakes
 
 
-class ProfileRecorder:
-    """Stands in for the profile transaction; records each call."""
+class Events(list):
+    """An ordered event log shared by the spies."""
 
-    def __init__(self) -> None:
+    def kinds(self) -> list[str]:
+        return [e[0] for e in self]
+
+
+class ProfileSpy:
+    """Wraps the profile transaction; records each call and calls through.
+
+    ``fail`` makes the next call raise after recording; ``before`` is called
+    with the kwargs before the real transaction runs."""
+
+    def __init__(self, events: Events | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.events = events if events is not None else Events()
+        self.fail: BaseException | None = None
+        self.before: Callable[[dict[str, Any]], None] | None = None
+        self._real: Any = None
 
-    def __call__(self, model: Any, **kwargs: Any) -> torch.Tensor:
+    def __call__(self, model: Any, **kwargs: Any) -> Any:
         self.calls.append(dict(kwargs))
-        return torch.zeros(1)
+        self.events.append(("profile", kwargs))
+        if self.before is not None:
+            self.before(kwargs)
+        if self.fail is not None:
+            raise self.fail
+        return self._real(model, **kwargs)
 
-    def install(self, monkeypatch: Any) -> ProfileRecorder:
+    def install(self, monkeypatch: Any) -> ProfileSpy:
         from vllm_nemotron_asr_streaming.nemotron_asr import profile_execution
 
+        self._real = profile_execution.run_persistent_state_profile
         monkeypatch.setattr(profile_execution, "run_persistent_state_profile", self)
         return self
 
 
-def stub_advance(monkeypatch: Any) -> list[Any]:
-    """Replace the row transaction with a stub; return the list of calls."""
-    from vllm_nemotron_asr_streaming.nemotron_asr import advance
+class AdvanceSpy:
+    """Wraps the row transaction; records each call and calls through.
+    ``before(kwargs)`` runs first (e.g. to make the step stale)."""
 
-    calls: list[Any] = []
+    def __init__(self, events: Events | None = None) -> None:
+        self.calls: list[Any] = []
+        self.events = events if events is not None else Events()
+        self.before: Callable[[dict[str, Any]], None] | None = None
+        self._real: Any = None
 
-    def advance_model_rows(core, input_ids, inputs_embeds, plan, **kwargs):
-        calls.append(plan)
-        return torch.zeros_like(inputs_embeds)
+    def __call__(self, core, input_ids, inputs_embeds, plan, **kwargs):
+        self.calls.append(plan)
+        self.events.append(("advance", plan))
+        if self.before is not None:
+            self.before(kwargs)
+        return self._real(core, input_ids, inputs_embeds, plan, **kwargs)
 
-    monkeypatch.setattr(advance, "advance_model_rows", advance_model_rows)
-    return calls
+    def install(self, monkeypatch: Any) -> AdvanceSpy:
+        from vllm_nemotron_asr_streaming.nemotron_asr import advance
+
+        self._real = advance.advance_model_rows
+        monkeypatch.setattr(advance, "advance_model_rows", self)
+        return self
 
 
 class Trap:
-    """An object that fails any attribute access once armed.
-
-    Wraps ``target`` and forwards to it until ``armed`` is set; ``reads``
-    records every attribute name read (armed or not).
-    """
+    """Forwards to ``target`` until ``armed``; then any attribute read fails.
+    ``reads`` records every attribute read."""
 
     def __init__(self, target: Any = None, name: str = "trap") -> None:
         object.__setattr__(self, "_target", target)
@@ -197,50 +313,231 @@ class RowsSpy:
 
 
 class BindingsSpy:
-    """Wraps core's ``StateSlotBindings``; records ``bind_rows`` calls and
-    every member the model reads, and wraps returned rows in ``RowsSpy``."""
+    """Wraps core's ``StateSlotBindings``; records ``bind_rows`` calls (with
+    the step phase), every other member the model reads, and wraps returned
+    rows in ``RowsSpy``."""
 
     def __init__(self, bindings: Any) -> None:
         object.__setattr__(self, "_bindings", bindings)
         object.__setattr__(self, "bind_calls", [])
         object.__setattr__(self, "reads", [])
         object.__setattr__(self, "row_reads", [])
-        object.__setattr__(self, "bind_phase", None)
+        object.__setattr__(self, "phase", None)
 
     def bind_rows(self, layer, ordered_request_ids, expected_handles):
         self.bind_calls.append(
-            (
-                layer,
-                tuple(ordered_request_ids),
-                tuple(expected_handles),
-                self.bind_phase,
-            )
+            (layer, tuple(ordered_request_ids), tuple(expected_handles), self.phase)
         )
         rows = self._bindings.bind_rows(layer, ordered_request_ids, expected_handles)
         return RowsSpy(rows, self.row_reads)
 
     def __getattr__(self, attr: str) -> Any:
-        self.reads.append(attr)
+        self.reads.append((attr, self.phase))
         return getattr(self._bindings, attr)
 
 
-def real_bindings(spec: Any, *, capacity: int = 8) -> Any:
-    """Core's ``StateSlotBindings`` over a CPU pool for the model's layer."""
+def core_bindings(bindings: Any) -> Any:
+    return bindings._bindings if isinstance(bindings, BindingsSpy) else bindings
+
+
+def real_bindings(spec: Any, *, capacity: int = 8, device: str = "cpu") -> Any:
+    """Core's ``StateSlotBindings`` over a pool for the model's layer."""
     from vllm.v1.worker.gpu.state_slots import StateSlotBindings
 
     group = SimpleNamespace(kv_cache_specs={STATE_LAYER: spec})
-    tensor = torch.zeros(capacity * spec.page_size_bytes, dtype=torch.uint8)
+    tensor = torch.zeros(
+        capacity * spec.page_size_bytes, dtype=torch.uint8, device=device
+    )
     return StateSlotBindings([group], {STATE_LAYER: tensor})
 
 
+def pool_tensor(bindings: Any) -> torch.Tensor:
+    return core_bindings(bindings).views[STATE_LAYER]._tensor
+
+
+def slot_bytes(bindings: Any, slot: int) -> torch.Tensor:
+    views = core_bindings(bindings).views[STATE_LAYER]
+    page = views.spec.page_size_bytes
+    return pool_tensor(bindings)[slot * page : (slot + 1) * page]
+
+
+class RecordingSampler:
+    """A working base sampler for dummy sampling: returns a ``SamplerOutput``
+    of the decision each logits row selects, and records every call."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
+        from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+        self.calls.append("sample")
+        rows = logits.shape[0]
+        return SamplerOutput(
+            sampled_token_ids=logits.argmax(dim=-1, keepdim=True),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=torch.ones(rows, dtype=torch.int32, device=logits.device),
+            num_rejected=torch.zeros(rows, dtype=torch.int32, device=logits.device),
+        )
+
+    def add_request(self, req_index: int, params: Any) -> None:
+        self.calls.append("add_request")
+
+    def apply_staged_writes(self) -> None:
+        self.calls.append("apply_staged_writes")
+
+
 # ---------------------------------------------------------------------------
-# Scheduler output and batches
+# Graph runtime double
+
+
+class FakeGraph:
+    """Stands for a captured graph."""
+
+
+class FakeGraphWrapper:
+    """Core's static graph wrapper's contract (``CUDAGraphWrapper``):
+    ``concrete_cudagraph_entries`` keyed by batch descriptor; under a forward
+    context whose mode is the wrapper's runtime mode, an entry without a
+    graph is captured, and one with a graph is replayed. Capture and replay
+    run the runnable eagerly and are logged."""
+
+    def __init__(self, runtime: FakeGraphRuntime, runnable, vllm_config, runtime_mode):
+        from vllm.compilation.cuda_graph import CUDAGraphEntry
+
+        self._runtime = runtime
+        self._entry_cls = CUDAGraphEntry
+        self.runnable = runnable
+        self.runtime_mode = runtime_mode
+        self.concrete_cudagraph_entries: dict[Any, Any] = {}
+        runtime.wrappers.append(self)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if not is_forward_context_available():
+            return self.runnable(*args, **kwargs)
+        context = get_forward_context()
+        mode = context.cudagraph_runtime_mode
+        if mode == CUDAGraphMode.NONE or mode != self.runtime_mode:
+            return self.runnable(*args, **kwargs)
+        descriptor = context.batch_descriptor
+        entry = self.concrete_cudagraph_entries.setdefault(
+            descriptor, self._entry_cls(batch_descriptor=descriptor)
+        )
+        if entry.cudagraph is None:
+            runtime = self._runtime
+            index = len(runtime.captures)
+            runtime.events.append(("capture", descriptor))
+            runtime.captures.append((self, descriptor))
+            if runtime.fail_capture == index:
+                raise RuntimeError(f"capture {index} failed")
+            output = self.runnable(*args, **kwargs)
+            if runtime.skip_capture != index:
+                entry.cudagraph = FakeGraph()
+            entry.output = output
+            return output
+        self._runtime.events.append(("replay", descriptor))
+        return self.runnable(*args, **kwargs)
+
+
+class FakeGraphRuntime:
+    """Replaces ``platform_graph_runtime`` with core's forward context and
+    batch descriptors plus a capture double (``FakeGraphWrapper``)."""
+
+    def __init__(self, events: Events | None = None) -> None:
+        self.events = events if events is not None else Events()
+        self.wrappers: list[FakeGraphWrapper] = []
+        #: ``(wrapper, descriptor)`` of every capture attempt, in order.
+        self.captures: list[tuple[Any, Any]] = []
+        #: Index of the capture attempt that raises / that stores no graph.
+        self.fail_capture: int | None = None
+        self.skip_capture: int | None = None
+        #: Raised by the eager warm-up call (forward context in mode NONE).
+        self.fail_eager: BaseException | None = None
+
+    def build(self) -> Any:
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import BatchDescriptor, set_forward_context
+
+        from vllm_nemotron_asr_streaming.nemotron_asr.decode_graph import (
+            GraphRuntime,
+        )
+
+        runtime = self
+
+        @contextlib.contextmanager
+        def capture_context(device):
+            runtime.events.append(("capture_context", str(device)))
+            yield
+
+        def forward_context(*args, **kwargs):
+            if (
+                runtime.fail_eager is not None
+                and kwargs.get("cudagraph_runtime_mode") == CUDAGraphMode.NONE
+            ):
+                raise runtime.fail_eager
+            return set_forward_context(*args, **kwargs)
+
+        values = {
+            "wrapper_factory": lambda runnable, vllm_config, runtime_mode=None, **kw: (
+                FakeGraphWrapper(runtime, runnable, vllm_config, runtime_mode)
+            ),
+            "forward_context": forward_context,
+            "capture_context": capture_context,
+            "descriptor_factory": lambda tier: BatchDescriptor(
+                num_tokens=tier, num_reqs=tier, uniform=True
+            ),
+            "eager_mode": CUDAGraphMode.NONE,
+            "graph_mode": CUDAGraphMode.PIECEWISE,
+            "synchronize": lambda device: None,
+            # Present only while the model's graph runtime still has a
+            # capture-enabled switch (REG-MEM-007); filled with a no-op.
+            "set_capture_enabled": lambda enabled: None,
+        }
+        names = {f.name for f in dataclasses.fields(GraphRuntime)}
+        return GraphRuntime(**{k: v for k, v in values.items() if k in names})
+
+    def install(self, monkeypatch: Any) -> FakeGraphRuntime:
+        from vllm_nemotron_asr_streaming.nemotron_asr import (
+            chunk_bucket_graph,
+            decode_graph,
+            encoder_execution,
+        )
+
+        for module in (decode_graph, chunk_bucket_graph, encoder_execution):
+            if hasattr(module, "platform_graph_runtime"):
+                monkeypatch.setattr(module, "platform_graph_runtime", self.build)
+        return self
+
+    def captured(self) -> list[tuple[Any, Any]]:
+        """``(wrapper, descriptor)`` of every entry that holds a graph."""
+        return [
+            (w, d)
+            for w in self.wrappers
+            for d, e in w.concrete_cudagraph_entries.items()
+            if e.cudagraph is not None
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Scheduler output and requests
 
 
 def handle(slot: int, generation: int = 1) -> Any:
     from vllm.v1.kv_cache_interface import StateSlotHandle
 
     return StateSlotHandle(EPOCH, slot, generation)
+
+
+def _layer(slot: int | tuple[int, int]) -> dict[str, Any]:
+    slot, generation = slot if isinstance(slot, tuple) else (slot, 1)
+    return {STATE_LAYER: handle(slot, generation)}
 
 
 def stream_envelope(
@@ -255,6 +552,10 @@ def stream_envelope(
     samples = RAW_SAMPLES_PER_CHUNK[tuple(CADENCES)[geometry]]
     row = torch.zeros(7 + samples, dtype=torch.float32)
     row[:7] = torch.tensor([2, samples, geometry, 0, prompt, sequence, 1])
+    row[7:] = torch.from_numpy(
+        np.random.default_rng(sequence).standard_normal(samples).astype(np.float32)
+        * 0.1
+    )
     return row
 
 
@@ -322,11 +623,14 @@ def scheduler_output(
     step_seq: int = 1,
     encoder_inputs: dict[str, list[int]] | None = None,
 ) -> Any:
-    """A real ``SchedulerOutput``; ``handles`` / ``cleanup`` map request IDs
-    to a slot (generation 1) or a ``(slot, generation)`` pair for the model's
-    state layer."""
+    """A real ``SchedulerOutput``. ``handles`` / ``cleanup`` map request IDs
+    to a slot (generation 1) or ``(slot, generation)``. When
+    ``encoder_inputs`` is ``None``, every new request with a multimodal
+    feature has its feature scheduled, as core schedules it on first sight."""
     from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
+    if encoder_inputs is None:
+        encoder_inputs = {r.req_id: [0] for r in new if r.mm_features}
     scheduled = {r.req_id: 1 for r in new} | {r: 1 for r in cached}
     output = SchedulerOutput(
         scheduled_new_reqs=list(new),
@@ -340,7 +644,7 @@ def scheduler_output(
         num_scheduled_tokens=scheduled,
         total_num_scheduled_tokens=sum(scheduled.values()),
         scheduled_spec_decode_tokens={},
-        scheduled_encoder_inputs=dict(encoder_inputs or {}),
+        scheduled_encoder_inputs=dict(encoder_inputs),
         finished_req_ids=set(finished),
         free_encoder_mm_hashes=[],
         state_slot_handles={r: _layer(s) for r, s in (handles or {}).items()},
@@ -350,145 +654,283 @@ def scheduler_output(
     return output
 
 
-def _layer(slot: int | tuple[int, int]) -> dict[str, Any]:
-    slot, generation = slot if isinstance(slot, tuple) else (slot, 1)
-    return {STATE_LAYER: handle(slot, generation)}
+class StepRequestStates:
+    """Stands for the runner's ``RequestState``: ``req_id_to_index``."""
+
+    def __init__(self) -> None:
+        self.req_id_to_index: dict[str, int] = {}
+
+    def add(self, req_id: str) -> int:
+        free = sorted(
+            set(range(len(self.req_id_to_index) + 1))
+            - set(self.req_id_to_index.values())
+        )
+        self.req_id_to_index[req_id] = free[0]
+        return free[0]
+
+    def remove(self, req_id: str) -> None:
+        self.req_id_to_index.pop(req_id, None)
 
 
-def dummy_batch(state: Any, num_reqs: int, num_tokens: int) -> Any:
+def dummy_batch(state: Any, num_reqs: int, num_tokens: int, *, is_padding=True):
     from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
     buffers = InputBuffers(state.max_num_reqs, state.max_num_tokens, state.device)
-    return InputBatch.make_dummy(num_reqs, num_tokens, buffers)
+    return InputBatch.make_dummy(num_reqs, num_tokens, buffers, is_padding=is_padding)
 
 
-def real_batch(state: Any, output: Any, computed: dict[str, int] | None = None) -> Any:
-    """An ``InputBatch`` for a real step: one token per scheduled request, in
-    the scheduler output's order (new, then cached)."""
-    req_ids = [r.req_id for r in output.scheduled_new_reqs]
-    req_ids += list(output.scheduled_cached_reqs.req_ids)
-    batch = dummy_batch(state, len(req_ids), len(req_ids))
-    tokens = [r.prefill_token_ids[0] for r in output.scheduled_new_reqs]
-    tokens += [0 for _ in output.scheduled_cached_reqs.req_ids]
-    batch.input_ids[: len(tokens)] = torch.tensor(tokens)
-    return dataclasses.replace(
-        batch,
-        req_ids=req_ids,
-        num_scheduled_tokens=np.ones(len(req_ids), dtype=np.int32),
-        num_computed_tokens_np=np.array(
-            [(computed or {}).get(r, 0) for r in req_ids], dtype=np.int32
-        ),
-    )
+class _CpuEvent:
+    """Stands for ``torch.cuda.Event`` in ``finish_step`` on CPU."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
 
-def req_states(req_ids: list[str]) -> Any:
-    return SimpleNamespace(req_id_to_index={r: i for i, r in enumerate(req_ids)})
+    def record(self, stream: Any = None) -> None:
+        pass
+
+    def synchronize(self) -> None:
+        pass
+
+    def query(self) -> bool:
+        return True
 
 
 # ---------------------------------------------------------------------------
-# Steps, as core's model runner sequences them
+# The runner
 
 
-def dummy_step(
-    state: Any,
-    model: Any,
-    *,
-    is_profile: bool,
-    num_tokens: int | None = None,
-    randomize_inputs: bool = False,
-    core_embeds: bool = True,
-) -> tuple[Any, torch.Tensor, Any]:
-    """``_dummy_run``: ``prepare_step`` (dummy), ``dummy_inputs_embeds``,
-    ``prepare_inputs``, then the forward. Returns ``(batch, output, embeds)``.
+class Runner:
+    """Drives the model and model state in core's order."""
 
-    ``core_embeds=False`` takes the embeddings core would receive (the model
-    state's pre-allocated buffer, REG-MS-002) without calling
-    ``dummy_inputs_embeds``, so tests of other specs do not depend on that
-    method's signature, which REG-MS-001/002 test on their own."""
-    from vllm.v1.core.sched.output import SchedulerOutput
+    def __init__(self, vllm_config: Any, model: Any, state: Any) -> None:
+        self.vllm_config = vllm_config
+        self.model = model
+        self.state = state
+        self.bindings: Any = None
+        self.req_states = StepRequestStates()
 
-    num_tokens = num_tokens or state.max_num_tokens
-    num_reqs = min(num_tokens, state.max_num_reqs)
-    output = SchedulerOutput.make_empty()
-    output.total_num_scheduled_tokens = num_tokens
-    output.num_scheduled_tokens = {f"_dummy_req_{i}": 1 for i in range(num_reqs)}
-    state.prepare_step(output, dummy_run=True, is_profile=is_profile)
-    batch = dummy_batch(state, num_reqs, num_tokens)
-    if randomize_inputs:
-        batch.input_ids.random_(0, int(model.config.vocab_size))
-    if core_embeds:
-        embeds = state.dummy_inputs_embeds(
-            batch.num_tokens_after_padding,
-            batch.input_ids if randomize_inputs else None,
+    # -- state slots ---------------------------------------------------------
+
+    def bind_pool(self, bindings: Any) -> Any:
+        """``initialize_state_slots``, as core calls it after profiling."""
+        self.state.initialize_state_slots(bindings)
+        self.bindings = bindings
+        if isinstance(bindings, BindingsSpy):
+            bindings.reads.clear()
+        if isinstance(bindings, Trap):
+            bindings.reads.clear()
+        return bindings
+
+    # -- forward ------------------------------------------------------------
+
+    def _forward(self, batch, embeds, kwargs, attn_metadata=None):
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import BatchDescriptor, set_forward_context
+        from vllm.model_executor.models.interfaces import requires_raw_input_tokens
+
+        num_tokens = batch.num_tokens_after_padding
+        input_ids = batch.input_ids[:num_tokens]
+        if embeds is not None and not requires_raw_input_tokens(self.model):
+            input_ids = None
+        inputs = {
+            "input_ids": input_ids,
+            "positions": batch.positions[:num_tokens],
+            "inputs_embeds": embeds,
+            "intermediate_tensors": None,
+            **kwargs,
+        }
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            batch_descriptor=BatchDescriptor(num_tokens=num_tokens),
+            is_padding=batch.is_padding,
+        ):
+            return self.model(**inputs)
+
+    def _attn(self, batch):
+        from vllm.config import CUDAGraphMode
+
+        return self.state.prepare_attn(
+            batch,
+            CUDAGraphMode.NONE,
+            (),
+            torch.zeros(batch.num_tokens, dtype=torch.int64, device=self.state.device),
+            [],
+            None,
         )
-    else:
-        embeds = state.encoder_runner.inputs_embeds[: batch.num_tokens_after_padding]
-    kwargs = state.prepare_inputs(batch, req_states(list(batch.req_ids)))
-    hidden = model(
-        input_ids=batch.input_ids,
-        positions=batch.positions,
-        inputs_embeds=embeds,
-        intermediate_tensors=None,
-        **kwargs,
-    )
-    return batch, hidden, embeds
+
+    # -- dummy steps --------------------------------------------------------
+
+    def dummy_step(
+        self,
+        *,
+        is_profile: bool,
+        num_tokens: int | None = None,
+        randomize_inputs: bool = False,
+        core_embeds: bool = True,
+        attn: bool = False,
+    ) -> tuple[Any, torch.Tensor, Any]:
+        """``_dummy_run``. ``attn=True`` builds attention metadata as core's
+        kernel warm-up does (no ``skip_attn``); otherwise as the profiling run
+        (``skip_attn``). ``core_embeds=False`` takes the pre-allocated buffer
+        core would receive without calling ``dummy_inputs_embeds`` (so tests
+        of other specs do not depend on REG-MS-002)."""
+        from vllm.v1.core.sched.output import SchedulerOutput
+
+        state = self.state
+        num_tokens = num_tokens or state.max_num_tokens
+        num_reqs = min(num_tokens, state.max_num_reqs)
+        output = SchedulerOutput.make_empty()
+        output.total_num_scheduled_tokens = num_tokens
+        output.num_scheduled_tokens = {f"_dummy_req_{i}": 1 for i in range(num_reqs)}
+        state.prepare_step(output, dummy_run=True, is_profile=is_profile)
+        batch = dummy_batch(state, num_reqs, num_tokens, is_padding=not is_profile)
+        if randomize_inputs:
+            batch.input_ids.random_(0, int(self.model.config.vocab_size))
+        attn_metadata = self._attn(batch) if attn else None
+        if core_embeds:
+            embeds = state.dummy_inputs_embeds(
+                batch.num_tokens_after_padding,
+                batch.input_ids if randomize_inputs else None,
+            )
+        else:
+            embeds = state.encoder_runner.inputs_embeds[
+                : batch.num_tokens_after_padding
+            ]
+        kwargs = state.prepare_inputs(batch, self.req_states)
+        hidden = self._forward(batch, embeds, kwargs, attn_metadata)
+        return batch, hidden, embeds
+
+    def profile_run(self, **kwargs: Any) -> tuple[Any, torch.Tensor, Any]:
+        return self.dummy_step(is_profile=True, **kwargs)
+
+    def dummy_sampler_run(self, sampler: Any, hidden: torch.Tensor) -> Any:
+        """``_dummy_sampler_run``, including the warm-up-parameter pass core
+        runs on GPU platforms."""
+        from vllm.sampling_params import SamplingParams
+
+        if self.state.dummy_sampler_run(sampler, hidden):
+            return None
+        num_reqs = hidden.shape[0]
+        logits = self.model.compute_logits(hidden)
+        batch = dummy_batch(self.state, num_reqs, num_reqs)
+        first = sampler(logits, batch)
+        warmup = SamplingParams.for_sampler_warmup()
+        for index in range(num_reqs):
+            sampler.add_request(index, warmup)
+        sampler.apply_staged_writes()
+        second = sampler(logits, batch)
+        return first, second
+
+    # -- real steps ---------------------------------------------------------
+
+    def _remove_request(self, req_id: str) -> None:
+        self.state.remove_request(req_id)
+        self.req_states.remove(req_id)
+        self.state.encoder_cache.remove_request(req_id)
+
+    def _phase(self, name: str) -> None:
+        if isinstance(self.bindings, BindingsSpy):
+            object.__setattr__(self.bindings, "phase", name)
+
+    def real_step(self, output: Any, computed: dict[str, int] | None = None) -> Any:
+        """``execute_model`` then ``sample_tokens``'s state hooks, for a real
+        step; returns ``(hidden, completion)``."""
+        from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+
+        state = self.state
+        core = core_bindings(self.bindings) if self.bindings is not None else None
+        self._phase("prepare_step")
+        state.prepare_step(output, dummy_run=False, is_profile=False)
+        self._phase("begin_step")
+        if core is not None:
+            core.begin_step(output, None)
+        finished = set(output.finished_req_ids) | set(
+            getattr(output, "preempted_req_ids", None) or ()
+        )
+        for req_id in sorted(finished):
+            self._remove_request(req_id)
+        for mm_hash in output.free_encoder_mm_hashes:
+            state.encoder_cache.free_encoder_cache(mm_hash)
+        if core is not None:
+            core.activate_requests()
+        self._phase("add_requests")
+        for request in output.scheduled_new_reqs:
+            self._remove_request(request.req_id)
+            index = self.req_states.add(request.req_id)
+            state.encoder_cache.add_request(request.req_id, request.mm_features)
+            state.add_request(index, request)
+        if output.scheduled_new_reqs:
+            state.apply_staged_writes()
+        if output.total_num_scheduled_tokens == 0:
+            return None, self._finish(EMPTY_MODEL_RUNNER_OUTPUT)
+        batch = self._real_batch(output, computed)
+        self._phase("prepare_inputs")
+        attn_metadata = self._attn(batch)
+        state.preprocess_state(batch, (), None, None)
+        embeds = state.prepare_inputs_embeds(
+            output.scheduled_encoder_inputs, batch, self.req_states
+        )
+        kwargs = state.prepare_inputs(batch, self.req_states)
+        self._phase("forward")
+        hidden = self._forward(batch, embeds, kwargs, attn_metadata)
+        self._phase("sample")
+        state.compute_sample_logits(hidden[batch.logits_indices])
+        state.postprocess_state(
+            batch.idx_mapping,
+            torch.ones(batch.num_reqs, dtype=torch.int32, device=state.device),
+            None,
+        )
+        self._phase("finish_step")
+        return hidden, self._finish(EMPTY_MODEL_RUNNER_OUTPUT)
+
+    def _finish(self, output: Any) -> Any:
+        if self.bindings is None:
+            return None
+        core = core_bindings(self.bindings)
+        with mock.patch.object(torch.cuda, "Event", _CpuEvent):
+            return core.finish_step(output, None)
+
+    def _real_batch(self, output: Any, computed: dict[str, int] | None) -> Any:
+        """One token per scheduled request, in the scheduler output's order
+        (new, then cached), agreeing with ``num_scheduled_tokens``."""
+        req_ids = [r.req_id for r in output.scheduled_new_reqs]
+        req_ids += list(output.scheduled_cached_reqs.req_ids)
+        assert [output.num_scheduled_tokens[r] for r in req_ids] == [1] * len(req_ids)
+        assert output.total_num_scheduled_tokens == len(req_ids)
+        n = len(req_ids)
+        batch = dummy_batch(self.state, n, n, is_padding=False)
+        tokens = [r.prefill_token_ids[0] for r in output.scheduled_new_reqs]
+        tokens += [ids[-1] for ids in output.scheduled_cached_reqs.new_token_ids]
+        batch.input_ids[:n] = torch.tensor(tokens)
+        index = np.array(
+            [self.req_states.req_id_to_index[r] for r in req_ids], dtype=np.intp
+        )
+        computed = computed or {}
+        return dataclasses.replace(
+            batch,
+            req_ids=req_ids,
+            idx_mapping=torch.from_numpy(index).to(self.state.device),
+            idx_mapping_np=index,
+            num_scheduled_tokens=np.ones(n, dtype=np.int32),
+            num_computed_tokens_np=np.array(
+                [computed.get(r, 0) for r in req_ids], dtype=np.int32
+            ),
+            prefill_len_np=np.ones(n, dtype=np.int32),
+        )
 
 
-def profile_run(state: Any, model: Any, **kwargs: Any) -> tuple[Any, torch.Tensor, Any]:
-    """``profile_run``'s forward: a profiling dummy step."""
-    return dummy_step(state, model, is_profile=True, **kwargs)
-
-
-def real_step(
-    state: Any,
-    model: Any,
-    bindings: Any,
-    output: Any,
-    *,
-    forward: bool = True,
-    computed: dict[str, int] | None = None,
-) -> Any:
-    """``execute_model`` for a real step: ``prepare_step``, the state-slot
-    ``begin_step`` / ``activate_requests``, ``add_request`` per new request,
-    then (when tokens are scheduled) ``prepare_inputs`` and the forward."""
-    state.prepare_step(output, dummy_run=False, is_profile=False)
-    if bindings is not None:
-        core = bindings._bindings if isinstance(bindings, BindingsSpy) else bindings
-        core.begin_step(output, None)
-        core.activate_requests()
-    for index, request in enumerate(output.scheduled_new_reqs):
-        state.add_request(index, request)
-    if output.total_num_scheduled_tokens == 0 or not forward:
-        return None
-    batch = real_batch(state, output, computed)
-    if bindings is not None and hasattr(bindings, "bind_phase"):
-        object.__setattr__(bindings, "bind_phase", "prepare_inputs")
-    kwargs = state.prepare_inputs(batch, req_states(list(batch.req_ids)))
-    embeds = torch.zeros(
-        batch.num_tokens, int(model.config.hidden_size), dtype=torch.float32
-    )
-    for index, request in enumerate(output.scheduled_new_reqs):
-        feature = request.mm_features[0] if request.mm_features else None
-        if feature is not None and "audio" in feature.data:
-            envelope = feature.data["audio"].data
-            embeds[index, : envelope.shape[0]] = envelope
-    if bindings is not None and hasattr(bindings, "bind_phase"):
-        object.__setattr__(bindings, "bind_phase", "forward")
-    return model(
-        input_ids=batch.input_ids[: batch.num_tokens],
-        positions=batch.positions[: batch.num_tokens],
-        inputs_embeds=embeds,
-        intermediate_tensors=None,
-        **kwargs,
-    )
-
-
-def call_with(
-    fn: Callable[..., Any], *args: Any, **kwargs: Any
-) -> BaseException | None:
+def call_with(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Exception | None:
     """Run ``fn``; return the exception it raised, or ``None``."""
     try:
         fn(*args, **kwargs)
     except Exception as error:  # noqa: BLE001 - the test inspects it
         return error
     return None
+
+
+@contextlib.contextmanager
+def nothing() -> Iterator[None]:
+    yield

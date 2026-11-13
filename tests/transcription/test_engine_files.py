@@ -690,3 +690,61 @@ def test_streaming_response_carries_only_label_text(server):
     assert "".join(t or "" for t in contents) == expected
     assert len(terminal) == 1
     assert terminal[0]["finish_reason"] == "stop"
+
+
+# ---------------------------------------------------------------------------
+# FILE-GRD-007: sampling-shaping fields do not change a file's tokens
+
+SHAPING_FIELDS = {
+    "temperature": 0.9,
+    "top_p": 0.5,
+    "top_k": 3,
+    "min_p": 0.3,
+    "seed": 1234,
+    "watermarking": True,
+    "repetition_penalty": 1.5,
+    "frequency_penalty": 1.2,
+    "presence_penalty": 1.2,
+}
+
+
+async def transcribe_file_with(engine, samples: np.ndarray, **fields: Any) -> list[int]:
+    """As ``transcribe_file``, with request fields set on the transcription
+    request before core turns it into sampling parameters."""
+    from fastapi import UploadFile
+    from vllm.config.speech_to_text import SpeechToTextConfig, SpeechToTextParams
+    from vllm.entrypoints.speech_to_text.transcription.protocol import (
+        TranscriptionRequest,
+    )
+
+    from vllm_nemotron_asr_streaming.model import Nemotron3_5AsrStreamingForRNNT
+
+    stt = SpeechToTextParams(
+        audio=samples,
+        stt_config=SpeechToTextConfig(
+            sample_rate=16000, max_audio_clip_s=None, min_energy_split_window_size=None
+        ),
+        model_config=engine.model_config,
+    )
+    prompt = Nemotron3_5AsrStreamingForRNNT.get_generation_prompt(stt)
+    request = TranscriptionRequest(
+        file=UploadFile(io.BytesIO(b"x"), filename="a.wav"), model="m", **fields
+    )
+    max_tokens = engine.model_config.max_model_len - len(prompt["prompt_token_ids"])
+    params = request.to_sampling_params(max_tokens)
+    tokens: list[int] = []
+    final = None
+    async for out in engine.generate(prompt, params, f"file-{uuid.uuid4().hex}"):
+        final = out
+    assert final is not None
+    tokens = list(final.outputs[0].token_ids)
+    return tokens
+
+
+@pytest.mark.parametrize("field", list(SHAPING_FIELDS))
+# @spec FILE-GRD-007
+def test_sampling_shaping_fields_do_not_change_a_files_tokens(run, engine, field):
+    audio = load_audio(8.0)
+    baseline = run(transcribe_file_with(engine, audio))
+    shaped = run(transcribe_file_with(engine, audio, **{field: SHAPING_FIELDS[field]}))
+    assert shaped == baseline

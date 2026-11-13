@@ -216,9 +216,8 @@ def test_hook_output_does_not_depend_on_the_queue_contents():
 # @spec SESS-PACK-008
 def test_hook_lets_the_packer_capacity_error_propagate(monkeypatch):
     # Never a normal close: the capacity error escapes the prompt stream.
-    from vllm_nemotron_asr_streaming.session.packer import Packer
-
     from vllm_nemotron_asr_streaming.session import PackerCapacityError
+    from vllm_nemotron_asr_streaming.session.packer import Packer
 
     def exhausted(self, samples):
         raise PackerCapacityError("sequence space exhausted")

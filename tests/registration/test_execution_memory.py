@@ -2,18 +2,25 @@
 """Execution memory, the model-state interface and state-slot access
 (REG-MEM-*, REG-MS-*, REG-STATE-*).
 
-The model and its model state are the real classes on CPU, driven in the
-order core's model runner uses (``support.model_harness``): a profiling run
-(``profile_run`` → ``_dummy_run(is_profile=True)``), later dummy steps (kernel
-warm-up), and real steps (``execute_model``: ``prepare_step``, core's
-``begin_step`` / ``activate_requests``, ``add_request``, ``prepare_inputs``,
-the forward). The pool is core's ``StateSlotBindings`` over CPU memory.
+The model and its model state are the real classes on CPU, driven in core's
+order by ``support.model_harness.Runner`` (see its docstring for what is real,
+what is omitted and which seams the doubles use): a profiling run, later
+dummy steps (kernel warm-up, with attention metadata), and complete real
+steps (``prepare_step`` through ``finish_step``) whose row transaction and
+commit are the plugin's own.
 
-The profile transaction and the row transaction cannot run the synthetic
-card's encoder on CPU; the profile transaction is recorded
-(``ProfileRecorder``) and the row transaction stubbed (``stub_advance``), so
-these tests check which preparation and state access the model performs,
-not its numerics.
+Execution arms (``ARMS``): the card default (``eager``), ``compiled-static``,
+a graphed decoder (``dense-graphed``) and CHUNK populations. CPU cannot
+capture graphs, so graphed arms run with ``FakeGraphRuntime``: core's forward
+context and batch descriptors, and a wrapper with core's entry contract whose
+capture is logged and can be made to fail or to store no graph.
+
+Readiness reads are logged by wrapping the inventories' readiness surfaces
+(encoder ``ready``, decoder ``captured_keys``, CHUNK ``ready``).
+
+Migration blockers are isolated per test (``legacy`` argument of ``build``):
+tests of REG-MEM-* run with the removed state-slot calls re-added so that
+REG-STATE-002..005 do not mask them; the REG-STATE contract tests do not.
 """
 
 from __future__ import annotations
@@ -31,74 +38,164 @@ from support import model_harness as h
 pytestmark = pytest.mark.engine
 
 LOOKAHEADS = (0, 1, 3, 6, 13)
-READINESS = re.compile(r"(?i)prepar|ready")
+#: Members of core's ``StateSlotBindings`` the model may use during a step:
+#: ``bind_rows`` (REG-STATE-003) and ``fail_requests`` (core's channel for
+#: model-reported row failures, used by ``postprocess_state``).
+PERMITTED_BINDINGS = {"bind_rows", "fail_requests"}
+PERMITTED_ROWS = {"component_pools", "slot_indices_cpu"}
+STALE = "Stale state step access"
+
+#: name → (configuration overrides, right context, max_num_seqs). Served sets
+#: are narrowed where the arm's warm-up cost on CPU grows with them.
+ARMS = {
+    "eager": ({}, 6, 2),
+    "compiled-static": (
+        {
+            "encoder_execution_arm": "compiled-static",
+            "supported_num_lookahead_tokens": [0],
+        },
+        0,
+        1,
+    ),
+    "dense-graphed": (
+        {
+            "decode_dispatch_arm": "dense-graphed",
+            "supported_num_lookahead_tokens": [0, 6],
+        },
+        6,
+        2,
+    ),
+    "chunk": (
+        {
+            "decode_dispatch_arm": "dense-graphed",
+            "encoder_execution_arm": "eager-graphed",
+            "chunk_bucket_graph_populations": [1],
+            "supported_num_lookahead_tokens": [1],
+        },
+        1,
+        1,
+    ),
+}
+GRAPHED = ("dense-graphed", "chunk")
 
 
 def geometry_of(right_context: int) -> int:
     return LOOKAHEADS.index(right_context)
 
 
-@pytest.fixture
-def build(monkeypatch, card_dir):
-    """Factory: ``build(**config)`` → namespace with the real model, model
-    state, configuration and the profile recorder."""
+def _log_reads(monkeypatch, events, cls, name, label):
+    original = getattr(cls, name)
 
-    def make(*, install_recorder: bool = True, **config):
+    def read(self):
+        events.append(("ready", label))
+        return original.fget(self)
+
+    monkeypatch.setattr(cls, name, property(read))
+
+
+@pytest.fixture
+def build(monkeypatch, tmp_path):
+    """``build(arm=..., legacy=..., **config)`` → the runner and its spies.
+
+    ``legacy``: ``"all"`` re-adds every removed state-slot call, ``"rows"``
+    all but ``validate_current``, ``"handle"`` only ``get_handle``, ``None``
+    nothing."""
+
+    def make(arm="eager", legacy="all", overrides=None, **config):
+        from vllm_nemotron_asr_streaming.nemotron_asr.chunk_bucket_graph import (
+            ExactChunkGraphBinding,
+        )
+        from vllm_nemotron_asr_streaming.nemotron_asr.decode_graph import (
+            DenseGraphBinding,
+        )
+        from vllm_nemotron_asr_streaming.nemotron_asr.encoder_execution import (
+            ResolvedEncoderExecution,
+        )
+
         h.spec_without_state_name(monkeypatch)
-        recorder = h.ProfileRecorder()
-        if install_recorder:
-            recorder.install(monkeypatch)
-        vllm_config = h.build_vllm_config(card_dir, **config)
+        if legacy is not None:
+            h.legacy_state_api(
+                monkeypatch,
+                rows_layout=legacy in ("all", "rows"),
+                validate_current=legacy == "all",
+            )
+        events = h.Events()
+        profile = h.ProfileSpy(events).install(monkeypatch)
+        advance = h.AdvanceSpy(events).install(monkeypatch)
+        graphs = h.FakeGraphRuntime(events).install(monkeypatch)
+        _log_reads(monkeypatch, events, ResolvedEncoderExecution, "ready", "encoder")
+        _log_reads(monkeypatch, events, DenseGraphBinding, "captured_keys", "decoder")
+        _log_reads(monkeypatch, events, ExactChunkGraphBinding, "ready", "chunk")
+        arm_overrides, right_context, max_num_seqs = ARMS[arm]
+        merged = dict(arm_overrides) | dict(overrides or {})
+        settings = {"right_context": right_context, "max_num_seqs": max_num_seqs}
+        settings.update(config)
+        card = h.write_runnable_card(tmp_path / f"card-{len(list(tmp_path.iterdir()))}")
+        vllm_config = h.build_vllm_config(card, overrides=merged, **settings)
         model = h.build_model(vllm_config)
         state = h.build_model_state(vllm_config, model)
+        served = merged.get("supported_num_lookahead_tokens", list(LOOKAHEADS))
         return SimpleNamespace(
+            arm=arm,
             vllm_config=vllm_config,
             model=model,
             state=state,
             config=model.config,
-            recorder=recorder,
+            runner=h.Runner(vllm_config, model, state),
+            events=events,
+            profile=profile,
+            advance=advance,
+            graphs=graphs,
+            max_num_seqs=settings["max_num_seqs"],
+            max_geometry=geometry_of(max(served)),
+            chunk_cells=[
+                (1, n) for n in merged.get("chunk_bucket_graph_populations", [])
+            ],
         )
 
     return make
 
 
-def pool(env, *, capacity: int = 8, spy: bool = True):
-    """Core's bindings over a CPU pool, bound to the model state as
-    ``initialize_state_slots`` binds them (after the profiling run)."""
+def pool(env, *, spy: bool = True, capacity: int = 8):
     bindings = h.real_bindings(h.model_spec(env.model), capacity=capacity)
-    if spy:
-        bindings = h.BindingsSpy(bindings)
-    env.state.initialize_state_slots(bindings)
-    if spy:
-        bindings.reads.clear()
-    return bindings
+    return env.runner.bind_pool(h.BindingsSpy(bindings) if spy else bindings)
 
 
 def trapped_pool(env):
-    """Bindings that fail on any access once armed (after binding)."""
     trap = h.Trap(h.real_bindings(h.model_spec(env.model)), "state_slots")
-    env.state.initialize_state_slots(trap)
-    trap.reads.clear()
+    env.runner.bind_pool(trap)
     trap.armed = True
     return trap
 
 
-def stream(env, req_id: str, *, geometry: int = 3):
+def stream(env, req_id: str, *, geometry: int | None = None, sequence: int = 0):
+    geometry = env.max_geometry if geometry is None else geometry
     return h.new_request(
         req_id,
         int(env.config.audio_chunk_token_id),
-        audio=h.stream_envelope(env.config, geometry=geometry),
+        audio=h.stream_envelope(env.config, geometry=geometry, sequence=sequence),
     )
 
 
-def file(env, req_id: str, n_samples: int = 4000, *, geometry: int = 3):
+def file(env, req_id: str, n_samples: int = 4000):
     samples = np.random.default_rng(0).standard_normal(n_samples).astype(np.float32)
     return h.new_request(
         req_id,
         int(env.config.file_carrier_token_id),
-        samples=samples,
-        header=[geometry, 0, n_samples],
+        samples=samples * 0.1,
+        header=[env.max_geometry, 0, n_samples],
     )
+
+
+def rows_of(env, kind: str):
+    rows, handles = [], {}
+    if kind in ("stream", "mixed"):
+        rows.append(stream(env, "s1"))
+        handles["s1"] = 1
+    if kind in ("file", "mixed"):
+        rows.append(file(env, "f1"))
+        handles["f1"] = 2
+    return h.scheduler_output(new=tuple(rows), handles=handles)
 
 
 def assert_dummy_output(output, embeds):
@@ -110,9 +207,33 @@ def assert_dummy_output(output, embeds):
     assert output.shape == embeds.shape
     assert output.dtype == embeds.dtype
     assert output.device == embeds.device
-    assert torch.equal(
-        read_decision_carrier(output), torch.zeros_like(read_decision_carrier(output))
-    )
+    carrier = read_decision_carrier(output)
+    assert torch.equal(carrier, torch.zeros_like(carrier))
+
+
+def max_shapes(env) -> set[tuple[int, int]]:
+    return {(env.max_num_seqs, env.max_geometry), *((n, g) for g, n in env.chunk_cells)}
+
+
+def profiled_shapes(env, calls=None) -> set[tuple[int, int]]:
+    return {
+        (c.get("num_rows"), c.get("geometry_id"))
+        for c in (env.profile.calls if calls is None else calls)
+    }
+
+
+def assert_bindings_valid(spy, output, since: int = 0):
+    """Every ``bind_rows`` call of the step (from index ``since``) names the
+    model's layer, requests of this step in the step's order, and their
+    scheduler-output handles."""
+    order = [r.req_id for r in output.scheduled_new_reqs]
+    order += list(output.scheduled_cached_reqs.req_ids)
+    for layer, ids, handles, _ in spy.bind_calls[since:]:
+        assert layer == h.STATE_LAYER
+        assert list(ids) == [r for r in order if r in ids], (ids, order)
+        assert handles == tuple(
+            output.state_slot_handles[r][h.STATE_LAYER] for r in ids
+        )
 
 
 # ===========================================================================
@@ -121,22 +242,29 @@ def assert_dummy_output(output, embeds):
 
 
 def _calls_accepted_by(signature: inspect.Signature):
-    """The calls a signature accepts, as ``(args, kwargs)`` of sentinels:
-    required arguments only, and every argument (positionals positionally,
-    keyword-only by name)."""
-    required_args, all_args, required_kw, all_kw = [], [], {}, {}
+    """Calls a signature accepts, as ``(args, kwargs)`` of sentinels: required
+    only; every parameter (positionals positionally); every parameter by
+    keyword where the kind allows it."""
+    required, every, keyword = ([], {}), ([], {}), ([], {})
     for name, param in list(signature.parameters.items())[1:]:  # drop self
         if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
             continue
+        value = object()
+        is_required = param.default is param.empty
         if param.kind is param.KEYWORD_ONLY:
-            all_kw[name] = object()
-            if param.default is param.empty:
-                required_kw[name] = object()
+            every[1][name] = value
+            keyword[1][name] = value
+            if is_required:
+                required[1][name] = value
             continue
-        all_args.append(object())
-        if param.default is param.empty:
-            required_args.append(object())
-    return [(required_args, required_kw), (all_args, all_kw)]
+        every[0].append(value)
+        if param.kind is param.POSITIONAL_ONLY:
+            keyword[0].append(value)
+        else:
+            keyword[1][name] = value
+        if is_required:
+            required[0].append(value)
+    return [required, every, keyword]
 
 
 # @spec REG-MS-001
@@ -160,9 +288,19 @@ def test_every_model_state_override_accepts_every_call_of_the_base_method():
                 override.bind(None, *args, **kwargs)
             except TypeError as error:
                 mismatched.append(f"{name}: {error}")
+        has_var = any(
+            p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+            for p in override.parameters.values()
+        )
         for pname, param in original.parameters.items():
             mine = override.parameters.get(pname)
-            if mine is not None and mine.default != param.default:
+            if mine is None:
+                if not has_var:
+                    mismatched.append(f"{name}: parameter {pname} missing")
+                continue
+            if mine.kind != param.kind:
+                mismatched.append(f"{name}: kind of {pname} differs")
+            if mine.default != param.default:
                 mismatched.append(f"{name}: default of {pname} differs")
     assert not mismatched, "\n".join(mismatched)
 
@@ -184,11 +322,9 @@ def test_dummy_inputs_embeds_returns_the_preallocated_buffer_slice(build, with_i
 
 
 # @spec REG-MS-002
-def test_dummy_inputs_embeds_is_called_as_core_calls_it_on_a_profiling_run(build):
-    """The profiling path reaches the forward through
-    ``dummy_inputs_embeds(num_tokens, input_ids)`` (positionally)."""
+def test_dummy_inputs_embeds_is_called_as_core_calls_it_on_warm_up(build):
     env = build()
-    _, output, embeds = h.profile_run(env.state, env.model, randomize_inputs=True)
+    _, output, embeds = env.runner.profile_run(randomize_inputs=True, attn=True)
     assert embeds.data_ptr() == env.state.encoder_runner.inputs_embeds.data_ptr()
     assert output.shape == embeds.shape
 
@@ -198,153 +334,211 @@ def test_dummy_inputs_embeds_is_called_as_core_calls_it_on_a_profiling_run(build
 # ===========================================================================
 
 
-# @spec REG-MEM-001
-def test_profiling_prepare_step_records_the_step_and_prepares_nothing(build):
-    from vllm.v1.core.sched.output import SchedulerOutput
-
-    env = build()
-    env.state.prepare_step(
-        SchedulerOutput.make_empty(), dummy_run=True, is_profile=True
-    )
-    env.state.prepare_step(
-        SchedulerOutput.make_empty(), dummy_run=True, is_profile=True
-    )
-    assert env.recorder.calls == []
+def recorded(state) -> tuple[bool, bool]:
+    """The model state's record of the current step: ``(dummy_run,
+    is_profile)`` (current attribute names ``_dummy_run`` / ``_is_profile``)."""
+    return bool(state._dummy_run), bool(state._is_profile)
 
 
 # @spec REG-MEM-001
-def test_a_later_non_profiling_prepare_step_replaces_the_profiling_record(build):
-    """A profiling ``prepare_step`` followed by a non-profiling dummy one: the
-    forward of the second step does not prepare."""
+def test_prepare_step_records_whether_the_step_is_a_profiling_dummy_step(build):
     from vllm.v1.core.sched.output import SchedulerOutput
 
     env = build()
-    env.state.prepare_step(
-        SchedulerOutput.make_empty(), dummy_run=True, is_profile=True
+    pool(env)
+    state = env.state
+    state.prepare_step(SchedulerOutput.make_empty(), dummy_run=True, is_profile=True)
+    assert recorded(state) == (True, True)
+    state.prepare_step(SchedulerOutput.make_empty(), dummy_run=True, is_profile=False)
+    assert recorded(state) == (True, False), "the profiling record was not replaced"
+    state.prepare_step(SchedulerOutput.make_empty(), dummy_run=True, is_profile=True)
+    state.prepare_step(
+        h.scheduler_output(finished=(), cleanup={}), dummy_run=False, is_profile=False
     )
-    _, output, embeds = h.dummy_step(
-        env.state, env.model, is_profile=False, core_embeds=False
-    )
-    assert env.recorder.calls == []
-    assert_dummy_output(output, embeds)
+    assert recorded(state) == (False, False), "a real step kept the profiling record"
+    assert env.profile.calls == [] and env.graphs.captures == []
 
 
-@pytest.mark.parametrize(
-    "served,default",
-    [((0, 1, 3, 6, 13), 6), ((0, 3), 3)],
-    ids=["all-five", "narrowed"],
-)
+@pytest.mark.parametrize("arm", list(ARMS))
 # @spec REG-MEM-002
-def test_first_profiling_forward_prepares_and_runs_the_profile_at_maximum_shape(
-    build, served, default
-):
-    env = build(
-        right_context=default,
-        overrides={"supported_num_lookahead_tokens": list(served)},
+def test_first_profiling_forward_prepares_in_order_at_maximum_shape(build, arm):
+    env = build(arm=arm)
+    retained = []
+    env.profile.before = lambda kw: retained.append(
+        (len(env.graphs.captured()), len(env.graphs.captures))
     )
-    _, output, embeds = h.profile_run(env.state, env.model, core_embeds=False)
-    assert len(env.recorder.calls) == 1, env.recorder.calls
-    call = env.recorder.calls[0]
-    assert call.get("num_rows") == env.vllm_config.scheduler_config.max_num_seqs
-    assert call.get("geometry_id") == geometry_of(max(served))
+    _, output, embeds = env.runner.profile_run(core_embeds=False)
+    env.events.append(("returned", None))
     assert_dummy_output(output, embeds)
+    kinds = env.events.kinds()
+    assert max_shapes(env) <= profiled_shapes(env), env.profile.calls
+    last_capture = max((i for i, k in enumerate(kinds) if k == "capture"), default=-1)
+    readiness = [i for i, k in enumerate(kinds) if k == "ready" and i > last_capture]
+    assert readiness, "no readiness check after warm-up and capture"
+    final = [
+        i
+        for i, (k, info) in enumerate(env.events)
+        if k == "profile"
+        and (info.get("num_rows"), info.get("geometry_id")) in max_shapes(env)
+        and i > readiness[0]
+    ]
+    assert final, "no maximum-shape profile transaction after the readiness check"
+    assert final[-1] < kinds.index("returned")
+    if arm in GRAPHED:
+        assert env.graphs.captured(), "graphed arm captured nothing"
+        assert all(have == tried for have, tried in retained[-len(final) :]), (
+            "a captured graph was not retained during the profile transaction"
+        )
+
+
+@pytest.mark.parametrize("arm", GRAPHED)
+# @spec REG-MEM-002
+def test_first_profiling_forward_refuses_an_entry_left_without_a_graph(build, arm):
+    """Each expected graph entry, in turn, is left without a graph in its
+    wrapper during capture; preparation must notice and fail."""
+    clean = build(arm=arm)
+    clean.runner.profile_run(core_embeds=False)
+    attempts = len(clean.graphs.captures)
+    assert attempts, "the first profiling step captured nothing (no preparation)"
+    for index in range(attempts):
+        env = build(arm=arm)
+        env.graphs.skip_capture = index
+        error = h.call_with(env.runner.profile_run, core_embeds=False)
+        assert error is not None, f"preparation accepted entry {index} without a graph"
 
 
 # @spec REG-MEM-002, REG-MEM-011
-def test_first_profiling_forward_leaves_the_worker_ready_to_serve(build, monkeypatch):
+def test_first_profiling_forward_leaves_the_worker_ready_to_serve(build):
     env = build()
-    advanced = h.stub_advance(monkeypatch)
-    h.profile_run(env.state, env.model, core_embeds=False)
-    bindings = pool(env)
-    output = h.scheduler_output(
-        new=(stream(env, "s1"),), handles={"s1": 1}, encoder_inputs={"s1": [0]}
-    )
-    h.real_step(env.state, env.model, bindings, output)
-    assert len(advanced) == 1
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    env.runner.real_step(rows_of(env, "stream"))
+    assert env.advance.calls, "the prepared worker did not execute the step"
 
 
+@pytest.mark.parametrize("arm", list(ARMS))
 # @spec REG-MEM-003
-def test_later_profiling_steps_after_the_pool_exists_check_and_return(build):
-    """E5: kernel warm-up may run further profiling dummy steps after the pool
-    exists, with random token IDs, several times."""
-    env = build()
-    h.profile_run(env.state, env.model, core_embeds=False)
-    assert len(env.recorder.calls) == 1
+def test_later_profiling_steps_after_the_pool_exists_check_and_return(build, arm):
+    """E5: kernel warm-up runs further profiling dummy steps after the pool
+    exists, with random token IDs and attention metadata, several times."""
+    env = build(arm=arm)
+    env.runner.profile_run(core_embeds=False)
+    profiles, captures = len(env.profile.calls), len(env.graphs.captures)
     trap = trapped_pool(env)
     for _ in range(3):
-        batch, output, embeds = h.profile_run(
-            env.state, env.model, randomize_inputs=True, core_embeds=False
+        before = len(env.events)
+        batch, output, embeds = env.runner.profile_run(
+            randomize_inputs=True, attn=True, core_embeds=False
         )
-        assert isinstance(batch.input_ids, torch.Tensor)
+        assert "ready" in h.Events(env.events[before:]).kinds(), (
+            "a later profiling step did not verify readiness"
+        )
         assert_dummy_output(output, embeds)
-    assert len(env.recorder.calls) == 1, "a later profiling step profiled again"
+    assert len(env.profile.calls) == profiles, "a later profiling step profiled"
+    assert len(env.graphs.captures) == captures, "a later profiling step captured"
     assert trap.reads == []
 
 
+@pytest.mark.parametrize("arm", GRAPHED)
 # @spec REG-MEM-003
-def test_later_profiling_step_verifies_readiness(build, monkeypatch):
-    """A later profiling step checks the inventory: if it is no longer ready,
-    the step raises rather than returning a dummy output."""
-    env = build()
-    h.profile_run(env.state, env.model, core_embeds=False)
-    execution = env.model._encoder_execution
-    monkeypatch.setattr(type(execution), "ready", property(lambda self: False))
-    error = h.call_with(h.profile_run, env.state, env.model, core_embeds=False)
+def test_later_profiling_step_refuses_a_wrapper_entry_without_a_graph(build, arm):
+    env = build(arm=arm)
+    env.runner.profile_run(core_embeds=False)
+    captured = env.graphs.captured()
+    assert captured
+    for wrapper, descriptor in captured:
+        entry = wrapper.concrete_cudagraph_entries[descriptor]
+        graph, entry.cudagraph = entry.cudagraph, None
+        attempts = len(env.graphs.captures)
+        error = h.call_with(env.runner.profile_run, core_embeds=False)
+        assert error is not None, f"later step accepted {descriptor} without a graph"
+        assert len(env.graphs.captures) == attempts, "a later step captured"
+        entry.cudagraph = graph
+
+
+# @spec REG-MEM-003
+def test_later_profiling_step_refuses_an_inventory_that_is_no_longer_ready(
+    build, monkeypatch
+):
+    from vllm_nemotron_asr_streaming.nemotron_asr.encoder_execution import (
+        ResolvedEncoderExecution,
+    )
+
+    env = build(arm="compiled-static")
+    env.runner.profile_run(core_embeds=False)
+    monkeypatch.setattr(ResolvedEncoderExecution, "ready", property(lambda s: False))
+    profiles = len(env.profile.calls)
+    error = h.call_with(env.runner.profile_run, core_embeds=False)
     assert error is not None, "a later profiling step skipped the readiness check"
-    assert len(env.recorder.calls) == 1
+    assert len(env.profile.calls) == profiles
+
+
+def _inject(env, where: str) -> None:
+    if where == "warm-up":
+        env.graphs.fail_eager = RuntimeError("warm-up failed")
+    elif where == "capture":
+        env.graphs.fail_capture = 1
+    elif where == "readiness":
+        env.graphs.skip_capture = 1
+    elif where == "profile":
+        env.profile.fail = RuntimeError("profile transaction failed")
+
+
+@pytest.mark.parametrize("where", ["warm-up", "capture", "readiness", "profile"])
+# @spec REG-MEM-004
+def test_failed_preparation_discards_its_state_and_stays_failed(build, where):
+    env = build(arm="dense-graphed")
+    _inject(env, where)
+    first = h.call_with(env.runner.profile_run, core_embeds=False)
+    assert first is not None, f"preparation passed despite a {where} failure"
+    attempted = len(env.graphs.captures) + len(env.profile.calls)
+    assert attempted, "the first profiling step attempted no preparation"
+    binding = env.model._decode_graph_binding
+    assert binding.captured_keys == (), "partial execution state was kept"
+    for attr in ("fail_eager", "fail_capture", "skip_capture"):
+        setattr(env.graphs, attr, None)
+    env.profile.fail = None
+    for _ in range(2):
+        later = h.call_with(env.runner.profile_run, core_embeds=False)
+        assert later is not None, "a profiling step after a failure passed"
+    assert len(env.graphs.captures) + len(env.profile.calls) == attempted, (
+        "a failed worker prepared again"
+    )
 
 
 # @spec REG-MEM-004
-def test_failed_preparation_raises_and_later_profiling_steps_raise_without_preparing(
-    build, monkeypatch
-):
+def test_failed_preparation_on_the_card_default_stays_failed(build):
     env = build()
-
-    def failing(model, **kwargs):
-        env.recorder.calls.append(kwargs)
-        raise RuntimeError("profile transaction failed")
-
-    from vllm_nemotron_asr_streaming.nemotron_asr import profile_execution
-
-    monkeypatch.setattr(profile_execution, "run_persistent_state_profile", failing)
-    first = h.call_with(h.profile_run, env.state, env.model, core_embeds=False)
-    assert first is not None
-    attempts = len(env.recorder.calls)
-    assert attempts >= 1, "the first profiling step did not attempt preparation"
-    second = h.call_with(h.profile_run, env.state, env.model, core_embeds=False)
-    assert second is not None, "a profiling step after a failed preparation passed"
-    assert len(env.recorder.calls) == attempts, "a failed worker prepared again"
+    env.profile.fail = RuntimeError("profile transaction failed")
+    assert h.call_with(env.runner.profile_run, core_embeds=False) is not None
+    calls = len(env.profile.calls)
+    assert calls >= 1
+    env.profile.fail = None
+    assert h.call_with(env.runner.profile_run, core_embeds=False) is not None
+    assert len(env.profile.calls) == calls
 
 
 # @spec REG-MEM-004, REG-MEM-011
-def test_failed_preparation_refuses_real_steps(build, monkeypatch):
+def test_failed_preparation_refuses_real_steps(build):
     env = build()
-    advanced = h.stub_advance(monkeypatch)
-    from vllm_nemotron_asr_streaming.nemotron_asr import profile_execution
-
-    def failing(model, **kwargs):
-        raise RuntimeError("profile transaction failed")
-
-    monkeypatch.setattr(profile_execution, "run_persistent_state_profile", failing)
-    h.call_with(h.profile_run, env.state, env.model, core_embeds=False)
-    bindings = pool(env)
-    output = h.scheduler_output(
-        new=(stream(env, "s1"),), handles={"s1": 1}, encoder_inputs={"s1": [0]}
-    )
-    error = h.call_with(h.real_step, env.state, env.model, bindings, output)
-    assert error is not None and READINESS.search(str(error)), error
-    assert advanced == []
+    env.profile.fail = RuntimeError("profile transaction failed")
+    h.call_with(env.runner.profile_run, core_embeds=False)
+    pool(env)
+    error = h.call_with(env.runner.real_step, rows_of(env, "stream"))
+    assert error is not None
+    assert env.advance.calls == []
 
 
+@pytest.mark.parametrize("arm", list(ARMS))
 # @spec REG-MEM-005
-def test_preparation_reads_no_state_slot_bindings(build):
-    """Core binds state slots after its profiling run; even when bindings
-    exist, preparation does not read them."""
-    env = build()
+def test_preparation_reads_no_state_slot_bindings_or_pool(build, arm):
+    env = build(arm=arm)
     trap = trapped_pool(env)
-    h.profile_run(env.state, env.model, core_embeds=False)
-    assert len(env.recorder.calls) == 1
+    pool_bytes = trap._target.views[h.STATE_LAYER]._tensor.clone()
+    env.runner.profile_run(core_embeds=False)
+    assert max_shapes(env) <= profiled_shapes(env)
     assert trap.reads == []
+    assert torch.equal(pool_bytes, trap._target.views[h.STATE_LAYER]._tensor)
 
 
 # @spec REG-MEM-005
@@ -368,30 +562,28 @@ def test_profile_scratch_is_built_from_the_models_state_spec(build):
 
 # @spec REG-MEM-008
 def test_first_profiling_step_runs_no_forward_time_profile(build):
-    """A profiling step with fewer dummy rows than ``max_num_seqs``: the only
-    profile is preparation's maximum-shape transaction, never one sized to
-    the dummy batch."""
-    env = build()
-    h.profile_run(env.state, env.model, num_tokens=2, core_embeds=False)
-    max_rows = env.vllm_config.scheduler_config.max_num_seqs
-    assert [c.get("num_rows") for c in env.recorder.calls] == [max_rows]
+    """A profiling step with fewer dummy rows than ``max_num_seqs``: no
+    profile is sized to the dummy batch."""
+    env = build(max_num_seqs=3)
+    env.runner.profile_run(num_tokens=1, core_embeds=False)
+    assert profiled_shapes(env) == max_shapes(env), env.profile.calls
 
 
 @pytest.mark.parametrize("prepared", [False, True], ids=["before", "after"])
 # @spec REG-MEM-009, REG-MEM-010
 def test_non_profiling_dummy_step_returns_the_dummy_output_only(build, prepared):
-    env = build()
+    env = build(arm="dense-graphed")
     if prepared:
-        h.profile_run(env.state, env.model, core_embeds=False)
-        trap = trapped_pool(env)
-    calls = len(env.recorder.calls)
-    _, output, embeds = h.dummy_step(
-        env.state, env.model, is_profile=False, randomize_inputs=True, core_embeds=False
+        env.runner.profile_run(core_embeds=False)
+    trap = trapped_pool(env)
+    profiles, captures = len(env.profile.calls), len(env.graphs.captures)
+    _, output, embeds = env.runner.dummy_step(
+        is_profile=False, randomize_inputs=True, attn=True, core_embeds=False
     )
-    assert len(env.recorder.calls) == calls
+    assert len(env.profile.calls) == profiles
+    assert len(env.graphs.captures) == captures
     assert_dummy_output(output, embeds)
-    if prepared:
-        assert trap.reads == []
+    assert trap.reads == []
 
 
 @pytest.mark.parametrize("step", ["first-profiling", "later-profiling", "dummy"])
@@ -399,9 +591,9 @@ def test_non_profiling_dummy_step_returns_the_dummy_output_only(build, prepared)
 def test_dummy_output_matches_the_input_embeddings(build, step):
     env = build()
     if step != "first-profiling":
-        h.profile_run(env.state, env.model, core_embeds=False)
-    _, output, embeds = h.dummy_step(
-        env.state, env.model, is_profile=step != "dummy", core_embeds=False
+        env.runner.profile_run(core_embeds=False)
+    _, output, embeds = env.runner.dummy_step(
+        is_profile=step != "dummy", core_embeds=False
     )
     assert_dummy_output(output, embeds)
 
@@ -410,70 +602,49 @@ def test_dummy_output_matches_the_input_embeddings(build, step):
 @pytest.mark.parametrize("is_profile", [False, True], ids=["dummy", "profiling"])
 # @spec REG-MEM-012
 def test_dummy_prepare_inputs_after_a_real_step_reads_nothing_retained(
-    build, monkeypatch, pool_exists, is_profile
+    build, pool_exists, is_profile
 ):
     """E15: core calls ``prepare_inputs`` on dummy steps after ``prepare_step``
     returned early; the previous real step's scheduler output is stale."""
+    from vllm.v1.core.sched.output import SchedulerOutput
+
     env = build()
-    h.profile_run(env.state, env.model, core_embeds=False)
-    real = h.Trap(
-        h.scheduler_output(
-            new=(stream(env, "s1"), file(env, "f1")),
-            handles={"s1": 1, "f1": 2},
-            encoder_inputs={"s1": [0]},
-        ),
-        "scheduler_output",
-    )
+    env.runner.profile_run(core_embeds=False)
+    real = h.Trap(rows_of(env, "mixed"), "scheduler_output")
     env.state.prepare_step(real, dummy_run=False, is_profile=False)
     real.armed = True
     trap = trapped_pool(env) if pool_exists else None
-    from vllm.v1.core.sched.output import SchedulerOutput
-
     env.state.prepare_step(
         SchedulerOutput.make_empty(), dummy_run=True, is_profile=is_profile
     )
-    batch = h.dummy_batch(env.state, 4, 4)
-    kwargs = env.state.prepare_inputs(batch, h.req_states(list(batch.req_ids)))
+    batch = h.dummy_batch(env.state, 2, 2)
+    kwargs = env.state.prepare_inputs(batch, env.runner.req_states)
     assert "'s1'" not in repr(kwargs) and "'f1'" not in repr(kwargs)
     if trap is not None:
         assert trap.reads == []
 
 
+@pytest.mark.parametrize("native_burst", [False, True], ids=["default", "native"])
 # @spec REG-MEM-013, REG-MEM-010
-def test_native_burst_dummy_sampling_reads_no_state_slots(build):
-    """E13: core indexes the profiling output by ``logits_indices``, computes
-    logits and samples them through the model's sampler hook."""
-    env = build(right_context=1, overrides={"experimental_native_burst": True})
-    batch, output, embeds = h.profile_run(env.state, env.model, core_embeds=False)
+def test_dummy_sampling_reads_no_state_slots(build, native_burst):
+    """E13: core indexes the profiling output by ``logits_indices`` and runs
+    ``_dummy_sampler_run`` (the model state's ``dummy_sampler_run``, then two
+    sampler passes with ``add_request`` / ``apply_staged_writes`` between)
+    through the sampler the model state installs."""
+    overrides = {"experimental_native_burst": True} if native_burst else {}
+    env = build(right_context=1 if native_burst else 6, overrides=overrides)
+    batch, output, embeds = env.runner.profile_run(core_embeds=False)
     assert_dummy_output(output, embeds)
     trap = trapped_pool(env)
-    base = h.Trap(SimpleNamespace(), "base_sampler")
-    base.armed = True
+    base = h.RecordingSampler()
     hooks = env.state.custom_sampler(base)
-    assert hooks is not None, "native burst installs no sampler wrapper"
-    sampler, _ = hooks
-    hidden = output[batch.logits_indices]
-    logits = env.model.compute_logits(hidden)
-    for _ in range(2):  # core samples twice after warm-up
-        sampled = sampler(
-            logits, h.dummy_batch(env.state, hidden.shape[0], hidden.shape[0])
-        )
-        assert sampled.sampled_token_ids.shape[0] == hidden.shape[0]
-    assert trap.reads == []
-
-
-# @spec REG-MEM-013, REG-MEM-010
-def test_profiling_chain_computes_logits_without_state(build):
-    """E13 without native burst: the dummy output's logits select the valid
-    decision ID in every row, reading no state slots."""
-    env = build()
-    trap = trapped_pool(env)
-    batch, output, embeds = h.profile_run(env.state, env.model, core_embeds=False)
-    hidden = output[batch.logits_indices]
-    logits = env.model.compute_logits(hidden)
-    assert logits.shape[0] == hidden.shape[0]
-    assert torch.all(logits.argmax(dim=-1) == 0)
-    assert env.state.custom_sampler(object()) is None
+    assert (hooks is not None) is native_burst
+    sampler = hooks[0] if hooks is not None else base
+    result = env.runner.dummy_sampler_run(sampler, output[batch.logits_indices])
+    if result is not None:
+        for sampled in result:
+            assert sampled.sampled_token_ids.shape[0] == len(batch.logits_indices)
+    assert "add_request" in base.calls and "apply_staged_writes" in base.calls
     assert trap.reads == []
 
 
@@ -482,71 +653,73 @@ def test_profiling_chain_computes_logits_without_state(build):
 # ===========================================================================
 
 
-def _first_real_step(env, kind: str):
-    rows, handles, encoder_inputs = [], {}, {}
-    if kind in ("stream", "both"):
-        rows.append(stream(env, "s1"))
-        handles["s1"] = 1
-        encoder_inputs["s1"] = [0]
-    if kind in ("file", "both"):
-        rows.append(file(env, "f1"))
-        handles["f1"] = 2
-    return h.scheduler_output(
-        new=tuple(rows), handles=handles, encoder_inputs=encoder_inputs
-    )
-
-
-@pytest.mark.parametrize("kind", ["file", "stream", "both"])
+@pytest.mark.parametrize("kind", ["file", "stream", "mixed"])
 # @spec REG-MEM-011
-def test_real_step_before_preparation_is_refused_without_preparing(
-    build, monkeypatch, kind
-):
+def test_real_step_before_preparation_is_refused_without_preparing(build, kind):
     """E14: no real step that runs model execution is served before
     preparation succeeded, whatever its rows."""
     env = build()
-    advanced = h.stub_advance(monkeypatch)
-    bindings = pool(env)
-    error = h.call_with(
-        h.real_step, env.state, env.model, bindings, _first_real_step(env, kind)
-    )
-    assert error is not None and READINESS.search(str(error)), error
-    assert env.recorder.calls == [], "a real step prepared lazily"
-    assert advanced == []
+    spy = pool(env)
+    output = rows_of(env, kind)
+    error = h.call_with(env.runner.real_step, output)
+    assert error is not None, "a real step ran before preparation"
+    assert env.profile.calls == [] and env.graphs.captures == [], "prepared lazily"
+    assert env.advance.calls == [], "the row transaction ran"
+    assert_bindings_valid(spy, output)
 
 
-@pytest.mark.parametrize("kind", ["file", "stream", "both"])
-# @spec REG-MEM-011, REG-STATE-003, REG-STATE-006
-def test_first_real_step_after_preparation_runs(build, monkeypatch, kind):
+@pytest.mark.parametrize("kind", ["file", "stream", "mixed"])
+# @spec REG-MEM-011
+def test_first_real_step_after_preparation_runs(build, kind):
     env = build()
-    advanced = h.stub_advance(monkeypatch)
-    h.profile_run(env.state, env.model, core_embeds=False)
-    bindings = pool(env)
-    output = _first_real_step(env, kind)
-    h.real_step(env.state, env.model, bindings, output)
-    assert len(advanced) == 1
-    assert len(env.recorder.calls) == 1, "a real step prepared again"
-    assert [c[0] for c in bindings.bind_calls] == [h.STATE_LAYER]
+    env.runner.profile_run(core_embeds=False)
+    profiles = len(env.profile.calls)
+    spy = pool(env)
+    output = rows_of(env, kind)
+    env.runner.real_step(output)
+    assert env.advance.calls, "the step was not executed"
+    assert len(env.profile.calls) == profiles, "a real step prepared again"
+    assert spy.bind_calls
+    assert_bindings_valid(spy, output)
 
 
 @pytest.mark.parametrize("prepared", [False, True], ids=["before", "after"])
 # @spec REG-MEM-014
-def test_cleanup_only_real_step_completes(build, monkeypatch, prepared):
+def test_cleanup_only_real_step_completes(build, prepared):
     env = build()
-    h.stub_advance(monkeypatch)
     if prepared:
-        h.profile_run(env.state, env.model, core_embeds=False)
-    bindings = pool(env)
+        env.runner.profile_run(core_embeds=False)
+    profiles = len(env.profile.calls)
+    spy = pool(env)
     # A request that held slot 3 in an earlier step and has now finished.
-    bindings._bindings.views[h.STATE_LAYER].bind("gone", h.handle(3))
+    h.core_bindings(spy).views[h.STATE_LAYER].bind("gone", h.handle(3))
     output = h.scheduler_output(finished=("gone",), cleanup={"gone": 3})
     assert output.total_num_scheduled_tokens == 0
-    h.real_step(env.state, env.model, bindings, output)
-    assert len(env.recorder.calls) == (1 if prepared else 0)
+    _, completion = env.runner.real_step(output)
+    assert completion is not None
+    assert len(env.profile.calls) == profiles and env.advance.calls == []
 
 
 # ===========================================================================
 # State-slot access
 # ===========================================================================
+
+
+@pytest.fixture
+def served_hf_config(tmp_path):
+    from vllm.config import ModelConfig
+
+    from vllm_nemotron_asr_streaming import register
+
+    register()
+    card = h.write_runnable_card(tmp_path / "card")
+    return ModelConfig(
+        model=str(card),
+        config_format="nemotron_asr_streaming",
+        hf_overrides={"num_lookahead_tokens": 6},
+        enforce_eager=True,
+        dtype="float32",
+    ).hf_config
 
 
 # @spec REG-STATE-001
@@ -572,116 +745,133 @@ def test_state_spec_is_layout_only(monkeypatch, served_hf_config):
     assert isinstance(spec, PersistentStateSpec)
 
 
-@pytest.fixture
-def served_hf_config(card_dir):
-    from vllm.config import ModelConfig
-
-    from vllm_nemotron_asr_streaming import register
-
-    register()
-    return ModelConfig(
-        model=str(card_dir),
-        config_format="nemotron_asr_streaming",
-        hf_overrides={"num_lookahead_tokens": 6},
-        enforce_eager=True,
-        dtype="float32",
-    ).hf_config
-
-
-@pytest.mark.parametrize("kind", ["file", "stream", "both"])
+@pytest.mark.parametrize("kind", ["file", "stream", "mixed"])
 # @spec REG-STATE-002, REG-STATE-007
-def test_prepare_step_reads_only_the_scheduler_output(build, kind):
-    env = build()
-    h.profile_run(env.state, env.model, core_embeds=False)
-    bindings = pool(env)
-    env.state.prepare_step(
-        _first_real_step(env, kind), dummy_run=False, is_profile=False
+def test_handles_come_only_from_the_scheduler_output(build, kind):
+    """Over a complete step: ``prepare_step`` reads no bindings member, and
+    no handle is looked up from the bindings at any point."""
+    env = build(legacy=None)
+    env.runner.profile_run(core_embeds=False)
+    spy = pool(env)
+    h.call_with(env.runner.real_step, rows_of(env, kind))
+    assert [r for r in spy.reads if r[1] == "prepare_step"] == []
+    assert [c for c in spy.bind_calls if c[3] == "prepare_step"] == []
+    assert "get_handle" not in [r[0] for r in spy.reads], spy.reads
+
+
+@pytest.mark.parametrize("kind", ["file", "stream", "mixed"])
+# @spec REG-STATE-003
+def test_rows_are_bound_with_the_steps_order_and_scheduler_handles(build, kind):
+    """Contract test, no shim: over a complete step the bindings are used only
+    through ``bind_rows`` (and ``fail_requests``), rows only through
+    ``component_pools`` and ``slot_indices_cpu``."""
+    env = build(legacy=None)
+    env.runner.profile_run(core_embeds=False)
+    spy = pool(env)
+    new = (
+        (stream(env, "s1"), file(env, "f1"), stream(env, "s2"))
+        if kind == "mixed"
+        else tuple(rows_of(env, kind).scheduled_new_reqs)
     )
-    assert bindings.reads == []
-    assert bindings.bind_calls == []
-
-
-# @spec REG-STATE-003, REG-STATE-005
-def test_rows_are_bound_with_the_steps_order_and_scheduler_handles(build, monkeypatch):
-    env = build()
-    h.stub_advance(monkeypatch)
-    h.profile_run(env.state, env.model, core_embeds=False)
-    bindings = pool(env)
+    slots = {"s1": 3, "f1": 1, "s2": 2}
     output = h.scheduler_output(
-        new=(stream(env, "s1"), file(env, "f1"), stream(env, "s2")),
-        handles={"s1": 3, "f1": 1, "s2": 2},
-        encoder_inputs={"s1": [0], "s2": [0]},
+        new=new, handles={r.req_id: slots[r.req_id] for r in new}
     )
-    h.real_step(env.state, env.model, bindings, output)
-    assert bindings.reads == [], "rows were read outside bind_rows"
-    assert len(bindings.bind_calls) == 1
-    layer, ids, handles, _phase = bindings.bind_calls[0]
-    assert layer == h.STATE_LAYER
-    assert ids == ("s1", "f1", "s2")
-    assert handles == tuple(output.state_slot_handles[r][h.STATE_LAYER] for r in ids)
-    assert set(bindings.row_reads) <= {"component_pools", "slot_indices_cpu"}, (
-        bindings.row_reads
+    env.runner.real_step(output)
+    assert {r[0] for r in spy.reads} <= PERMITTED_BINDINGS, spy.reads
+    assert spy.bind_calls
+    assert_bindings_valid(spy, output)
+    bound = {r for call in spy.bind_calls for r in call[1]}
+    assert bound == set(output.num_scheduled_tokens)
+    assert set(spy.row_reads) <= PERMITTED_ROWS, spy.row_reads
+
+
+@pytest.mark.parametrize("kind", ["file", "stream", "mixed"])
+# @spec REG-STATE-005
+def test_pool_projection_uses_only_component_pools_and_the_models_spec(build, kind):
+    """``get_handle`` re-added (REG-STATE-002 isolated); nothing else."""
+    env = build(legacy="handle")
+    env.runner.profile_run(core_embeds=False)
+    spy = pool(env)
+    h.call_with(env.runner.real_step, rows_of(env, kind))
+    assert spy.row_reads, "no rows were read"
+    assert set(spy.row_reads) <= PERMITTED_ROWS, spy.row_reads
+
+
+def _commit(env, kind: str, *, stale: bool):
+    """A complete step through the production commit path; with ``stale``,
+    core begins another step after the rows were bound and before the row
+    transaction runs, so the commit-time re-read is refused."""
+    env.runner.profile_run(core_embeds=False)
+    spy = pool(env)
+    output = rows_of(env, kind)
+    slots = [1, 2] if kind == "mixed" else [1 if kind == "stream" else 2]
+    before = h.pool_tensor(spy).clone()
+    reads = []
+    if stale:
+
+        def make_stale(kwargs):
+            reads.append(len(spy.row_reads))
+            h.core_bindings(spy).begin_step(h.scheduler_output(step_seq=99), None)
+
+        env.advance.before = make_stale
+    error = h.call_with(env.runner.real_step, output)
+    return spy, before, slots, error, reads
+
+
+@pytest.mark.parametrize("kind", ["file", "stream", "mixed"])
+# @spec REG-STATE-004, REG-STATE-006
+def test_commit_writes_the_bound_slots(build, kind):
+    """Control: a live step commits state into exactly its bound slots."""
+    env = build(legacy="rows")
+    spy, before, slots, error, _ = _commit(env, kind, stale=False)
+    assert error is None, repr(error)
+    after = h.pool_tensor(spy)
+    page = h.model_spec(env.model).page_size_bytes
+    for slot in range(len(after) // page):
+        changed = not torch.equal(
+            before[slot * page : (slot + 1) * page],
+            after[slot * page : (slot + 1) * page],
+        )
+        assert changed is (slot in slots), f"slot {slot}"
+
+
+@pytest.mark.parametrize("kind", ["file", "stream", "mixed"])
+# @spec REG-STATE-004, REG-STATE-006
+def test_stale_commit_rereads_the_pools_and_writes_nothing(build, kind):
+    env = build(legacy="rows")
+    spy, before, _, error, reads = _commit(env, kind, stale=True)
+    assert reads, "the row transaction did not run"
+    assert "component_pools" in spy.row_reads[reads[0] :], (
+        "the commit did not re-read component_pools"
     )
-
-
-# @spec REG-STATE-004
-def test_commit_rereads_the_pools_and_writes_nothing_when_that_fails(
-    build, monkeypatch
-):
-    """The row transaction's commit sink re-reads ``component_pools`` before
-    it writes; here the step is made stale first (core began another step),
-    so the re-read raises and no state may be written."""
-    from vllm_nemotron_asr_streaming.nemotron_asr import advance
-
-    env = build()
-    h.profile_run(env.state, env.model, core_embeds=False)
-    bindings = pool(env)
-    core = bindings._bindings
-    tensor = core.views[h.STATE_LAYER]._tensor
-    outcome: dict = {}
-
-    def advance_model_rows(core_model, input_ids, inputs_embeds, plan, **kwargs):
-        before = tensor.clone()
-        reads = len(bindings.row_reads)
-        core.begin_step(h.scheduler_output(step_seq=99), None)
-        sink = kwargs["commit_sink"]
-        outcome["error"] = h.call_with(sink.reserve, plan)
-        outcome["reread"] = bindings.row_reads[reads:].count("component_pools")
-        outcome["unchanged"] = torch.equal(before, tensor)
-        return torch.zeros_like(inputs_embeds)
-
-    monkeypatch.setattr(advance, "advance_model_rows", advance_model_rows)
-    output = h.scheduler_output(
-        new=(stream(env, "s1"),), handles={"s1": 1}, encoder_inputs={"s1": [0]}
-    )
-    h.real_step(env.state, env.model, bindings, output)
-    assert outcome["reread"] >= 1, "the commit did not re-read component_pools"
-    assert outcome["error"] is not None, "a stale commit was accepted"
-    assert outcome["unchanged"]
+    assert isinstance(error, ValueError) and STALE in str(error), repr(error)
+    assert torch.equal(before, h.pool_tensor(spy)), "a stale commit wrote state"
 
 
 # @spec REG-STATE-006
-def test_file_rows_on_recycled_slots_and_mixed_batches(build, monkeypatch):
+def test_file_rows_on_recycled_slots_and_mixed_batches(build):
     """E7: a file whose slot is recycled to a new file (higher generation),
-    and a file sharing its step with a stream, bind like stream rows."""
-    env = build()
-    h.stub_advance(monkeypatch)
-    h.profile_run(env.state, env.model, core_embeds=False)
-    bindings = pool(env)
+    sharing its step with a stream, binds and commits like stream rows."""
+    env = build(legacy="rows")
+    env.runner.profile_run(core_embeds=False)
+    spy = pool(env)
     first = h.scheduler_output(new=(file(env, "f1"),), handles={"f1": (1, 1)})
-    h.real_step(env.state, env.model, bindings, first)
+    env.runner.real_step(first)
+    after_first = h.slot_bytes(spy, 1).clone()
     recycled = h.scheduler_output(
-        new=(file(env, "f2"), stream(env, "s1")),
+        new=(file(env, "f2", 6000), stream(env, "s1")),
         finished=("f1",),
         handles={"f2": (1, 2), "s1": 2},
-        encoder_inputs={"s1": [0]},
         step_seq=2,
     )
-    h.real_step(env.state, env.model, bindings, recycled)
-    assert [c[1] for c in bindings.bind_calls] == [("f1",), ("f2", "s1")]
-    assert bindings.bind_calls[1][2] == (h.handle(1, 2), h.handle(2, 1))
-    assert set(bindings.row_reads) <= {"component_pools", "slot_indices_cpu"}
-    assert bindings.reads == []
+    since = len(spy.bind_calls)
+    env.runner.real_step(recycled)
+    assert_bindings_valid(spy, recycled, since)
+    bound = {r for call in spy.bind_calls[since:] for r in call[1]}
+    assert bound == {"f2", "s1"}
+    assert set(spy.row_reads) <= PERMITTED_ROWS
+    assert not torch.equal(after_first, h.slot_bytes(spy, 1))
 
 
 # ===========================================================================
@@ -698,8 +888,7 @@ def _package_sources(repo_root):
 def test_package_neither_imports_nor_calls_a_capture_enabled_switch(repo_root):
     found = []
     for name, source in _package_sources(repo_root).items():
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
+        for node in ast.walk(ast.parse(source)):
             text = None
             if isinstance(node, ast.ImportFrom) and node.module:
                 text = node.module + " " + " ".join(a.name for a in node.names)
@@ -743,51 +932,62 @@ def test_graph_runtime_uses_cores_capture_context_forward_context_and_wrapper(
 
 @pytest.mark.gpu
 # @spec REG-MEM-002, REG-MEM-006
-def test_graphed_preparation_captures_and_serving_refuses_a_cleared_wrapper(
-    monkeypatch, card_dir
+def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
+    monkeypatch, tmp_path
 ):
-    """On CUDA with the dense-graphed decoder: the first profiling step
-    captures every (served geometry, batch tier) entry in its graph wrapper;
-    if a wrapper's entry is then emptied, a real step that would use it
-    raises without capturing again."""
-    from vllm.config import DeviceConfig
+    """On CUDA with the dense-graphed decoder and core's own graph runtime:
+    preparation captures every entry; a prepared serving step succeeds; then
+    exactly the entry the next step needs loses its graph, and that step is
+    refused before the row transaction runs and without capturing.
 
+    The refusal is the model's own check, so the error must not be one of
+    the generic failures an unguarded replay or lookup would raise."""
     h.spec_without_state_name(monkeypatch)
+    h.legacy_state_api(monkeypatch)
+    advance = h.AdvanceSpy().install(monkeypatch)
+    card = h.write_runnable_card(tmp_path / "card")
     vllm_config = h.build_vllm_config(
-        card_dir, overrides={"decode_dispatch_arm": "dense-graphed"}
+        card,
+        overrides={
+            "decode_dispatch_arm": "dense-graphed",
+            "supported_num_lookahead_tokens": [6],
+        },
+        device="cuda",
     )
-    vllm_config.device_config = DeviceConfig(device="cuda")
-    with torch.device("cuda"):
-        model = h.build_model(vllm_config).to("cuda")
-        state = h.build_model_state(vllm_config, model)
-        h.profile_run(state, model, core_embeds=False)
+    model = h.build_model(vllm_config)
+    state = h.build_model_state(vllm_config, model)
+    runner = h.Runner(vllm_config, model, state)
+    runner.profile_run(core_embeds=False)
     binding = model._decode_graph_binding
-    assert binding is not None and binding.captured_keys
-    wrappers = [entry.wrapper for entry in binding._entries.values()]
-    assert all(
-        any(e.cudagraph is not None for e in w.concrete_cudagraph_entries.values())
-        for w in wrappers
+    entries = list(binding._entries.values())
+    assert entries and all(
+        e.wrapper.concrete_cudagraph_entries[e.descriptor].cudagraph is not None
+        for e in entries
     )
-    for wrapper in wrappers:
-        for entry in wrapper.concrete_cudagraph_entries.values():
-            entry.cudagraph = None
-    bindings = h.real_bindings(h.model_spec(model))
-    state.initialize_state_slots(bindings)
-    output = h.scheduler_output(
-        new=(
-            h.new_request(
-                "s1",
-                int(model.config.audio_chunk_token_id),
-                audio=h.stream_envelope(model.config).cuda(),
-            ),
-        ),
-        handles={"s1": 1},
-        encoder_inputs={"s1": [0]},
+    runner.bind_pool(h.real_bindings(h.model_spec(model), device="cuda"))
+
+    def unit(sequence):
+        return h.new_request(
+            "s1",
+            int(model.config.audio_chunk_token_id),
+            audio=h.stream_envelope(model.config, geometry=3, sequence=sequence),
+        )
+
+    runner.real_step(h.scheduler_output(new=(unit(0),), handles={"s1": 1}))
+    executed = len(advance.calls)
+    assert executed, "the prepared serving step did not run"
+    target = next(e for e in entries if e.tier == 1 and e.geometry == 3)
+    wrapper_entry = target.wrapper.concrete_cudagraph_entries[target.descriptor]
+    wrapper_entry.cudagraph = None
+    before = dict(target.wrapper.concrete_cudagraph_entries)
+    error = h.call_with(
+        runner.real_step,
+        h.scheduler_output(new=(unit(1),), handles={"s1": 1}, step_seq=2),
     )
-    error = h.call_with(h.real_step, state, model, bindings, output)
-    assert error is not None
-    assert all(
-        e.cudagraph is None
-        for w in wrappers
-        for e in w.concrete_cudagraph_entries.values()
-    ), "serving captured a graph"
+    assert error is not None, "the step ran without its graph"
+    assert not isinstance(error, (AttributeError, TypeError, KeyError, IndexError)), (
+        repr(error)
+    )
+    assert len(advance.calls) == executed, "the row transaction ran"
+    assert wrapper_entry.cudagraph is None, "serving captured a graph"
+    assert dict(target.wrapper.concrete_cudagraph_entries) == before
