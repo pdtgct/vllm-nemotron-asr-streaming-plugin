@@ -76,7 +76,7 @@ refuses it cleanly:
   processor, and cannot tell a file request from a stream.
 
 So the guards belong in `get_generation_prompt`, which is the only point that is both a clean 400
-and self-contained. At the pinned core (vLLM PR #65544 head `de2722ca2a`), the parameters it
+and self-contained. On upstream `main` without vllm#67151, the parameters it
 receives are `SpeechToTextParams` (`vllm/config/speech_to_text.py:17-54`), built by
 `build_stt_params` (`transcription/protocol.py:195-212`), and they carry neither
 `use_beam_search` nor `max_completion_tokens`. **This needs a small core change:** two optional
@@ -84,9 +84,9 @@ fields on `SpeechToTextParams`, `use_beam_search: bool = False` and
 `max_completion_tokens: int | None = None`, filled by `build_stt_params` of the transcription (and
 translation) request. The class docstring already provides for adding fields without changing the
 `get_generation_prompt` signature. The guards activate when the fields are present; against a core
-without them, `getattr` finds neither and the model behaves as before. No core has the fields yet; they are
-settled to go in a small separate upstream core pull request, and until it lands the guards are
-inactive and the README states the limits.
+without them, `getattr` finds neither and the model behaves as before. vllm#67151 adds the fields
+(head `dbae7c72cf`, stacked on #67144) and is part of the stage 1 build (HLD Constraints); on a
+core without it the guards are inactive and the README states the limits.
 
 What reaches the model, by core request field:
 - Beam search and a completion limit are text-decoding options. They do not apply to audio
@@ -161,18 +161,21 @@ Five things bound a file or set its cost today:
 - **No model-side admission check.** The worst-case refusal of earlier drafts (FILE-BUD-001, 71
   tokens per chunk at 560 ms, about 1/71 of what core's actual-token stop allows) is retired (Pete,
   2026-11-11). The model imposes no input-length limit; the operator sizes `max_model_len`.
-- **How core reports the stop.** Today a request that ends with `length`, `error` or `abort`
-  returns HTTP 200 with partial text (`base/serving.py:601-690`). The small upstream core pull
-  request therefore has two parts: (a) `use_beam_search` and `max_completion_tokens` on
-  `SpeechToTextParams`; (b) on the transcription and translation routes, a request that ends with
-  `length` caused by a server limit (the request reaching `max_model_len`), or with `error` or
-  `abort`, is reported to the client as an error. A `length` caused by a client's own
-  `max_completion_tokens` stays HTTP 200 for other models (this plugin refuses that field). Non-
-  streaming: an error response and no partial text. Streaming: once the event stream has started
-  HTTP 200 is committed, so a terminal error event follows any partial deltas and no normal
-  completion event is sent (core now puts `finish_reason` in the final event, `serving.py:797-803`).
-  On a core without (b), a file whose real token count ends in a server-caused `length` returns
-  partial text with HTTP 200, and the README limits say so (FILE-BUD-004).
+- **How core reports the stop.** On upstream `main` a request that ends with `length`, `error` or
+  `abort` returns HTTP 200 with partial text. Two upstream pull requests, both in the stage 1
+  build, change that on the transcription and translation routes, which share core's
+  speech-to-text serving:
+  - vllm#67144 fails an `error` ending (non-streaming: an error response; streaming: an error
+    event after any partial deltas) and an `abort` ending (non-streaming: an error response;
+    streaming: a final chunk with `finish_reason` `abort`, after which the remaining chunks are
+    skipped).
+  - vllm#67151 fails a `length` ending caused by a server limit (the request reaching
+    `max_model_len`) with HTTP 422 non-streaming and an error event streaming. A `length` caused by
+    a client's own `max_completion_tokens` stays HTTP 200 for other models; this plugin refuses
+    that field, so every `length` ending of its files is server-caused.
+
+  On a core without these PRs such a file returns partial text with HTTP 200, and the README
+  limits say so (FILE-BUD-004).
 - **Upload and decode (core settings).** Core reads the upload into bytes and decodes the whole
   file to float32 under the limits above, then carries every sample in the request's
   `multi_modal_data`.
@@ -338,8 +341,8 @@ events (the finish event, optional usage, and `[DONE]`) are sent as for any mode
 
 A file's transcript is complete only when its request finishes with EOS after the final tail. Core's
 serving returns the text for any ending, so an `error` or `abort` ending (for example a preempted
-slot, whose queued labels are lost) still returns partial text until core treats those endings as
-failures, which is part (b) of the small upstream core change (Input length). Beam search and every client completion limit are refused by the model before
+slot, whose queued labels are lost) returns partial text on a core without vllm#67144, and a
+server-caused `length` on a core without vllm#67151 (Input length). Beam search and every client completion limit are refused by the model before
 submission (Request guards), so neither can truncate a transcript.
 
 ## Engine interaction
@@ -397,15 +400,13 @@ submission (Request guards), so neither can truncate a transcript.
 ## Open Questions & Future Decisions
 
 ### Open
-1. The small upstream core pull request (settled): (a) `use_beam_search` and
-   `max_completion_tokens` on `SpeechToTextParams`; (b) a `length` caused by a server limit (the
-   request reaching `max_model_len`), an `error` or an `abort` ending reported as an error on the
-   transcription and translation routes (non-streaming: an error response; streaming: a terminal
-   error event after any partial deltas, with no normal completion event). The guards stay inactive
-   until (a) lands; the over-length behaviour is partial text with HTTP 200 until (b) lands.
-2. For the README limits: on a core without (a), beam search issues about `max_model_len` engine
-   requests per upload (Request guards), so the route is not to be exposed to untrusted clients
-   until (a) lands.
+1. The core changes are open upstream as vllm#67144 (`error` and `abort` endings) and vllm#67151
+   (the two request fields and server-caused `length` endings), and both are in the stage 1 build.
+   Until they merge, the README states the behaviour on a core without them: guards inactive, and
+   partial text with HTTP 200 for these endings.
+2. For the README limits: on a core without vllm#67151, beam search issues about `max_model_len`
+   engine requests per upload (Request guards), so the route is not to be exposed to untrusted
+   clients on such a core.
 
 ### Deferred
 1. A request-chosen cadence (for example through `vllm_xargs`), if deployments need one.

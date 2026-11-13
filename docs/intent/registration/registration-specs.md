@@ -5,7 +5,7 @@ Design: [registration-design.md](registration-design.md). Prefix `REG`.
 ## Entry point and `register()`
 
 - [x] **REG-001**: The distribution `vllm-nemotron-asr-streaming` shall expose exactly one `vllm.general_plugins` entry point, named `nemotron_asr_streaming`, whose target is the plugin's `register` function.
-- [x] **REG-002**: If `AsyncLLM.generate` has no `stream_admission` parameter, or `AsyncLLM.wait_stream_retired` does not exist, then `register()` shall raise an error that names each missing call and states that the plugin requires an RFC 1 + RFC 2 vLLM build, and shall leave `ModelRegistry`, `MODELS_CONFIG_MAP`, the config parsers and the tokenizer modes unchanged.
+- [x] **REG-002**: If `AsyncLLM.generate` has no `stream_admission` parameter, or `AsyncLLM.wait_stream_retired` does not exist, then `register()` shall raise an error that names each missing call and states that the plugin requires a vLLM build with RFC 1's stream admission (vllm#67375), and shall leave `ModelRegistry`, `MODELS_CONFIG_MAP`, the config parsers and the tokenizer modes unchanged.
 - [x] **REG-003**: When `register()` runs, it shall register the architecture `Nemotron3_5AsrStreamingForRNNT` with `ModelRegistry` as the lazy reference `vllm_nemotron_asr_streaming.model:Nemotron3_5AsrStreamingForRNNT`, without importing the model module.
 - [x] **REG-004**: When `register()` runs, it shall set `MODELS_CONFIG_MAP["Nemotron3_5AsrStreamingForRNNT"]` to the plugin's verify-and-update class.
 - [x] **REG-005**: When `register()` runs, it shall register the card parser under the config format name `nemotron_asr_streaming`.

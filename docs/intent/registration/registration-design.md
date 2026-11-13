@@ -36,7 +36,7 @@ mode below do not exist and core rejects `--config-format nemotron_asr_streaming
 passed:
 1. **Client-path check.** `AsyncLLM.generate` must accept `stream_admission` and
    `AsyncLLM.wait_stream_retired` must exist. A missing one raises, naming it and stating that the
-   plugin targets an RFC 1 + RFC 2 build. `register()` initializes no device and loads no model;
+   plugin needs a vLLM build with RFC 1's stream admission (vllm#67375 on #67374). `register()` initializes no device and loads no model;
    the imports it needs may pull in engine modules transitively.
 2. **Architecture.** `ModelRegistry.register_model("Nemotron3_5AsrStreamingForRNNT",
    "vllm_nemotron_asr_streaming.model:Nemotron3_5AsrStreamingForRNNT")`, a lazy reference.
@@ -201,16 +201,60 @@ Both raise `ValueError` listing every violated condition.
 
 The persistent-state model needs one scheduler step at a time, one copy of each session's state
 and a single device. The plugin refuses:
-- asynchronous scheduling (`async_scheduling` must be `False`; unset counts as a refusal);
-- prefix caching;
+- asynchronous scheduling: an explicit `async_scheduling = True`. Unset is accepted:
+  `verify_and_update_config` runs before core resolves the option and sees it unset, and core
+  then resolves it to `False` for a model that declares persistent state (and itself raises on
+  `True`). The model state re-checks the resolved value when it is constructed and refuses
+  anything but `False`;
+- prefix caching: an explicit `enable_prefix_caching = True`. Unset is accepted, because core
+  reports prefix caching as unsupported for a model that declares persistent state and resolves
+  it off; the model state re-checks the resolved value;
 - speculative decoding, KV transfer, dual-batch overlap, sleep mode, the cumem allocator and
   hierarchical sparse attention;
 - any tensor, pipeline, data, decode-context or prefill-context parallel size other than 1 (a
   setting the build does not have counts as 1);
-- an outer runner that is not eager (`enforce_eager` must be set). The model runs its own
-  captured encoder and decoder graphs inside the eager outer step.
+- an outer runner that is not eager: `enforce_eager` must be set explicitly, since core's default
+  is `False`. The model runs its own captured encoder and decoder graphs inside the eager outer
+  step (Execution memory). Core resolves an unset `cudagraph_mode` to `NONE` for a persistent-state
+  model and raises on any other mode, so with `enforce_eager` core captures no graphs of its own.
 
 The README's serve command shows the required flags.
+
+## Execution memory
+
+The model's own execution (static encoder execution, decoder graphs per served geometry and batch
+tier, and the optional CHUNK buckets) retains device memory, and its largest transaction needs
+transient memory beyond that. Core must count both before it sizes the KV cache and the state pool
+(`max_num_seqs + 1` pages), which it does from the memory profile of its profiling run; it binds
+state slots only after that allocation (`initialize_state_slots`). The RFC 1 PRs have no hook
+dedicated to model execution memory, so the model state does this work in `prepare_step` on the
+first profiling step:
+
+- On the first `prepare_step` with `dummy_run` and `is_profile` both true, the model state
+  warms and captures its execution inventory, checks the inventory is complete (every served
+  geometry and batch tier), and then, with every captured graph retained, runs the profile
+  transaction at its maximum shape so the profile records the transient peak. This runs inside
+  core's memory profile and before the state pool exists.
+- Capture and profiling use model-owned scratch state built from the model's
+  `PersistentStateSpec`, never the state pool: captured graphs copy state into and out of their
+  own static buffers, and the gather from and scatter to the pool run outside any graph. So no
+  step of the preparation needs the pool or its addresses.
+- The preparation runs once per worker. A later profiling step re-checks the inventory and
+  returns. A failure marks the worker failed, discards partial execution state and raises, so
+  startup fails; the next attempt is a fresh worker.
+- A non-profiling step that finds the inventory not prepared raises rather than capturing during
+  serving, where the memory would not be budgeted. Every core startup path runs the profiling step
+  before serving, so this is a guard against a core that changes that order.
+
+## State-slot access
+
+The model reads its state through the RFC 1 bindings only during a live step: `bind_rows` for the
+step's ordered requests and their handles (from the scheduler output's state-slot handles), then
+`StateSlotRows.component_pools` and `slot_indices_cpu`. The model's own projection of pools into
+named state tensors takes the component pools and the model's spec, not members that the RFC 1 PRs
+removed (the rows' spec and views, handle lookup by request, and the current-step check). The
+persistent-state spec is layout only: `PersistentStateSpec(descriptors=..., page_size_bytes=...,
+block_size=1)`.
 
 ## Supported tasks
 
@@ -260,6 +304,7 @@ Adding a dependency means adding it here and to the import-time check.
 | Where launch options are resolved | Post-override validation of the final configuration; the parser reads only the checkpoint | Reading `hf_overrides` inside the parser; a plugin-specific environment variable | Core gives the parser only flat overrides, applies dictionary overrides after it, and also calls it with none when deriving a generation configuration |
 | Control tokens in the tokenizer | A registered tokenizer mode that appends them as special tokens, with park as the tokenizer's EOS | Publishing a modified tokenizer; leaving them unknown | Core detokenizes every token; unknown IDs break detokenization and unmarked ones appear in text; the card must stay usable unmodified |
 | Context ceiling | Translation sets `max_position_embeddings` to 2^24 | Requiring `VLLM_ALLOW_LONG_MAX_MODEL_LEN` | The model has no positional limit; long files need a context far above the card's 32,768 |
+| Where model execution memory is prepared | First profiling `prepare_step`, before the state pool, inside core's memory profile | `initialize_state_slots` or first serving step: graphs created after core sized the KV cache and state pool, so their memory is unbudgeted. A new core hook: core adds no interface the RFC 1 PRs do not need (Pete, 2026-11-12) | Only the profiling step is both budgeted and available without a core change |
 | Override of the served set | Replaces the card's set; values limited to the five geometries | Union with the card's set; any value | Replacement lets a deployment narrow the warmed set; values without a geometry cannot run |
 | Load-time checks | Client calls in `register()`; adapter symbols at model import | All checks in `register()` | `register()` and the session factory do not import the model class modules, so loading the plugin stays cheap; core's speech-to-text serving imports the model class in the API server when it starts, so importing it initializes no device and loads no weights |
 | `generate` task | Not advertised (model-state override) | Advertise for compatibility | The model emits transcript labels, not text generation |

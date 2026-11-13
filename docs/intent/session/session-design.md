@@ -33,7 +33,7 @@ the protocol is structural.
 - returns `None` when the served architecture is not `Nemotron3_5AsrStreamingForRNNT`;
 - raises when the engine client lacks `generate(..., stream_admission=True)` or
   `wait_stream_retired` (typed against `EngineClient` where the engine declares them there, and
-  otherwise requiring `AsyncLLM`);
+  otherwise requiring `AsyncLLM`; vllm#67375 declares them only on `AsyncLLM`);
 - otherwise returns a `SessionFactory`. `served_cadences` is the set of cadence labels of the
   served lookaheads, `locales` the model's locale table keys, and `default_locale` the locale for a
   stream whose client names none: `auto` when the table has it, else the table's only locale, else
@@ -134,7 +134,9 @@ stream_admission=True)` running as a factory-owned task.
 | `teardown()` | Cancel the `generate()` task; no awaits and no direct engine calls. |
 
 **Engine aborts while idle.** The engine aborts an admitted stream that is never fed, parked idle
-or draining past its configured deadlines; an operator abort looks the same to the client. When the
+or draining past its configured deadlines (core's `--stream-admission-timeouts`, vllm#67375:
+`never_fed_timeout`, `parked_idle_timeout`, `draining_timeout`); an operator abort looks the same
+to the client. When the
 `generate()` task ends with an `abort` finish while the session has no unit outstanding, no `flush`
 is in progress and its input is not closed, the lease fails with `expired` (the engine ended an idle stream; deadlines are the
 usual cause), and the next call raises it. An idle end by `EngineDeadError` fails it with
