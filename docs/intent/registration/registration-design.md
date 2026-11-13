@@ -210,8 +210,10 @@ and a single device. The plugin refuses:
   option arrives already `False`: `EngineArgs` resolves it from the model, which reports prefix
   caching as unsupported when it declares persistent state. A configuration built directly with
   `True` is refused here (and by core's state validation);
-- speculative decoding, KV transfer, dual-batch overlap, sleep mode, the cumem allocator and
-  hierarchical sparse attention;
+- speculative decoding, KV transfer, dual-batch overlap, sleep mode, the cumem allocator,
+  hierarchical sparse attention and fault tolerance (`parallel_config.enable_fault_tolerance`, which
+  keeps core's JIT kernel warm-up on under `enforce_eager`; that warm-up runs synthetic real steps
+  without state-slot handles);
 - any tensor, pipeline, data, decode-context or prefill-context parallel size other than 1 (a
   setting the build does not have counts as 1);
 - an outer runner that is not eager: `enforce_eager` must be set explicitly, since core's default
@@ -238,6 +240,18 @@ memory, so the model prepares its execution on core's profiling step:
   transaction at its maximum shape so the measurement includes the transient peak. It returns
   the dummy output core expects. The earlier forward-time profile of an unprepared encoder is
   retired: it cannot run once the inventory is sealed.
+- **Dummy output.** Core indexes the profiling step's forward output by its logits indices, computes
+  logits and runs the sampler on it. The dummy output matches the input embeddings' token count,
+  width, dtype and device, and its carrier column holds a valid decision ID (zeros), so dummy sampling
+  needs no state; dummy sampling, including the native-burst sampler wrapper, reads no state slots.
+- **Repeated profiling steps.** Core runs one profiling run per worker, but its kernel warm-up may run
+  further profiling dummy steps after the state pool exists (FlashInfer autotuning on recent GPUs),
+  with real token IDs and attention metadata, possibly several times. Each is handled as a later
+  profiling step: the inventory is checked and the dummy output returned, with no capture and no pool
+  access.
+- **Other dummy steps.** Core skips its state-slot step bookkeeping on every dummy step, and calls
+  `prepare_inputs` after `prepare_step` returned early, so on a dummy step the model reads no handles,
+  no rows and nothing left from an earlier real step.
 - **No state pool needed.** Capture and profiling use model-owned scratch state built from the
   model's `PersistentStateSpec`: captured graphs copy state into and out of their own static
   buffers, and the gather from and scatter to the pool run outside any graph, so preparation needs
@@ -245,7 +259,11 @@ memory, so the model prepares its execution on core's profiling step:
 - **Once per worker.** A later profiling step checks the inventory and returns. A failure marks the
   worker failed, discards partial execution state and raises, so startup fails; the next attempt
   is a fresh worker.
-- **Serving guard.** Before a serving step uses graphed execution, the model checks that every
+- **Readiness on every real step.** The model refuses any real step that runs model execution unless
+  preparation succeeded in this worker, whatever the execution arm; a cleanup-only step (no scheduled
+  rows) is allowed. It never prepares lazily during serving. Normal startup cannot admit a request
+  before preparation, because core profiles and initializes caches before it constructs the scheduler.
+- **Serving guard for graphs.** Before a serving step uses graphed execution, the model checks that every
   expected graph entry is captured in its graph wrapper (the wrapper's entry holds a graph), not
 only listed in the model's inventory and not merely that preparation ran, and raises otherwise rather
   than capturing during serving, where the memory is not budgeted. This also covers a core that
@@ -264,6 +282,11 @@ only listed in the model's inventory and not merely that preparation ran, and ra
   platform's static graph wrapper. At these heads core has no capture-enabled switch (removed with
   Model Runner V1), so the model's graph runtime has none; capture legality is the model's own
   ordering above.
+- **Configured graphed execution.** Graphed execution is configured exactly when
+  `decode_dispatch_arm` is `"dense-graphed"`, `encoder_execution_arm` is `dense-graphed` or
+  `eager-graphed`, or `chunk_bucket_graph_populations` is non-empty. `compiled-static` is warmed and
+  readiness-checked but not graphed. The card default (encoder `eager`, decoder `dense-eager`, no
+  CHUNK populations) captures nothing.
 
 ## Model-state interface
 
@@ -351,7 +374,7 @@ adding it here and to the import-time check.
 | Where launch options are resolved | Post-override validation of the final configuration; the parser reads only the checkpoint | Reading `hf_overrides` inside the parser; a plugin-specific environment variable | Core gives the parser only flat overrides, applies dictionary overrides after it, and also calls it with none when deriving a generation configuration |
 | Control tokens in the tokenizer | A registered tokenizer mode that appends them as special tokens, with park as the tokenizer's EOS | Publishing a modified tokenizer; leaving them unknown | Core detokenizes every token; unknown IDs break detokenization and unmarked ones appear in text; the card must stay usable unmodified |
 | Context ceiling | Translation sets `max_position_embeddings` to 2^24 | Requiring `VLLM_ALLOW_LONG_MAX_MODEL_LEN` | The model has no positional limit; long files need a context far above the card's 32,768 |
-| Where model execution memory is prepared | The model's forward on core's first profiling dummy step (flagged by `prepare_step`), before the state pool, inside core's memory profile | `initialize_state_slots` or first serving step: graphs created after core sized the KV cache and state pool, so their memory is unbudgeted. A new core hook: core adds no interface the RFC 1 PRs do not need (Pete, 2026-11-12) | Only the profiling step is both budgeted and available without a core change |
+| Where model execution memory is prepared | The model's forward on core's first profiling dummy step (flagged by `prepare_step`), before the state pool, inside core's memory profile | `initialize_state_slots` or first serving step: graphs created after core sized the KV cache and state pool, so their memory is unbudgeted. A new core hook: core adds no interface the RFC 1 PRs do not need (Pete, 2026-11-12) | Only the profiling step is both budgeted and available without a core change. A failed preparation ends worker startup and the engine is restarted: partial preparation is not safely retryable in the worker, and no serving state outlives the failure |
 | Override of the served set | Replaces the card's set; values limited to the five geometries | Union with the card's set; any value | Replacement lets a deployment narrow the warmed set; values without a geometry cannot run |
 | Load-time checks | Client calls in `register()`; adapter symbols at model import | All checks in `register()` | `register()` and the session factory do not import the model class modules, so loading the plugin stays cheap; core's speech-to-text serving imports the model class in the API server when it starts, so importing it initializes no device and loads no weights |
 | `generate` task | Not advertised (model-state override) | Advertise for compatibility | The model emits transcript labels, not text generation |
