@@ -359,7 +359,7 @@ adding it here and to the import-time check.
 ## Open Questions & Future Decisions
 
 ### Deferred
-1. A version gate for clean vLLM releases once RFC 1 and RFC 2 ship; until then the client-path
+1. A version gate for clean vLLM releases once RFC 1's stream admission ships; until then the client-path
    check is the gate.
 
 ## References
