@@ -13,7 +13,7 @@ Design: [registration-design.md](registration-design.md). Prefix `REG`.
 - [x] **REG-007**: If the `ModelRegistry` entry or the `MODELS_CONFIG_MAP` entry for the offline architecture `Nemotron3_5AsrForRNNT` differs after `register()` from its state before `register()`, then `register()` shall raise.
 - [x] **REG-008**: When `register()` is called more than once in one process, every call after the first shall leave the registrations of REG-003 to REG-006 unchanged and shall not raise.
 - [x] **REG-009**: `register()` shall initialize no device and load no model weights.
-- [x] **REG-010**: If any adapter dependency listed in the registration design (module and name) cannot be imported when the model class module is imported, then the import shall raise an error naming every missing module and name, before any weights load.
+- [ ] **REG-010**: If any adapter dependency listed in the registration design (module and name), other than the graph-runtime and batch-invariant rows, cannot be imported when the model class module is imported, then the import shall raise an error naming every missing module and name, before any weights load. If a graph-runtime row cannot be imported when graphed execution is configured, or a batch-invariant row when that mode is configured, then model construction shall raise an error naming it.
 - [x] **REG-012**: After importing `vllm_nemotron_asr_streaming`, running `register()` and importing `vllm_nemotron_asr_streaming.session`, neither model class module (`vllm_nemotron_asr_streaming.model`, `vllm_nemotron_asr_streaming.nemotron_asr.nemotron_asr`) shall be in `sys.modules`; the card parser's configuration module and engine modules imported by the public client and configuration APIs are allowed.
 - [x] **REG-013**: Importing the model class module shall initialize no device and load no weights.
 
@@ -64,13 +64,37 @@ These checks run in `verify_and_update_model_config`, after core has applied eve
 
 ## Engine settings
 
-- [x] **REG-ENG-001**: If asynchronous scheduling is enabled or not explicitly set to `False`, then `verify_and_update_config` shall refuse the configuration.
-- [x] **REG-ENG-002**: If prefix caching is enabled, then `verify_and_update_config` shall refuse the configuration.
+- [ ] **REG-ENG-001**: If `async_scheduling` is `True`, then `verify_and_update_config` shall refuse the configuration; an unset `async_scheduling` (`None`) shall not be refused there.
+- [x] **REG-ENG-002**: If `enable_prefix_caching` is `True` in the configuration, then `verify_and_update_config` shall refuse the configuration.
 - [x] **REG-ENG-003**: If speculative decoding, KV transfer, dual-batch overlap, sleep mode, the cumem allocator or hierarchical sparse attention is enabled, then `verify_and_update_config` shall refuse the configuration, naming each enabled setting.
 - [x] **REG-ENG-004**: If any of the tensor, pipeline, data, decode-context or prefill-context parallel sizes that the running vLLM build defines is other than 1, then `verify_and_update_config` shall refuse the configuration; a parallel setting the build does not define shall count as 1.
 - [x] **REG-ENG-005**: If `enforce_eager` is not set, then `verify_and_update_config` shall refuse the configuration.
-- [x] **REG-ENG-006**: When the model state is constructed, it shall re-check REG-ENG-001 to REG-ENG-005 against the final engine configuration and raise as in REG-VAL-003 if any fails.
-- [x] **REG-ENG-007**: The README's serve command shall show every flag REG-ENG-001 to REG-ENG-005 require, including an explicit `--no-async-scheduling`, together with `--dtype float32` (the model's qualified precision),  `--config-format nemotron_asr_streaming`, `--tokenizer-mode nemotron_asr_streaming` and the `num_lookahead_tokens` override.
+- [ ] **REG-ENG-006**: When the model state is constructed, it shall re-check REG-ENG-002 to REG-ENG-005 against the final engine configuration, and shall refuse a resolved `async_scheduling` that is not `False` (including `None`), raising as in REG-VAL-003 if any fails.
+- [ ] **REG-ENG-007**: The README's serve command shall show every flag REG-ENG-002 to REG-ENG-005 require, including `--enforce-eager`, and may omit `--no-async-scheduling` (core resolves it off), together with `--dtype float32` (the model's qualified precision),  `--config-format nemotron_asr_streaming`, `--tokenizer-mode nemotron_asr_streaming` and the `num_lookahead_tokens` override.
+
+## Execution memory
+
+- [ ] **REG-MEM-001**: When `prepare_step` is called with `dummy_run` and `is_profile` both true, it shall record the step as a profiling dummy step and shall not prepare execution itself.
+- [ ] **REG-MEM-002**: When the model's forward runs on the first profiling dummy step of a worker, it shall warm and capture the configured execution inventory, verify that every expected entry (each served geometry and batch tier, and each configured CHUNK bucket) is captured, then, with every captured graph retained, run the profile transaction at its maximum shape, and return the dummy output core expects (a tensor shaped like the input embeddings).
+- [ ] **REG-MEM-003**: When the model's forward runs on a later profiling dummy step of a worker whose preparation succeeded, it shall verify the inventory as in REG-MEM-002 and return the dummy output without capturing or re-running the profile transaction.
+- [ ] **REG-MEM-004**: If any step of REG-MEM-002 fails, then the model shall discard its partial execution state, mark the worker's preparation failed and raise; any later profiling dummy step in that worker shall raise without preparing.
+- [ ] **REG-MEM-005**: Preparation (REG-MEM-002) shall use model-owned scratch state built from the model's `PersistentStateSpec` and shall not read the state-slot bindings or the state pool.
+- [ ] **REG-MEM-006**: If a step that is not a profiling dummy step would use graphed execution and any expected graph entry is not captured in its graph wrapper (the wrapper's entry holds no graph), then the model shall raise without capturing.
+- [ ] **REG-MEM-007**: The model's graph runtime shall capture through core's graph-capture context, forward context and the platform's static graph wrapper, and shall neither import nor call a capture-enabled switch.
+- [ ] **REG-MEM-008**: The model's forward shall not run a forward-time profile of an unprepared encoder on a profiling dummy step; REG-MEM-002 is the only profile the model runs.
+
+## Model-state interface
+
+- [ ] **REG-MS-001**: Every `ModelState` method the model state overrides shall accept every call that the base method's signature at the target core accepts (same positional parameters, keyword-only parameters and defaults).
+- [ ] **REG-MS-002**: When `dummy_inputs_embeds(num_tokens, input_ids)` is called, with `input_ids` a tensor or `None`, the model state shall return its pre-allocated embeddings buffer sliced to `num_tokens`.
+
+## State-slot access
+
+- [ ] **REG-STATE-001**: The persistent-state layer shall build its spec as `PersistentStateSpec(descriptors=..., page_size_bytes=..., block_size=1)`, passing no other argument.
+- [ ] **REG-STATE-002**: `prepare_step` shall read state-slot handles only from the scheduler output and shall not call `bind_rows` or read `component_pools`.
+- [ ] **REG-STATE-003**: The model shall read state-slot rows only through `bind_rows` with the step's ordered request IDs and their scheduler-output handles, and then only `component_pools` and `slot_indices_cpu` of the result.
+- [ ] **REG-STATE-004**: Before committing state for a step, the model shall re-read the rows' `component_pools`, so that an access outside the live step raises before any write.
+- [ ] **REG-STATE-005**: The model's projection of state pools into named state tensors shall take the component pools and the model's `PersistentStateSpec` and use no other member of the rows.
 
 ## Supported tasks
 
@@ -79,4 +103,4 @@ These checks run in `verify_and_update_model_config`, after core has applied eve
 
 ## Deferred
 
-- [D] **REG-011**: Where vLLM releases include RFC 1 and RFC 2, `register()` shall check a minimum vLLM version in addition to the client-path check of REG-002.
+- [D] **REG-011**: Where vLLM releases include RFC 1's stream admission, `register()` shall check a minimum vLLM version in addition to the client-path check of REG-002.
