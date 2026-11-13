@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Engine settings the model refuses (REG-ENG-001 to REG-ENG-007).
+"""Engine settings the model refuses (REG-ENG-001 to REG-ENG-008).
 
 ``verify_and_update_config`` is called on ``VllmConfig``-shaped namespaces whose
 attribute paths are the ones core's own persistent-state validation reads
@@ -28,6 +28,7 @@ NAMES = {
     "enable_sleep_mode": ("sleep",),
     "enable_cumem_allocator": ("cumem",),
     "hisparse_config": ("hisparse", "hierarchical sparse"),
+    "enable_fault_tolerance": ("fault tolerance", "fault_tolerance", "fault-tolerance"),
     "enforce_eager": ("eager",),
     "tensor_parallel_size": ("tensor_parallel_size", "tensor parallel"),
     "pipeline_parallel_size": ("pipeline_parallel_size", "pipeline parallel"),
@@ -77,10 +78,16 @@ def test_accepted_engine_configuration_passes(engine_config):
     _hook().verify_and_update_config(engine_config())
 
 
-@pytest.mark.parametrize("value", [True, None])
 # @spec REG-ENG-001
-def test_async_scheduling_enabled_or_unset_is_refused(engine_config, value):
-    _refuse(engine_config(async_scheduling=value), "async_scheduling")
+def test_async_scheduling_enabled_is_refused(engine_config):
+    _refuse(engine_config(async_scheduling=True), "async_scheduling")
+
+
+# @spec REG-ENG-001
+def test_async_scheduling_left_unset_is_not_refused_by_the_hook(engine_config):
+    """The hook runs before core resolves the option, so it sees ``None``;
+    core then resolves it to ``False`` for a persistent-state model."""
+    _hook().verify_and_update_config(engine_config(async_scheduling=None))
 
 
 # @spec REG-ENG-002
@@ -97,6 +104,7 @@ def test_prefix_caching_is_refused(engine_config):
         "enable_sleep_mode",
         "enable_cumem_allocator",
         "hisparse_config",
+        "enable_fault_tolerance",
     ],
 )
 # @spec REG-ENG-003
@@ -114,6 +122,7 @@ def test_every_enabled_unsupported_feature_is_named(engine_config):
         "enable_sleep_mode",
         "enable_cumem_allocator",
         "hisparse_config",
+        "enable_fault_tolerance",
     )
     config = engine_config(
         **{s: (object() if s.endswith("_config") else True) for s in settings}
@@ -151,7 +160,7 @@ def test_an_outer_runner_that_is_not_eager_is_refused(engine_config, value):
 # @spec REG-VAL-003
 def test_every_refused_setting_is_listed_in_one_error(engine_config):
     config = engine_config(
-        async_scheduling=None,
+        async_scheduling=True,
         enable_prefix_caching=True,
         speculative_config=object(),
         kv_transfer_config=object(),
@@ -159,6 +168,7 @@ def test_every_refused_setting_is_listed_in_one_error(engine_config):
         enable_sleep_mode=True,
         enable_cumem_allocator=True,
         hisparse_config=object(),
+        enable_fault_tolerance=True,
         enforce_eager=False,
         tensor_parallel_size=2,
         pipeline_parallel_size=2,
@@ -184,11 +194,38 @@ def test_real_vllm_config_with_accepted_settings_constructs(
 
 
 # @spec REG-ENG-001
-def test_real_vllm_config_with_async_scheduling_left_unset_is_refused(
+def test_real_vllm_config_with_async_scheduling_left_unset_constructs(
     make_model_config, make_vllm_config, card_dir
 ):
-    with pytest.raises(ValueError, match="(?i)async"):
-        make_vllm_config(make_model_config(card_dir), async_scheduling=None)
+    """An unset option is accepted by the hook and core resolves it off for
+    a model that declares persistent state."""
+    vllm_config = make_vllm_config(make_model_config(card_dir), async_scheduling=None)
+    assert vllm_config.scheduler_config.async_scheduling is False
+
+
+# @spec REG-ENG-003
+def test_real_vllm_config_with_fault_tolerance_is_refused(
+    make_model_config, make_vllm_config, card_dir
+):
+    """``enable_fault_tolerance`` keeps core's JIT kernel warm-up on under
+    ``enforce_eager``; that warm-up runs synthetic real steps without
+    state-slot handles."""
+    from vllm.config import ParallelConfig
+
+    model_config = make_model_config(card_dir)
+    with pytest.raises(ValueError) as excinfo:
+        _hook().verify_and_update_config(
+            _with_parallel(
+                make_vllm_config(model_config),
+                ParallelConfig(enable_fault_tolerance=True),
+            )
+        )
+    assert _names(str(excinfo.value), "enable_fault_tolerance")
+
+
+def _with_parallel(vllm_config, parallel_config):
+    vllm_config.parallel_config = parallel_config
+    return vllm_config
 
 
 # @spec REG-ENG-002
@@ -228,6 +265,13 @@ _MUTATIONS = {
     ),
     "speculative_config": lambda c: setattr(c, "speculative_config", object()),
     "enable_dbo": lambda c: setattr(c.parallel_config, "enable_dbo", True),
+    "enable_sleep_mode": lambda c: setattr(c.model_config, "enable_sleep_mode", True),
+    "enable_cumem_allocator": lambda c: setattr(
+        c.model_config, "enable_cumem_allocator", True
+    ),
+    "enable_fault_tolerance": lambda c: setattr(
+        c.parallel_config, "enable_fault_tolerance", True
+    ),
 }
 
 
@@ -241,6 +285,19 @@ def test_model_state_refuses_a_configuration_resolved_after_the_hook(
     with pytest.raises(ValueError) as excinfo:
         build_model_state(config)
     assert _names(str(excinfo.value), setting)
+
+
+# @spec REG-ENG-006
+def test_model_state_refuses_a_resolved_async_scheduling_of_none(
+    good_vllm_config, build_model_state
+):
+    """The hook accepts ``None``; at model-state construction the value is
+    resolved, and anything but ``False`` (including ``None``) is refused."""
+    config = good_vllm_config()
+    config.scheduler_config.async_scheduling = None
+    with pytest.raises(ValueError) as excinfo:
+        build_model_state(config)
+    assert _names(str(excinfo.value), "async_scheduling")
 
 
 # @spec REG-ENG-006, REG-VAL-003
@@ -270,10 +327,11 @@ def _serve_command(readme: str) -> str:
 
 # @spec REG-ENG-007
 def test_readme_serve_command_shows_every_required_flag(repo_root):
+    """``--no-async-scheduling`` and ``--no-enable-prefix-caching`` may be
+    omitted (core resolves both off for this model); every other flag the
+    engine-setting checks require must be shown."""
     command = _serve_command((repo_root / "README.md").read_text())
     for flag in (
-        "--no-async-scheduling",
-        "--no-enable-prefix-caching",
         "--dtype float32",
         "--enforce-eager",
         "--config-format nemotron_asr_streaming",
@@ -281,4 +339,90 @@ def test_readme_serve_command_shows_every_required_flag(repo_root):
     ):
         assert flag in command, f"{flag} missing from: {command}"
     assert re.search(r"--hf-overrides[^\n]*num_lookahead_tokens", command), command
-    assert "--async-scheduling" not in command
+    # Nothing in the command turns on a setting REG-ENG-001 to REG-ENG-005
+    # refuses.
+    for refused in (
+        " --async-scheduling",
+        " --enable-prefix-caching",
+        "--speculative-config",
+        "--kv-transfer-config",
+        "--enable-dbo",
+        "--enable-sleep-mode",
+        "--fault-tolerance-config",
+        "--enable-fault-tolerance",
+        "--tensor-parallel-size",
+        "--pipeline-parallel-size",
+        "--data-parallel-size",
+    ):
+        assert refused not in command, f"{refused} in: {command}"
+
+
+# --------------------------------------------------------------------------
+# Native burst's configuration check
+# --------------------------------------------------------------------------
+
+
+def _native_burst_config(*, drop=(), **parallel):
+    from types import SimpleNamespace
+
+    values = {
+        "pipeline_parallel_size": 1,
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 1,
+        "decode_context_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+        "enable_expert_parallel": False,
+    }
+    values.update(parallel)
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        speculative_config=None,
+        parallel_config=SimpleNamespace(
+            **{k: v for k, v in values.items() if k not in drop}
+        ),
+        model_config=SimpleNamespace(logits_processors=None),
+    )
+
+
+def _validate_native_burst(config):
+    from vllm_nemotron_asr_streaming.nemotron_asr.native_burst import (
+        validate_native_burst_config,
+    )
+
+    validate_native_burst_config(config)
+
+
+# @spec REG-ENG-008
+def test_native_burst_accepts_the_single_device_configuration():
+    _validate_native_burst(_native_burst_config())
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [*PARALLEL, "enable_expert_parallel"],
+)
+# @spec REG-ENG-008
+def test_native_burst_counts_an_undefined_parallel_setting_as_one_or_off(setting):
+    """A parallel size the build does not define counts as 1, and an
+    undefined expert-parallel setting as off (as REG-ENG-004 does)."""
+    _validate_native_burst(_native_burst_config(drop=(setting,)))
+
+
+# @spec REG-ENG-008
+def test_native_burst_with_every_parallel_setting_undefined_is_accepted():
+    _validate_native_burst(
+        _native_burst_config(drop=(*PARALLEL, "enable_expert_parallel"))
+    )
+
+
+@pytest.mark.parametrize("setting", PARALLEL)
+# @spec REG-ENG-008
+def test_native_burst_still_refuses_a_defined_parallel_size_other_than_one(setting):
+    with pytest.raises(ValueError, match="native burst"):
+        _validate_native_burst(_native_burst_config(**{setting: 2}))
+
+
+# @spec REG-ENG-008
+def test_native_burst_still_refuses_expert_parallelism():
+    with pytest.raises(ValueError, match="native burst"):
+        _validate_native_burst(_native_burst_config(enable_expert_parallel=True))

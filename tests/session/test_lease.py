@@ -24,6 +24,7 @@ from support.fake_engine import (
     Silent,
     Text,
     contains_key,
+    refusal,
     run,
     unit_of,
     wait_until,
@@ -387,9 +388,8 @@ def test_cancelled_call_cleanup_calls_do_not_raise_cancelled(build):
 
 
 async def trigger_input_capacity(build, monkeypatch):
-    from vllm_nemotron_asr_streaming.session.packer import Packer
-
     from vllm_nemotron_asr_streaming.session import PackerCapacityError
+    from vllm_nemotron_asr_streaming.session.packer import Packer
 
     def exhausted(self, samples):
         raise PackerCapacityError("sequence space exhausted")
@@ -841,14 +841,12 @@ def test_release_waits_for_retirement_of_its_caller_id(build):
 # @spec SESS-REL-001
 @pytest.mark.parametrize("kind", ["value-error", "admission-error"])
 def test_release_resolves_terminal_wait_results_like_cleanup(build, kind):
-    from vllm.v1.engine import StreamAdmissionError, StreamAdmissionResult
+    from vllm.v1.engine import StreamAdmissionError
 
     result = (
         ValueError("no longer tracked")
         if kind == "value-error"
-        else StreamAdmissionError(
-            StreamAdmissionResult(False, "x", "refused", "capacity")
-        )
+        else StreamAdmissionError(refusal("x", "capacity"))
     )
 
     async def scenario():

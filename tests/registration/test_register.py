@@ -85,7 +85,12 @@ emit(raised=raised, message=message, unchanged=before == snap(), after=snap())
     assert out["raised"], "register() did not raise on an engine without the calls"
     for name in missing:
         assert name in out["message"]
-    assert "RFC 1" in out["message"] and "RFC 2" in out["message"]
+    # The plugin needs RFC 1's stream admission (vllm#67375 on #67374); the
+    # message names that build, not RFC 2, which the plugin does not need.
+    message = out["message"]
+    assert "RFC 1" in message and "stream admission" in message, message
+    assert "vllm#67375" in message and "#67374" in message, message
+    assert "RFC 2" not in message, message
     assert out["unchanged"]
     after = out["after"]
     assert ARCH not in after["models"]
@@ -144,6 +149,7 @@ def test_models_config_map_entry_is_the_plugin_hook(registered):
 def test_card_parser_registered_under_its_format_name(registered):
     from vllm.transformers_utils.config import get_config_parser
     from vllm.transformers_utils.config_parser_base import ConfigParserBase
+
     from vllm_nemotron_asr_streaming.card_parser import (
         NemotronAsrStreamingConfigParser,
     )

@@ -359,7 +359,9 @@ The graph-runtime rows are imported when graphed execution is configured, and th
 row when that mode is; the import-time check covers the rest. vLLM's model-registration, config
 parser, tokenizer and renderer registries, model configuration hooks (`VerifyAndUpdateConfig`,
 `MODELS_CONFIG_MAP`), speech-to-text configuration, multimodal processing, `SupportsTranscription`,
-logging and Hub file helpers, which out-of-tree models use, are outside this table. Adding a dependency means
+logging and Hub file helpers, which out-of-tree models use, are outside this table, as is the public
+client surface that the session and `register()` use (`AsyncLLM`, `StreamingInput`, `SamplingParams`,
+`StreamAdmissionError`, `EngineDeadError`; see the HLD's Engine surface constraint). Adding a dependency means
 adding it here and to the import-time check.
 
 ## Implementation notes

@@ -227,6 +227,7 @@ def engine_config() -> Callable[..., SimpleNamespace]:
             "enable_sleep_mode": False,
             "enable_cumem_allocator": False,
             "hisparse_config": None,
+            "enable_fault_tolerance": False,
             "enforce_eager": True,
             "tensor_parallel_size": 1,
             "pipeline_parallel_size": 1,
@@ -246,6 +247,7 @@ def engine_config() -> Callable[..., SimpleNamespace]:
                 "decode_context_parallel_size",
                 "prefill_context_parallel_size",
                 "enable_dbo",
+                "enable_fault_tolerance",
             )
             if name not in drop
         }

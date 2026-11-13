@@ -401,9 +401,7 @@ class FakeEngine:
             earlier = self.requests.get(request_id)
             if earlier is not None and earlier.reserved:
                 raise StreamAdmissionError(
-                    StreamAdmissionResult(
-                        False, request_id, "refused", "request_id_in_use"
-                    )
+                    _refusal(StreamAdmissionResult, request_id, "request_id_in_use")
                 )
             req = FakeRequest(request_id)
             self.requests[request_id] = req
@@ -429,7 +427,7 @@ class FakeEngine:
                 # AL 861-863: ``raise StreamAdmissionError(result)``.
                 self._end(req, None)
                 raise StreamAdmissionError(
-                    StreamAdmissionResult(False, request_id, "refused", admission)
+                    _refusal(StreamAdmissionResult, request_id, admission)
                 )
             self._log("admitted", request_id)
             req.input_task = asyncio.ensure_future(self._handle_inputs(req, prompt))
@@ -548,10 +546,26 @@ class FakeEngine:
         if self.admission is not None and isinstance(self.admission, str):
             if self.admission not in ("hang", "end"):
                 raise StreamAdmissionError(
-                    StreamAdmissionResult(False, request_id, "refused", self.admission)
+                    _refusal(StreamAdmissionResult, request_id, self.admission)
                 )
         req.retired = True
         self._log("retired", request_id)
+
+
+# ------------------------------------------------------ admission results
+
+
+def refusal(request_id: str, reason: str) -> Any:
+    """A refused admission as the target core builds it: the three-field
+    ``StreamAdmissionResult(accepted, request_id, reason)`` (EN), imported
+    from core so that a schema change there fails these doubles."""
+    from vllm.v1.engine import StreamAdmissionResult
+
+    return _refusal(StreamAdmissionResult, request_id, reason)
+
+
+def _refusal(result_type: Any, request_id: str, reason: str) -> Any:
+    return result_type(accepted=False, request_id=request_id, reason=reason)
 
 
 # -------------------------------------------------------- unit extraction

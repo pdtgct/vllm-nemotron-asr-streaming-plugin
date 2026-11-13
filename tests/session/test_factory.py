@@ -22,6 +22,7 @@ from support.fake_engine import (
     FakeEngine,
     make_hf_config,
     make_model_config,
+    refusal,
     run,
     wait_until,
 )
@@ -340,6 +341,59 @@ def test_open_maps_admission_refusal_to_session_refused(build, reason):
     assert error.session_error == "refused" and error.reason == reason
 
 
+# @spec SESS-OPEN-007
+@pytest.mark.engine
+def test_admission_doubles_build_the_target_cores_three_field_result():
+    """The doubles use core's own ``StreamAdmissionResult``: three fields,
+    ``accepted``, ``request_id`` and ``reason``, and no status field."""
+    from vllm.v1.engine import StreamAdmissionError, StreamAdmissionResult
+
+    assert StreamAdmissionResult.__struct_fields__ == (
+        "accepted",
+        "request_id",
+        "reason",
+    )
+    result = refusal("caller", "capacity")
+    assert type(result) is StreamAdmissionResult
+    assert (result.accepted, result.request_id, result.reason) == (
+        False,
+        "caller",
+        "capacity",
+    )
+    assert StreamAdmissionError(result).result is result
+
+
+# @spec SESS-OPEN-004, SESS-OPEN-007
+@pytest.mark.engine
+def test_refusal_reason_reaches_session_refused_from_the_real_error(build):
+    """The engine raises core's ``StreamAdmissionError`` carrying a
+    three-field result; ``open`` reports that result's ``reason``."""
+    from vllm.v1.engine import StreamAdmissionError
+
+    seen: list = []
+
+    async def scenario():
+        engine, factory = build(FakeEngine(admission="active_limit"))
+        original = engine.generate
+
+        async def spy(*args, **kwargs):
+            try:
+                async for item in original(*args, **kwargs):
+                    yield item
+            except StreamAdmissionError as error:
+                seen.append(error.result)
+                raise
+
+        engine.generate = spy
+        with pytest.raises(Exception) as caught:
+            await factory.open(cadence=CADENCE, locale=LOCALE)
+        return caught.value
+
+    error = run(scenario())
+    assert len(seen) == 1 and not hasattr(seen[0], "status")
+    assert error.session_error == "refused" and error.reason == "active_limit"
+
+
 # @spec SESS-OPEN-004
 @pytest.mark.engine
 def test_second_open_with_a_reserved_id_is_refused_by_the_engine(build, monkeypatch):
@@ -510,13 +564,11 @@ RETIREMENT_RESULTS = [
 
 
 def _result(value):
-    from vllm.v1.engine import StreamAdmissionError, StreamAdmissionResult
+    from vllm.v1.engine import StreamAdmissionError
     from vllm.v1.engine.exceptions import EngineDeadError
 
     if value == "admission-error":
-        return StreamAdmissionError(
-            StreamAdmissionResult(False, "x", "refused", "capacity")
-        )
+        return StreamAdmissionError(refusal("x", "capacity"))
     if value == "engine-dead":
         return EngineDeadError()
     return value
