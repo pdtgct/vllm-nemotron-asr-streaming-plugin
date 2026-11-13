@@ -439,16 +439,26 @@ class FakeGraphWrapper:
         runtime = self._runtime
         if entry.cudagraph is None:
             index = len(runtime.captures)
+            key = (id(self), descriptor)
             runtime.events.append(("capture", descriptor))
             runtime.captures.append((weakref.ref(self), descriptor))
-            if runtime.fail_capture == index:
+            if runtime.skip_capture == index and runtime.skipped is None:
+                runtime.skipped = key
+                runtime.skipped_ref = (weakref.ref(self), descriptor)
+            if (
+                runtime.fail_capture_after is not None
+                and runtime.captures_completed >= runtime.fail_capture_after
+                and runtime.failed_capture is None
+            ):
+                runtime.failed_capture = index
                 raise RuntimeError(f"capture {index} failed")
             output = self.runnable(*args, **kwargs)
-            if runtime.skip_capture != index:
+            if runtime.skipped != key:
                 graph = FakeGraph()
                 runtime.graphs.append(weakref.ref(graph))
                 entry.cudagraph = graph
             entry.output = output
+            runtime.captures_completed += 1
             return output
         runtime.events.append(("replay", descriptor))
         runtime.replays.append((weakref.ref(self), descriptor))
@@ -467,13 +477,36 @@ class FakeGraphRuntime:
         #: ``(wrapper ref, descriptor)`` of every capture attempt / replay.
         self.captures: list[tuple[weakref.ref, Any]] = []
         self.replays: list[tuple[weakref.ref, Any]] = []
-        #: Index of the capture attempt that raises / that stores no graph.
-        self.fail_capture: int | None = None
+        #: Sticky skip: the entry ``(wrapper, descriptor)`` of capture attempt
+        #: ``skip_capture`` is selected, and every capture of it, then or
+        #: later, stores no graph.
         self.skip_capture: int | None = None
-        #: Index of the eager warm-up call (forward context in mode NONE
-        #: entered through the runtime) that raises.
-        self.fail_eager: int | None = None
+        self.skipped: tuple[int, Any] | None = None
+        self.skipped_ref: tuple[weakref.ref, Any] | None = None
+        #: Fail the first capture attempted once ``fail_capture_after``
+        #: captures have completed.
+        self.fail_capture_after: int | None = None
+        self.failed_capture: int | None = None
+        self.captures_completed = 0
+        #: Fail the first eager warm-up call (forward context in mode NONE
+        #: entered through the runtime) made once ``fail_eager_after`` eager
+        #: calls have completed.
+        self.fail_eager_after: int | None = None
+        self.failed_eager: int | None = None
         self.eager_calls = 0
+        self.eager_completed = 0
+
+    def disarm(self) -> None:
+        self.skip_capture = self.fail_capture_after = self.fail_eager_after = None
+
+    def skipped_entry_has_graph(self) -> bool | None:
+        """Whether the selected skipped entry holds a graph (``None`` if no
+        entry was selected or its wrapper is gone)."""
+        if self.skipped_ref is None or self.skipped_ref[0]() is None:
+            return None
+        wrapper, descriptor = self.skipped_ref[0](), self.skipped_ref[1]
+        entry = wrapper.concrete_cudagraph_entries.get(descriptor)
+        return entry is not None and entry.cudagraph is not None
 
     def build(self) -> Any:
         from vllm.config import CUDAGraphMode
@@ -490,14 +523,24 @@ class FakeGraphRuntime:
             runtime.events.append(("capture_context", str(device)))
             yield
 
+        @contextlib.contextmanager
         def forward_context(*args, **kwargs):
-            if kwargs.get("cudagraph_runtime_mode") == CUDAGraphMode.NONE:
+            eager = kwargs.get("cudagraph_runtime_mode") == CUDAGraphMode.NONE
+            if eager:
                 index = runtime.eager_calls
                 runtime.eager_calls += 1
                 runtime.events.append(("eager", kwargs.get("batch_descriptor")))
-                if runtime.fail_eager == index:
+                if (
+                    runtime.fail_eager_after is not None
+                    and runtime.eager_completed >= runtime.fail_eager_after
+                    and runtime.failed_eager is None
+                ):
+                    runtime.failed_eager = index
                     raise RuntimeError(f"eager warm-up {index} failed")
-            return set_forward_context(*args, **kwargs)
+            with set_forward_context(*args, **kwargs):
+                yield
+            if eager:
+                runtime.eager_completed += 1
 
         values = {
             "wrapper_factory": lambda runnable, vllm_config, runtime_mode=None, **kw: (

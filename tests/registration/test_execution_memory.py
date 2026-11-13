@@ -115,6 +115,10 @@ def expected_entries(env) -> int:
     if overrides.get("decode_dispatch_arm") == "dense-graphed":
         count += len(env.served_geometries) * len(batch_tiers(env.max_num_seqs))
     if overrides.get("encoder_execution_arm") in ("dense-graphed", "eager-graphed"):
+        # Without population bucketing a graphed encoder has one entry per
+        # population 1..max_num_seqs. On the CHUNK arm (max_num_seqs=2) those
+        # populations coincide with the decoder's batch tiers (1, 2) only
+        # because max_num_seqs is 2; the two terms are counted separately.
         cells = {
             (g, n)
             for g in env.served_geometries
@@ -413,16 +417,32 @@ def test_first_profiling_forward_prepares_in_order_at_maximum_shape(build, arm):
     assert len(env.graphs.captured()) == expected
     kinds = env.events.kinds()
     last_capture = max((i for i, k in enumerate(kinds) if k == "capture"), default=-1)
+    returned = kinds.index("returned")
+    # Each required profile (maximum shape and each CHUNK cell) runs after the
+    # last capture, with every expected graph retained, before the return.
+    # Executions at those shapes before the first capture are warm-up (the
+    # first step of REG-MEM-002, which warms before it captures); the spec
+    # does not forbid warming at the shapes it later profiles, so they are
+    # allowed. A required-shape call between captures is neither warm-up nor
+    # the profile transaction and is forbidden.
+    first_capture = kinds.index("capture") if "capture" in kinds else returned
+    seen_after: dict[tuple, int] = {}
+    profiles = [
+        (i, (info.get("num_rows"), info.get("geometry_id")))
+        for i, (k, info) in enumerate(env.events)
+        if k == "profile"
+    ]
+    for index, shape in profiles:
+        if shape not in max_shapes(env):
+            continue
+        assert index < first_capture or index > last_capture, (
+            f"a profile at {shape} ran while capture was incomplete"
+        )
+        if index > last_capture:
+            seen_after[shape] = index
     for shape in max_shapes(env):
-        after = [
-            i
-            for i, (k, info) in enumerate(env.events)
-            if k == "profile"
-            and (info.get("num_rows"), info.get("geometry_id")) == shape
-            and i > last_capture
-        ]
-        assert after, f"no profile at {shape} after warm-up and capture"
-        assert after[-1] < kinds.index("returned")
+        assert shape in seen_after, f"no profile at {shape} after capture"
+        assert seen_after[shape] < returned
         assert retained[shape][-1] == expected, (
             f"profile at {shape} ran without every expected graph retained"
         )
@@ -440,10 +460,19 @@ def test_first_profiling_forward_refuses_an_entry_left_without_a_graph(build, ar
         env = build(arm=arm)
         env.graphs.skip_capture = index
         error = h.call_with(env.runner.profile_run, core_embeds=False)
+        kinds = env.events.kinds()
         assert len(env.graphs.captures) > index, (
             f"capture {index} was never attempted (no preparation)"
         )
+        assert env.graphs.skipped_entry_has_graph() is False
         assert error is not None, f"preparation accepted entry {index} without a graph"
+        # Readiness precedes the profile transaction, so no profile runs once
+        # capture has begun (warm-up executions before the first capture are
+        # allowed: they are not the profile transaction).
+        first_capture = kinds.index("capture")
+        assert "profile" not in kinds[first_capture:], (
+            f"a profile ran although entry {index} had no graph"
+        )
 
 
 # @spec REG-MEM-002, REG-MEM-011
@@ -509,34 +538,61 @@ def test_later_profiling_step_refuses_an_inventory_that_is_no_longer_ready(
 
 
 def _inject(env, where: str) -> None:
-    """Fail preparation part-way: the second eager warm-up call, the second
-    capture, a capture that stores no graph (readiness), or the profile
-    transaction (after every capture)."""
+    """Fail preparation part-way, by condition rather than position: the first
+    eager warm-up made after one has completed; the first capture made after
+    one has completed; a selected entry that never holds a graph (readiness);
+    the first required profile made once every expected graph is captured."""
     if where == "warm-up":
-        env.graphs.fail_eager = 1
+        env.graphs.fail_eager_after = 1
     elif where == "capture":
-        env.graphs.fail_capture = 1
+        env.graphs.fail_capture_after = 1
     elif where == "readiness":
         env.graphs.skip_capture = 1
     elif where == "profile":
-        env.profile.fail = RuntimeError("profile transaction failed")
+        expected = expected_entries(env)
+
+        def fail(kwargs):
+            shape = (kwargs.get("num_rows"), kwargs.get("geometry_id"))
+            if (
+                not env.profile_failed
+                and shape in max_shapes(env)
+                and len(env.graphs.captured()) >= expected
+            ):
+                env.profile_failed = True
+                raise RuntimeError("profile transaction failed")
+
+        env.profile_failed = False
+        env.profile.before = fail
 
 
 def _reached(env, where: str) -> bool:
     """The injection point was reached after demonstrable partial
-    preparation (something was already warmed or captured)."""
-    captures = len(env.graphs.captures)
+    preparation."""
+    graphs = env.graphs
     if where == "warm-up":
-        return env.graphs.eager_calls >= 2 and captures >= 1
+        return graphs.failed_eager is not None and graphs.eager_completed >= 1
     if where == "capture":
-        return captures >= 2
+        return graphs.failed_capture is not None and graphs.captures_completed >= 1
     if where == "readiness":
-        return captures == expected_entries(env)
-    return bool(env.profile.calls) and captures == expected_entries(env)
+        return (
+            len(graphs.captures) >= expected_entries(env)
+            and graphs.skipped_entry_has_graph() is False
+        )
+    return env.profile_failed
 
 
 def _attempts(env) -> int:
     return env.graphs.eager_calls + len(env.graphs.captures) + len(env.profile.calls)
+
+
+def _release(error: BaseException | None) -> None:
+    """Clear the frames of an exception and its whole cause/context chain."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        traceback.clear_frames(error.__traceback__)
+        error.__traceback__ = None
+        error = error.__cause__ or error.__context__
 
 
 @pytest.mark.parametrize("arm", GRAPHED)
@@ -548,18 +604,20 @@ def test_failed_preparation_discards_its_state_and_stays_failed(build, arm, wher
     first = h.call_with(env.runner.profile_run, core_embeds=False)
     assert _reached(env, where), f"the {where} injection point was not reached"
     assert first is not None, f"preparation passed despite a {where} failure"
-    traceback.clear_frames(first.__traceback__)
+    _release(first)
     del first
+    env.graphs.disarm()
+    env.profile.fail = None
+    env.profile.before = None
     gc.collect()
     assert env.graphs.live_graphs() == 0, (
         "a graph of the failed preparation is still referenced"
     )
-    env.graphs.fail_eager = env.graphs.fail_capture = env.graphs.skip_capture = None
-    env.profile.fail = None
     attempts = _attempts(env)
     for _ in range(2):
         later = h.call_with(env.runner.profile_run, core_embeds=False)
         assert later is not None, "a profiling step after a failure passed"
+        _release(later)
     assert _attempts(env) == attempts, "a failed worker prepared again"
 
 
@@ -1000,39 +1058,39 @@ def _prepare_graphed(env) -> None:
         env.model.prepare_execution_memory()
 
 
-def _frames(error) -> list[str]:
-    return [f.f_code.co_qualname for f, _ in traceback.walk_tb(error.__traceback__)]
-
-
 # @spec REG-MEM-006
 def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph_cpu(build):
-    """CPU, ``FakeGraphRuntime``: after a good real step that replayed a graph,
-    the entry it replayed loses its graph; the next step that needs it is
-    refused by the model before replaying or capturing, and writes no state."""
+    """CPU, ``FakeGraphRuntime``: a good real step replays graphs; one entry
+    that step replayed loses its graph; the identical step is refused with no
+    capture, no wrapper invocation and no state write; with the graph restored
+    the identical step succeeds again (which attributes the refusal to the
+    missing graph). No exception type or message is pinned, and the check may
+    sit inside the row transaction."""
     env = build(arm="dense-graphed")
     _prepare_graphed(env)
     spy = pool(env)
-    unit0 = h.scheduler_output(new=(stream(env, "s1"),), handles={"s1": 1})
-    env.runner.real_step(unit0)
-    assert env.graphs.replays, "the prepared step replayed no graph"
-    wrapper_ref, descriptor = env.graphs.replays[-1]
-    entry = wrapper_ref().concrete_cudagraph_entries[descriptor]
-    entry.cudagraph = None
-    captures = len(env.graphs.captures)
+
+    def step():
+        return h.scheduler_output(new=(stream(env, "s1"),), handles={"s1": 1})
+
     replays = len(env.graphs.replays)
+    env.runner.real_step(step())
+    new = env.graphs.replays[replays:]
+    assert new, "the prepared step replayed no graph"
+    wrapper_ref, descriptor = new[-1]
+    entry = wrapper_ref().concrete_cudagraph_entries[descriptor]
+    graph, entry.cudagraph = entry.cudagraph, None
+    captures, replays = len(env.graphs.captures), len(env.graphs.replays)
     before = h.pool_tensor(spy).clone()
-    unit1 = h.scheduler_output(
-        new=(stream(env, "s1", sequence=1),), handles={"s1": 1}, step_seq=2
-    )
-    error = h.call_with(env.runner.real_step, unit1)
+    error = h.call_with(env.runner.real_step, step())
     assert error is not None, "the step ran without its graph"
     assert len(env.graphs.captures) == captures, "serving attempted a capture"
-    assert len(env.graphs.replays) == replays, "serving replayed a graph"
+    assert len(env.graphs.replays) == replays, "a wrapper was invoked"
     assert entry.cudagraph is None
-    assert "FakeGraphWrapper.__call__" not in _frames(error), (
-        "the refusal did not come before the wrapper was invoked"
-    )
     assert torch.equal(before, h.pool_tensor(spy)), "the refused step wrote state"
+    entry.cudagraph = graph
+    env.runner.real_step(step())
+    assert len(env.graphs.replays) > replays, "the restored step did not replay"
 
 
 @pytest.mark.gpu
@@ -1040,12 +1098,8 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph_cpu(b
 def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
     monkeypatch, tmp_path
 ):
-    """CUDA, core's own graph runtime and static graph wrapper. Preparation
-    captures; a prepared serving step replays; the entry it replayed loses its
-    graph; the next step is refused before the wrapper is invoked, with zero
-    capture attempts across all wrappers and no state write.
-
-    Seam: the replayed entry is found by instrumenting core's
+    """CUDA, core's own graph runtime and static graph wrapper: as the CPU
+    test. Wrapper invocations are counted by instrumenting core's
     ``CUDAGraphWrapper.__call__`` (no model-internal attribute is read)."""
     from vllm.compilation.cuda_graph import CUDAGraphWrapper
     from vllm.forward_context import get_forward_context
@@ -1081,26 +1135,32 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
     assert any(kind == "capture" for _, _, kind in calls), "nothing was captured"
     bindings = runner.bind_pool(h.real_bindings(h.model_spec(model), device="cuda"))
 
-    def unit(sequence):
-        return h.new_request(
-            "s1",
-            int(model.config.audio_chunk_token_id),
-            audio=h.stream_envelope(model.config, geometry=3, sequence=sequence),
+    def step():
+        return h.scheduler_output(
+            new=(
+                h.new_request(
+                    "s1",
+                    int(model.config.audio_chunk_token_id),
+                    audio=h.stream_envelope(model.config, geometry=3),
+                ),
+            ),
+            handles={"s1": 1},
         )
 
-    runner.real_step(h.scheduler_output(new=(unit(0),), handles={"s1": 1}))
-    replayed = [(w, d) for w, d, kind in calls if kind == "replay"]
+    mark = len(calls)
+    runner.real_step(step())
+    replayed = [(w, d) for w, d, kind in calls[mark:] if kind == "replay"]
     assert replayed, "the prepared serving step replayed no graph"
     wrapper, descriptor = replayed[-1]
-    wrapper.concrete_cudagraph_entries[descriptor].cudagraph = None
-    attempts = len(calls)
+    entry = wrapper.concrete_cudagraph_entries[descriptor]
+    graph, entry.cudagraph = entry.cudagraph, None
+    mark = len(calls)
     before = h.pool_tensor(bindings).clone()
-    error = h.call_with(
-        runner.real_step,
-        h.scheduler_output(new=(unit(1),), handles={"s1": 1}, step_seq=2),
-    )
+    error = h.call_with(runner.real_step, step())
     assert error is not None, "the step ran without its graph"
-    assert len(calls) == attempts, "a wrapper was invoked (capture or replay)"
-    assert "instrumented" not in _frames(error)
-    assert wrapper.concrete_cudagraph_entries[descriptor].cudagraph is None
+    assert calls[mark:] == [], "a wrapper was invoked (capture or replay)"
+    assert entry.cudagraph is None
     assert torch.equal(before, h.pool_tensor(bindings)), "the refused step wrote state"
+    entry.cudagraph = graph
+    runner.real_step(step())
+    assert any(kind == "replay" for _, _, kind in calls[mark:])
