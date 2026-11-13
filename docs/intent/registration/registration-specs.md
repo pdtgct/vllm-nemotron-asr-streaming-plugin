@@ -70,12 +70,16 @@ These checks run in `verify_and_update_model_config`, after core has applied eve
 - [ ] **REG-ENG-001**: If `async_scheduling` is `True`, then `verify_and_update_config` shall refuse the configuration; an unset `async_scheduling` (`None`) shall not be refused there.
 - [x] **REG-ENG-002**: If `enable_prefix_caching` is `True` in the configuration, then `verify_and_update_config` shall refuse the configuration.
 - [ ] **REG-ENG-003**: If speculative decoding, KV transfer, dual-batch overlap, sleep mode, the cumem allocator, hierarchical sparse attention or fault tolerance (`parallel_config.enable_fault_tolerance`) is enabled, then `verify_and_update_config` shall refuse the configuration, naming each enabled setting.
+- [ ] **REG-ENG-008**: The native-burst configuration check shall count a parallel setting that the running build does not define as 1, and an undefined expert-parallel setting as off.
 - [x] **REG-ENG-004**: If any of the tensor, pipeline, data, decode-context or prefill-context parallel sizes that the running vLLM build defines is other than 1, then `verify_and_update_config` shall refuse the configuration; a parallel setting the build does not define shall count as 1.
 - [x] **REG-ENG-005**: If `enforce_eager` is not set, then `verify_and_update_config` shall refuse the configuration.
 - [ ] **REG-ENG-006**: When the model state is constructed, it shall re-check REG-ENG-002 to REG-ENG-005 against the final engine configuration, and shall refuse a resolved `async_scheduling` that is not `False` (including `None`), raising as in REG-VAL-003 if any fails.
 - [ ] **REG-ENG-007**: The README's serve command shall show `--enforce-eager` and every other flag REG-ENG-003 to REG-ENG-005 require, and may omit `--no-async-scheduling` and `--no-enable-prefix-caching` (core resolves both off for this model), together with `--dtype float32` (the model's qualified precision),  `--config-format nemotron_asr_streaming`, `--tokenizer-mode nemotron_asr_streaming` and the `num_lookahead_tokens` override.
 
 ## Execution memory
+
+A real step is a step whose `prepare_step` was called with `dummy_run` false; a dummy step is one called
+with `dummy_run` true.
 
 - [ ] **REG-MEM-001**: When `prepare_step` is called with `dummy_run` and `is_profile` both true, it shall record the step as a profiling dummy step and shall not prepare execution itself; when it is called with `dummy_run` or `is_profile` false, it shall record the step as not a profiling dummy step, replacing any earlier record.
 - [ ] **REG-MEM-002**: When the model's forward runs on the first profiling dummy step of a worker, it shall warm and capture the configured execution inventory, verify readiness of every configured execution entry and capture of every configured graph entry (each served geometry and batch tier of a graphed arm, and each configured CHUNK bucket), then, with every captured graph retained, run the profile transaction at its maximum shape, and return the dummy output core expects (a tensor shaped like the input embeddings).
@@ -84,9 +88,12 @@ These checks run in `verify_and_update_model_config`, after core has applied eve
 - [ ] **REG-MEM-005**: Preparation (REG-MEM-002) shall use model-owned scratch state built from the model's `PersistentStateSpec` and shall not read the state-slot bindings or the state pool.
 - [ ] **REG-MEM-006**: If a real step would use graphed execution and any expected graph entry is not captured in its graph wrapper (the wrapper's entry holds no graph), then the model shall raise without capturing.
 - [ ] **REG-MEM-007**: The model's graph runtime shall capture through core's graph-capture context, forward context and the platform's static graph wrapper, and shall neither import nor call a capture-enabled switch.
-- [ ] **REG-MEM-009**: When the model's forward or `prepare_inputs` runs on a dummy step that is not a profiling dummy step, it shall return the dummy output (from the forward) without capturing, without running the profile transaction, without reading state-slot handles or rows, and without using scheduler output from an earlier step.
-- [ ] **REG-MEM-010**: The dummy output of REG-MEM-002, REG-MEM-003 and REG-MEM-009 shall have the input embeddings' token count, width, dtype and device, with every carrier-column value a valid decision ID (zero), and core's dummy sampling of it, including through the native-burst sampler wrapper, shall read no state slots.
-- [ ] **REG-MEM-011**: If a real step schedules any row for model execution and preparation has not succeeded in this worker, then the model shall raise without preparing; a real step that schedules no row shall be allowed.
+- [ ] **REG-MEM-009**: When the model's forward runs on a dummy step that is not a profiling dummy step, it shall return the dummy output without capturing, without running the profile transaction and without reading state-slot handles or rows.
+- [ ] **REG-MEM-012**: When `prepare_inputs` runs on a dummy step (profiling or not, before or after the state pool exists), the model state shall prepare dummy inputs without reading state-slot handles, state-slot rows or scheduler output retained from an earlier step.
+- [ ] **REG-MEM-010**: The dummy output of REG-MEM-002, REG-MEM-003 and REG-MEM-009 shall have the input embeddings' token count, width, dtype and device, with every carrier-column value a valid decision ID (zero).
+- [ ] **REG-MEM-013**: When core samples a dummy output, the model's sampler hooks, including the native-burst sampler wrapper, shall read no state slots.
+- [ ] **REG-MEM-011**: If a real step schedules any row for model execution and preparation has not succeeded in this worker, then the model shall raise without preparing.
+- [ ] **REG-MEM-014**: When a real step schedules no row for model execution (cleanup only), the model shall complete it whether or not preparation has succeeded.
 - [ ] **REG-MEM-008**: The model's forward shall not run a forward-time profile of an unprepared encoder on a profiling dummy step; REG-MEM-002 is the only profile the model runs.
 
 ## Model-state interface
@@ -101,7 +108,8 @@ These checks run in `verify_and_update_model_config`, after core has applied eve
 - [ ] **REG-STATE-003**: The model shall read state-slot rows only through `bind_rows` with the model's state layer name, the step's ordered request IDs and their scheduler-output handles, and then only `component_pools` and `slot_indices_cpu` of the result.
 - [ ] **REG-STATE-004**: When the model commits state for a step, it shall first re-read the rows' `component_pools`; if that read raises, then the model shall write no state.
 - [ ] **REG-STATE-005**: The model's projection of state pools into named state tensors shall take the component pools and the model's `PersistentStateSpec` and use no other member of the rows.
-- [ ] **REG-STATE-006**: File-row planning, initialization and commits shall follow REG-STATE-003 and REG-STATE-004 as stream rows do; taking a file request in `prepare_step` shall read only the scheduler output and host data.
+- [ ] **REG-STATE-006**: File-row planning, initialization and commits shall follow REG-STATE-003 and REG-STATE-004 as stream rows do.
+- [ ] **REG-STATE-007**: When `prepare_step` takes a file request, it shall read only the scheduler output and host data.
 
 ## README
 

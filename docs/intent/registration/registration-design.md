@@ -213,7 +213,9 @@ and a single device. The plugin refuses:
 - speculative decoding, KV transfer, dual-batch overlap, sleep mode, the cumem allocator,
   hierarchical sparse attention and fault tolerance (`parallel_config.enable_fault_tolerance`, which
   keeps core's JIT kernel warm-up on under `enforce_eager`; that warm-up runs synthetic real steps
-  without state-slot handles);
+  without state-slot handles; `--fault-tolerance-config` turns it on, and the refusal names that
+  cause). Moving execution preparation into core's profiling step does not make sleep mode or the
+  cumem allocator usable: both stay refused, so there is no wake-up re-preparation;
 - any tensor, pipeline, data, decode-context or prefill-context parallel size other than 1 (a
   setting the build does not have counts as 1);
 - an outer runner that is not eager: `enforce_eager` must be set explicitly, since core's default
@@ -221,6 +223,9 @@ and a single device. The plugin refuses:
   check, so core captures no graphs of its own; the model runs its own encoder and decoder graphs,
   where its configuration selects graphed execution, inside the eager outer step (Execution
   memory).
+
+Native burst's own configuration check, run at model construction, applies the same rule for a
+setting the build does not define: a parallel size counts as 1 and expert parallelism as off.
 
 The README's serve command shows the required flags.
 
