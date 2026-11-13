@@ -155,7 +155,7 @@ the leaf designs cite them where they depend on them.
 - **Model-owned execution memory.** The model's retained execution memory (its own captured
   encoder and decoder graphs and their buffers) and the peak transient memory of its execution
   must be in place or exercised before core's memory profiling measures the budget that the state
-  pool and the KV cache must fit. Core binds state slots only after that allocation. The RFC 1 PRs
+  pool and the KV cache must fit. Core binds state slots only after it allocates the state pool and the KV cache. The RFC 1 PRs
   provide no hook dedicated to this; the `registration` design settles where in the model's
   lifecycle this happens, using only the permitted model-adapter dependencies.
 - **Engine surface.** Session operations use only `AsyncLLM` / `EngineClient` public and
@@ -233,7 +233,7 @@ implementations differ:
 
 | | Offline plugin | This plugin (target design; installed-engine validation pending) |
 | --- | --- | --- |
-| Engine | released vLLM; Transformers modules | RFC 1 primitive (and RFC 2 for frontends); native vLLM implementation |
+| Engine | released vLLM; Transformers modules | the stage 1 build (stage 2 for frontends), defined in Constraints; native vLLM implementation |
 | Execution | one encoder pass over the whole file, per-request RNN-T decoder state; no live audio continuation | encoder caches and decoder state carried in a state slot from chunk to chunk |
 | Live streaming (`/v1/realtime`, frontends) | no | designed for it |
 | Whole-file length | encoder frames ≤ min(5000, `max_model_len`): files above about 164 s are refused at the default `max_model_len` of 2048, above about 400 s at 5000 | no model limit by design; one state slot walks the file in bounded steps |
@@ -243,8 +243,9 @@ implementations differ:
 ## Success Metrics
 
 Acceptance is tiered; a claim names the tier it has met and the build (stage 1 or stage 2) it was
-met on. Stage 1 can meet every tier on core's routes; legs through a frontend (the seam conformance
-suite run against a frontend, `Recognize`, the factory's stream admission) need stage 2.
+met on. Stage 1 can meet every tier on core's routes. The CPU seam conformance suite needs only the
+frontend package installed; served legs through a frontend (`Recognize`, the factory's stream
+admission) need stage 2.
 
 1. **CPU conformance.** Unit and contract tests, including the frontend's seam conformance suite run
    against this plugin's real factory, pass without a GPU.
@@ -258,7 +259,7 @@ suite run against a frontend, `Recognize`, the factory's stream admission) need 
 4. **Mixed load.** The latency goal above holds in unprofiled serving measurements.
 
 Falsification signals: any whole-file transcript that differs from streaming under matched
-conditions; any session factory session or stage 1 transcription request reported complete
+conditions; any session factory session, or core transcription request on either build, reported complete
 without EOS after the final flush; a slot or host buffer
 that outlives its request's release; more files actively scheduled than `max_num_seqs`, or than a frontend's file cap if one runs.
 
