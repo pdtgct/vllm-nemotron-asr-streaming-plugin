@@ -149,6 +149,9 @@ usual cause), and the next call raises it. An idle end by `EngineDeadError` fail
   generator's first read) or `refused` (`StreamAdmissionError` from the task). A task that is
   cancelled, or ends with another exception, before either signal leaves the state `pending`: core
   may still have admitted the stream and will abort it.
+- **Refusal result.** A refusal is `StreamAdmissionError` carrying a `StreamAdmissionResult` with
+  three fields, `accepted`, `request_id` and `reason` (vllm#67375); the factory reads `reason`. The
+  earlier status field is gone, so test doubles build the three-field result.
 - **Retirement wait.** For any record not `refused`, cleanup awaits `wait_stream_retired`. Its
   terminal results: it returns (the slot retired); `StreamAdmissionError` (admission was refused);
   `ValueError` (admission was never sent, or the retirement already happened and is no longer

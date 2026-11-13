@@ -69,9 +69,9 @@ refuses it cleanly:
 - **The model state's `add_request`** sees the engine's `SamplingParams` but runs inside the
   engine step (`vllm/v1/worker/gpu/model_runner.py:1377`, no handler): an exception there ends
   the engine, so it is not a refusal point. Failing the row through the state transaction instead
-  ends that request with finish reason `error`, and core's non-streaming transcription path never
-  reads the finish reason (`base/serving.py` lines 601-690), so the client would receive HTTP 200
-  with empty or partial text. Neither is acceptable.
+  ends that request with finish reason `error`, which upstream `main` returns as HTTP 200 with
+  empty or partial text and vllm#67144 returns as HTTP 500: a server error, not a refusal of the
+  client's option. Neither is acceptable.
 - **Logits-processor `validate_params`** sees only `SamplingParams`, needs the operator to list the
   processor, and cannot tell a file request from a stream.
 
@@ -165,10 +165,10 @@ Five things bound a file or set its cost today:
   `abort` returns HTTP 200 with partial text. Two upstream pull requests, both in the stage 1
   build, change that on the transcription and translation routes, which share core's
   speech-to-text serving:
-  - vllm#67144 fails an `error` ending (non-streaming: an error response; streaming: an error
-    event after any partial deltas) and an `abort` ending (non-streaming: an error response;
-    streaming: a final chunk with `finish_reason` `abort`, after which the remaining chunks are
-    skipped).
+  - vllm#67144 fails an `error` ending (non-streaming: HTTP 500; streaming: an error event after
+    any partial deltas, then `data: [DONE]`) and an `abort` ending (non-streaming: HTTP 503,
+    retryable; streaming: a final chunk with `finish_reason` `abort`, after which the remaining
+    chunks are skipped, a usage chunk may follow, then `data: [DONE]`).
   - vllm#67151 fails a `length` ending caused by a server limit (the request reaching
     `max_model_len`) with HTTP 422 non-streaming and an error event streaming. A `length` caused by
     a client's own `max_completion_tokens` stays HTTP 200 for other models; this plugin refuses
@@ -393,7 +393,7 @@ submission (Request guards), so neither can truncate a transcript.
 | Repeated uploads | A random per-request multimodal UUID | A nonce in the header; disabling the multimodal cache | Core hashes items by their UUID, so no header field is needed, and the server's cache settings stay untouched |
 | Silence | A continuation token | Emitting nothing; the park/EOS token | Every step emits a token; EOS would end the request |
 | Distinguishing file rows | A dedicated file-carrier prompt token | The stream carrier with a different field | Row roles come from the scheduled token |
-| Where to refuse beam search and completion limits | `get_generation_prompt`, with two request fields added to `SpeechToTextParams` | The model state's `add_request`; row failure; a logits processor | `add_request` cannot raise without ending the engine; row failure becomes HTTP 200 with partial text; a logits processor cannot see the prompt |
+| Where to refuse beam search and completion limits | `get_generation_prompt`, with two request fields added to `SpeechToTextParams` | The model state's `add_request`; row failure; a logits processor | `add_request` cannot raise without ending the engine; row failure becomes a server error (HTTP 500 with vllm#67144, HTTP 200 with partial text without it); a logits processor cannot see the prompt |
 | Budget | No admission check; `B` is sizing guidance only (Pete, 2026-11-11) | Worst-case refusal (FILE-BUD-001, retired); a typical-output bound | The model imposes no input-length limit; core's actual-token stop is the bound, and reporting a server-caused `length` as an error is core work (Open 1) |
 | Regional languages | Explicit `language_locales` mapping, and an exact locale in `vllm_xargs` | Picking a default region | A guessed region changes transcripts silently; a client that names a locale must get that locale |
 

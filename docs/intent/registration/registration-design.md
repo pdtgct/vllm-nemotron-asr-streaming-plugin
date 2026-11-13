@@ -206,55 +206,75 @@ and a single device. The plugin refuses:
   then resolves it to `False` for a model that declares persistent state (and itself raises on
   `True`). The model state re-checks the resolved value when it is constructed and refuses
   anything but `False`;
-- prefix caching: an explicit `enable_prefix_caching = True`. Unset is accepted, because core
-  reports prefix caching as unsupported for a model that declares persistent state and resolves
-  it off; the model state re-checks the resolved value;
+- prefix caching: `enable_prefix_caching = True` in the resolved configuration. An unset command-line
+  option arrives already `False`: `EngineArgs` resolves it from the model, which reports prefix
+  caching as unsupported when it declares persistent state. A configuration built directly with
+  `True` is refused here (and by core's state validation);
 - speculative decoding, KV transfer, dual-batch overlap, sleep mode, the cumem allocator and
   hierarchical sparse attention;
 - any tensor, pipeline, data, decode-context or prefill-context parallel size other than 1 (a
   setting the build does not have counts as 1);
 - an outer runner that is not eager: `enforce_eager` must be set explicitly, since core's default
-  is `False`. The model runs its own captured encoder and decoder graphs inside the eager outer
-  step (Execution memory). Core resolves an unset `cudagraph_mode` to `NONE` for a persistent-state
-  model and raises on any other mode, so with `enforce_eager` core captures no graphs of its own.
+  is `False`. With it, core normalizes `cudagraph_mode` to `NONE` before its persistent-state
+  check, so core captures no graphs of its own; the model runs its own encoder and decoder graphs,
+  where its configuration selects graphed execution, inside the eager outer step (Execution
+  memory).
 
 The README's serve command shows the required flags.
 
 ## Execution memory
 
-The model's own execution (static encoder execution, decoder graphs per served geometry and batch
-tier, and the optional CHUNK buckets) retains device memory, and its largest transaction needs
-transient memory beyond that. Core must count both before it sizes the KV cache and the state pool
-(`max_num_seqs + 1` pages), which it does from the memory profile of its profiling run; it binds
-state slots only after that allocation (`initialize_state_slots`). The RFC 1 PRs have no hook
-dedicated to model execution memory, so the model state does this work in `prepare_step` on the
-first profiling step:
+The model's own execution (static encoder execution; when its configuration selects them, the
+decoder graphs per served geometry and batch tier and the CHUNK buckets) retains device memory,
+and its largest transaction needs transient memory beyond that. Core sizes the KV cache and the
+state pool from the memory profile of its profiling run, and binds state slots only after it
+allocates them (`initialize_state_slots`). The RFC 1 PRs have no hook dedicated to model execution
+memory, so the model prepares its execution on core's profiling step:
 
-- On the first `prepare_step` with `dummy_run` and `is_profile` both true, the model state
-  warms and captures its execution inventory, checks the inventory is complete (every served
+- **One owner.** `prepare_step` records that the step is a profiling dummy step; the model's
+  forward on that step is the only place that prepares execution. On the first profiling forward
+  it warms and captures the execution inventory, checks the inventory is complete (every served
   geometry and batch tier), and then, with every captured graph retained, runs the profile
-  transaction at its maximum shape so the profile records the transient peak. This runs inside
-  core's memory profile and before the state pool exists.
-- Capture and profiling use model-owned scratch state built from the model's
-  `PersistentStateSpec`, never the state pool: captured graphs copy state into and out of their
-  own static buffers, and the gather from and scatter to the pool run outside any graph. So no
-  step of the preparation needs the pool or its addresses.
-- The preparation runs once per worker. A later profiling step re-checks the inventory and
-  returns. A failure marks the worker failed, discards partial execution state and raises, so
-  startup fails; the next attempt is a fresh worker.
-- A non-profiling step that finds the inventory not prepared raises rather than capturing during
-  serving, where the memory would not be budgeted. Every core startup path runs the profiling step
-  before serving, so this is a guard against a core that changes that order.
+  transaction at its maximum shape so the measurement includes the transient peak. It returns
+  the dummy output core expects. The earlier forward-time profile of an unprepared encoder is
+  retired: it cannot run once the inventory is sealed.
+- **No state pool needed.** Capture and profiling use model-owned scratch state built from the
+  model's `PersistentStateSpec`: captured graphs copy state into and out of their own static
+  buffers, and the gather from and scatter to the pool run outside any graph, so preparation needs
+  neither the pool nor its addresses.
+- **Once per worker.** A later profiling step checks the inventory and returns. A failure marks the
+  worker failed, discards partial execution state and raises, so startup fails; the next attempt
+  is a fresh worker.
+- **Serving guard.** Before a serving step uses graphed execution, the model checks that every
+  expected graph entry is captured, not merely that preparation ran, and raises otherwise rather
+  than capturing during serving, where the memory is not budgeted. This also covers a core that
+  clears graph wrappers after its profiling run: at these heads core clears registered graph
+  wrappers only when it profiles its own graph memory, which it skips with `cudagraph_mode` `NONE`.
+- **Budget.** Core measures the profile only when it computes the budget itself. When the operator
+  sets `kv_cache_memory_bytes`, core still runs the profiling step, so preparation happens, but
+  takes the given budget as is; the operator then leaves room for the model's execution memory.
+  Core's elastic expert-parallel scale-up path skips profiling, and cannot apply: the plugin
+  refuses any data-parallel size other than 1. The pool is `max_num_seqs + 1` pages unless the
+  operator overrides the block count.
+- **Graph runtime.** Graph capture uses core's graph-capture context, forward context and the
+  platform's static graph wrapper. At these heads core has no capture-enabled switch (removed with
+  Model Runner V1), so the model's graph runtime has none; capture legality is the model's own
+  ordering above.
 
 ## State-slot access
 
-The model reads its state through the RFC 1 bindings only during a live step: `bind_rows` for the
-step's ordered requests and their handles (from the scheduler output's state-slot handles), then
-`StateSlotRows.component_pools` and `slot_indices_cpu`. The model's own projection of pools into
-named state tensors takes the component pools and the model's spec, not members that the RFC 1 PRs
-removed (the rows' spec and views, handle lookup by request, and the current-step check). The
-persistent-state spec is layout only: `PersistentStateSpec(descriptors=..., page_size_bytes=...,
-block_size=1)`.
+- `prepare_step` reads only the scheduler output, including its state-slot handles; the bindings
+  give no row access there.
+- The model binds rows inside the step, after core begins the step and activates its requests:
+  `bind_rows` for the step's ordered requests and their handles, then
+  `StateSlotRows.component_pools` and `slot_indices_cpu`.
+- Before committing state, the model re-reads `component_pools`, which core refuses outside the live
+  step; that replaces the removed current-step check.
+- The model's projection of pools into named state tensors takes the component pools and the
+  model's spec, not members that the RFC 1 PRs removed (the rows' spec and views, and handle lookup
+  by request).
+- The persistent-state spec is layout only: `PersistentStateSpec(descriptors=..., page_size_bytes=...,
+  block_size=1)`, with no state name.
 
 ## Supported tasks
 
@@ -284,8 +304,20 @@ is imported:
 | `vllm.model_executor.layers.state` | `PersistentStateLayerBase` |
 | `vllm.multimodal` | `MULTIMODAL_REGISTRY` |
 | `vllm.v1.attention.backends.utils` | `NULL_BLOCK_ID` |
+| `vllm.v1.kv_cache_interface` (state layout) | `PersistentStateSpec`, `PersistentStateDescriptor` |
+| `vllm.v1.worker.gpu.sample.output` | `SamplerOutput` |
+| `vllm.distributed.parallel_state` | `graph_capture` |
+| `vllm.forward_context` | `BatchDescriptor`, `set_forward_context` |
+| `vllm.platforms` | `current_platform` (its static graph wrapper class) |
+| `vllm.utils.import_utils` | `resolve_obj_by_qualname` |
+| `vllm.utils.torch_utils` | `direct_register_custom_op` |
+| `vllm.model_executor.determinism.batch_invariant` | the batch-invariant matmul used by the batch-invariant mode |
 
-Adding a dependency means adding it here and to the import-time check.
+The graph-runtime rows are imported when graphed execution is configured, and the batch-invariant
+row when that mode is; the import-time check covers the rest. vLLM's model-registration, config
+parser, tokenizer and renderer registries, multimodal processing and `SupportsTranscription`
+interfaces, which every out-of-tree model uses, are outside this table. Adding a dependency means
+adding it here and to the import-time check.
 
 ## Implementation notes
 
@@ -304,7 +336,7 @@ Adding a dependency means adding it here and to the import-time check.
 | Where launch options are resolved | Post-override validation of the final configuration; the parser reads only the checkpoint | Reading `hf_overrides` inside the parser; a plugin-specific environment variable | Core gives the parser only flat overrides, applies dictionary overrides after it, and also calls it with none when deriving a generation configuration |
 | Control tokens in the tokenizer | A registered tokenizer mode that appends them as special tokens, with park as the tokenizer's EOS | Publishing a modified tokenizer; leaving them unknown | Core detokenizes every token; unknown IDs break detokenization and unmarked ones appear in text; the card must stay usable unmodified |
 | Context ceiling | Translation sets `max_position_embeddings` to 2^24 | Requiring `VLLM_ALLOW_LONG_MAX_MODEL_LEN` | The model has no positional limit; long files need a context far above the card's 32,768 |
-| Where model execution memory is prepared | First profiling `prepare_step`, before the state pool, inside core's memory profile | `initialize_state_slots` or first serving step: graphs created after core sized the KV cache and state pool, so their memory is unbudgeted. A new core hook: core adds no interface the RFC 1 PRs do not need (Pete, 2026-11-12) | Only the profiling step is both budgeted and available without a core change |
+| Where model execution memory is prepared | The model's forward on core's first profiling dummy step (flagged by `prepare_step`), before the state pool, inside core's memory profile | `initialize_state_slots` or first serving step: graphs created after core sized the KV cache and state pool, so their memory is unbudgeted. A new core hook: core adds no interface the RFC 1 PRs do not need (Pete, 2026-11-12) | Only the profiling step is both budgeted and available without a core change |
 | Override of the served set | Replaces the card's set; values limited to the five geometries | Union with the card's set; any value | Replacement lets a deployment narrow the warmed set; values without a geometry cannot run |
 | Load-time checks | Client calls in `register()`; adapter symbols at model import | All checks in `register()` | `register()` and the session factory do not import the model class modules, so loading the plugin stays cheap; core's speech-to-text serving imports the model class in the API server when it starts, so importing it initializes no device and loads no weights |
 | `generate` task | Not advertised (model-state override) | Advertise for compatibility | The model emits transcript labels, not text generation |
