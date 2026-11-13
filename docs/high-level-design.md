@@ -82,7 +82,8 @@ core's `/v1/realtime`, so the two streaming paths cannot segment audio different
 ## Non-Goals
 
 - Running on released vLLM. The plugin needs the RFC 1 primitive; until it is released, the
-  supported engine is a build of the RFC branches.
+  supported engines are the stage 1 and stage 2 builds of upstream `main` with the open PRs
+  (Constraints).
 - A second decoding algorithm. There is no full-context or non-streaming decoder; complete files
   use the streaming transition.
 - Translation, diarization, word timestamps or beam search.
@@ -101,9 +102,9 @@ core's `/v1/realtime`, so the two streaming paths cannot segment audio different
 
 ```mermaid
 flowchart LR
-  subgraph serve["vllm serve (RFC 1 + RFC 2 build)"]
+  subgraph serve["vllm serve (stage 1 build; frontend parts need the stage 2 build)"]
     direction LR
-    FE["Frontend endpoint plugin<br/>(e.g. vllm-riva-frontend)"]
+    FE["Frontend endpoint plugin, stage 2<br/>(e.g. vllm-riva-frontend)"]
     CORE_RT["core /v1/realtime"]
     CORE_TX["core /v1/audio/transcriptions"]
     subgraph plugin["this plugin"]
@@ -142,18 +143,21 @@ the leaf designs cite them where they depend on them.
   builds of upstream vLLM `main` are targets:
   - **Stage 1, the model alone** on core's `/v1/realtime` and `/v1/audio/transcriptions`:
     #67374, #67375, and the speech-to-text PRs #67144 and #67151 (Whole-file serving, below).
-  - **Stage 2, with a frontend:** stage 1 plus RFC 2, #65546 and #67294.
+  - **Stage 2, with a frontend:** stage 1 plus RFC 2 (#65546 and #67294) and a frontend
+    endpoint plugin such as `vllm-riva-frontend`.
 
   The README records the commits each acceptance tier was actually met on, and claims only the
-  tiers met. Python `>=3.11,<3.15`. Synchronous scheduling, no prefix caching and eager execution
-  of the outer runner are required. An unset `async_scheduling` is accepted, because core resolves
-  it to off for a model that declares persistent state; the plugin refuses to start when any of
-  these is explicitly requested otherwise.
-- **Model-owned execution memory.** The model's own captured encoder and decoder graphs and
-  their buffers must exist before core sizes state slots and the KV cache, so that core's memory
-  profile counts them. The RFC 1 PRs provide no hook dedicated to this; the `registration` design
-  settles where in the model's lifecycle they are created, using only the permitted model-adapter
-  dependencies.
+  tiers met. Python `>=3.11,<3.15`. The resolved engine settings must be synchronous scheduling,
+  no prefix caching and an eager outer runner, and the plugin refuses to start otherwise. Settings
+  that core resolves to the required value for a model that declares persistent state (an unset
+  `async_scheduling` or prefix-caching option) are accepted unset; the `registration` design
+  states the rule for each setting, including that `--enforce-eager` must be given.
+- **Model-owned execution memory.** The model's retained execution memory (its own captured
+  encoder and decoder graphs and their buffers) and the peak transient memory of its execution
+  must be in place or exercised before core's memory profiling measures the budget that the state
+  pool and the KV cache must fit. Core binds state slots only after that allocation. The RFC 1 PRs
+  provide no hook dedicated to this; the `registration` design settles where in the model's
+  lifecycle this happens, using only the permitted model-adapter dependencies.
 - **Engine surface.** Session operations use only `AsyncLLM` / `EngineClient` public and
   RFC-proposed calls, never `engine_core` or scheduler internals. The model adapter's own
   dependencies (model-state interface, state-slot bindings, scheduler output types) are an
@@ -171,14 +175,20 @@ the leaf designs cite them where they depend on them.
   the 560 ms cadence (lookahead 6), and it refuses to start against a server that does not serve
   it. The experimental native-burst mode requires the configured lookahead to be 1 (160 ms); it
   does not restrict the served set to that cadence.
-- **Completeness.** A transcript is reported complete only after EOS following the final flush.
-  A stream that ends any other way fails. A whole file whose request ends with `length` because
-  it reached `max_model_len`, or with `error` or `abort` (for example a preempted slot), can still
-  return partial text with HTTP 200 through core's transcription serving until core reports those
-  endings as errors. #67144 reports an `error` or `abort` ending as an error (non-streaming: an
-  error response; streaming: a terminal error event); a `length` ending still returns partial
-  text with HTTP 200, so the operator sizes `max_model_len` for the longest file served. This
-  plugin depends on neither behaviour.
+- **Completeness.** The model and the session factory treat a transcript as complete only after
+  EOS following the final flush; a session that ends any other way fails. How core's own routes
+  report a request that ends without EOS is core's behaviour, not the plugin's:
+  - `/v1/realtime` ignores the finish reason and sends its final transcript event whenever
+    generation ends, so a stream stopped by `length`, `error` or `abort` is reported done there.
+  - On the transcription route, #67144 fails an `error` ending (non-streaming: an error response;
+    streaming: an error event) and an `abort` ending (non-streaming: an error response;
+    streaming: a final chunk with `finish_reason` `abort`). #67151 also fails a `length` ending
+    caused by a server limit such as `max_model_len` (HTTP 422; streaming: an error event); since
+    the model refuses client completion limits, every `length` ending is server-caused. On a
+    core without these PRs such endings return partial text with HTTP 200.
+
+  The plugin needs no core change for its own completeness rule; the stage 1 build includes
+  #67144 and #67151 so that core's transcription route reports these endings.
 - **Whole-file serving is self-contained on core's route, once core carries two request fields.**
   The model imposes no file-size limit; core's upload and decode settings belong to the operator.
   The model refuses beam search and any client completion limit as options that do not apply to
@@ -186,8 +196,8 @@ the leaf designs cite them where they depend on them.
   `SpeechToTextParams` (Request guards). #67151 adds those fields and is part of the stage 1
   build; on a core without them the guards are inactive and the README states the limits. The
   model drops its worst-case admission check: the only length bound is core's actual-token
-  `max_model_len` stop, which the operator sizes; a file that reaches it ends with `length` and
-  returns partial text with HTTP 200 (Completeness). On a core without #67151, beam search
+  `max_model_len` stop, which the operator sizes; a file that reaches it fails with HTTP 422 on
+  the stage 1 build (Completeness). On a core without #67151, beam search
   issues up to `n × max_model_len` engine requests (one per beam per pass) per upload, so the
   route is not to be exposed to untrusted clients on such a core. The model also refuses to
   start under a generation-config token limit or foreign EOS. Without a frontend, `max_num_seqs`
@@ -232,25 +242,30 @@ implementations differ:
 
 ## Success Metrics
 
-Acceptance is tiered; a claim names the tier it has met.
+Acceptance is tiered; a claim names the tier it has met and the build (stage 1 or stage 2) it was
+met on. Stage 1 can meet every tier on core's routes; legs through a frontend (the seam conformance
+suite run against a frontend, `Recognize`, the factory's stream admission) need stage 2.
 
 1. **CPU conformance.** Unit and contract tests, including the frontend's seam conformance suite run
    against this plugin's real factory, pass without a GPU.
-2. **Installed-engine cycle.** On the target engine with the plugin installed: plugin load →
-   stream admitted → audio → final transcript → slot retired, for one and for concurrent sessions.
+2. **Installed-engine cycle.** On the target build with the plugin installed: plugin load →
+   stream started → audio → final transcript → slot retired, for one and for concurrent sessions.
+   On stage 1 the stream is a `/v1/realtime` session; on stage 2 it is also a factory session
+   admitted with stream admission.
 3. **Equivalence.** On public clips from 20 s to over 400 s, whole-file transcripts (core
    transcription route and `Recognize`) equal the streaming transcript, and at a matched lookahead
    equal the offline plugin's within its supported length.
 4. **Mixed load.** The latency goal above holds in unprofiled serving measurements.
 
 Falsification signals: any whole-file transcript that differs from streaming under matched
-conditions; any request reported complete without EOS after the final flush; a slot or host buffer
+conditions; any session factory session or stage 1 transcription request reported complete
+without EOS after the final flush; a slot or host buffer
 that outlives its request's release; more files actively scheduled than `max_num_seqs`, or than a frontend's file cap if one runs.
 
 ## References
 
 - RFC 1: [vllm#65543](https://github.com/vllm-project/vllm/issues/65543), PRs [#67374](https://github.com/vllm-project/vllm/pull/67374) (state lifetime) and [#67375](https://github.com/vllm-project/vllm/pull/67375) (stream admission); superseded draft [#65544](https://github.com/vllm-project/vllm/pull/65544)
-- Speech-to-text core PRs: [#67144](https://github.com/vllm-project/vllm/pull/67144) (fail `error` and `abort` endings), [#67151](https://github.com/vllm-project/vllm/pull/67151) (request fields)
+- Speech-to-text core PRs: [#67144](https://github.com/vllm-project/vllm/pull/67144) (fail `error` and `abort` endings), [#67151](https://github.com/vllm-project/vllm/pull/67151) (request fields; fail server-caused `length` endings)
 - RFC 2: [vllm#65545](https://github.com/vllm-project/vllm/issues/65545), PRs [#65546](https://github.com/vllm-project/vllm/pull/65546) and [#67294](https://github.com/vllm-project/vllm/pull/67294) (readiness and draining)
 - Model card: [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
 - Offline plugin: [Sohaib-Ahmed21/vllm-nemotron-asr-plugin](https://github.com/Sohaib-Ahmed21/vllm-nemotron-asr-plugin); its vLLM PR [vllm#59827](https://github.com/vllm-project/vllm/pull/59827)
