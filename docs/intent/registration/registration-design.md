@@ -318,6 +318,13 @@ the dummy output.
   by request).
 - The persistent-state spec is layout only: `PersistentStateSpec(descriptors=..., page_size_bytes=...,
   block_size=1)`, with no state name.
+- Core sends no token IDs for scheduled cached requests unless pipeline parallelism is on, which the
+  plugin refuses. `prepare_step` therefore records each request's prompt when core delivers it as a
+  new request (a session turn arrives that way, with its prompt from position zero) and reads a
+  cached row's scheduled tokens from that record. A position past the recorded prompt holds a token
+  the sampler produced on the device; the host does not read it (that would synchronize with the
+  device), and no sampled token is a CHUNK carrier, so the row is planned as a non-CHUNK row. The
+  record is dropped when the request finishes.
 
 ## Supported tasks
 

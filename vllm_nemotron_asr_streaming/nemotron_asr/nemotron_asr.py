@@ -458,10 +458,13 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         # @spec REG-014: the graph-runtime dependencies are needed only when
         # graphed execution is configured; name any that is missing now,
         # before weights load.
-        if (
+        self._graphed_execution = bool(
             getattr(hf_config, "decode_dispatch_arm", None) == "dense-graphed"
             or getattr(hf_config, "chunk_bucket_graph_populations", ())
-        ):
+            or getattr(hf_config, "encoder_execution_arm", None)
+            in {"dense-graphed", "eager-graphed"}
+        )
+        if self._graphed_execution:
             decode_graph.platform_graph_runtime()
         self._encoder_execution = build_encoder_execution(
             self.core,
@@ -904,9 +907,11 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             self._prepare_execution_memory(device)
         except Exception:
             self._execution_memory_failed = True
-            self._encoder_execution._discard()
-            if self._decode_graph_binding is not None:
-                self._decode_graph_binding.discard()
+            try:
+                self._encoder_execution._discard()
+            finally:
+                if self._decode_graph_binding is not None:
+                    self._decode_graph_binding.discard()
             raise
         self._execution_memory_prepared = True
 
@@ -1123,11 +1128,10 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 "execution memory was not prepared on this worker (preparation "
                 "runs on core's profiling step and never lazily while serving)"
             )
-        if not self._graphs_present():
-            raise RuntimeError(
-                "a captured execution graph entry holds no graph; refusing the "
-                "step rather than capturing while serving"
-            )
+        if self._graphed_execution:
+            # The expected inventory and every graph, not only graph presence;
+            # the eager default keeps its steps cheap.
+            self._require_execution_ready()
         context = self._stage_v2_projection(persistent_state_projection)
         state_batch = persistent_state_projection.state_batch
         if state_batch is None:

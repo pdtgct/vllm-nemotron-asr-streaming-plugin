@@ -98,10 +98,11 @@ def persistent_state_config_errors(
         errors.append("HiSparse (hierarchical sparse attention) must be off")
     if getattr(parallel, "enable_fault_tolerance", False):
         # Core's kernel warm-up then runs synthetic real steps that carry no
-        # state-slot handles (pass no --fault-tolerance-config).
+        # state-slot handles (pass neither --enable-fault-tolerance nor
+        # --fault-tolerance-config).
         errors.append(
             "fault tolerance must be off "
-            "(--fault-tolerance-config enables it; remove it)"
+            "(remove --enable-fault-tolerance and --fault-tolerance-config)"
         )
     for name in PARALLEL_SIZES_MUST_BE_ONE:
         if getattr(parallel, name, 1) != 1:

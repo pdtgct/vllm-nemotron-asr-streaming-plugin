@@ -110,6 +110,7 @@ with `dummy_run` true.
 - [ ] **REG-STATE-005**: The model's projection of state pools into named state tensors shall take the component pools and the model's `PersistentStateSpec` and use no other member of the rows.
 - [ ] **REG-STATE-006**: File-row planning, initialization and commits shall follow REG-STATE-003 and REG-STATE-004 as stream rows do.
 - [ ] **REG-STATE-007**: When `prepare_step` takes a file request, it shall read only the scheduler output and host data.
+- [ ] **REG-STATE-008**: When a live step schedules a cached request, `prepare_step` shall take that row's scheduled tokens from the prompt it recorded at the request's latest new-request delivery, and shall plan a position past that prompt as a sampled, non-CHUNK token without reading device memory; if no prompt is recorded for the request, or the scheduled window crosses the end of the prompt, then it shall raise an error naming the request.
 
 ## README
 

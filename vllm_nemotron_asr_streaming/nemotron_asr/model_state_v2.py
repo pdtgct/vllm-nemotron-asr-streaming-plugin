@@ -44,6 +44,11 @@ from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
 )
 
 
+#: Host-side stand-in for a scheduled token the sampler produced on the
+#: device: never a valid token id, so never the CHUNK or file carrier.
+SAMPLED_TOKEN = -1
+
+
 @dataclass(frozen=True)
 class RowBinding:
     request_id: str
@@ -159,6 +164,8 @@ class NemotronASRModelState(ModelState):
         self._scheduled_encoder_inputs: dict[str, list[int]] = {}
         self._features: torch.Tensor | None = None
         self._scheduled_tokens: dict[str, tuple[int, ...]] = {}
+        #: Each live request's latest prompt, as core delivered it.
+        self._prompts: dict[str, tuple[int, ...]] = {}
 
     # @spec REG-TASK-002
     def get_supported_generation_tasks(self) -> tuple[Any, ...]:
@@ -174,7 +181,7 @@ class NemotronASRModelState(ModelState):
         # All resident writes run on the runner stream. Inner graphs also replay
         # there; no auxiliary state-writing stream is created by this consumer.
 
-    # @spec REG-MEM-001, REG-STATE-002, REG-STATE-007
+    # @spec REG-MEM-001, REG-STATE-002, REG-STATE-007, REG-STATE-008
     def prepare_step(
         self, scheduler_output: SchedulerOutput, *, dummy_run: bool, is_profile: bool
     ) -> None:
@@ -193,17 +200,37 @@ class NemotronASRModelState(ModelState):
             # an earlier step is kept for them to read.
             self._scheduler_output = None
             return
+        # Core sends no token slices for cached requests unless pipeline
+        # parallelism is on, which this model refuses. The host token of a
+        # cached row is therefore read from the prompt this state recorded when
+        # core delivered it as a new request (a session turn arrives that way
+        # too, with its prompt starting at position zero). A position past the
+        # recorded prompt holds a token the sampler produced on the device; the
+        # host never reads it, and no sampled token is a CHUNK carrier, so such
+        # a row is marked with ``SAMPLED_TOKEN``.
+        for req_id in scheduler_output.finished_req_ids:
+            self._prompts.pop(req_id, None)
         cached = scheduler_output.scheduled_cached_reqs
-        if len(cached.req_ids) != len(cached.new_token_ids):
-            raise ValueError("state step omitted cached host token slices")
-        self._scheduled_tokens = {
-            req_id: tuple(tokens)
-            for req_id, tokens in zip(cached.req_ids, cached.new_token_ids)
-        }
+        for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens):
+            prompt = self._prompts.get(req_id)
+            if prompt is None:
+                raise ValueError(
+                    f"cached request {req_id!r} has no recorded prompt tokens"
+                )
+            start = int(computed)
+            count = scheduler_output.num_scheduled_tokens[req_id]
+            window = prompt[start : start + count]
+            if window and len(window) != count:
+                raise ValueError(
+                    f"cached request {req_id!r} schedules tokens across the end "
+                    "of its prompt"
+                )
+            self._scheduled_tokens[req_id] = window or (SAMPLED_TOKEN,) * count
         for request in scheduler_output.scheduled_new_reqs:
             tokens = request.prefill_token_ids
             if tokens is None:
                 raise ValueError("state step omitted new host token slice")
+            self._prompts[request.req_id] = tuple(tokens)
             start = request.num_computed_tokens
             count = scheduler_output.num_scheduled_tokens[request.req_id]
             self._scheduled_tokens[request.req_id] = tuple(
@@ -399,6 +426,7 @@ class NemotronASRModelState(ModelState):
         # terminal identities; the same live handle preserves its acoustic state.
         self._metadata.pop(req_id, None)
 
+    # @spec REG-MEM-013
     def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         handoff = getattr(getattr(self, "model", None), "_native_burst_handoff", None)
         if handoff is None:
@@ -443,6 +471,7 @@ class NemotronASRModelState(ModelState):
             )[: input_batch.num_tokens_after_padding]
         return self._features
 
+    # @spec REG-MEM-012
     def prepare_inputs(
         self,
         input_batch: InputBatch,

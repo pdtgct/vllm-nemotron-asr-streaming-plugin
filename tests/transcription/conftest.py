@@ -258,7 +258,7 @@ def make_step() -> Callable[..., Any]:
             scheduled_new_reqs=list(new),
             scheduled_cached_reqs=CachedRequestData(
                 req_ids=list(cached),
-                new_token_ids=[[0] for _ in cached],
+                new_token_ids=[],
                 new_block_ids=[None for _ in cached],
                 num_computed_tokens=[1 for _ in cached],
                 num_output_tokens=[1 for _ in cached],

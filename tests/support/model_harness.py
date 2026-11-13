@@ -75,6 +75,8 @@ import torch
 #: The model's state layer name for ``prefix="nemotron"`` (``f"{prefix}.state"``).
 STATE_LAYER = "nemotron.state"
 EPOCH = "epoch-1"
+#: A token the runner sampled: a transcript label, never a carrier.
+SAMPLED_LABEL = 1
 
 #: Encoder fields of the runnable synthetic card.
 RUNNABLE_ENCODER = {
@@ -693,8 +695,12 @@ def scheduler_output(
     cleanup: dict[str, int | tuple[int, int]] | None = None,
     step_seq: int = 1,
     encoder_inputs: dict[str, list[int]] | None = None,
+    computed: dict[str, int] | None = None,
 ) -> Any:
-    """A real ``SchedulerOutput``. ``handles`` / ``cleanup`` map request IDs
+    """A real ``SchedulerOutput`` as core builds it without pipeline
+    parallelism: cached requests carry no token slices (``new_token_ids`` is
+    empty), and ``computed`` gives each cached request's ``num_computed_tokens``
+    (default 1). ``handles`` / ``cleanup`` map request IDs
     to a slot (generation 1) or ``(slot, generation)``. When
     ``encoder_inputs`` is ``None``, every new request with a multimodal
     feature has its feature scheduled, as core schedules it on first sight."""
@@ -707,9 +713,9 @@ def scheduler_output(
         scheduled_new_reqs=list(new),
         scheduled_cached_reqs=CachedRequestData(
             req_ids=list(cached),
-            new_token_ids=[[0] for _ in cached],
+            new_token_ids=[],
             new_block_ids=[None for _ in cached],
-            num_computed_tokens=[1 for _ in cached],
+            num_computed_tokens=[(computed or {}).get(r, 1) for r in cached],
             num_output_tokens=[1 for _ in cached],
         ),
         num_scheduled_tokens=scheduled,
@@ -779,6 +785,7 @@ class Runner:
         self.state = state
         self.bindings: Any = None
         self.req_states = StepRequestStates()
+        self._prompts: dict[str, list[int]] = {}
 
     # -- state slots ---------------------------------------------------------
 
@@ -995,12 +1002,21 @@ class Runner:
         n = len(req_ids)
         batch = dummy_batch(self.state, n, n, is_padding=False)
         tokens = [r.prefill_token_ids[0] for r in output.scheduled_new_reqs]
-        tokens += [ids[-1] for ids in output.scheduled_cached_reqs.new_token_ids]
+        for r in output.scheduled_new_reqs:
+            self._prompts[r.req_id] = list(r.prefill_token_ids)
+        cached = output.scheduled_cached_reqs
+        for req_id, position in zip(cached.req_ids, cached.num_computed_tokens):
+            # A prompt token if the request's prompt reaches this position,
+            # else the runner's own sampled token (a label, never a carrier).
+            prompt = self._prompts[req_id]
+            tokens.append(prompt[position] if position < len(prompt) else SAMPLED_LABEL)
         batch.input_ids[:n] = torch.tensor(tokens)
         index = np.array(
             [self.req_states.req_id_to_index[r] for r in req_ids], dtype=np.intp
         )
-        computed = computed or {}
+        computed = dict(
+            zip(cached.req_ids, cached.num_computed_tokens, strict=True)
+        ) | (computed or {})
         return dataclasses.replace(
             batch,
             req_ids=req_ids,

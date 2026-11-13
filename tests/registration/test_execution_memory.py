@@ -22,10 +22,9 @@ Model-internal seams these tests read (beyond the harness's): the model
 state's step record (``_dummy_run`` / ``_is_profile``, REG-MEM-001, no public
 accessor), the model's state-layer spec (``_persistent_state_layer``), the
 profile scratch (``build_profile_invocation(...).storage.spec``), the encoder
-inventory's ``ready`` property (REG-MEM-003 inventory test) and, only while
-REG-MEM-002 is unimplemented, ``prepare_execution_memory`` (REG-MEM-006 CPU
-test). The GPU test reads no model attribute: it finds graph entries by
-instrumenting core's ``CUDAGraphWrapper.__call__``.
+inventory's ``ready`` property (REG-MEM-003 inventory test). The GPU test
+reads no model attribute: it finds graph entries by instrumenting
+core's ``CUDAGraphWrapper.__call__``.
 
 Migration blockers are isolated per test (``legacy`` argument of ``build``):
 tests of REG-MEM-* run with the removed state-slot calls re-added so that
@@ -45,6 +44,8 @@ import numpy as np
 import pytest
 import torch
 from support import model_harness as h
+
+from vllm_nemotron_asr_streaming.nemotron_asr.model_state_v2 import SAMPLED_TOKEN
 
 pytestmark = pytest.mark.engine
 
@@ -820,6 +821,67 @@ def test_first_real_step_after_preparation_runs(build, kind):
     assert_bindings_valid(spy, output)
 
 
+def cached_step(env, cached, computed, *, new=(), handles):
+    """A step as core builds it without pipeline parallelism: cached requests
+    carry no token slices; ``computed`` is each one's ``num_computed_tokens``."""
+    return h.scheduler_output(
+        new=tuple(new), cached=tuple(cached), handles=handles, computed=computed
+    )
+
+
+# @spec REG-STATE-008
+@pytest.mark.parametrize("kind", ["stream", "file", "mixed"])
+def test_consecutive_cached_steps_run_on_core_scheduler_output(build, kind):
+    """Core sends no ``new_token_ids`` for cached requests (no pipeline
+    parallelism): every step after a request's first still runs, the host
+    reading its prompt token or marking a sampled one."""
+    env = build()
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    first = rows_of(env, kind)
+    assert first.scheduled_cached_reqs.new_token_ids == []
+    env.runner.real_step(first)
+    ids = [r.req_id for r in first.scheduled_new_reqs]
+    handles = {r: (1 if r == "s1" else 2) for r in ids}
+    for step_no in range(1, 4):
+        out = cached_step(env, ids, {r: step_no for r in ids}, handles=handles)
+        assert out.scheduled_cached_reqs.new_token_ids == []
+        env.runner.real_step(out)
+        # a token the sampler produced on the device, never a carrier
+        assert env.state._scheduled_tokens == {r: (SAMPLED_TOKEN,) for r in ids}
+
+
+# @spec REG-STATE-008
+def test_session_turn_arrives_as_a_new_request_between_cached_steps(build):
+    """A later stream unit is a new request delivery (core resets its computed
+    tokens); it is a CHUNK again while a file row beside it keeps decoding."""
+    env = build()
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    handles = {"s1": 1, "f1": 2}
+    env.runner.real_step(
+        h.scheduler_output(new=(stream(env, "s1"), file(env, "f1")), handles=handles)
+    )
+    env.runner.real_step(
+        cached_step(env, ["s1", "f1"], {"s1": 1, "f1": 1}, handles=handles)
+    )
+    env.runner.real_step(
+        cached_step(
+            env, ["f1"], {"f1": 2}, new=[stream(env, "s1", sequence=1)], handles=handles
+        )
+    )
+    chunk = int(env.config.audio_chunk_token_id)
+    assert env.state._scheduled_tokens == {"s1": (chunk,), "f1": (SAMPLED_TOKEN,)}
+
+
+# @spec REG-STATE-008
+def test_cached_request_without_a_recorded_prompt_is_refused(build):
+    env = build()
+    out = cached_step(env, ["ghost"], {"ghost": 1}, handles={"ghost": 1})
+    error = h.call_with(env.state.prepare_step, out, dummy_run=False, is_profile=False)
+    assert isinstance(error, ValueError) and "ghost" in str(error)
+
+
 @pytest.mark.parametrize("prepared", [False, True], ids=["before", "after"])
 # @spec REG-MEM-014
 def test_cleanup_only_real_step_completes(build, prepared):
@@ -1072,12 +1134,8 @@ def test_graph_runtime_uses_cores_capture_context_forward_context_and_wrapper(
 
 
 def _prepare_graphed(env) -> None:
-    """Prepare through the first profiling step. While the model does not yet
-    prepare there (REG-MEM-002), call its current preparation directly
-    (seam: ``prepare_execution_memory``), so REG-MEM-006 is tested on its own."""
+    """Prepare through the first profiling step (REG-MEM-002)."""
     env.runner.profile_run(core_embeds=False)
-    if not env.graphs.captured():
-        env.model.prepare_execution_memory()
 
 
 # @spec REG-MEM-006

@@ -46,6 +46,7 @@ def _filled(value: int) -> Callable[..., torch.Tensor]:
     return initialize
 
 
+# @spec REG-STATE-001
 def build_nemotron_persistent_state_spec(config: Any) -> PersistentStateSpec:
     """Build the one aggregate page directly from the published manifest.
 

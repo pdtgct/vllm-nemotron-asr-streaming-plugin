@@ -55,7 +55,8 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
 ```
 
 - The persistent-state model needs synchronous scheduling, no prefix caching, a single device and an
-  eager outer runner (it runs its own captured graphs inside the step). Core resolves synchronous
+  eager outer runner (it runs its own captured graphs inside the step when a graphed arm is
+  configured). Core resolves synchronous
   scheduling and no prefix caching for this model, so the command omits `--no-async-scheduling` and
   `--no-enable-prefix-caching`; `--enforce-eager` is required because core's default is not eager.
   Other settings it refuses (speculative decoding, KV transfer, dual-batch overlap, sleep mode, the
@@ -114,19 +115,21 @@ a stage 1 or stage 2 build.
 - Historical build: the merge of RFC 1 `persistent-state-primitive-v2` @ `c384f178cd` and RFC 2
   `endpoint-plugin-lifecycle` @ `6b1ce05706` on `pdtgct/vllm` (branch `rfc12-integration-v2` @
   `c7cf80ac45`).
-- Achieved (historical, integration build `c7cf80ac45`), tier 1 (CPU conformance): the CPU-tier
+- Achieved (historical, integration build `c7cf80ac45`, plugin revision not recorded), tier 1 (CPU
+  conformance): the CPU-tier
   tests passed, including the request guards of the transcription route (run against a core
   `SpeechToTextParams` that carries the two fields of vllm#67151). The frontend-free file route was
   not run at tier 2 (installed engine).
-- Achieved (historical, integration build `c7cf80ac45`), tier 2 (installed-engine cycle), on one A40
+- Achieved (historical, integration build `c7cf80ac45`, plugin `4e4fd6f` for the GPU tier; the
+  unmodified-client runs record no plugin revision), tier 2 (installed-engine cycle), on one A40
   with the Riva frontend at `782dec8`: this repository's GPU tier passed, and unmodified Riva clients
   completed streaming, `Recognize`, Realtime WebSocket and file-route requests, for one session and
   for eight concurrent sessions.
-- Partly achieved (historical, integration build `c7cf80ac45`), tier 3 (equivalence), same A40: on
+- Partly achieved (historical, integration build `c7cf80ac45`, plugin revision not recorded), tier 3 (equivalence), same A40: on
   eight public clips from 20 s to 428 s, the core transcription route (sent with `language`) and
   `Recognize` returned identical transcripts, and the whole-file transcript equaled a session at the
   1120 ms file cadence. The comparison with the offline plugin has not been run on these clips.
-- Not met (historical, integration build `c7cf80ac45`), tier 4 (mixed load): with one 293 s file
+- Not met (historical, integration build `c7cf80ac45`, plugin revision not recorded), tier 4 (mixed load): with one 293 s file
   request in flight, eight concurrent streams' p95 final latency rose from 0.55 s to 3.64 s, with no
   preemptions. Run file traffic on a separate server, or keep files short, until this is fixed.
 - These are exploratory measurements on one GPU, not a qualification run.
