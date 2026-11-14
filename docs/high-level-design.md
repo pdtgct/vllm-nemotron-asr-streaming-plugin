@@ -72,8 +72,9 @@ one graph launch and the commit stage. Any step that no cell covers, or whose si
 from its cell's, runs the eager transaction, which is the reference, and is counted as a fallback.
 
 The model captures these graphs through #67583's model-state capture hook, into core's graph pool
-and on core's capture stream, first over core's profiling state pools so that core's graph-memory
-estimate charges their memory before state pages are planned, then over the serving pools. The
+and on core's capture stream: when core runs its graph-memory estimate, first over core's
+profiling state pools so that the estimate charges their memory before state pages are planned,
+and then, always, over the serving pools. The
 plugin keeps no graph pool of its own. The option runs without `--enforce-eager` and is refused
 with it, because core runs no capture hook under `--enforce-eager`; the outer runner still
 captures nothing (`cudagraph_mode` NONE). The option serves exactly one geometry, 80 ms or
@@ -103,6 +104,11 @@ captures nothing (`cudagraph_mode` NONE). The option serves exactly one geometry
 - With transaction graphs on, transcripts and resident state equal the eager transaction's bit for
   bit, and the served step is faster than with the option off by the threshold of Success
   Metrics, tier 5.
+- Transaction graphs become the default configuration. They ship opt-in until the default-on gate
+  in the `transaction-graph` design passes and Pete approves the change; every design choice keeps
+  that path open (cells keyed by geometry, no configuration that only an opt-in feature tolerates).
+  Once the option is on by default, `--enforce-eager` turns it off with a log line; an explicit
+  request for it under `--enforce-eager` is refused.
 - Every claim in this repository's README names the acceptance tier it has met (Success Metrics).
 
 ## Non-Goals
@@ -118,9 +124,10 @@ captures nothing (`cudagraph_mode` NONE). The option serves exactly one geometry
 - Changing the offline plugin
   ([`Sohaib-Ahmed21/vllm-nemotron-asr-plugin`](https://github.com/Sohaib-Ahmed21/vllm-nemotron-asr-plugin))
   or its architecture key.
-- Transaction graphs by default, at the 320, 560 or 1120 ms geometries, or at more than one
-  geometry in one engine. Turning them on by default needs its own evidence and Pete's approval
-  (the `transaction-graph` design states the gate).
+- Transaction graphs at the 320, 560 or 1120 ms geometries, or at more than one geometry in one
+  engine, in their first release. Default-on needs both, because the default served set has
+  four geometries; they are the next increment, each with its own exactness and latency
+  evidence.
 
 ## Tenets
 
@@ -168,9 +175,14 @@ carry these responsibilities toward it:
   the model's own graph capture by configuration: under `--enforce-eager`, on the first
   profiling dummy step; under the hook configuration, in the capture hook. Its permitted
   model-adapter dependencies include the hook's modules.
-- `transcription` states that no cell covers a whole-file row. A step with one runs eagerly and
-  counts as a fallback, and file and stream rows can share a step, so while a file is in flight
-  every step it shares with streams runs eagerly and those streams lose the saving.
+- `transcription` runs each whole-file step as a row of an existing stream role: draining queued
+  labels as REPLAY, a regular chunk or the final tail as CHUNK, and the end step (EOS) as FLUSH.
+  The file-specific device work (the role check against the file's last emitted token, an armed
+  echo on a chunk row, continuation emission where a stream row would park) stays per row, selected
+  by a per-row file mask. `transaction-graph` captures those selects in every cell and takes the
+  mask as a graph input, so steps that mix file and stream rows replay like any other. A file's
+  samples reach the device by their own host-to-device copy, and the per-step read of its label
+  counts is either removed or counted by `transaction-graph`.
 - `session` keeps native burst off while the option is on.
 
 The acoustic internals under `vllm_nemotron_asr_streaming/nemotron_asr/` (encoder, RNN-T decoder,
@@ -179,28 +191,28 @@ the leaf designs cite them where they depend on them.
 
 ### Constraints
 
-- **Engine.** The plugin requires the state-lifetime and stream-admission API of the RFC 1 PRs
-  #67374 and #67375 and no earlier RFC 1 head; core keeps no compatibility interfaces for the
-  superseded #65544 API. Two builds of upstream vLLM `main` are targets:
+- **Engine.** The plugin requires the model API of the RFC 1 PRs #67374 (state lifetime), #67375
+  (stream admission) and #67583 (model-state hooks and graph capture), and no earlier RFC 1 head;
+  core keeps no compatibility interfaces for the superseded #65544 API. Two builds of upstream
+  vLLM `main` are targets:
   - **Stage 1, the model alone** on core's `/v1/realtime` and `/v1/audio/transcriptions`:
-    #67374, #67375, and the speech-to-text PRs #67144 and #67151 (Whole-file serving, below).
+    #67374, #67375, #67583, and the speech-to-text PRs #67144 and #67151 (Whole-file serving,
+    below).
   - **Stage 2, with a frontend:** stage 1 plus RFC 2 (#65546 and #67294) and a frontend
     endpoint plugin such as `vllm-riva-frontend`.
 
-  The model-state hooks of #67583 are an optional capability, detected at startup. On a core
-  without them the outer runner must be eager (`--enforce-eager`) and every option that needs the
-  capture hook is refused with a message naming the missing hook. Features that need the hook,
-  transaction graphs among them, are qualified on **stage 1 plus #67583**. The README records the
-  commits each acceptance tier was actually met on, and claims only the tiers met. Python
-  `>=3.11,<3.15`.
+  The plugin refuses to start on a core without #67583's model-state hooks, naming the missing
+  hooks. The README records the commits each acceptance tier was actually met on, and claims only
+  the tiers met; a tier met only on a build without #67583 is a historical record until it is met
+  again on stage 1. Python `>=3.11,<3.15`.
 - **Engine settings.** The resolved engine settings must be synchronous scheduling, no prefix
   caching and an outer runner that captures no CUDA graphs and compiles nothing, and the plugin
   refuses to start otherwise. Two configurations give such a runner:
-  - `--enforce-eager`. Core then runs none of the three graph-capture hooks (on a core with
-    #67583 it still calls `prepare_execution_memory`, `post_warmup` and `shutdown`), and the
+  - `--enforce-eager`. Core then runs none of the three graph-capture hooks (it still calls
+    `prepare_execution_memory`, `post_warmup` and `shutdown`), and the
     model captures its own encoder and decoder graphs on the first profiling dummy step.
     Transaction graphs are refused in this configuration.
-  - The hook configuration: on a core with #67583, `cudagraph_mode` NONE with compilation off.
+  - The hook configuration: `cudagraph_mode` NONE with compilation off.
     Every graph the model runs, segment graphs and transaction graphs alike, is then captured in
     `capture_cudagraphs`, and none on the profiling dummy step. This configuration is accepted
     only when it selects at least one graph that the hook captures. With segment graphs alone it
@@ -227,16 +239,19 @@ the leaf designs cite them where they depend on them.
   its serving capture, or graphs with at least their memory, and the model keeps nothing derived
   from the profiling pools once `clear_cudagraphs` returns. Core locks the workspace after the
   serving capture, so all workspace-backed memory is sized by the time that capture returns.
-- **Graph memory is charged before capacity is fixed.** Transaction graphs bake in resident
+- **Graph memory is charged before capacity is fixed when core estimates it.** Transaction graphs bake in resident
   state-pool addresses and retain on the order of gigabytes (about 2 GB for nine cells in the
   prototype's measurement), far more than the segment graphs, so their memory must be in core's
-  graph-memory estimate before the state pages are planned. The option is therefore refused
-  whenever that estimate will not run: a fixed `kv_cache_memory_bytes`, the estimate disabled,
-  or a platform without it. A refusal names the option and the setting that blocks it. A serving
-  capture of transaction graphs with no profiling capture before it in the same worker fails
-  startup, which also covers paths that configuration cannot predict. The CuMem allocator and
-  sleep mode are already refused for every persistent-state model (core, and `registration`'s
-  REG-ENG-003).
+  graph-memory estimate before the state pages are planned whenever core runs that estimate.
+  When it does not (a budget fixed through `--kv-cache-memory-bytes`, the estimate disabled, or a
+  platform without it), core subtracts no graph memory from the budget, whether that budget is
+  fixed or profiled, as for every graph the model captures, so the budget must leave room. The
+  model then logs that its transaction graphs were not charged and the graph memory the serving
+  capture retained, and a serving capture that cannot allocate fails startup with a message
+  naming the option, the cell whose capture failed, the graph memory the cells captured so far
+  retained, and the budget setting. The CuMem
+  allocator and sleep mode are already refused for every persistent-state model (core, and
+  `registration`'s REG-ENG-003).
 - **Engine surface.** Session operations use only `AsyncLLM` / `EngineClient` public and
   RFC-proposed calls, never `engine_core` or scheduler internals. The model adapter's own
   dependencies (model-state interface, state-slot bindings, scheduler output types) are an
@@ -250,13 +265,14 @@ the leaf designs cite them where they depend on them.
   from that set when it is admitted and keeps it for the stream's life. A cadence outside the
   served set is refused at admission. Whole files run at the server's default cadence (the
   configured `num_lookahead_tokens`, which must be in the served set); the `transcription` design
-  settles whether a request may choose another. The reference frontend's streaming surfaces need
-  the 560 ms cadence (lookahead 6), and it refuses to start against a server that does not serve
-  it. The experimental native-burst mode requires the configured lookahead to be 1 (160 ms); it
+  settles whether a request may choose another. A frontend opens each stream at a cadence from the
+  served set: the client's choice where its protocol carries one, else the server's default;
+  `vllm-riva-frontend` v0.4.0b1 opens every stream at 560 ms and refuses a server that does not
+  serve it, so transaction graphs behind a frontend need a frontend release that takes the cadence
+  from the client or the server's default. The experimental native-burst mode requires the configured lookahead to be 1 (160 ms); it
   does not restrict the served set to that cadence. Transaction graphs do restrict it: with them
   on, the served set is exactly one geometry, lookahead 0 or 1 (80 or 160 ms), and native burst is
-  off. Whole files then run at that geometry too, and the reference frontend, which needs 560 ms,
-  does not start against such a server.
+  off. Whole files then run at that geometry too, and every stream opens at it.
 - **Completeness.** The model and the session factory treat a transcript as complete only after
   EOS following the final flush; a session that ends any other way fails. How core's own routes
   report a request that ends without EOS is core's behaviour, not the plugin's:
@@ -297,12 +313,13 @@ the leaf designs cite them where they depend on them.
 | Architecture key | `Nemotron3_5AsrStreamingForRNNT`, selected through a registered config parser; the Hub card's `Nemotron3_5AsrForRNNT` stays the offline plugin's key | Register the card's key: zero-configuration serving, but it would override the offline plugin when both are installed and remove whole-file service from released-vLLM users. Consolidation onto one key is planned with the offline plugin's author (below) |
 | Relationship to the offline plugin | Independent package now; planned merge with the offline plugin into one package under the card's key, choosing the implementation at startup by whether the engine provides the RFC 1 primitive | Replace the offline implementation outright: breaks released-vLLM users until RFC 1 ships. Keep two packages permanently: users must choose between two packages for one model |
 | Complete files | This model's own stateful path (`SupportsTranscription`), at most one chunk per step | A full-file forward pass: stalls the batch and is bounded by encoder positions. Delegating files to the offline plugin: a second implementation on the same server and the same ~400 s bound |
-| Core API | Only the model API of #67374 and #67375 (Pete, 2026-11-12), plus #67583's model-state hooks where the engine provides them; the plugin adapts to it | Ask core for compatibility interfaces with #65544's API: core would carry API that no proposal needs. Support both APIs in the plugin: two code paths for one model, and #65544 is superseded |
+| Core API | Only the model API of #67374, #67375 and #67583 (Pete, 2026-11-12 and 2026-11-14); the plugin adapts to it | Make #67583 optional and detect it at startup: two core APIs to detect and test, and transaction graphs, the default-on goal, absent on one of them. Ask core for compatibility interfaces with #65544's API: core would carry API that no proposal needs. Support both APIs in the plugin: two code paths for one model, and #65544 is superseded |
 | Frontend coupling | Structural protocol plus an entry-point group owned by the frontend; neither package imports the other | A shared interface package: a third release to coordinate for a small protocol |
 | Whole-step graph replay | A `transaction-graph` component in this repository, designed against #67583's model-state capture hook; the whole-transaction prototype at `pdtgct/vllm` `76376a0b36` (design `docs/design/nemotron_asr_transaction_graph.md`) is its measured evidence base, not its source | Import the prototype's modules from a vLLM build: they are in no core proposal, and core would carry model code. Transplant the prototype's patches: they target an in-tree copy of the model that has diverged from this one, and they carry a model-owned memory admission that the hook makes unnecessary |
 | Graph-memory accounting | Core's graph-memory estimate, through the capture hook: the profiling capture over core's profiling state pools, then the serving capture into core's graph pool | A model-owned admission inventory and graph pool, retained through the profiling window and checked against the serving capture: core's estimate already measures the same graphs before planning, and the inventory needs its own fit rule and release check. Extrapolating from one captured cell: unsound, because cells do not share memory predictably |
-| Served geometry under transaction graphs | Exactly one, 80 or 160 ms; the deployment configures it as both the served set and the default lookahead | Two geometries in one engine: more cells and memory with no mixed-geometry use yet. The 320 to 1120 ms geometries: no exactness or latency evidence for transactions that the replay accepts, and their step time is larger relative to host dispatch, so the expected saving is smaller |
-| Steps with whole-file rows under transaction graphs | No cell covers them: they run eagerly and are counted | Classify file rows into cells: more cells and an exactness proof for the whole-file row role before any use needs it |
+| Served geometry under transaction graphs | First release: exactly one, 80 or 160 ms, configured as both the served set and the default lookahead; cells are keyed by geometry so that more geometries add cells, not a redesign | All published geometries at once: the 320 to 1120 ms geometries have no exactness or latency evidence for transactions the replay accepts, and several geometries per engine multiply cells and graph memory; both are needed for default-on and follow as measured increments |
+| Whole-file rows under transaction graphs | Run as rows of the stream roles REPLAY, CHUNK and FLUSH, in the same cells, with the file-specific selects captured in every cell and chosen by a per-row file mask; the `transaction-graph` design proves each against the option-off transaction of the same row plan | Leave file rows uncovered: every step a file shares with streams would run eagerly, so streams lose the saving whenever a file is in flight. Separate file cells: more cells and graph memory for device work that is already the streams' |
+| Graph memory when core does not estimate it | Allowed: the budget must leave room, the model logs the uncharged graph memory, and an allocation failure in the serving capture fails startup with the figures | Refuse the option under a fixed budget: a default-on option would then break every deployment that fixes its budget |
 
 ### Same model, two implementations
 
@@ -344,7 +361,7 @@ admission) need stage 2.
    equal the offline plugin's within its supported length.
 4. **Mixed load.** The latency goal above holds in unprofiled serving measurements.
 5. **Transaction graphs** (opt-in; met separately at 80 ms and at 160 ms, on the A40 at FP32,
-   on stage 1 plus #67583):
+   on stage 1):
    - the graphs are captured through #67583's capture hook with `cudagraph_mode` NONE, without
      `--enforce-eager` and without a model-owned graph pool;
    - "option-off" below means the same engine configuration with only the option changed: both
@@ -353,9 +370,12 @@ admission) need stage 2.
    - on the qualification workload (test-clean streams at the served geometry, at populations
      the declared cells cover) every covered step's outputs and resident state equal the
      option-off transaction's bit for bit, the transcripts equal the option-off run's, and the
-     run records zero fallbacks of any kind; steps that no cell covers (an undeclared
-     population, a whole-file row) are tested separately, each with its expected fallback count
-     and outputs equal to the option-off run's;
+     run records zero fallbacks of any kind; the same holds on a mixed workload of those
+     streams with whole-file requests in flight, at declared populations that count stream and
+     file rows together and that include silent chunks, an empty final tail, label drain and the
+     end step; equality is against the option-off transaction of the same row plan; steps that
+     no cell covers (an undeclared population) are tested separately, with their expected fallback count and outputs equal to
+     the option-off run's;
    - at populations 1, 31 and 63 the median option-on step is faster than the smaller of two
      bracketing option-off medians by at least the larger of 5 ms and the difference between
      those two medians, in each of two blocks; the `transaction-graph` design gives the
@@ -363,26 +383,28 @@ admission) need stage 2.
    - the single-stream admission demand measured through `AsyncLLM` in a multiprocess engine,
      from audio feed to slot park, improves by its own pre-registered rule, given in the
      `transaction-graph` design;
-   - U(1), the per-step admission demand of one stream as compiled from a calibration run, is
-     compiled with the option on and with it off, and the calibration records the option as part
-     of the configuration it calibrated; the `transaction-graph` design owns this calibration run
-     until the plugin has an admission-calibration component;
+   - the `transaction-graph` design's calibration measures U(1), the step time one admitted
+     stream adds at the served geometry, from which admission computes how many streams fit a
+     step, with the option on and with it off, and records the option as part of the
+     configuration it calibrated;
    - each cell's graph memory is measured and reported; an installed-engine check shows that
      core's estimate charged the profiling capture before the state pages were planned and that
-     the serving capture retained no more; each guard in Constraints refuses its configuration;
-   - TLA+ models of the capture lifecycle on the hook, kept in this repository, check without
-     violations.
+     the serving capture retained no more; under a fixed budget the startup log reports the
+     uncharged graph memory; each refusal in Constraints refuses its configuration (the option
+     under `--enforce-eager`, more than one served geometry, native burst, a core without
+     #67583's hooks);
+   - TLA+ models of the capture lifecycle on the hook, versioned in this repository as a system
+     model and updated with every change to that lifecycle, check without violations.
 
-   Tier 4 is claimed with the option off. With it on, mixed load is measured and reported
-   separately, because steps shared with a whole-file row run eagerly.
+   Tier 4 must be met, and is claimed, separately with the option off and with it on.
 
 Falsification signals: any whole-file transcript that differs from streaming under matched
 conditions; any session factory session, or core transcription request on either build, reported complete
 without EOS after the final flush; a slot or host buffer
 that outlives its request's release; more files actively scheduled than `max_num_seqs`, or than a frontend's file cap if one runs; with transaction graphs on, any covered step whose outputs or
-resident state differ from the option-off transaction's, or any serving capture of transaction
-graphs that ran without a profiling capture before it or retained more graph memory than that
-profiling capture.
+resident state differ from the option-off transaction's, or, where core ran its graph-memory
+estimate, any serving capture of transaction graphs with no profiling capture before it or one
+that retained more graph memory than that profiling capture.
 
 ## References
 
