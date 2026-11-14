@@ -25,7 +25,7 @@ nemotron_asr_streaming = "vllm_nemotron_asr_streaming.session:create_session_fac
 [project.urls]
 Repository = "https://github.com/pdtgct/vllm-nemotron-asr-streaming-plugin"
 SourceModel = "https://github.com/pdtgct/vllm/tree/rfc1-5212-vllm/vllm/models/nemotron_asr"
-Rfc1Tip = "https://github.com/pdtgct/vllm/tree/persistent-state-primitive-v2"
+Rfc1Tip = "https://github.com/pdtgct/vllm/tree/persistent-state-admission-20261112"
 
 [tool.setuptools.packages.find]
 include = ["vllm_nemotron_asr_streaming*"]

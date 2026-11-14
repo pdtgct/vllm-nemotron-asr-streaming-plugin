@@ -1266,6 +1266,7 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph_cpu(b
     env.runner.real_step(step())
     assert len(env.graphs.replays) > replays, "the restored step did not replay"
     # every step that committed (the refused one raised before committing) was clean
+    assert env.runner.commit_log, "no step committed"
     assert all(not failed for _, failed in env.runner.commit_log)
     assert all(v == 0 for st, _ in env.runner.commit_log for v in st.values())
 

@@ -1,8 +1,8 @@
 # Status
 
 The implementation follows the specs in `docs/intent/` (registration, session, transcription).
-The CPU tiers pass. The GPU tier passed on an A40 (23 passed, in-process engine 2 passed) at `4e4fd6f`, on
-vLLM `rfc12-integration-v2` `c7cf80ac45` with the Riva frontend; it has not yet run on RFC 1 alone.
+The CPU tiers pass. The GPU tier passed on an A40 (35 passed, 1 skipped) at `5acd9d2`, on the stage 1
+build (`pdtgct/vllm` `stage1-build-20261113` `b7e7a20c26`: upstream `main` + vllm#67375 + vllm#67151).
 
 ## First GPU round (A40)
 

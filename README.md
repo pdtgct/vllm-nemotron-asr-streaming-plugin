@@ -109,8 +109,17 @@ Support boundary:
 
 Every claim names its tier, the build and the source revisions it was met on. The measurements below
 were made on the earlier integration build of RFC 1 (the superseded #65544 API) and RFC 2, not on
-stage 1 or stage 2; they are historical and are not claims about either. No tier has yet been met on
-a stage 1 or stage 2 build.
+stage 1 or stage 2; they are historical and are not claims about either, except the stage 1 entry,
+which comes first.
+
+- Stage 1 build: `pdtgct/vllm` `stage1-build-20261113` @ `b7e7a20c26` (upstream `main` `cf8fce503c` +
+  vllm#67375 + vllm#67151), precompiled wheel `191e5d5df2` (cu132), one NVIDIA A40. Evidence:
+  `pdtgct/nemotron-omni-port` `experiments/2026-11-13-two-stage-stage1-a40/`.
+- Achieved (stage 1, plugin `5acd9d2`), tier 1 (CPU conformance): 1203 passed, 43 skipped.
+- Achieved (stage 1; serving at plugin `a850916`, GPU tier at `5acd9d2`, which changes only tests since),
+  tier 2 (installed-engine cycle): the GPU tier passed (35 passed, 1 skipped), and 5559 LibriSpeech
+  `/v1/realtime` sessions at concurrency 32 each reached a final transcript with none failed.
+  Tiers 3 and 4 have not been run on stage 1.
 
 - Historical build: the merge of RFC 1 `persistent-state-primitive-v2` @ `c384f178cd` and RFC 2
   `endpoint-plugin-lifecycle` @ `6b1ce05706` on `pdtgct/vllm` (branch `rfc12-integration-v2` @
