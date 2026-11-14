@@ -1273,7 +1273,7 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph_cpu(b
 @pytest.mark.gpu
 # @spec REG-MEM-002, REG-MEM-006
 def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, single_process_dist
 ):
     """CUDA, core's own graph runtime and static graph wrapper: as the CPU
     test. Wrapper invocations are counted by instrumenting core's

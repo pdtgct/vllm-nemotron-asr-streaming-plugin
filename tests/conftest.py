@@ -82,3 +82,14 @@ def real_card_dir() -> Path:
     if not path:
         pytest.skip("NEMOTRON_CARD_DIR not set")
     return Path(path)
+
+
+@pytest.fixture
+def single_process_dist(tmp_path: Path):
+    """World-size-1 distributed environment and model-parallel groups, for
+    in-process model tests that reach ``graph_capture`` (see
+    ``support.distributed``). NCCL on CUDA."""
+    from support.distributed import single_process_distributed
+
+    with single_process_distributed(tmp_path / "dist_init", "nccl"):
+        yield
