@@ -426,3 +426,148 @@ def test_native_burst_still_refuses_a_defined_parallel_size_other_than_one(setti
 def test_native_burst_still_refuses_expert_parallelism():
     with pytest.raises(ValueError, match="native burst"):
         _validate_native_burst(_native_burst_config(enable_expert_parallel=True))
+
+
+# --------------------------------------------------------------------------
+# enforce_eager off for core-captured model graphs (experimental)
+# --------------------------------------------------------------------------
+
+
+def _not_eager_config(
+    engine_config, *, mode="none", cudagraph="none", arm=True, level=2, **hf
+):
+    from types import SimpleNamespace
+
+    from vllm.config import CUDAGraphMode
+    from vllm.config.compilation import CompilationMode
+
+    modes = {
+        "none": CompilationMode.NONE,
+        "compile": CompilationMode.VLLM_COMPILE,
+        None: None,
+    }
+    graphs = {
+        "none": CUDAGraphMode.NONE,
+        "piecewise": CUDAGraphMode.PIECEWISE,
+        None: None,
+    }
+    config = engine_config(enforce_eager=False)
+    config.compilation_config = SimpleNamespace(
+        mode=modes[mode], cudagraph_mode=graphs[cudagraph]
+    )
+    config.optimization_level = level
+    hf_config = {"decode_dispatch_arm": "dense-graphed" if arm else "compact-eager"}
+    hf_config.update(hf)
+    config.model_config.hf_config = SimpleNamespace(**hf_config)
+    return config
+
+
+@pytest.fixture
+def hooks(monkeypatch):
+    from vllm_nemotron_asr_streaming import engine_flags
+
+    def set_hooks(present: bool):
+        monkeypatch.setattr(engine_flags, "core_has_graph_hooks", lambda: present)
+
+    set_hooks(True)
+    return set_hooks
+
+
+def _errors(config, resolved=False):
+    from vllm_nemotron_asr_streaming.engine_flags import persistent_state_config_errors
+
+    return persistent_state_config_errors(config, resolved=resolved)
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+def test_not_eager_is_accepted_for_core_captured_decoder_graphs(
+    engine_config, hooks, resolved
+):
+    assert _errors(_not_eager_config(engine_config), resolved) == []
+
+
+def test_unset_graph_mode_and_O0_are_accepted_before_core_resolves_them(
+    engine_config, hooks
+):
+    config = _not_eager_config(engine_config, mode=None, cudagraph=None, level=0)
+    assert _errors(config) == []
+    assert _errors(config, resolved=True), "unresolved values accepted as final"
+
+
+_NOT_EAGER_REFUSALS = {
+    "no hooks": ({}, "hooks"),
+    "core graphs": ({"cudagraph": "piecewise"}, "cudagraph_mode"),
+    "torch.compile": ({"mode": "compile"}, "torch.compile"),
+    "default compile": ({"mode": None, "level": 2}, "torch.compile"),
+    "eager decoder": ({"arm": False}, "dense-graphed"),
+    "graphed encoder": ({"encoder_execution_arm": "eager-graphed"}, "dense-graphed"),
+    "chunk": ({"chunk_bucket_graph_populations": [1]}, "dense-graphed"),
+}
+
+
+@pytest.mark.parametrize("case", list(_NOT_EAGER_REFUSALS))
+def test_not_eager_is_refused_naming_the_missing_condition(engine_config, hooks, case):
+    settings, word = _NOT_EAGER_REFUSALS[case]
+    if case == "no hooks":
+        hooks(False)
+    errors = _errors(_not_eager_config(engine_config, **settings))
+    assert len(errors) == 1 and "enforce_eager" in errors[0], errors
+    assert word in errors[0], errors[0]
+
+
+def test_not_eager_refusal_names_every_missing_condition(engine_config, hooks):
+    hooks(False)
+    config = _not_eager_config(
+        engine_config, mode="compile", cudagraph="piecewise", arm=False
+    )
+    (error,) = _errors(config)
+    for word in ("hooks", "cudagraph_mode", "torch.compile", "dense-graphed"):
+        assert word in error, (word, error)
+
+
+def test_core_hook_detection_matches_the_installed_core():
+    from vllm.v1.worker.gpu.model_states.interface import ModelState
+
+    from vllm_nemotron_asr_streaming.engine_flags import (
+        MODEL_STATE_GRAPH_HOOKS,
+        core_has_graph_hooks,
+    )
+
+    assert core_has_graph_hooks() is all(
+        callable(getattr(ModelState, n, None)) for n in MODEL_STATE_GRAPH_HOOKS
+    )
+
+
+def test_real_not_eager_config_constructs_on_a_core_with_the_hooks(
+    make_model_config, card_dir
+):
+    """The serve flags of the latency arm: ``--no-enforce-eager``-equivalent
+    with ``-cc.mode none`` and the dense-graphed decoder (core resolves
+    ``cudagraph_mode`` to NONE for persistent state)."""
+    from vllm.config import (
+        CacheConfig,
+        CompilationConfig,
+        CUDAGraphMode,
+        DeviceConfig,
+        SchedulerConfig,
+        VllmConfig,
+    )
+
+    from vllm_nemotron_asr_streaming.engine_flags import core_has_graph_hooks
+
+    if not core_has_graph_hooks():
+        pytest.skip("the installed vLLM has no model-state graph hooks")
+    model_config = make_model_config(
+        card_dir,
+        overrides={"decode_dispatch_arm": "dense-graphed"},
+        enforce_eager=False,
+    )
+    config = VllmConfig(
+        model_config=model_config,
+        device_config=DeviceConfig(device="cpu"),
+        cache_config=CacheConfig(enable_prefix_caching=False),
+        scheduler_config=SchedulerConfig.default_factory(async_scheduling=False),
+        compilation_config=CompilationConfig(mode=0),
+    )
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert _errors(config, resolved=True) == []

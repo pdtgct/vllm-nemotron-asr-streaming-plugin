@@ -530,6 +530,9 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         self._host_staging: HostStaging | None = None
         self._execution_memory_prepared = False
         self._execution_memory_failed = False
+        #: Set when core's model-state capture hook, not the profiling step,
+        #: captures the decoder graphs (``prepare_execution_memory_hook``).
+        self._graphs_by_core = False
 
     def _state_pools(self, projection: Any) -> Any:
         return projection.state_batch.pools
@@ -843,8 +846,13 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             resident_request_ids=tuple(projection.req_states.req_id_to_index),
         )
 
-    def _require_execution_inventory_ready(self) -> None:
-        """Validate complete model-owned inventory without creating allocations."""
+    def _require_execution_inventory_ready(
+        self, *, capture_pending_ok: bool = False
+    ) -> None:
+        """Validate complete model-owned inventory without creating allocations.
+
+        ``capture_pending_ok``: accept a decoder that core's capture hook has
+        not captured yet (startup only; serving steps never pass it)."""
         if not self._encoder_execution.ready:
             raise RuntimeError("encoder execution inventory is incomplete")
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
@@ -854,6 +862,8 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         if binding is None:
             if getattr(self.config, "decode_dispatch_arm", None) == "dense-graphed":
                 raise RuntimeError("decoder execution inventory is missing")
+            return
+        if capture_pending_ok and self._graphs_by_core and not binding.captured_keys:
             return
         from vllm_nemotron_asr_streaming.nemotron_asr.decode_graph import execution_tiers
 
@@ -875,10 +885,10 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             binding is None or binding.graphs_present
         )
 
-    def _require_execution_ready(self) -> None:
+    def _require_execution_ready(self, *, capture_pending_ok: bool = False) -> None:
         """Readiness of the whole inventory, including that every captured
         graph entry still holds its graph, without creating allocations."""
-        self._require_execution_inventory_ready()
+        self._require_execution_inventory_ready(capture_pending_ok=capture_pending_ok)
         if not self._graphs_present():
             raise RuntimeError(
                 "a captured execution graph entry holds no graph; the model "
@@ -901,7 +911,8 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 "execution memory preparation failed; a fresh worker is required"
             )
         if self._execution_memory_prepared:
-            self._require_execution_ready()
+            # Core's capture hook may not have captured yet (graphs by core).
+            self._require_execution_ready(capture_pending_ok=True)
             return
         try:
             self._prepare_execution_memory(device)
@@ -917,11 +928,16 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
 
     # @spec PORT-STATE-003, PORT-PERF-009, PORT-PERF-011
     @torch.inference_mode()
-    def _prepare_execution_memory(self, device: torch.device) -> None:
+    def _prepare_execution_memory(
+        self, device: torch.device, *, capture: bool = True
+    ) -> None:
         """Retain execution inventory and profile its transient headroom.
 
         Profiling uses model-owned scratch state built from the model's
         ``PersistentStateSpec``; it reads no state-slot bindings or pool.
+        ``capture=False`` (core's capture hook captures the decoder graphs
+        later) skips the decoder capture; the profile transaction then runs
+        the dense eager decoder, as it does today when no CHUNK graphs exist.
         """
         from vllm_nemotron_asr_streaming.nemotron_asr.profile_execution import (
             run_persistent_state_profile,
@@ -929,14 +945,17 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         )
 
         warmup_static_encoder_execution(self, device=device)
-        if self._decode_graph_binding is not None:
+        chunk_binding = getattr(self, "_chunk_bucket_binding", None)
+        if not capture:
+            if chunk_binding is not None:
+                raise RuntimeError("CHUNK graphs are captured on the profiling step")
+        elif self._decode_graph_binding is not None:
             self._decode_graph_binding.warmup(
                 device, self.core.policy.dtype_for("activations")
             )
-        chunk_binding = getattr(self, "_chunk_bucket_binding", None)
         if chunk_binding is not None:
             chunk_binding.warmup(device)
-        self._require_execution_ready()
+        self._require_execution_ready(capture_pending_ok=not capture)
         # All retained graph buffers must coexist with this temporary
         # transaction so the profiler sees their combined high-water mark.
         if chunk_binding is not None:
@@ -957,7 +976,93 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             geometry_id=max(_served_geometry_ids(self.config)),
             ready_domain=True,
         )
-        self._require_execution_ready()
+        self._require_execution_ready(capture_pending_ok=not capture)
+
+    # Core's model-state graph hooks (a core that defines them; the model
+    # state forwards ``prepare_execution_memory``, ``capture_cudagraphs``,
+    # ``clear_cudagraphs`` and ``shutdown`` here).
+    def prepare_execution_memory_hook(
+        self, device: torch.device, *, graphs_by_core: bool
+    ) -> None:
+        """Core's ``prepare_execution_memory``: once, before the profiling
+        forward, inside core's memory profile. Captures nothing.
+
+        With ``graphs_by_core`` (core's capture hook captures the decoder
+        graphs), prepare everything but those graphs. Otherwise a
+        configuration that captures nothing prepares in full here, and one
+        that captures leaves preparation to the first profiling step, as on
+        a core without the hooks. The profiling step never prepares again.
+        """
+        if self._execution_memory_prepared or self._execution_memory_failed:
+            return
+        if not graphs_by_core:
+            if not self._graphed_execution:
+                self._profile_dummy_step(device)
+            return
+        if (
+            self._decode_graph_binding is None
+            or getattr(self, "_chunk_bucket_binding", None) is not None
+            or getattr(self._encoder_execution, "arm", None)
+            in ("dense-graphed", "eager-graphed")
+        ):
+            raise RuntimeError(
+                "core's capture hook captures only the dense-graphed decoder; "
+                "graphed encoder and CHUNK arms are captured on the profiling step"
+            )
+        self._graphs_by_core = True
+        try:
+            self._prepare_execution_memory(device, capture=False)
+        except Exception:
+            self._execution_memory_failed = True
+            try:
+                self._encoder_execution._discard()
+            finally:
+                self._decode_graph_binding.discard()
+            raise
+        self._execution_memory_prepared = True
+
+    def capture_graphs_hook(
+        self,
+        device: torch.device,
+        *,
+        graph_pool: Any,
+        stream: Any,
+        profile_only: bool,
+    ) -> None:
+        """Core's ``capture_cudagraphs``: capture the decoder graphs into
+        ``graph_pool`` on ``stream``. The profile-only capture is the same
+        capture (same keys and buffers), released by ``release_core_graphs``.
+        """
+        del profile_only  # the measured capture is the serving capture
+        if not self._graphs_by_core:
+            raise RuntimeError("core's capture hook was not selected at preparation")
+        if self._execution_memory_failed or not self._execution_memory_prepared:
+            raise RuntimeError("execution memory is not prepared on this worker")
+        binding = self._decode_graph_binding
+        assert binding is not None
+        if binding.captured_keys:
+            raise RuntimeError(
+                "the decoder graphs are already captured; core releases the "
+                "profiling capture before it captures again"
+            )
+        try:
+            binding.warmup(
+                device,
+                self.core.policy.dtype_for("activations"),
+                stream=stream,
+                graph_pool=graph_pool,
+            )
+            self._require_execution_ready()
+        except Exception:
+            binding.discard()
+            raise
+
+    def release_core_graphs(self) -> None:
+        """Core's ``clear_cudagraphs`` / ``shutdown``: drop the graphs and
+        buffers core's capture hook created. Tolerates nothing captured."""
+        binding = getattr(self, "_decode_graph_binding", None)
+        if binding is not None and getattr(self, "_graphs_by_core", False):
+            binding.discard()
 
     def execution_profile_receipt(self) -> dict[str, Any]:
         """Report the resolved execution arms and startup coverage."""

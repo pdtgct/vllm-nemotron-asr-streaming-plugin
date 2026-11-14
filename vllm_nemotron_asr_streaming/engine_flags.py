@@ -14,6 +14,9 @@ Serve with the settings explicit (see the README), for example::
         --dtype float32 \\
         --enforce-eager
 
+``enforce_eager`` off is accepted only when core captures the model's graphs
+through its model-state hooks (``hook_capture_refusals``).
+
 Importing this module imports no vLLM.
 """
 
@@ -108,12 +111,88 @@ def persistent_state_config_errors(
         if getattr(parallel, name, 1) != 1:
             errors.append(f"{name} must be 1")
     if not getattr(model, "enforce_eager", False):
-        errors.append(
-            "enforce_eager must be set: the outer runner has to be eager "
-            "(pass enforce_eager=True or --enforce-eager); the model runs its "
-            "own captured graphs inside the eager step"
-        )
+        missing = hook_capture_refusals(vllm_config, resolved=resolved)
+        if missing:
+            errors.append(
+                "enforce_eager must be set: the outer runner has to be eager "
+                "(pass enforce_eager=True or --enforce-eager); the model runs its "
+                "own captured graphs inside the eager step. enforce_eager off is "
+                "accepted only for core-captured model graphs, and here "
+                + ", ".join(missing)
+            )
     return errors
+
+
+#: The model-state graph hooks a core must define for the model's graphs to
+#: be captured by core (``capture_model``) instead of on the profiling step.
+MODEL_STATE_GRAPH_HOOKS: tuple[str, ...] = (
+    "prepare_execution_memory",
+    "needs_cudagraph_capture",
+    "capture_cudagraphs",
+    "clear_cudagraphs",
+    "shutdown",
+)
+
+
+def core_has_graph_hooks() -> bool:
+    """Whether the installed core's ``ModelState`` defines every graph hook."""
+    try:
+        from vllm.v1.worker.gpu.model_states.interface import ModelState
+    except ImportError:
+        return False
+    return all(callable(getattr(ModelState, n, None)) for n in MODEL_STATE_GRAPH_HOOKS)
+
+
+def hook_captured_arm(hf_config: Any) -> bool:
+    """Whether the configuration selects the graphed arm core's capture hook
+    captures: the ``dense-graphed`` decoder with an ungraphed encoder and no
+    CHUNK graphs (those are captured on the profiling step only)."""
+    return (
+        getattr(hf_config, "decode_dispatch_arm", None) == "dense-graphed"
+        and getattr(hf_config, "encoder_execution_arm", None)
+        not in ("dense-graphed", "eager-graphed")
+        and not getattr(hf_config, "chunk_bucket_graph_populations", ())
+    )
+
+
+def _mode_value(mode: Any) -> Any:
+    return getattr(mode, "value", mode)
+
+
+def hook_capture_refusals(vllm_config: Any, *, resolved: bool = False) -> list[str]:
+    """The conditions for ``enforce_eager`` off that ``vllm_config`` misses
+    (empty when every one holds).
+
+    ``enforce_eager`` off lets core capture the model's graphs through the
+    model-state hooks. It requires: a core with those hooks; core's own CUDA
+    graphs off (``cudagraph_mode`` NONE; unset is accepted before core
+    resolves it, since core sets NONE for persistent state); torch.compile
+    off (compilation mode NONE: ``-cc.mode none``, or ``-O0`` before core
+    resolves the mode); and a configuration whose graphs the hooks capture.
+    """
+    missing: list[str] = []
+    if not core_has_graph_hooks():
+        missing.append("the installed vLLM has no model-state graph hooks")
+    compilation = getattr(vllm_config, "compilation_config", None)
+    cudagraph_mode = getattr(compilation, "cudagraph_mode", None)
+    graph_mode = _mode_value(cudagraph_mode)
+    if compilation is None or not (
+        graph_mode == 0 or (graph_mode is None and not resolved)
+    ):
+        missing.append("cudagraph_mode must be NONE (pass -cc.cudagraph_mode none)")
+    mode = _mode_value(getattr(compilation, "mode", None))
+    if mode is None and not resolved:
+        level = _mode_value(getattr(vllm_config, "optimization_level", None))
+        mode = 0 if level == 0 else None
+    if compilation is None or mode != 0:
+        missing.append("torch.compile must be off (pass -cc.mode none)")
+    model = getattr(vllm_config, "model_config", None)
+    if not hook_captured_arm(getattr(model, "hf_config", None)):
+        missing.append(
+            "the configuration must select decode_dispatch_arm=dense-graphed "
+            "with no graphed encoder arm and no CHUNK graph populations"
+        )
+    return missing
 
 
 def engine_config_refusal(

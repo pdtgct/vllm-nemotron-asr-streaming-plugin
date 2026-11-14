@@ -1351,3 +1351,224 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
     assert all(v == 0 for st, _ in runner.commit_log for v in st.values()), (
         runner.commit_log
     )
+
+
+# ===========================================================================
+# Core's model-state graph hooks (experimental: a core that defines them)
+# ===========================================================================
+#
+# Core calls, when the runner is not eager: ``prepare_execution_memory`` once
+# before the profiling forward; ``capture_cudagraphs(profile_only=True)`` for
+# the graph-memory estimate, then ``clear_cudagraphs``; the state pool; then
+# ``capture_cudagraphs(profile_only=False)`` with the global pool and the
+# ``graph_capture`` stream; ``shutdown`` last. ``needs_cudagraph_capture`` is
+# asked only when the runner is not eager. These tests call the hooks in that
+# order on the model's real model state; they do not need core to define them.
+
+
+def _not_eager(env):
+    """The runner core runs when it captures the model's graphs (the engine
+    check accepted ``enforce_eager`` off; see the flag tests below)."""
+    env.vllm_config.model_config.enforce_eager = False
+    return env
+
+
+def _capture(env, *, profile_only, graph_pool="pool", stream="stream"):
+    env.state.capture_cudagraphs(
+        graph_pool=graph_pool, stream=stream, profile_only=profile_only
+    )
+
+
+def _wrapper_pools(env) -> set:
+    return {w.graph_pool for w, _ in env.graphs.captured()}
+
+
+def test_core_hooks_capture_in_cores_order_and_release_the_profile_capture(build):
+    env = _not_eager(build(arm="dense-graphed"))
+    expected = expected_entries(env)
+    assert env.state.needs_cudagraph_capture() is True
+    assert env.state.needs_cudagraph_capture() is True  # stable
+    # Preparation: once, the final profile at the maximum shape, no capture.
+    env.state.prepare_execution_memory()
+    assert env.graphs.captures == [], "preparation captured"
+    finals = [c for c in env.profile.calls if is_final(c)]
+    assert {shape_of(c) for c in finals} == max_shapes(env)
+    profiles = len(env.profile.calls)
+    env.state.prepare_execution_memory()
+    _, output, embeds = env.runner.profile_run(core_embeds=False)
+    assert_dummy_output(output, embeds)
+    assert len(env.profile.calls) == profiles, "preparation ran twice"
+    assert env.graphs.captures == [], "the profiling step captured"
+    # The graph-memory estimate: the full inventory, into core's pool and on
+    # core's stream, released by clear_cudagraphs.
+    _capture(env, profile_only=True, graph_pool="throwaway", stream="s0")
+    assert len(env.graphs.captures) == expected
+    assert len(env.graphs.captured()) == expected
+    assert _wrapper_pools(env) == {"throwaway"}
+    assert set(env.graphs.capture_streams) == {"s0"}
+    env.state.clear_cudagraphs()
+    gc.collect()
+    assert env.graphs.captured() == [] and env.graphs.live_graphs() == 0
+    # A real step before the serving capture is refused.
+    pool(env)
+    assert h.call_with(env.runner.real_step, rows_of(env, "stream")) is not None
+    assert env.advance.calls == []
+    # The serving capture: the same inventory, the global pool.
+    _capture(env, profile_only=False, graph_pool="global", stream="s1")
+    assert len(env.graphs.captures) == 2 * expected
+    assert len(env.graphs.captured()) == expected
+    assert _wrapper_pools(env) == {"global"}
+    # Kernel warm-up after capture neither prepares nor captures.
+    env.runner.profile_run(randomize_inputs=True, attn=True, core_embeds=False)
+    assert len(env.profile.calls) == profiles
+    assert len(env.graphs.captures) == 2 * expected
+
+
+def test_core_hooks_serve_with_the_core_captured_graphs(build):
+    env = _not_eager(build(arm="dense-graphed"))
+    env.state.prepare_execution_memory()
+    env.runner.profile_run(core_embeds=False)
+    _capture(env, profile_only=True)
+    env.state.clear_cudagraphs()
+    pool(env)
+    _capture(env, profile_only=False)
+    replays = len(env.graphs.replays)
+    env.runner.real_step(
+        h.scheduler_output(new=(stream(env, "s1", final=False),), handles={"s1": 1})
+    )
+    assert env.advance.calls, "the step did not run"
+    assert len(env.graphs.replays) > replays, "the step replayed no graph"
+    env.state.shutdown()
+    gc.collect()
+    assert env.graphs.captured() == [] and env.graphs.live_graphs() == 0
+
+
+def test_core_capture_never_captures_twice(build):
+    env = _not_eager(build(arm="dense-graphed"))
+    env.state.prepare_execution_memory()
+    _capture(env, profile_only=False)
+    captures = len(env.graphs.captures)
+    assert h.call_with(_capture, env, profile_only=False) is not None
+    assert len(env.graphs.captures) == captures
+    assert len(env.graphs.captured()) == captures, "the refusal dropped graphs"
+    env.runner.profile_run(core_embeds=False)
+    assert len(env.graphs.captures) == captures, "the profiling step captured"
+
+
+def test_failed_core_capture_keeps_no_partial_inventory(build):
+    env = _not_eager(build(arm="dense-graphed"))
+    env.state.prepare_execution_memory()
+    env.graphs.fail_capture_after = 1
+    assert h.call_with(_capture, env, profile_only=True) is not None
+    env.state.clear_cudagraphs()
+    gc.collect()
+    assert env.graphs.captured() == [] and env.graphs.live_graphs() == 0
+    env.graphs.disarm()
+    _capture(env, profile_only=False)
+    assert len(env.graphs.captured()) == expected_entries(env)
+
+
+@pytest.mark.parametrize("arm", list(ARMS))
+def test_clear_and_shutdown_tolerate_nothing_captured(build, arm):
+    env = build(arm=arm)
+    env.state.clear_cudagraphs()
+    env.state.shutdown()
+
+
+def test_eager_runner_keeps_capture_on_the_first_profiling_step(build):
+    """``enforce_eager`` on, a core with the hooks: the capture hook is never
+    called; preparation and capture stay on the first profiling step."""
+    env = build(arm="dense-graphed")
+    env.state.prepare_execution_memory()
+    assert env.profile.calls == [] and env.graphs.captures == []
+    env.runner.profile_run(core_embeds=False)
+    assert len(env.graphs.captures) == expected_entries(env)
+    assert len(env.graphs.captured()) == expected_entries(env)
+    assert set(env.graphs.capture_streams) == {None}, "not core's own context"
+    profiles = len(env.profile.calls)
+    env.state.prepare_execution_memory()
+    assert len(env.profile.calls) == profiles
+    assert h.call_with(_capture, env, profile_only=False) is not None
+
+
+@pytest.mark.parametrize("arm", ["eager", "compiled-static"])
+def test_a_configuration_that_captures_nothing_prepares_on_the_hook(build, arm):
+    env = build(arm=arm)
+    assert env.state.needs_cudagraph_capture() is False
+    env.state.prepare_execution_memory()
+    profiles = len(env.profile.calls)
+    assert profiles and any(is_final(c) for c in env.profile.calls)
+    env.runner.profile_run(core_embeds=False)
+    assert len(env.profile.calls) == profiles, "preparation ran twice"
+    pool(env)
+    env.runner.real_step(rows_of(env, "stream"))
+    assert env.advance.calls
+
+
+@pytest.mark.parametrize("arm", list(ARMS))
+def test_without_the_hooks_the_profiling_step_prepares_as_before(build, arm):
+    """A core without the hooks never calls them: the first profiling step
+    prepares (and captures) exactly as the REG-MEM-002 tests pin."""
+    env = build(arm=arm)
+    env.runner.profile_run(core_embeds=False)
+    assert len(env.graphs.captured()) == expected_entries(env)
+    assert any(is_final(c) for c in env.profile.calls)
+
+
+@pytest.mark.gpu
+def test_core_hooks_capture_and_serve_on_cuda(
+    monkeypatch, tmp_path, single_process_dist
+):
+    """CUDA, core's graph runtime: the hooks in core's order with core's
+    global graph pool and ``graph_capture`` stream (a throwaway pool for the
+    profile capture), then a real step."""
+    from vllm.distributed.parallel_state import graph_capture
+    from vllm.platforms import current_platform
+
+    h.spec_without_state_name(monkeypatch)
+    h.legacy_state_api(monkeypatch)
+    card = h.write_runnable_card(tmp_path / "card")
+    vllm_config = h.build_vllm_config(
+        card,
+        overrides={
+            "decode_dispatch_arm": "dense-graphed",
+            "supported_num_lookahead_tokens": [6],
+        },
+        device="cuda",
+    )
+    model = h.build_model(vllm_config)
+    state = h.build_model_state(vllm_config, model)
+    vllm_config.model_config.enforce_eager = False
+    runner = h.Runner(vllm_config, model, state)
+    device = torch.device("cuda")
+    assert state.needs_cudagraph_capture()
+    state.prepare_execution_memory()
+    runner.profile_run(core_embeds=False)
+    free_before = torch.cuda.mem_get_info()[0]
+    with torch.inference_mode(), graph_capture(device) as context:
+        state.capture_cudagraphs(
+            graph_pool=current_platform.graph_pool_handle(),
+            stream=context.stream,
+            profile_only=True,
+        )
+    state.clear_cudagraphs()
+    gc.collect()
+    torch.cuda.empty_cache()
+    assert torch.cuda.mem_get_info()[0] >= free_before - (64 << 20), (
+        "the profile capture was not released"
+    )
+    runner.bind_pool(h.real_bindings(h.model_spec(model), device="cuda"))
+    with torch.inference_mode(), graph_capture(device) as context:
+        state.capture_cudagraphs(
+            graph_pool=current_platform.get_global_graph_pool(),
+            stream=context.stream,
+            profile_only=False,
+        )
+    env = SimpleNamespace(
+        runner=runner, config=model.config, max_geometry=3, model=model
+    )
+    runner.real_step(
+        h.scheduler_output(new=(stream(env, "s1", final=False),), handles={"s1": 1})
+    )
+    assert runner.commit_log and not runner.commit_log[-1][1]
+    state.shutdown()

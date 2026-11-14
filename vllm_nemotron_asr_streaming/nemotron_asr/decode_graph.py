@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -38,7 +39,9 @@ class GraphRuntime:
 
     wrapper_factory: Callable[..., Any]
     forward_context: Callable[..., AbstractContextManager]
-    capture_context: Callable[[torch.device], AbstractContextManager]
+    #: ``capture_context(device)``, or ``capture_context(device, stream)``
+    #: to capture on a given stream (core's capture hook passes its own).
+    capture_context: Callable[..., AbstractContextManager]
     descriptor_factory: Callable[[int], Any]
     eager_mode: Any
     graph_mode: Any
@@ -97,7 +100,11 @@ def platform_graph_runtime() -> GraphRuntime:
             current_platform.get_static_graph_wrapper_cls()
         ),
         forward_context=set_forward_context,
-        capture_context=lambda device: graph_capture(device=device),
+        capture_context=lambda device, stream=None: (
+            graph_capture(device=device)
+            if stream is None
+            else graph_capture(device=device, stream=stream)
+        ),
         descriptor_factory=lambda tier: BatchDescriptor(
             num_tokens=tier,
             num_reqs=tier,
@@ -319,10 +326,34 @@ class DenseGraphBinding:
             raise RuntimeError("dense graph capture/replay differs from eager decode")
 
     # @spec PORT-PERF-004
-    def warmup(self, device: torch.device, dtype: torch.dtype) -> None:
+    def warmup(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        stream: Any = None,
+        graph_pool: Any = None,
+    ) -> None:
+        """Capture every declared key. ``stream`` and ``graph_pool`` (core's
+        capture hook) capture on that stream into that pool; by default core's
+        capture context picks the stream and the wrapper its global pool."""
         if self._entries:
             return
-        runtime = self._runtime or platform_graph_runtime()
+        base = runtime = self._runtime or platform_graph_runtime()
+        if graph_pool is not None:
+            factory = base.wrapper_factory
+
+            def pooled_wrapper(*args: Any, **kwargs: Any) -> Any:
+                wrapper = factory(*args, **kwargs)
+                wrapper.graph_pool = graph_pool
+                return wrapper
+
+            runtime = dataclasses.replace(runtime, wrapper_factory=pooled_wrapper)
+        capture = (
+            runtime.capture_context(device)
+            if stream is None
+            else runtime.capture_context(device, stream)
+        )
         pending = {
             self._batch_invariant_mode.graph_key(
                 "decode_fn", (geometry, tier)
@@ -338,7 +369,7 @@ class DenseGraphBinding:
             for tier in self._tiers
         }
         # @spec REG-MEM-007: capture through core's graph-capture context.
-        with torch.inference_mode(), runtime.capture_context(device):
+        with torch.inference_mode(), capture:
             for entry in pending.values():
                 eager = self._snapshot(self._call(entry, runtime, runtime.eager_mode))
                 captured = self._call(entry, runtime, runtime.graph_mode)
@@ -349,7 +380,7 @@ class DenseGraphBinding:
         decode_fns = {
             key: self._bind_decode(entry, runtime) for key, entry in pending.items()
         }
-        self._runtime = runtime
+        self._runtime = base
         self._entries = pending
         self._decode_fns = decode_fns
 

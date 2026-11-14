@@ -415,6 +415,8 @@ class FakeGraphWrapper:
     def __init__(self, runtime: FakeGraphRuntime, runnable, vllm_config, runtime_mode):
         from vllm.compilation.cuda_graph import CUDAGraphEntry
 
+        #: Core's wrapper binds the global pool at construction.
+        self.graph_pool = None
         self._runtime = runtime
         self._entry_cls = CUDAGraphEntry
         self.runnable = runnable
@@ -502,6 +504,8 @@ class FakeGraphRuntime:
         self.failed_eager: int | None = None
         self.eager_calls = 0
         self.eager_completed = 0
+        #: The stream passed to each capture context (``None``: core's own).
+        self.capture_streams: list[Any] = []
 
     def disarm(self) -> None:
         self.skip_capture = self.fail_capture_after = self.fail_eager_after = None
@@ -526,8 +530,9 @@ class FakeGraphRuntime:
         runtime = self
 
         @contextlib.contextmanager
-        def capture_context(device):
+        def capture_context(device, stream=None):
             runtime.events.append(("capture_context", str(device)))
+            runtime.capture_streams.append(stream)
             yield
 
         @contextlib.contextmanager

@@ -25,7 +25,10 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.state_slots import StateSlotBindings, StateSlotRows
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
-from vllm_nemotron_asr_streaming.engine_flags import check_engine_config
+from vllm_nemotron_asr_streaming.engine_flags import (
+    check_engine_config,
+    hook_captured_arm,
+)
 from vllm_nemotron_asr_streaming.nemotron_asr import file_rows
 from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import (
     FileAction,
@@ -166,6 +169,48 @@ class NemotronASRModelState(ModelState):
         self._scheduled_tokens: dict[str, tuple[int, ...]] = {}
         #: Each live request's latest prompt, as core delivered it.
         self._prompts: dict[str, tuple[int, ...]] = {}
+
+    # Core's graph hooks. A core without them never calls these; the model
+    # then prepares and captures on its first profiling step.
+    def _graphs_by_core(self) -> bool:
+        """Whether core captures this model's graphs through
+        ``capture_cudagraphs`` (core asks only when the runner is not eager)."""
+        return (
+            not self.vllm_config.model_config.enforce_eager
+            and self.needs_cudagraph_capture()
+        )
+
+    def prepare_execution_memory(self) -> None:
+        self.model.prepare_execution_memory_hook(
+            self.device, graphs_by_core=self._graphs_by_core()
+        )
+
+    def needs_cudagraph_capture(self) -> bool:
+        # Configuration only: the engine check accepts a non-eager runner only
+        # for the arm the capture hook captures (``hook_captured_arm``).
+        return hook_captured_arm(self.model.config)
+
+    def capture_cudagraphs(
+        self,
+        *,
+        graph_pool: Any,
+        stream: torch.cuda.Stream,
+        profile_only: bool,
+    ) -> None:
+        self.model.capture_graphs_hook(
+            self.device,
+            graph_pool=graph_pool,
+            stream=stream,
+            profile_only=profile_only,
+        )
+
+    def clear_cudagraphs(self) -> None:
+        self.model.release_core_graphs()
+
+    def shutdown(self) -> None:
+        model = getattr(self, "model", None)
+        if model is not None and hasattr(model, "release_core_graphs"):
+            model.release_core_graphs()
 
     # @spec REG-TASK-002
     def get_supported_generation_tasks(self) -> tuple[Any, ...]:
