@@ -540,11 +540,14 @@ def test_engine_stages_copies_and_encodes_at_most_one_chunk_per_file_step(
 # @spec FILE-BUD-002, FILE-GRD-006
 def test_file_past_the_old_worst_case_bound_ends_with_eos_not_length(run, engine):
     # Silence queues no labels, so a file emits one token per chunk: about
-    # MAX_MODEL_LEN / 2 tokens here, well inside core's actual-token stop, yet
-    # far above the length the retired worst-case check admitted (about
-    # MAX_MODEL_LEN / 71 chunks at this geometry). The model refuses no file
-    # for its length; the request ends with EOS, not ``length``.
-    n = CHUNK * (MAX_MODEL_LEN // 2)
+    # MAX_MODEL_LEN / 16 tokens here, well inside core's actual-token stop, yet
+    # more than four times the length the retired worst-case check admitted
+    # (about MAX_MODEL_LEN / 71 chunks at this geometry). The model refuses no
+    # file for its length; the request ends with EOS, not ``length``. (Eager
+    # file decoding runs about 0.1 s per chunk on an A40, so this stays far
+    # under the per-test time limit.)
+    n = CHUNK * (MAX_MODEL_LEN // 16)
+    assert MAX_MODEL_LEN // 16 > 4 * (MAX_MODEL_LEN // 71)
     audio = np.zeros(n, dtype=np.float32)
     result = run(transcribe_file(engine, audio))
     assert result.finish_reason == "stop"
