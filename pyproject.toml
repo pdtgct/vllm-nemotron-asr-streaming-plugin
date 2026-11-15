@@ -17,14 +17,14 @@ test = ["pytest>=8"]
 
 # The two direct references pin the counterpart frontend release (SESS-FAC-007):
 # vllm-riva-frontend and its seam conformance suite, vllm-riva-frontend-dev (the
-# repository's dev/ subdirectory), both at one revision of the frontend
-# repository. That revision becomes the release tag when the pair is released.
+# repository's dev/ subdirectory), both at the commit of the frontend release
+# tag v0.4.0b3. The full commit, not the tag name, keeps the pin immutable.
 # A dependency group stays out of the built package metadata.
 [dependency-groups]
 test = [
     "pytest>=8",
-    "vllm-riva-frontend @ git+https://github.com/pdtgct/vllm-riva-frontend.git@95d415b96b92ef20030a23afc56ac000ea675ba4",
-    "vllm-riva-frontend-dev @ git+https://github.com/pdtgct/vllm-riva-frontend.git@95d415b96b92ef20030a23afc56ac000ea675ba4#subdirectory=dev",
+    "vllm-riva-frontend @ git+https://github.com/pdtgct/vllm-riva-frontend.git@125ac198846d27ca17a1aaa9f1e17c009b40c676",
+    "vllm-riva-frontend-dev @ git+https://github.com/pdtgct/vllm-riva-frontend.git@125ac198846d27ca17a1aaa9f1e17c009b40c676#subdirectory=dev",
 ]
 
 [project.entry-points."vllm.general_plugins"]

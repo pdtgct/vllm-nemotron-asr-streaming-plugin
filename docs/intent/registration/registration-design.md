@@ -288,7 +288,7 @@ any weights load. Under `--enforce-eager` core still calls `prepare_execution_me
 ### README serve command
 
 The README's serve command is the default configuration: the default segment arms and the
-checkpoint's default geometry (320 ms), so it sets no `num_lookahead_tokens` and no
+checkpoint's default lookahead (3, which is 320 ms, on the published card), so it sets no `num_lookahead_tokens` and no
 `supported_num_lookahead_tokens`. It shows `--dtype float32`, `--config-format
 nemotron_asr_streaming`, `--tokenizer-mode nemotron_asr_streaming`, one of the two runner
 configurations, chosen from those that acceptance tier 2 has met with the default arms (until the

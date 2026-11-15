@@ -105,7 +105,7 @@ the condition and the rejected value. The shared runner and platform conditions 
 | Condition | Rule |
 | --- | --- |
 | Populations | A list of `int` values (not `bool`), distinct, each in `1 … min(max_num_seqs, max_num_batched_tokens)`; under `num_gpu_blocks_override`, each at most `override − 1` (the non-null pages). A limit core has not yet resolved when the configuration hook runs bounds nothing there; model-state construction applies the full bound. |
-| Geometry | The server's one geometry, as `registration` resolves it at startup (the `num_lookahead_tokens` override, else the checkpoint's default lookahead), is lookahead 0 or 1 (80 or 160 ms). The checkpoint default, 3 (320 ms), is refused with the remedy `num_lookahead_tokens` 0 or 1. When `served_lookahead` raises, the condition carries its message. |
+| Geometry | The server's one geometry, as `registration` resolves it at startup (the `num_lookahead_tokens` override, else the checkpoint's default lookahead), is lookahead 0 or 1 (80 or 160 ms). Lookahead 3 (320 ms), the published checkpoint's default, is refused with the remedy `num_lookahead_tokens` 0 or 1. When `served_lookahead` raises, the condition carries its message. |
 | Native burst | `experimental_native_burst` is false or absent. |
 | Segment arms | The arms the model will run are the default arms: `encoder_execution_arm` `eager-graphed` and `decode_dispatch_arm` `dense-graphed`, configured or written by card translation (REG-CARD-008). An unset key resolves to an eager arm (`eager` encoder, `compact-eager` decoder) and is refused. Every other arm is refused as well, the `dense-graphed` encoder included, which `registration` also refuses under the hook configuration (REG-ENG-005); a non-empty `chunk_bucket_graph_populations` is refused there by `registration`, not by this function. |
 | Runner | `enforce_eager` off. `cudagraph_mode` NONE, compilation off and a CUDA platform are the hook configuration, which `registration` validates (REG-ENG-005 in the configuration hook, REG-ENG-006 at model-state construction); this function does not repeat those conditions. |
@@ -1171,8 +1171,8 @@ Each sibling owner applies its own; this list does not change their documents.
 ## Default-on gate
 
 Turning the option on by default needs the maintainers' approval and, against a declared
-baseline: cells, exactness and latency evidence at 320, 560 and 1120 ms (the checkpoint's default
-is 320 ms); served fallback rates and the `(K, E)` histogram under admitted, staggered sessions
+baseline: cells, exactness and latency evidence at 320, 560 and 1120 ms (the published checkpoint's
+default is 320 ms); served fallback rates and the `(K, E)` histogram under admitted, staggered sessions
 and whole-file load; A40 fit, transient peaks and startup time of both captures at each
 geometry, with the resident capacity they cost accepted explicitly; the counter reader in routine
 use under a multiprocess engine; U(1) calibrated with the option on and used by admission; the

@@ -182,8 +182,8 @@ the first captured counts and fail before capturing the rest. The eager arms (`e
   ([`Sohaib-Ahmed21/vllm-nemotron-asr-plugin`](https://github.com/Sohaib-Ahmed21/vllm-nemotron-asr-plugin))
   or its architecture key.
 - Transaction graphs at the 320, 560 or 1120 ms geometries in their first release. Default-on
-  needs them, because the checkpoint's default geometry is 320 ms and a server may be started at
-  any of the five; each is the next increment, with its own exactness and latency evidence.
+  needs them, because the published checkpoint's default lookahead is 3 (320 ms) and a server may
+  be started at any of the five; each is the next increment, with its own exactness and latency evidence.
 - Serving more than one geometry from one engine.
 
 ## Tenets
