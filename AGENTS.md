@@ -20,7 +20,7 @@ live under `docs/intent/<component>/`.
 
 ## LID Tooling
 
-- Spec prefixes owned here: `REG`, `SESS`, `FILE` (`docs/intent/*/*-specs.md`).
+- Spec prefixes owned here: `REG`, `SESS`, `FILE`, `TXG` (`docs/intent/*/*-specs.md`).
 - The vendored model package under `vllm_nemotron_asr_streaming/nemotron_asr/` carries
   `@spec PORT-…` annotations inherited from its source. They are provenance, not this repository's
   specs; coherence checks ignore IDs outside the owned prefixes.

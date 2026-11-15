@@ -15,10 +15,12 @@ streaming transition a live stream uses, on the request's own state slot.
 
 Guiding principles:
 - **A file is a stream that is already fully buffered.** It runs the same transition at the
-  server's default cadence, with the same final-tail handling and numerics as a stream at that
-  cadence, so its transcript can equal that stream's transcript of the same audio.
+  server's one geometry, fixed at startup, with the same final-tail handling and numerics as a
+  stream at that geometry, so its transcript can equal that stream's transcript of the same audio.
+  Its steps are rows of the stream roles, marked as file rows by a per-row file mask.
 - **A file costs about what a stream costs per step.** Each engine step advances a file by at most
-  one cadence chunk and emits one token.
+  one cadence chunk and emits one token, and planning a file's next step reads nothing from the
+  device beyond the commit status the host already consumes.
 - **Complete or an error.** The model refuses no file for its length; a file is reported complete
   only when its request ends with EOS after its final tail, and one that core stops at
   `max_model_len` is an error where core reports it (Input length).
@@ -158,9 +160,10 @@ Five things bound a file or set its cost today:
   boundary succeeds), and sizes the sampled-token history at `max_num_reqs × max_model_len`
   (`v1/worker/gpu/states.py:38`). Core's stop counts actual tokens. Raising `max_model_len` costs
   about 4 bytes per token per slot and no KV memory.
-- **No model-side admission check.** The worst-case refusal of earlier drafts (FILE-BUD-001, 71
-  tokens per chunk at 560 ms, about 1/71 of what core's actual-token stop allows) is retired (Pete,
-  2026-11-11). The model imposes no input-length limit; the operator sizes `max_model_len`.
+- **No model-side admission check.** The model does not refuse a file for its worst-case token
+  count: at 560 ms that bound reserves 71 tokens per chunk (Token count), so a refusal against it
+  would admit only about 1/71 of the file length core's actual-token stop allows. The model
+  imposes no input-length limit; the operator sizes `max_model_len`.
 - **How core reports the stop.** On upstream `main` a request that ends with `length`, `error` or
   `abort` returns HTTP 200 with partial text. Two upstream pull requests, both in the stage 1
   build, change that on the transcription and translation routes, which share core's
@@ -224,8 +227,17 @@ audio item (`multi_modal_data`) and the header in `mm_processor_kwargs`, the sta
 a vLLM prompt. The model's processor turns them into two `keep_on_cpu` fields, so core's batching
 never moves the file to the device:
 - `samples`: the file's 16 kHz float32 samples;
-- `file_header`: int64 values: geometry (the server's default lookahead), locale row and sample
-  count.
+- `file_header`: int64 values: the geometry index of the server's one geometry, locale row and
+  sample count.
+
+`get_generation_prompt` takes the geometry from `served_lookahead` in
+`vllm_nemotron_asr_streaming.lookahead`, the one function that the session factory, `buffer_realtime_audio` and the
+model's geometry checks also use (the `session` design's SESS-GEOM-001; the `registration` design's
+REG-LA-009), so a file's header and every stream unit carry the same right context and
+geometry index. The index follows the implemented order of SESS-PACK-005 (right context 0, 1, 3,
+6, 13 as index 0 to 4). The request has no cadence field, and the model reads no cadence from
+`vllm_xargs`: a server warms and captures graphs for its one geometry only (HLD Constraints), so a
+file at another cadence would have no warmed path.
 
 The prompt gives the audio item a random per-request multimodal UUID (`multi_modal_uuids`). Core
 hashes an item from its UUID and the request's processor arguments, so every file item's hash is
@@ -257,33 +269,131 @@ hold their decoded audio in the API server with no bound; a frontend may add a c
 
 ## Whole-file rows
 
-A file request is a new row role, **FILE**, beside the stream roles (CHUNK, REPLAY, EOU, FLUSH). The
-role comes from host authority: the scheduled token is the file-carrier token at the first
-schedule, and the model state marks the request as a file request for its life. FILE rows carry no
-unit deadlines.
+A file request runs on the stream row roles (CHUNK, REPLAY, FLUSH); being a file is metadata on
+the row, not a role of its own. Membership comes from host authority: when the token scheduled at
+a request's first schedule is the file-carrier token, the model state marks the request as a file
+request for its life, and on every step it is scheduled its row's bit is set in the step's per-row
+**file mask**. File rows carry no unit deadlines.
 
-Let the file have `N` samples and the default geometry `s` samples per chunk. Then
-`C = floor(N / s)` regular chunks and a tail of `T = N − C × s` samples (`0 ≤ T < s`).
+Let the file have `N` samples and the server's geometry, with right context `r`, have
+`s = 1280 × (r + 1)` samples per chunk. Then `C = floor(N / s)` regular chunks and a tail of
+`T = N − C × s` samples (`0 ≤ T < s`).
 
-Each step for a FILE row does exactly one of the following, checked in order:
-1. **Drain.** If the row's label queue is not empty, emit its next token (a label, or the EOU token
-   if endpointing ever fires). No audio advances.
-2. **Regular chunk.** Else, if a full regular chunk remains, advance it through the streaming
-   transition, queue its labels, and emit the first queued token, or the continuation token if it
-   queued none.
-3. **Final tail.** Else, if the tail has not been processed, advance the `T` remaining samples
-   (possibly none) with the same final-tail rule and finalization a stream gets at its final tail
-   and close, record that the tail is done, queue its labels, and emit the first queued token, or
-   the continuation token if it queued none.
-4. **End.** Else emit EOS.
+Each step for a file row does exactly one of the following, checked in order against the file's
+queue count (Queue counts) and progress:
 
-The label queue is the same per-slot queue streams use, with capacity 141. A FILE row advances audio
-only when it is empty, and one chunk, or the tail, queues at most `Q_g = (r + 1) × 10 + 1` tokens
-for geometry `g` with right context `r` (labels, at most 10 per encoder frame, plus an optional
-EOU), at most 141. So the queue cannot overflow.
+| Step | Condition | Row role | Emits |
+| --- | --- | --- | --- |
+| Drain | the queue count is not zero | REPLAY | the next queued token (a label, or the EOU token if endpointing ever fires); no audio advances |
+| Regular chunk | else, a full regular chunk remains | CHUNK, fresh on the file's first step | the first queued token, or the continuation token if the chunk queued none |
+| Final tail | else, the tail has not been processed | CHUNK with the final-tail flag, fresh on the file's first step when `C = 0` | the first queued token, or the continuation token if the tail queued none |
+| End | else | REPLAY when the file's last emitted token was a label, FLUSH when it was the continuation token | EOS (park) |
+
+The final tail advances the `T` remaining samples (possibly none) with the final-tail rule and
+finalization a stream gets at its final tail and close, and records that the tail is done.
+
+The host decides only whether a file row advances audio, from the step rule: an advancing row is
+CHUNK, and its envelope (header and the one chunk's samples) is written into its carrier row of
+`inputs_embeds` before the transaction by the file's own host-to-device copy (Implementation
+notes). A row that does not advance audio takes its role from the transaction's role derivation,
+the same as a stream row's: REPLAY when an echo is pending, FLUSH otherwise. Every step emits one
+token and a pending echo is the last emitted label's, so the end row is REPLAY exactly when the
+file's last emitted token was a label, and FLUSH when the final tail queued nothing and emitted the
+continuation token; the final tail finalized the session, so either row emits park, the file
+request's EOS.
+
+A file row differs from a stream row of the same role only in per-row selects on its file-mask
+bit:
+- **Role check.** A file row's scheduled token is the token it emitted last (the file carrier on
+  its first step, then a label or the continuation token), never the stream carrier. Its CHUNK row
+  is a role mismatch if its token is the stream carrier, or if no echo is pending and its token is
+  neither the file carrier nor the continuation token.
+- **Armed echo on a CHUNK row.** A file CHUNK row follows a drained queue whose last label's echo
+  may still be armed. The echo is validated as a REPLAY row's is, and the chunk then replaces it;
+  the pending echo does not count as an undrained queue for a file CHUNK row.
+- **Continuation emission.** A file CHUNK row that advanced audio but queued no label emits the
+  continuation token where a stream row would emit park.
+- **Decision legality.** The continuation token is a legal decision only on a file row.
+
+The transaction receives the file mask (one bit per row, all false on a step with no file row) and
+the file-carrier and continuation token IDs, which are configuration constants, on every step, and
+evaluates these selects on every step. With an all-false mask each select reduces exactly to the
+stream rule (the `transaction-graph` design, Mask identities), so the transaction's inputs have
+the same form whether or not a step holds a file row, and under transaction graphs file rows
+replay in the stream cells.
+
+The label queue is the same per-slot queue streams use, with capacity 141. A file row advances
+audio only when its queue count is zero, and one chunk, or the tail, queues at most
+`Q_g = (r + 1) × 10 + 1` tokens for geometry `g` with right context `r` (labels, at most 10 per
+encoder frame, plus an optional EOU), at most 141 at every implemented geometry. So the queue
+cannot overflow.
 
 A file shorter than one chunk has `C = 0` and is all tail; an empty file runs only the tail step
-and the end step and returns empty text.
+(an empty final tail, which emits the continuation token) and the end step (FLUSH) and returns
+empty text.
+
+## Queue counts
+
+The step rule needs each file's **queue count**: the labels queued on its slot and not yet
+emitted. The device holds it in the label book (`QUEUE_LEN − QUEUE_HEAD`). The host learns it from
+the step's commit status, which it already consumes once per step, so planning never reads the
+label book and never derives a count itself. The transport carries a count for every row of every
+step, with transaction graphs on or off; only file rows use it.
+
+1. **Commit plan.** `CommitPlan.queue_counts` is a device int32 tensor of shape `(rows,)`: in
+   binding order, each row's queue count after the step, from its proposed label book. The
+   streaming transaction fills it from its step output `remaining_step[:P]` (the
+   `transaction-graph` design, Queue counts); the option-off transaction writes the same counts.
+   `reserve` refuses, before it pins the lease, a field whose shape or dtype differs, as it does
+   for `progress`. Like `progress` the field is optional in the type; a plan without it yields no
+   counts.
+2. **Stage.** The sink allocates at construction a host int32 buffer of `max_rows` counts, pinned
+   on CUDA, beside its status and progress buffers. `stage` copies `queue_counts` into it with one
+   non-blocking device-to-host copy, issued before the completion event is recorded. It allocates
+   no tensor storage and does not synchronize, so `stage` stays no-fail.
+3. **Report.** After the completion event, `collect` sets `SessionStatusReport.queue_count` for a
+   row only when the row's status is 0 and the stage-time lease revalidation held; otherwise it is
+   `None`. The count does not depend on `progress_key`, which is `None` for some clean rows (a
+   park echo publishes no progress) whose count the planner still needs.
+4. **Collection.** `collect_commit_status` returns a `CommitCollection`: the status dictionary,
+   the failed-request set, and a tuple of `QueueCount` values (request ID, admission generation,
+   count), one for each report that `resolve_status_reports` resolved to status 0 (so its session
+   was registry-current) and whose `queue_count` is not `None`. With no staged commit all three
+   are empty.
+5. **Application.** `postprocess_state` applies the counts after `collect_commit_status` returns
+   and before the next step is planned, and never at planning or staging. A count is *accepted*
+   only for the file progress of a file request the step being post-processed scheduled, with the
+   same request ID and the admission generation that file progress has recorded; any other count
+   is not applied. A file progress is created at take with no recorded generation, and records one
+   only from the clean report of its own first step's row: the row this step scheduled for that
+   file progress, the incarnation taken at this request's first schedule. A count from an earlier
+   request with a reused request ID, or from an older generation, therefore never reaches a later
+   file's progress.
+
+A file's count, through its life:
+- **Fresh.** Taking the file at its first schedule sets its count to 0, and its first step plans
+  with that count. A fresh row is always the file's first step.
+- **Clean step.** The accepted count replaces it: a drain reports one fewer, and a chunk or tail
+  reports the labels it queued minus the one it emitted, or 0 if it queued none.
+- **Rejected row.** A report whose resolved status is not 0, including the geometry-only status,
+  leaves the count as it was: a rejected row's scatter is masked, so its label book did not
+  change. The file request fails (below).
+- **No outcome.** When a step planned a file row and no count was accepted for it, and its report
+  was not a rejection (no staged commit, no report for the row, a clean report without a count, or
+  a count whose identity does not match), the count becomes unknown. Planning advanced the file's
+  position before the transaction, so the host cannot tell where the file stands.
+- **Failure after collection.** After collection, every file request whose planned row had no
+  count accepted, whether its report was rejected or carried no usable count, fails alone:
+  `postprocess_state` passes it to `state_slots.fail_requests` (core's
+  `StateSlotBindings.fail_requests`) with the step's other failures, and the step does not fail.
+  The request ends with finish reason `error`. Stream rows keep their own recovery rules; only
+  file rows are failed this way. A file's header is immutable and planning advances its position,
+  so a rejected file row could only repeat the rejection, or continue past audio or a
+  finalization that never committed.
+- **Unknown at planning.** A continuing file row whose count is unknown is failed through the
+  row-failure path before the step is planned (the path a malformed file item takes), ending the
+  request with finish reason `error`. Failure after collection normally ends such a request first;
+  this check is the backstop, and the model state never reads the label book to recover a count.
 
 ## Continuation token
 
@@ -311,8 +421,7 @@ produce at most `Q_g` tokens (at least one), plus one EOS:
 
 `B = 1 + (C + 1) × Q_g + 1`
 
-`get_generation_prompt` does not check `B` against `max_model_len` (FILE-BUD-001 and 003 are retired):
-the bound is pessimistic, and core's stop counts actual tokens. A file whose actual count stays
+`get_generation_prompt` does not check `B` against `max_model_len`: the bound is pessimistic, and core's stop counts actual tokens. A file whose actual count stays
 below `max_model_len`, with no completion limit (Request guards refuse every client limit; startup
 refuses a generation-config `max_tokens`), reaches EOS before core's length limit. An abort or
 error can still end it earlier (Completion).
@@ -347,54 +456,66 @@ submission (Request guards), so neither can truncate a transcript.
 
 ## Engine interaction
 
-- **Step cost.** A FILE row contributes at most one encoder chunk per step, the same as a stream
-  row, so the encoder's captured populations (up to `max_num_seqs` rows) and the profiled step
-  memory need no change.
-- **Mixed steps.** One step may hold FILE rows and stream rows. The model groups chunk rows by
-  geometry, and a FILE row advances in the group for its geometry alongside stream rows of the
-  same geometry.
+- **Step cost.** A file row contributes at most one encoder chunk per step, the same as a stream
+  row, and counts as one row of its role. The encoder's segment graphs (one per CHUNK count up to
+  `max_num_seqs`), the decoder's tiers, the transaction-graph cells and the profiled step memory
+  therefore need no file-specific entries.
+- **Mixed steps.** One step may hold file rows and stream rows. Every row runs at the server's one
+  geometry, so a file's CHUNK row joins the step's one CHUNK bucket beside the stream CHUNK rows,
+  in step position order, and its REPLAY and FLUSH rows run beside the stream rows of those roles.
+  Under transaction graphs a step that mixes file and stream rows replays in the same cells as an
+  all-stream step of the same kinds and counts.
 - **Admission.** A file request is an ordinary request: it waits in core's queue until a state slot
   is free, takes it at first schedule, and counts against the engine's active-request limit, where
   it can delay or refuse streams. Without a frontend nothing bounds file admission beyond `max_num_seqs`, and
   it does not reserve capacity for streams: a finished file's slot is held until it retires, so the next file can be
   admitted while it is still occupied.
-- **Step order.** Within a step, chunk groups (one per geometry) run in order of urgency: a group's
-  urgency is the earliest unit deadline among its stream rows; FILE rows, which have no deadlines,
-  add nothing to it; groups holding only FILE rows run after every group with a stream row, and
-  ties are broken by geometry index.
 - **Endpointing.** Disabled, as for streams on core.
 
 ## Implementation notes
 
-- **Host view of the label queue.** The step rule needs each FILE row's queued-token count. After a
-  step in which a FILE row advanced audio, the model state reads the counts of those rows from the
-  device-resident label book in one batched copy; after a drain step the host already knows the
-  count. This is one small synchronous read per step that advances a file. The planned
-  replacement carries each row's remaining count in the per-step status the device already
-  returns, which removes the read.
+- **Queue-count transport.** `CommitPlan.queue_counts` sits beside `progress` in
+  `nemotron_asr/advance.py`; the host buffer, the report field and `CommitCollection` with
+  `QueueCount` live in `nemotron_asr/commit_sink.py`; `collect_commit_status` is the model's
+  (`nemotron_asr/nemotron_asr.py`) and its one production caller is the model state's
+  `postprocess_state` (`nemotron_asr/model_state_v2.py`). The file progress there holds the count,
+  an unknown marker and the recorded admission generation.
 - **Where malformed file items are refused.** The processor checks a file item's header against
-  its samples (geometry index in range, locale row non-negative, sample count equal to the samples'
-  length), so a malformed request fails at input processing. The model state repeats the checks
-  and fails only that row if one gets through; it never fails the step.
+  its samples and the served configuration (geometry index equal to the server's, locale row
+  inside the locale table, sample count equal to the samples' length), so a malformed request
+  fails at input processing. The model state repeats the checks and fails only that row if one
+  gets through; it never fails the step.
 - **Device route.** File samples leave the host buffer only through `FileHostBuffers.stage` and
-  reach the device only through `file_rows.copy_chunk_to_device`; their encoder chunks run through
-  the same per-geometry chunk path as stream rows.
-- **Served geometries.** The model, the session factory and `buffer_realtime_audio` take the served
-  set from one function, `lookahead.served_lookaheads`.
+  reach the device only through `file_rows.copy_chunk_to_device`, which the step planner calls to
+  make a device copy of the one chunk. In the model's forward, before the transaction runs,
+  `NemotronASRForRNNT._write_file_envelopes` writes each advancing file row's envelope header and
+  that device chunk into the row's carrier row of `inputs_embeds`. Their encoder chunks run
+  through the same CHUNK path as stream rows.
+- **One geometry function.** `get_generation_prompt`, the processor's and the model state's header
+  checks, and the file step planner's chunk size all take the server's geometry from the one
+  function `served_lookahead` in `vllm_nemotron_asr_streaming.lookahead` that SESS-GEOM-001 requires the session
+  factory, `buffer_realtime_audio` and the model's geometry checks to use; no second geometry
+  helper exists.
 
 ## Decisions & Alternatives
 
 | Decision | Chosen | Alternatives Considered | Rationale |
 |----------|--------|------------------------|-----------|
 | Chunks per step | At most one | Up to `k > 1` | One chunk keeps a file row within the encoder's captured populations and profiled memory and fits the one-token-per-step queue; `k > 1` needs capture and profiling for `k ×` rows and a queue holding `k` bursts |
-| Cadence | The server's default lookahead | Request-chosen | Core's transcription request has no lookahead field |
+| Cadence | The server's one geometry, from the shared geometry function | A cadence chosen per request (for example through `vllm_xargs`) | A server warms and captures graphs for one geometry only (HLD Constraints), so another cadence would have no warmed path; core's transcription request has no lookahead field |
 | Where samples live | Request-owned host buffer, one chunk staged per step | A device copy of the file; reading from the encoder cache | A device copy grows with file length; core may drop encoder-cache entries once the prompt is consumed |
 | When the buffer is freed | When the request is reported finished (any reason) | A release-fence hook | The engine exposes no model hook at the release fence; under synchronous scheduling no in-flight step reads the buffer |
 | Repeated uploads | A random per-request multimodal UUID | A nonce in the header; disabling the multimodal cache | Core hashes items by their UUID, so no header field is needed, and the server's cache settings stay untouched |
 | Silence | A continuation token | Emitting nothing; the park/EOS token | Every step emits a token; EOS would end the request |
-| Distinguishing file rows | A dedicated file-carrier prompt token | The stream carrier with a different field | Row roles come from the scheduled token |
+| Distinguishing file rows | A dedicated file-carrier prompt token at the first schedule, kept as host metadata for the request's life | The stream carrier with a different header field | The first scheduled token is host authority the model state reads before any device work |
+| File steps on the device | Rows of the stream roles (CHUNK, REPLAY, FLUSH) with a per-row file mask selecting the file-specific checks and emissions | A row role of its own for files | A separate role needs its own device path and, under transaction graphs, its own cells and graph memory for work the stream roles already do; an all-false mask reduces each select exactly to the stream rule |
+| Token IDs and file mask | Passed to the transaction on every step | Passed only on steps that hold a file row | A transaction whose inputs change form with file presence cannot be captured once for both; the IDs are configuration constants |
+| Source of a file's queue count | The device count in the commit status, carried by the commit plan, staged into a pinned host buffer and collected with the status | A synchronous read of the label book after each advancing step; a host-side decrement after a drain | The read is a device synchronization on every step that advances a file; the decrement assumes the drain committed, so a rejected drain would leave the host one short; the status is already consumed once per step |
+| Collection seam for counts | An amended return value of `collect_commit_status` (`CommitCollection`: statuses, failed set, queue counts) | A consume-once accessor beside `consume_committed_progress` | One call yields statuses, failures and counts from one consumption of the reports, so a count cannot be applied from another step's collection and the model holds no count state that every return path (including the one with no staged commit) must clear; the changed type makes each caller handle the counts, and there is one production caller |
+| A file row with no accepted count after collection | Fail that file request alone in postprocessing (`state_slots.fail_requests`), keeping its prior count; stream recovery unchanged | Keep the request and its prior count; roll the position back and retry the step | A file's header is immutable and planning advances its position, so a rejected file row can only repeat the rejection or skip audio or finalization; rolling back would duplicate the planner's position state for one failure case |
+| A continuing file row with no count at planning | Fail that row before planning, as a backstop | Read the label book; assume the prior count | A read reintroduces the synchronization; planning advanced the file's position before the step whose outcome is unknown, so the prior count may be wrong |
 | Where to refuse beam search and completion limits | `get_generation_prompt`, with two request fields added to `SpeechToTextParams` | The model state's `add_request`; row failure; a logits processor | `add_request` cannot raise without ending the engine; row failure becomes a server error (HTTP 500 with vllm#67144, HTTP 200 with partial text without it); a logits processor cannot see the prompt |
-| Budget | No admission check; `B` is sizing guidance only (Pete, 2026-11-11) | Worst-case refusal (FILE-BUD-001, retired); a typical-output bound | The model imposes no input-length limit; core's actual-token stop is the bound, and reporting a server-caused `length` as an error is core work (Open 1) |
+| Budget | No admission check; `B` is sizing guidance only | A worst-case refusal; a typical-output bound | The model imposes no input-length limit; core's actual-token stop is the bound, and reporting a server-caused `length` as an error is core work (Open 1) |
 | Regional languages | Explicit `language_locales` mapping, and an exact locale in `vllm_xargs` | Picking a default region | A guessed region changes transcripts silently; a client that names a locale must get that locale |
 
 ## Open Questions & Future Decisions
@@ -409,8 +530,7 @@ submission (Request guards), so neither can truncate a transcript.
    clients on such a core.
 
 ### Deferred
-1. A request-chosen cadence (for example through `vllm_xargs`), if deployments need one.
-2. `k > 1` chunks per step, if measured file latency needs it.
+1. `k > 1` chunks per step, if measured file latency needs it.
 
 ## References
 
@@ -419,4 +539,6 @@ submission (Request guards), so neither can truncate a transcript.
 - Core serving: `vllm/entrypoints/speech_to_text/base/serving.py`.
 - `keep_on_cpu` fields: `vllm/multimodal/inputs.py`; token history: `vllm/v1/worker/gpu/states.py`.
 - Row roles and emission: `nemotron_asr/plan.py`, `nemotron_asr/advance.py`; queue:
-  `nemotron_asr/state_profile.py`, `nemotron_asr/manifests.py`.
+  `nemotron_asr/state_profile.py`, `nemotron_asr/manifests.py`; commit status and queue-count
+  transport: `nemotron_asr/commit_sink.py`; file planning: `nemotron_asr/file_rows.py`,
+  `nemotron_asr/model_state_v2.py`.

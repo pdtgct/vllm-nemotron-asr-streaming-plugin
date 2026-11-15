@@ -122,12 +122,14 @@ against about 25 s for the eager arms. At 64 rows the 160 ms and 80 ms geometrie
 and 1.6 GiB. Under the hook configuration the retained memory, capture peak and startup time
 are unmeasured. Graphs are captured only for the server's one geometry (Constraints). The README's
 serve command therefore sets `--max-num-seqs` to a value the tier 2 measurement verified to fit
-the A40 at the default geometry. The model logs the segment graphs' retained memory and capture
+the A40 at the default geometry; until that measurement exists, the README may carry an interim
+value, marked interim and unpublished, that qualifies neither runner configuration (the
+`registration` design). The model logs the segment graphs' retained memory and capture
 time, `max_num_seqs` and the geometry when it captures them: before core plans capacity under
 `--enforce-eager` and when core runs its graph-memory estimate, and after it otherwise. A capture that cannot
 allocate fails startup with the model's message, naming those figures and a complete remedy: a
 smaller `max_num_seqs`, or the overrides that select the eager arms together with the runner
-setting they need (`--enforce-eager`, transaction graphs off). A later capacity failure is core's
+setting they need (`--enforce-eager`, with transaction graphs and CHUNK-bucket graphs off). A later capacity failure is core's
 own, and the logged line is its diagnosis. The `registration` design may project the total from
 the first captured counts and fail before capturing the rest. The eager arms (`eager` encoder, `dense-eager` decoder) remain selectable through
 `--hf-overrides` and are the reference that the graphed arms are tested against.
@@ -273,7 +275,8 @@ the leaf designs cite them where they depend on them.
   - The hook configuration: `cudagraph_mode` NONE with compilation off.
     Every graph the model runs, segment graphs and transaction graphs alike, is then captured in
     `capture_cudagraphs`, and none on the profiling dummy step. This configuration is accepted
-    only when it selects at least one graph that the hook captures. With segment graphs alone it
+    only when it selects at least one graph that the hook captures; the `registration` design
+    names which selections those are. With segment graphs alone it
     is an accepted configuration, and acceptance tiers 1 and 2 are claimed for it only once they
     have been met on it. Likewise a tier met only with the eager segment arms is a historical record
     for the default configuration until it is met again with the graphed arms.
@@ -335,9 +338,10 @@ the leaf designs cite them where they depend on them.
   `num_lookahead_tokens` in `--hf-overrides` selects another. The model warms execution and captures graphs for
   that geometry only. Every stream and every whole file runs at it, and admission refuses a
   request for any other cadence. The session factory's `open` takes only a locale, every session
-  runs at that geometry, and a frontend neither passes nor reads a cadence. `vllm-riva-frontend`
-  v0.4.0b1 predates this rule: it opens every stream at 560 ms and refuses a server that does not
-  serve it, so a server behind that release must be started at 560 ms. The experimental native-burst mode requires the
+  runs at that geometry, and a frontend neither passes nor reads a cadence. The plugin
+  is released together with a `vllm-riva-frontend` release that opens streams by locale only;
+  v0.4.0b1 reads the factory's served cadences when it starts and passes a cadence to `open`, so
+  it fails startup against this plugin. The experimental native-burst mode requires the
   160 ms geometry. Transaction graphs require the 80 or 160 ms geometry and native burst off.
 - **Completeness.** The model and the session factory treat a transcript as complete only after
   EOS following the final flush; a session that ends any other way fails. How core's own routes

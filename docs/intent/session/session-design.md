@@ -12,7 +12,8 @@ frontends a session API (open, feed, flush, abort, release) over vLLM's admitted
 path. It owns the packer that turns 16 kHz audio into the model's input units, and the projection
 from the engine's outputs to transcript text. The same packer serves core's native `/v1/realtime`
 through the model's `buffer_realtime_audio` hook, so every streaming path segments audio
-identically.
+identically. Every session, every core realtime stream and every whole file runs at the server's
+one geometry, fixed at startup; neither a frontend nor a session chooses it.
 
 Guiding principles:
 - **No unowned engine work.** Every task that talks to the engine belongs to the factory's session
@@ -34,19 +35,19 @@ the protocol is structural.
 - raises when the engine client lacks `generate(..., stream_admission=True)` or
   `wait_stream_retired` (typed against `EngineClient` where the engine declares them there, and
   otherwise requiring `AsyncLLM`; vllm#67375 declares them only on `AsyncLLM`);
-- otherwise returns a `SessionFactory`. `served_cadences` is the set of cadence labels of the
-  served lookaheads, `locales` the model's locale table keys, and `default_locale` the locale for a
-  stream whose client names none: `auto` when the table has it, else the table's only locale, else
-  `None` (the client must name one).
+- otherwise returns a `SessionFactory`. `locales` is the set of the model's locale table keys,
+  and `default_locale` the locale for a stream whose client names none: `auto` when the table has
+  it, else the table's only locale, else `None` (the client must name one). The factory reads the
+  server's geometry (Server geometry) when it is built and packs every session at it. It publishes
+  no cadence attribute: there is no `served_cadences` and no `default_cadence`.
 
 ## Protocol
 
 ```python
 class SessionFactory(Protocol):
-    served_cadences: frozenset[str]
     locales: frozenset[str]
     default_locale: str | None
-    async def open(self, *, cadence: str, locale: str) -> SessionLease: ...
+    async def open(self, *, locale: str) -> SessionLease: ...
     async def drain(self, deadline: float) -> list[BaseException]: ...
     def teardown_all(self) -> set[asyncio.Task]: ...
 
@@ -59,6 +60,13 @@ class SessionLease(Protocol):
     async def release(self) -> None: ...
     def teardown(self) -> None: ...
 ```
+
+The bound method `open` takes one keyword-only argument, `locale`, with no default. Python binds
+the arguments before the method's body runs, so a call that passes any other argument, such as
+`cadence`, or omits `locale` raises `TypeError` before every check the body makes, the
+closed-factory check included: it calls no engine method, inserts no session record and starts no
+task. The behaviour of `open` below, and its closed-factory rule, apply to calls whose arguments
+bind.
 
 `samples` is a one-dimensional `float32` array of 16 kHz mono audio; other shapes or dtypes and
 non-finite values raise `ValueError` and leave the lease unchanged; an empty array is accepted (`on_accepted(0)`) and sends nothing. A valid
@@ -121,7 +129,7 @@ stream_admission=True)` running as a factory-owned task.
 
 | Call | Behaviour |
 | --- | --- |
-| `open(cadence, locale)` | Refuse a cadence not in `served_cadences` (`refused`, `cadence`) or a locale not in `locales` (`refused`, `locale`). Mint the caller ID, insert the session record, start the `generate()` task. Admission is signalled by the input generator's first read. Return the lease on that signal. If the task ends first: `StreamAdmissionError` → `refused` with its reason; `EngineDeadError` → `failed` (`engine_dead`); another exception or a normal end → `failed` (`abnormal_end`). |
+| `open(locale)` | Refuse a locale not in `locales` (`refused`, `locale`). Mint the caller ID, insert the session record, start the `generate()` task. Admission is signalled by the input generator's first read. Return the lease on that signal. If the task ends first: `StreamAdmissionError` → `refused` with its reason; `EngineDeadError` → `failed` (`engine_dead`); another exception or a normal end → `failed` (`abnormal_end`). |
 | cancellation of `open` | Cancel the `generate()` task and hand the session to the factory's cleanup (below), which owns it through the cancellation and the retirement-wait outcome. The record is removed at once only if the task never started. Once `open` has returned the lease, the caller owns cleanup. |
 | stream end while a unit is outstanding | If the `generate()` task ends while `feed` or `flush` awaits a unit's outcome, the lease fails with `engine_dead` for `EngineDeadError`, otherwise `abnormal_end` (an `error` or `abort` finish, or any end without the unit's park). |
 | `feed(samples, on_accepted)` | Append to the packer and call `on_accepted(len(samples))`. For each complete unit: send it, await its outcome, project it. Return the cumulative transcript after each unit whose text changed; with no complete unit, return `[]` at once. |
@@ -150,8 +158,8 @@ usual cause), and the next call raises it. An idle end by `EngineDeadError` fail
   cancelled, or ends with another exception, before either signal leaves the state `pending`: core
   may still have admitted the stream and will abort it.
 - **Refusal result.** A refusal is `StreamAdmissionError` carrying a `StreamAdmissionResult` with
-  three fields, `accepted`, `request_id` and `reason` (vllm#67375); the factory reads `reason`. The
-  earlier status field is gone, so test doubles build the three-field result.
+  three fields, `accepted`, `request_id` and `reason` (vllm#67375); the factory reads `reason`, and
+  test doubles build results with exactly those three fields.
 - **Retirement wait.** For any record not `refused`, cleanup awaits `wait_stream_retired`. Its
   terminal results: it returns (the slot retired); `StreamAdmissionError` (admission was refused);
   `ValueError` (admission was never sent, or the retirement already happened and is no longer
@@ -176,18 +184,20 @@ usual cause), and the next call raises it. An idle end by `EngineDeadError` fail
 
 Exceptions raised by `open` or a lease carry two attributes the frontend reads with `getattr`:
 - `session_error = "refused"`, with `reason` one of `capacity`, `active_limit`, `engine_paused`,
-  `request_id_in_use`, `cadence`, `locale`;
+  `request_id_in_use`, `locale`;
 - `session_error = "failed"`, with `reason` one of `rejected_input`, `abnormal_end`, `expired`,
   `engine_dead`, `cancelled`, `output_capacity`, `input_capacity`, `state`.
 
 The plugin defines `SessionRefused` and `SessionFailed` carrying them. Other exceptions
-(`ValueError` for bad audio, `RuntimeError` for concurrent calls) carry neither and indicate a
-caller bug.
+(`ValueError` for bad audio, `RuntimeError` for concurrent calls, `TypeError` for an `open` call
+with an argument other than `locale`) carry neither and indicate a caller bug.
 
 ## Packer
 
 The packer turns a stream of samples into units of the model's envelope. One packer belongs to one
-session (or one core realtime stream) and is fixed to one geometry.
+session (or one core realtime stream) and is fixed to the server's geometry. The packer itself
+takes the geometry as a parameter, so it is defined and tested for all five implemented
+geometries.
 
 **Envelope.** Each unit is a prompt of exactly one token, the stream chunk-carrier token
 (`blank + 2`), plus one audio row of width 17,927: a 7-value header
@@ -202,7 +212,9 @@ carries the remaining samples, strictly fewer than `s_g` and possibly zero, and 
 unit.
 
 **Fields.** The row is `float32`. `valid_samples` is the number of samples the unit carries;
-`final_tail` is 1 for the final tail and 0 for every other unit. `geometry_id` is the geometry's index in the implemented order. `prompt_index` is the
+`final_tail` is 1 for the final tail and 0 for every other unit. `geometry_id` is the geometry's
+index in the implemented order: right context 0, 1, 3, 6 and 13 (80, 160, 320, 560 and 1120 ms)
+have indices 0 to 4. `prompt_index` is the
 locale's row in the locale table, as of when the unit is packed. `admission_ms_mod` is the
 wall-clock time, in epoch milliseconds modulo 2^24, at which the unit became complete (its last
 sample was appended, or `flush` was called for the final tail); a resent unit keeps it. The model
@@ -213,19 +225,61 @@ reconstructs each unit's deadline from it, which is valid while a unit is used w
 capacity error rather than wrap (about 15.5 days at 80 ms). The session maps it to
 `SessionFailed(reason="input_capacity")`; on core `/v1/realtime` the error ends the stream.
 
-## Served-set enforcement in the model
+## Server geometry
 
-The model fixes a stream's geometry from its first unit and fails the row of a later unit whose
-geometry differs. It also fails the row of a first unit whose geometry is not in the served set.
-A failed row ends the request with finish reason `error`, which a session reports as
-`abnormal_end`. Neither plugin path can send such a unit (`open` refuses an unserved cadence, and
-`buffer_realtime_audio` packs at the default lookahead, which is served); the check protects direct
-clients of the engine.
+A server serves exactly one of the five implemented geometries, fixed at startup (the HLD's
+Constraint "One geometry per server, chosen at startup"). `registration` resolves it: the
+checkpoint's default lookahead unless `num_lookahead_tokens` in `--hf-overrides` selects another.
+This component calls it the *server's geometry*: one right context `r` and its geometry index.
+
+- **One definition.** `served_lookahead(hf_config)` in `vllm_nemotron_asr_streaming.lookahead`
+  (`registration`, REG-LA-001) returns the server's lookahead, its right context `r`; the geometry
+  index comes from the implemented table (SESS-PACK-005) as `geometry_index(r)`. The session
+  factory, `buffer_realtime_audio`, the model's geometry check (below) and `transcription`'s
+  `get_generation_prompt` all obtain it through that function (REG-LA-009), so no reader can
+  disagree with another on the field or its fallback.
+- **One lookahead for the server's lifetime.** The configuration is fixed once startup ends, so
+  every session the factory opens, every core realtime stream and every whole-file request on
+  core's transcription route runs at the same lookahead for as long as the server process lives.
+  No lease call, request field or frontend call selects or changes it; `update_locale` changes
+  only the locale. A frontend that ingests a file through sessions, and a client that uploads the
+  same file to core's transcription route, therefore get the same lookahead, which the HLD's
+  equivalence goal requires.
+- **No discovery.** The factory publishes no cadence, and a frontend neither passes one nor reads
+  one. The frontend sends samples in pieces of any size; the packer alone segments them.
+
+**Geometry check in the model.** The model fails the row of any unit whose `geometry_id` is not
+the server's geometry index, whether it is a stream's first unit or a later one. A failed row ends
+the request with finish reason `error`, which a session reports as `abnormal_end`. Neither plugin
+path can send such a unit, because both pack at the server's geometry; the check protects direct
+clients of the engine. This plan-time row failure is what the HLD's constraint calls refusing a
+request for another cadence; it is not a stream-admission refusal, which `open` reports as
+`SessionRefused` with a `StreamAdmissionResult` reason.
+
+## Compatibility with frontends
+
+The structural protocol has no version negotiation, so this plugin is released only together
+with a counterpart `vllm-riva-frontend` release that opens sessions by locale only, and the two
+are qualified as a pair. This factory meets a mismatched frontend as follows:
+- A frontend that reads `served_cadences` when it discovers or starts the factory finds no such
+  attribute and fails its own startup; `vllm-riva-frontend` v0.4.0b1 does this.
+- A frontend that bypasses that discovery and calls `open` with a `cadence` gets `TypeError` from
+  argument binding (Protocol), so it opens no session.
+
+**Counterpart pin and conformance run.** The `conformance` extra in `pyproject.toml` is the one
+place that pins the counterpart release, as an exact `vllm-riva-frontend` version; the README's
+compatibility line repeats that version. Tier 1 installs the extra and runs the counterpart
+suite's CPU seam conformance tests through this repository's pytest suite
+(`tests/session/test_frontend_conformance.py`), against the factory that `create_session_factory`
+returns for `Nemotron3_5AsrStreamingForRNNT`, built on this repository's engine double. The tier 1
+record names the counterpart version and the command it ran. A run in which the frontend package
+is missing or those tests are skipped does not meet tier 1. The suite's parts that need a real
+engine client on the stage 2 build (the GPU lane) are not tier 1; they belong to tier 2.
 
 ## Core `/v1/realtime`
 
 The model's `buffer_realtime_audio(audio_stream, input_stream, model_config)` hook runs the packer at
-the server's default lookahead, with the locale `auto` when the locale table has it, else its only
+the server's geometry, with the locale `auto` when the locale table has it, else its only
 locale; a multi-locale table without `auto` makes the hook raise `ValueError` naming the locales.
 It yields one prompt per unit and the final tail when `audio_stream` ends. Core puts every output's
 token IDs on `input_stream`; the model needs no generated-token context, so the hook drains that
@@ -278,6 +332,10 @@ part of that later design.
 | Final tail | One explicit final-tail unit, then close | A flush control token | The model finalizes from the final-tail unit and the close |
 | Packer ownership | One implementation shared by the factory and `buffer_realtime_audio` | Separate packers | Two packers could segment the same audio differently |
 | Caller IDs | Fresh `uuid4` per session | Caller-chosen, reused IDs | An ID is reserved until retirement on this path |
+| Cadence at `open` | None: `open(*, locale)`, every session at the server's geometry | `open(*, cadence, locale)` refusing a cadence the server does not serve; an optional `cadence` accepted only when it names the server's geometry | The server serves one geometry fixed at startup, so a per-stream cadence chooses nothing; an optional, checked argument keeps a protocol surface no caller needs and keeps frontends coded to pass it |
+| Geometry discovery | The factory publishes no cadence | A singleton `served_cadences`; a `default_cadence` for the frontend to read | No frontend decision depends on the geometry: the packer, not the frontend, segments audio. A published value invites frontends to branch on server configuration |
+| Geometry source | `lookahead.served_lookahead`, which returns the right context, with the index from the implemented table, called by the factory, the realtime hook, the model's check and the file prompt (REG-LA-009) | Each caller reads the configuration itself | Separate readers can disagree on the field or its fallback, and the equivalence goal needs files and streams at the same lookahead |
+| Release coupling | Plugin and frontend release as a pair; the `conformance` extra pins the counterpart, and tier 1 runs its CPU seam conformance tests | Version negotiation in the protocol; a shim accepting both `open` signatures | Negotiation adds a protocol surface and a matrix of release pairs to test for one argument; a shim keeps the cadence argument alive |
 
 ## Open Questions & Future Decisions
 

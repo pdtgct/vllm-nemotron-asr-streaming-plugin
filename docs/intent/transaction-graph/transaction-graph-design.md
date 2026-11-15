@@ -108,8 +108,9 @@ Every comparison in this design ("the option-off transaction", "option-off run")
 That is the hook configuration (`cudagraph_mode` NONE, compilation off, no `--enforce-eager`) with
 the default segment arms captured through the hook (`eager-graphed` encoder at every CHUNK count
 from 1 to `max_num_seqs`, `dense-graphed` decoder at its tiers), no CHUNK-bucket graphs, native
-burst off, and the same geometry, batching limits, dtype, device and budget setting: the default
-configuration at that geometry, so the option changes exactly one setting.
+burst off, and the same geometry, batching limits, dtype, device and budget setting, so the option
+changes exactly one setting. `B_hook` is defined by these runner flags, not by the README's default
+serve command, which may run under `--enforce-eager` until the hook configuration meets tier 2.
 
 ## Transaction structure
 
@@ -465,7 +466,7 @@ segment graphs' part, which runs first in each capture call.
 
 | Hook | Transaction-graph behaviour |
 | --- | --- |
-| `needs_cudagraph_capture()` | True under the default segment arms and whenever `transaction_graph_populations` is non-empty, on CUDA. Configuration only, the same value for the model state's lifetime. Under `--enforce-eager` the runner does not ask. |
+| `needs_cudagraph_capture()` | True exactly when the platform is CUDA and the configuration selects a hook-captured graph: the `eager-graphed` encoder, the `dense-graphed` decoder or a non-empty `transaction_graph_populations` (REG-MEM-019). Configuration only, the same value for the model state's lifetime. Under `--enforce-eager` the runner does not ask. |
 | `prepare_execution_memory()` | Called once before the profiling forward pass, before any state pool exists, in both runner configurations. This component allocates nothing there: its buffers belong to the captures, which the estimate charges. |
 | profiling forward pass | Runs under the hook configuration too (`prepare_step` with `is_profile=True`); `registration` runs its profile transaction there or in `prepare_execution_memory`, over model-owned storage, at the maximum shape. No cell is captured or replayed. |
 | `initialize_state_slots(bindings)` | Records the bindings: profiling bindings, then serving bindings. Cells exist only after the serving capture, over the bindings current at that capture; Repeated bindings reconciles later calls. |
@@ -666,8 +667,10 @@ replay a graph (no step authorizes the pools there) and does not enlarge the wor
 
 **Per-row rejections are not step failures.** A rejected row has a nonzero status, its pages stay
 as core's slot initialization left them at the start of the step, and the other rows commit. Under
-replay as under the option-off transaction, its status flows through the sink's collection: a
-terminal status fails that request (`state_slots.fail_requests`), a recoverable one does not. Such
+replay as under the option-off transaction, its status flows through the sink's collection, and
+the owning design decides whether the request fails (`state_slots.fail_requests`): `session` for
+stream rows, `transcription` for file rows, where every non-clean status fails the file
+(FILE-QC-012). Such
 a step neither raises nor latches.
 
 **Before the first launch**, work touches only binding-owned buffers and host bookkeeping; a
@@ -983,29 +986,32 @@ change. It models one worker with a small `N` and bounded steps:
 
 ## README
 
-This component owns the README's section for the option. Its serve command is the default serve
-command with `num_lookahead_tokens` 0 or 1 and `transaction_graph_populations` in
-`--hf-overrides`, at the `--max-num-seqs` and `N` that the tier 5 run verified to fit the A40. The
+This component owns the README's section for the option. Its serve command runs the hook
+configuration (no `--enforce-eager`) with the default segment arms, `num_lookahead_tokens` 0 or 1
+and `transaction_graph_populations` in `--hf-overrides`, a `--max-model-len` that covers the
+geometry (`registration`, REG-ENG-010), at the `--max-num-seqs` and `N` that the tier 5 run verified to fit the A40. The
 section states the measured graph memory, transient peaks and capture time with the build,
 device, geometry and `N`; the `(K, E)` histogram `N` was chosen from; that a fixed budget must
 leave room for the graphs, which the startup log reports; the limits (one geometry per server,
 80 or 160 ms; `N` bounded by `max_num_seqs`; steps beyond `N` CHUNK or other rows run option-off
-and are counted; refused under `--enforce-eager` and with native burst); that a frontend which
-opens every stream at 560 ms, such as `vllm-riva-frontend` v0.4.0b1, cannot be used with the
-option; and the tier each claim met, with its build.
+and are counted; refused under `--enforce-eager` and with native burst); that the server needs a
+frontend release that opens streams by locale only; and the tier each claim met, with its build.
 
 ## Permitted dependencies
 
-The option adds these internal dependencies of the model adapter, for `registration`'s table and
-import-time check (conditional rows, imported only when the option is on):
+The option uses these internal dependencies of the model adapter. `registration`'s table and
+import-time check own them: `ModelState.post_warmup` and the `memory_contributors` argument are
+unconditional rows (REG-010), and `capture_pool` and `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS`
+are conditional on graphed execution (REG-014), because the default segment arms use them with the
+option off. The option adds only the `StateSlotBindings` methods, conditional on the option (REG-018):
 
-| Module | Names | Use |
+| Module | Names | Use by this component |
 | --- | --- | --- |
-| `vllm.compilation.cudagraph_pool` | `capture_pool` | captures into the pool core passes |
-| `vllm.v1.worker.gpu.state_slots` | `StateSlotBindings.startup_pool_access`, `StateSlotBindings.pool_layout` (methods of a permitted class) | capture rows and post-warmup verification |
-| `vllm.v1.worker.gpu.model_states.interface` | `ModelState.post_warmup` (a method of a permitted class) | post-warmup verification |
-| `vllm.v1.kv_cache_interface` | `PersistentStateSpec(memory_contributors=...)` (an argument of a permitted class) | names the option in core's memory notes |
-| `vllm.envs` | `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` | whether a profiling capture is required |
+| `vllm.v1.worker.gpu.state_slots` | `StateSlotBindings.startup_pool_access`, `StateSlotBindings.pool_layout` (methods of a permitted class) | capture rows and post-warmup verification (REG-018) |
+| `vllm.compilation.cudagraph_pool` | `capture_pool` | captures into the pool core passes (REG-014) |
+| `vllm.v1.worker.gpu.model_states.interface` | `ModelState.post_warmup` (a method of a permitted class) | post-warmup verification (REG-010) |
+| `vllm.v1.kv_cache_interface` | `PersistentStateSpec(memory_contributors=...)` (an argument of a permitted class) | names the option in core's memory notes (REG-010) |
+| `vllm.envs` | `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` | whether a profiling capture is required (REG-014) |
 
 `torch.cuda.CUDAGraph`, `torch.cuda.graph` and `torch.cuda.mem_get_info` are PyTorch, not vLLM.
 The counter reader uses `AsyncLLM.collective_rpc`, part of the public client surface.
@@ -1025,9 +1031,9 @@ Each sibling owner applies its own; this list does not change their documents.
 - **`session`:** SESS-FAC-004, SESS-OPEN-001/002, SESS-MODEL-002 and SESS-RT-001: the factory's
   `open` takes only a locale, every session runs at the server's one startup geometry, and a
   frontend neither passes nor discovers a cadence; with a seam-conformance test.
-- **`transcription`:** file steps as stream-role rows (FILE-ROW-002, FILE-ROW-003 with the token
+- **`transcription`:** file steps as stream-role rows (FILE-ROW-002, FILE-ROW-003 and FILE-ROW-010 with the token
   IDs always present, the end step as REPLAY or FLUSH); FILE-PROMPT-002 and one geometry helper;
-  FILE-DEF-001 retires. It also owns the **queue-count transport**, for every row with the option
+  no request-chosen cadence remains as deferred work. It also owns the **queue-count transport**, for every row with the option
   on or off, replacing its synchronous read of the label book and the host-side decrement. It
   defines: a typed `CommitPlan` field, a device int32 tensor of one count per row that `reserve`
   validates like `progress` (this component fills it from `remaining_step[:P]`); a preallocated

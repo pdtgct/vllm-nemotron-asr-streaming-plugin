@@ -10,8 +10,10 @@ admitted stream; a lease is the handle `open` returns for it.
 - [x] **SESS-FAC-001**: The distribution shall expose an entry point in the group `vllm_riva_frontend.session_factories`, named `nemotron_asr_streaming`, with the value `vllm_nemotron_asr_streaming.session:create_session_factory`.
 - [x] **SESS-FAC-002**: When the served architecture is not `Nemotron3_5AsrStreamingForRNNT`, `create_session_factory(engine_client, model_config)` shall return `None`.
 - [x] **SESS-FAC-003**: If the engine client given to `create_session_factory` has no `generate` accepting `stream_admission` or no `wait_stream_retired`, then `create_session_factory` shall raise an error naming the missing call.
-- [x] **SESS-FAC-004**: The session factory's `served_cadences` shall be the cadence labels of exactly the served lookahead set, using the one table right context 0, 1, 3, 6, 13 ↔ label `80ms`, `160ms`, `320ms`, `560ms`, `1120ms` ↔ geometry index 0 to 4; its `locales` shall be exactly the keys of the served locale table; and its `default_locale` shall be `auto` when the table has it, else the table's only locale, else `None`.
-- [x] **SESS-FAC-005**: The plugin shall not import the frontend package, and the session factory and lease shall satisfy the protocol in the session design (§Protocol) structurally.
+- [ ] **SESS-FAC-004**: The session factory's `locales` shall be exactly the keys of the served locale table, and its `default_locale` shall be `auto` when the table has it, else the table's only locale, else `None`.
+- [ ] **SESS-FAC-005**: The plugin shall not import the frontend package, and the session factory and lease shall satisfy the protocol in the session design (§Protocol) structurally.
+- [ ] **SESS-FAC-006**: The bound method `open` of the session factory that `create_session_factory` returns shall be a coroutine function whose signature, excluding `self`, has exactly one parameter, the keyword-only `locale` with no default; and the factory shall expose no cadence attribute: neither `served_cadences` nor `default_cadence`.
+- [ ] **SESS-FAC-007**: Tier 1 CPU conformance shall execute the CPU seam conformance tests of the `vllm-riva-frontend` release pinned, at an exact version, by the `conformance` extra in `pyproject.toml`, against the non-`None` factory that `create_session_factory` returns for `Nemotron3_5AsrStreamingForRNNT` on the repository's engine double, and every one of those tests shall pass; the tier 1 record shall name the counterpart version and the command that ran the tests, and a run in which the frontend package is missing or those tests are skipped shall not meet tier 1. The suite's tests that need a real engine client on the stage 2 build are outside tier 1.
 
 ## Audio input to `feed`
 
@@ -32,13 +34,22 @@ admitted stream; a lease is the handle `open` returns for it.
 
 ## Opening a session
 
-- [x] **SESS-OPEN-001**: If `open` is given a cadence not in `served_cadences`, then it shall raise `SessionRefused(reason="cadence")`; if given a locale not in `locales`, then it shall raise `SessionRefused(reason="locale")`; in both cases before any engine call.
-- [x] **SESS-OPEN-002**: When `open` is called with a served cadence and locale, it shall mint a fresh `uuid4` caller ID, insert the session record in the factory's session table, and only then start the `generate(..., stream_admission=True)` task.
+- [ ] **SESS-OPEN-001**: If `open` is called on an unclosed factory with arguments that bind to its signature (SESS-FAC-006) and a locale not in `locales`, then it shall raise `SessionRefused(reason="locale")` before any engine call.
+- [ ] **SESS-OPEN-002**: When `open` is called on an unclosed factory with arguments that bind to its signature (SESS-FAC-006) and a locale in `locales`, it shall mint a fresh `uuid4` caller ID, insert the session record in the factory's session table, and only then start the `generate(..., stream_admission=True)` task, whose units the session packs at the server's geometry (SESS-GEOM-001).
+- [ ] **SESS-OPEN-008**: If `open` is called with any argument other than the keyword `locale`, including `cadence`, or without `locale`, then, whether or not the factory is closed, it shall raise `TypeError` from argument binding, before any check in its body, without calling the engine, inserting a session record or starting a task.
 - [x] **SESS-OPEN-003**: When the input generator of a session's `generate()` task is first read, `open` shall return the lease in state `open`.
 - [ ] **SESS-OPEN-004**: If the `generate()` task raises `StreamAdmissionError` before its input generator is first read, then `open` shall raise `SessionRefused` with the `reason` of that error's `StreamAdmissionResult` (`capacity`, `active_limit`, `engine_paused` or `request_id_in_use`), a result that has only `accepted`, `request_id` and `reason`.
-- [ ] **SESS-OPEN-007**: Session test doubles shall build admission results with the target core's three-field `StreamAdmissionResult` (`accepted`, `request_id`, `reason`), without a status field.
+- [ ] **SESS-OPEN-007**: Session test doubles shall build admission results with the target core's `StreamAdmissionResult` with exactly its three fields `accepted`, `request_id` and `reason`.
 - [x] **SESS-OPEN-005**: If the `generate()` task raises `EngineDeadError` before its input generator is first read, then `open` shall raise `SessionFailed(reason="engine_dead")`; if it raises any other exception or ends normally before that read, then `open` shall raise `SessionFailed(reason="abnormal_end")`.
 - [x] **SESS-OPEN-006**: If `open` is cancelled before it returns, then it shall cancel the session's `generate()` task; if the task never started, it shall remove the session record and start no cleanup task, and otherwise it shall hand the session to exactly one factory cleanup task (SESS-OWN-003).
+
+## Server geometry
+
+The server's geometry is the one lookahead `registration` resolves at startup: the checkpoint's
+default lookahead unless `num_lookahead_tokens` in `--hf-overrides` selects another.
+
+- [ ] **SESS-GEOM-001**: For a served configuration `config`, every unit a session packs and every unit `buffer_realtime_audio` packs shall carry the right context `r = served_lookahead(config)` and `geometry_id = geometry_index(r)`, every whole-file prompt's `file_header` shall carry that same geometry index, and the model's geometry check (SESS-MODEL-001, SESS-MODEL-002) shall compare against it; the call sites that obtain `r` are those of REG-LA-009.
+- [ ] **SESS-GEOM-002**: For the life of a server process, every session the factory opens, every core `/v1/realtime` stream and every whole-file request on core's transcription route shall run at the server's geometry; no lease call (including `update_locale`), request field or frontend call shall select or change it.
 
 ## Engine binding
 
@@ -75,19 +86,19 @@ admitted stream; a lease is the handle `open` returns for it.
 ## Factory ownership
 
 - [ ] **SESS-OWN-001**: The factory shall keep one session record per session, keyed by caller ID, with admission state `pending` until the input generator's first read (`accepted`) or a `StreamAdmissionError` from the task (`refused`); a task cancelled or failed before either shall leave the state `pending`.
-- [ ] **SESS-OWN-002**: For every session record whose admission state is not `refused`, the factory's cleanup shall await `wait_stream_retired` and remove the record when it returns or raises `StreamAdmissionError`, `ValueError` or `EngineDeadError`; a `refused` record shall be removed at once.
+- [ ] **SESS-OWN-002**: For every session record whose admission state is not `refused`, the factory's cleanup shall await `wait_stream_retired` and shall remove the record only when both the retirement wait has reached a terminal result (it returns, or raises `StreamAdmissionError`, `ValueError` or `EngineDeadError`) and the session's `generate()` task has ended; while the retirement wait has a terminal result and the task is still ending (for example still cancelling), the factory shall keep the record and one tracked task that `teardown_all` cancels; a `refused` record shall be removed at once.
 - [x] **SESS-OWN-008**: When a factory cleanup task's retirement wait raises `EngineDeadError` or any exception other than `StreamAdmissionError` and `ValueError`, the factory shall log it and record it as a cleanup fault.
 - [x] **SESS-OWN-003**: When a session's owner is gone (a cancelled or failed `open`, a cancelled `release`), the factory shall start exactly one tracked cleanup task for it that runs SESS-OWN-002 with no deadline of its own.
 - [x] **SESS-OWN-004**: When `drain(deadline)` is called with an absolute `time.monotonic()` deadline, the factory shall await its cleanup tasks until they finish or the deadline passes, keep ownership of any still running, and return the cleanup faults recorded since the previous `drain`, clearing them.
 - [x] **SESS-OWN-005**: When `teardown_all()` is called, the factory shall mark itself closed before returning, cancel every task it owns, and return the set of those tasks.
-- [x] **SESS-OWN-006**: While the factory is closed, `open` shall raise `SessionFailed(reason="cancelled")`, every lease call other than `teardown` shall raise `SessionFailed(reason="cancelled")`, and a cancelled pending `open` shall cancel its task without starting cleanup.
+- [ ] **SESS-OWN-006**: While the factory is closed, an `open` call whose arguments bind to its signature (SESS-FAC-006) shall raise `SessionFailed(reason="cancelled")`, every lease call other than `teardown` shall raise `SessionFailed(reason="cancelled")`, and a cancelled pending `open` shall cancel its task without starting cleanup.
 - [x] **SESS-OWN-007**: Every task the factory cancels shall carry a done-callback that retrieves the task's exception.
 
 ## Error contract
 
-- [x] **SESS-ERR-001**: `SessionRefused` shall carry `session_error = "refused"` and `reason`, one of `capacity`, `active_limit`, `engine_paused`, `request_id_in_use`, `cadence`, `locale`.
+- [ ] **SESS-ERR-001**: `SessionRefused` shall carry `session_error = "refused"` and `reason`, one of `capacity`, `active_limit`, `engine_paused`, `request_id_in_use`, `locale`.
 - [x] **SESS-ERR-002**: `SessionFailed` shall carry `session_error = "failed"` and `reason`, one of `rejected_input`, `abnormal_end`, `expired`, `engine_dead`, `cancelled`, `output_capacity`, `input_capacity`, `state`.
-- [x] **SESS-ERR-003**: Exceptions from `open` or a lease other than `SessionRefused` and `SessionFailed` (`ValueError` for bad audio, `RuntimeError` for concurrent calls) shall carry neither `session_error` nor `reason`.
+- [ ] **SESS-ERR-003**: Exceptions from `open` or a lease other than `SessionRefused` and `SessionFailed` (`ValueError` for bad audio, `RuntimeError` for concurrent calls, `TypeError` for an `open` call with an argument other than `locale`) shall carry neither `session_error` nor `reason`.
 
 ## Packer
 
@@ -98,19 +109,19 @@ packer implementation.
 - [x] **SESS-PACK-002**: For a packer fixed to geometry `g` with right context `r`, every unit other than the final tail shall carry exactly `1280 × (r + 1)` samples, and the samples of consecutive units shall be consecutive in the input audio.
 - [x] **SESS-PACK-003**: The packer shall set `chunk_sequence` to 0 for its first unit and increase it by 1 for each later unit.
 - [x] **SESS-PACK-004**: When the stream is closed (`flush` on a session, or the end of `audio_stream` on core `/v1/realtime`), the packer shall emit exactly one final-tail unit with `final_tail = 1` carrying the remaining samples (fewer than `1280 × (r + 1)`, possibly zero), and shall emit no unit after it.
-- [x] **SESS-PACK-005**: The packer shall set `geometry_id` to the geometry's index in the implemented order (80, 160, 320, 560, 1120 ms) and `prompt_index` to the current locale's row in the locale table at the time the unit is packed.
+- [x] **SESS-PACK-005**: The packer shall set `geometry_id` to the geometry's index in the implemented order (right context 0, 1, 3, 6, 13, that is 80, 160, 320, 560, 1120 ms, ↔ index 0 to 4) and `prompt_index` to the current locale's row in the locale table at the time the unit is packed.
 - [x] **SESS-PACK-006**: The packer shall set `admission_ms_mod` to the wall-clock time, in epoch milliseconds modulo 2^24, at which the unit became complete (its last sample was appended, or the stream was closed, for the final tail).
 - [x] **SESS-PACK-007**: Every header value the packer writes shall be a non-negative integer below 2^24.
 - [x] **SESS-PACK-008**: If a unit would need a `chunk_sequence` of 2^24 or more, then the packer shall raise its capacity error instead of emitting the unit; the session factory shall report it as `SessionFailed(reason="input_capacity")`, and on core `/v1/realtime` `buffer_realtime_audio` shall let the error propagate (ending the stream as failed, never with a normal close).
 
-## Served-set enforcement in the model
+## Geometry check in the model
 
-- [ ] **SESS-MODEL-001**: When the model receives a stream's first unit, it shall fix the stream's geometry from that unit's `geometry_id`; if a later unit of the stream carries a different `geometry_id`, then the model shall fail that row, ending the request with finish reason `error`.
-- [ ] **SESS-MODEL-002**: If a stream's first unit carries a geometry that is not in the served lookahead set, then the model shall fail that row, ending the request with finish reason `error` (reachable only by direct engine clients; both plugin paths send served geometries).
+- [ ] **SESS-MODEL-001**: If a unit after a stream's first carries a `geometry_id` other than the server's geometry index (SESS-GEOM-001), then the model shall fail that row alone, ending the request with finish reason `error`; the outputs of the stream's earlier units are unaffected.
+- [ ] **SESS-MODEL-002**: If a stream's first unit carries a `geometry_id` other than the server's geometry index (SESS-GEOM-001), then the model shall fail that row, ending the request with finish reason `error` (reachable only by direct engine clients; the session factory and `buffer_realtime_audio` pack every unit at the server's geometry).
 
 ## Core `/v1/realtime`
 
-- [x] **SESS-RT-001**: The model's `buffer_realtime_audio(audio_stream, input_stream, model_config)` shall pack the audio from `audio_stream` with the session packer at the server's default lookahead and yield one prompt per unit, followed by the final-tail unit when `audio_stream` ends.
+- [ ] **SESS-RT-001**: The model's `buffer_realtime_audio(audio_stream, input_stream, model_config)` shall pack the audio from `audio_stream` with the session packer at the server's geometry (SESS-GEOM-001) and yield one prompt per unit, followed by the final-tail unit when `audio_stream` ends.
 - [x] **SESS-RT-002**: The model's `buffer_realtime_audio` shall use the same default locale as SESS-FAC-004's `default_locale`; if that is `None`, then it shall raise `ValueError` naming the locales.
 - [x] **SESS-RT-003**: The model's `buffer_realtime_audio` shall drain `input_stream` for the life of the connection without using its contents.
 
