@@ -1100,11 +1100,12 @@ class TransactionGraphBinding:
             "endpoint_book_pool": roles.endpoint_book,
         }
         work.resident = advance.resident_layout(**work.pool_kwargs)
-        # The capture rows' pages, to prove that no capture stores a page:
-        # copied to host memory once per call, so the snapshot adds no device
-        # memory beside the state pages and the KV cache.
+        # The null page and the capture rows' pages, to prove that no capture
+        # stores a page, the null page included (TXG-CAP-008): copied to host
+        # memory once per call, so the snapshot adds no device memory beside
+        # the state pages and the KV cache.
         work.snapshot = {
-            name: pool[1 : self.n + 1].to("cpu", copy=True)
+            name: pool[: self.n + 1].to("cpu", copy=True)
             for name, pool in components.items()
         }
 
@@ -1285,12 +1286,16 @@ class TransactionGraphBinding:
                     f"the validation replay's {name} differ from the eager "
                     "reference of the same capture rows"
                 )
-        # The pages are compared in host memory with the call's snapshot.
+        # The pages are compared in host memory with the call's snapshot: the
+        # null page and the cell's capture rows' pages.
         for name, pool in work.components.items():
-            if not _same_bits(pool[1 : count + 1].cpu(), work.snapshot[name][:count]):
+            if not _same_bits(
+                pool[: count + 1].cpu(), work.snapshot[name][: count + 1]
+            ):
                 raise RuntimeError(
-                    f"the capture rows' pages of state pool {name!r} changed: "
-                    "the reference and the validation replay store no page"
+                    f"the null page or the capture rows' pages of state pool "
+                    f"{name!r} changed: the reference and the validation "
+                    "replay store no page"
                 )
         self.cells[key] = Cell(key, self._graphs[-1], program.signature, program.tier)
 

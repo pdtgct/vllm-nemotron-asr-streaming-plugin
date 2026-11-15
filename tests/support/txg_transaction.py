@@ -74,6 +74,9 @@ CONFIGS: tuple[tuple[str, bool, bool], ...] = tuple(
     itertools.product(("chunk", "other"), (False, True), (False, True))
 )
 
+#: The seed of the fixture model's weights (``build_env``).
+FIXTURE_SEED = 0
+
 HEADER_SLOTS = 7
 #: Envelope header slots (``advance.ENV_*``).
 H_VERSION, H_SAMPLES, H_GEOMETRY, H_FINAL, H_PROMPT, H_SEQUENCE = 0, 1, 2, 3, 4, 5
@@ -88,17 +91,81 @@ def config_name(config: tuple[str, bool, bool]) -> str:
 # Pools
 
 
+#: The allocator alignment a layout-preserving copy keeps for each storage's
+#: base address, so every view keeps its address modulo this value.
+_BASE_ALIGNMENT = 512
+
+
+def layout_clone(tensors: Sequence[torch.Tensor], *, zero: bool = False) -> list:
+    """Copies of ``tensors`` that keep the resident layout: each distinct
+    storage is copied once, with its base address at the same offset modulo
+    :data:`_BASE_ALIGNMENT`, and every tensor is re-viewed on its storage's
+    copy at its own storage offset, shape and strides. Views that shared a
+    storage share its copy. A copy therefore has the shape, strides, dtype
+    and pointer alignment of the original (a new address), so the masked
+    scatter receives a specialization startup warmed (TXG-CAP-013); a plain
+    ``Tensor.clone`` of a strided resident view is contiguous and does not.
+    ``zero`` zeroes the copies instead of copying the bytes."""
+    copies: dict[tuple[Any, int], tuple[torch.Tensor, int]] = {}
+    out = []
+    for tensor in tensors:
+        storage = tensor.untyped_storage()
+        key = (tensor.device, storage.data_ptr())
+        if key not in copies:
+            nbytes = storage.nbytes()
+            raw = torch.empty(
+                nbytes + _BASE_ALIGNMENT, dtype=torch.uint8, device=tensor.device
+            )
+            shift = (storage.data_ptr() - raw.data_ptr()) % _BASE_ALIGNMENT
+            body = raw[shift : shift + nbytes]
+            if zero:
+                body.zero_()
+            else:
+                source = torch.empty(0, dtype=torch.uint8, device=tensor.device)
+                source.set_(storage, 0, (nbytes,), (1,))
+                body.copy_(source)
+            copies[key] = (raw, shift)
+        raw, shift = copies[key]
+        size = tensor.element_size()
+        assert shift % size == 0, "the copy cannot keep this view's alignment"
+        view = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
+        view.set_(
+            raw.untyped_storage(),
+            shift // size + tensor.storage_offset(),
+            tuple(tensor.shape),
+            tensor.stride(),
+        )
+        assert view.data_ptr() % _BASE_ALIGNMENT == (
+            tensor.data_ptr() % _BASE_ALIGNMENT
+        )
+        out.append(view)
+    return out
+
+
 @dataclasses.dataclass
 class Pools:
     tensors: dict[str, Any]
 
-    def clone(self) -> Pools:
+    def _rebuilt(self, *, zero: bool) -> Pools:
+        """A copy over new storage that keeps every view's layout
+        (:func:`layout_clone`)."""
+        flat = [t for _, t in self.flat()]
+        copies = iter(layout_clone(flat, zero=zero))
         return Pools(
             {
-                k: [t.clone() for t in v] if isinstance(v, list) else v.clone()
+                k: [next(copies) for _ in v] if isinstance(v, list) else next(copies)
                 for k, v in self.tensors.items()
             }
         )
+
+    def clone(self) -> Pools:
+        """A copy of the pages over new storage with the same resident
+        layout (:func:`layout_clone`)."""
+        return self._rebuilt(zero=False)
+
+    def zeros(self) -> Pools:
+        """Zeroed pools over new storage with the same resident layout."""
+        return self._rebuilt(zero=True)
 
     def flat(self) -> Iterator[tuple[str, torch.Tensor]]:
         for name, value in self.tensors.items():
@@ -159,8 +226,12 @@ def same_bits(a: torch.Tensor | None, b: torch.Tensor | None) -> bool:
         return a is None and b is None
     if a.shape != b.shape or a.dtype != b.dtype:
         return False
-    a = a.detach().contiguous().cpu().reshape(-1).view(torch.uint8)
-    b = b.detach().contiguous().cpu().reshape(-1).view(torch.uint8)
+    if a.device != b.device:
+        a, b = a.cpu(), b.cpu()
+    # Compared where they live: one comparison and one synchronization per
+    # tensor on CUDA, no device-to-host copy of every pool.
+    a = a.detach().contiguous().reshape(-1).view(torch.uint8)
+    b = b.detach().contiguous().reshape(-1).view(torch.uint8)
     return bool(torch.equal(a, b))
 
 
@@ -663,7 +734,12 @@ def build_env(
                 max_num_seqs=capacity - 1,
                 device=device,
             )
-            model = h.build_model(vllm_config)
+            # Seeded weights: the drive must reach every configuration the
+            # planner produces whatever ran earlier in the process.
+            devices = [torch.cuda.current_device()] if device == "cuda" else []
+            with torch.random.fork_rng(devices=devices):
+                torch.manual_seed(FIXTURE_SEED)
+                model = h.build_model(vllm_config)
             state = h.build_model_state(vllm_config, model)
             runner = h.Runner(vllm_config, model, state)
             # The eager runner: no capture hook; real steps before post_warmup.
@@ -793,24 +869,13 @@ def _env_from_calls(
     calls = [c for c in calls if "statuses" in c]
     first = calls[0]
     kwargs = {k: v for k, v in first["kwargs"].items() if k not in STEP_OWNED}
-    template = first["pools"].clone()
-    template = Pools(
-        {
-            name: (
-                [
-                    torch.zeros(
-                        (capacity, *t.shape[1:]), dtype=t.dtype, device=t.device
-                    )
-                    for t in value
-                ]
-                if isinstance(value, list)
-                else torch.zeros(
-                    (capacity, *value.shape[1:]), dtype=value.dtype, device=value.device
-                )
-            )
-            for name, value in template.tensors.items()
-        }
-    )
+    # Zeroed pools with the live pools' resident layout (the composed pools'
+    # block count is the live pool's), so the option-off transaction over a
+    # composed step launches the masked scatter at a layout startup warmed.
+    live = pools_of(first["kwargs"])
+    for name, tensor in live.flat():
+        assert tensor.shape[0] == capacity, (name, tuple(tensor.shape), capacity)
+    template = live.zeros()
     fixtures: dict[tuple[str, bool, bool], list[RowFixture]] = {c: [] for c in CONFIGS}
     for call in calls:
         plan = call["plan"]

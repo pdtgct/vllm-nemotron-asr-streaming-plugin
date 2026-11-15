@@ -601,6 +601,26 @@ def slots_at_step_start(bindings: Any, slots: Any) -> dict[int, torch.Tensor]:
     return taken
 
 
+def pool_at_step_start(bindings: Any) -> dict[str, torch.Tensor]:
+    """The whole state pool as core's slot initialization leaves it at the
+    start of the next step (after ``activate_requests``: core zeroes and
+    initializes the page of every newly bound slot), under key ``"pool"``
+    once that step runs. A step that fails before it writes a page must leave
+    the pool equal to this (TXG-EXEC-003)."""
+    core = h.core_bindings(bindings)
+    original = core.activate_requests
+    taken: dict[str, torch.Tensor] = {}
+
+    def activate_requests(*args: Any, **kwargs: Any) -> Any:
+        result = original(*args, **kwargs)
+        taken["pool"] = h.pool_tensor(bindings).clone()
+        object.__setattr__(core, "activate_requests", original)
+        return result
+
+    object.__setattr__(core, "activate_requests", activate_requests)
+    return taken
+
+
 def silence_collection(env: Any, req_ids: set[str]) -> None:
     """Make the sink's collection report nothing for ``req_ids`` (no
     status, no failure, no queue count) to the model state, so a test can

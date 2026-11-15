@@ -310,6 +310,21 @@ class AdvanceSpy:
         return self
 
 
+def drop_advance_records() -> None:
+    """Drop what every installed :class:`AdvanceSpy` recorded (each spy
+    installed later wraps the one before it). The recorded keyword arguments
+    hold the pools of every transaction the spies saw, the profile
+    transactions' scratch included, so a test that measures the device memory
+    the model retains drops them first."""
+    from vllm_nemotron_asr_streaming.nemotron_asr import advance
+
+    spy = advance.advance_model_rows
+    while isinstance(spy, AdvanceSpy):
+        spy.calls.clear()
+        spy.kwargs.clear()
+        spy = spy._real
+
+
 class Trap:
     """Forwards to ``target`` until ``armed``; then any attribute read fails.
     ``reads`` records every attribute read."""

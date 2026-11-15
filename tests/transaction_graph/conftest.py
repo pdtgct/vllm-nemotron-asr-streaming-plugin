@@ -51,6 +51,32 @@ def pytest_configure(config: pytest.Config) -> None:
         "slow: an exhaustive case the tier record requires but a developer loop "
         'may deselect (-m "not slow")',
     )
+    config.addinivalue_line(
+        "markers",
+        "installed_engine(name, ...): the test reads the named engine runs of its "
+        "module's ENGINE_RUNS, started in child processes before any test runs "
+        "(support.engine_child)",
+    )
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Start the installed-engine runs the selected, unskipped tests name,
+    one at a time, before any test runs (``support.engine_child``): the
+    in-process CUDA tests leave device memory allocated in this process, and
+    each engine needs its fraction of the device free."""
+    if session.config.option.collectonly:
+        return
+    runs = []
+    for item in session.items:
+        marker = item.get_closest_marker("installed_engine")
+        if marker is None or item.get_closest_marker("skip") is not None:
+            continue
+        table = getattr(item.module, "ENGINE_RUNS", {})
+        runs.extend((name, table[name]) for name in marker.args)
+    if runs:
+        from support.engine_child import prestart
+
+        prestart(runs)
 
 
 @pytest.fixture

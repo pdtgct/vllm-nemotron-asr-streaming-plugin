@@ -21,6 +21,7 @@ import torch
 from support import model_harness as h
 from support import txgcap_harness as t
 from support.fake_cuda import FakeCuda
+from support.isolation import ran_in_child
 from support.txg_api import Record
 
 pytestmark = pytest.mark.engine
@@ -701,41 +702,127 @@ def test_transaction_graph_part_is_released_before_the_segment_graphs(on_cpu, re
 # CUDA
 
 
+def _released() -> tuple[int, int]:
+    """Device memory after everything unreferenced is returned: the test
+    spies' recorded transaction arguments are dropped (they hold every
+    transaction's pools, the profile transactions' scratch included), then a
+    collection, a synchronize, PyTorch's per-stream cuBLAS workspaces (a
+    library cache: the first matmul on a stream, such as the capture stream
+    core creates for each capture call, allocates one of 8,519,680 bytes on
+    the A40 that PyTorch keeps for the process) and the allocator's cache
+    release. Returns the allocator's reserved bytes and the driver's free
+    bytes."""
+    h.drop_advance_records()
+    gc.collect()
+    torch.cuda.synchronize()
+    torch._C._cuda_clearCublasWorkspaces()
+    torch.cuda.empty_cache()
+    return torch.cuda.memory_reserved(), torch.cuda.mem_get_info()[0]
+
+
+def _warm_the_process(on_cuda) -> None:
+    """One throwaway profiling capture and release: the process's first
+    capture loads kernels and creates library handles for core's capture
+    stream, device memory outside the allocator that no release returns
+    (about 70 MiB on the A40, once per process), so a driver-level reading
+    of a later capture measures only that capture."""
+    env = on_cuda(n=2)
+    env.core.prepare()
+    env.core.bind_profiling()
+    env.core.profiling_capture()
+    env.core.clear()
+    env.state.shutdown()
+
+
+#: The transaction-graph part of the model, as an allocation's stack names it.
+TRANSACTION_GRAPH_SOURCE = (
+    "vllm_nemotron_asr_streaming/nemotron_asr/transaction_graph.py"
+)
+
+
+def _allocations_during(fn) -> list[list[str]]:
+    """The Python stacks of every device allocation the caching allocator
+    traces while ``fn`` runs (``torch.cuda.memory._record_memory_history``)."""
+    torch.cuda.synchronize()
+    torch.cuda.memory._record_memory_history(max_entries=200_000)
+    try:
+        fn()
+        torch.cuda.synchronize()
+        snapshot = torch.cuda.memory._snapshot()
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
+    device = torch.cuda.current_device()
+    return [
+        [f"{frame['filename']}:{frame['line']}" for frame in entry.get("frames", [])]
+        for entry in snapshot["device_traces"][device]
+        if entry["action"] in ("alloc", "segment_alloc")
+    ]
+
+
 @pytest.mark.gpu
 # @spec TXG-LIFE-001
 def test_prepare_execution_memory_allocates_no_device_memory_for_the_option_cuda(
-    on_cuda, monkeypatch, tmp_path
+    on_cuda, monkeypatch, tmp_path, request
 ):
+    """The allocator's own trace of the preparation with the option on holds
+    no allocation from the transaction-graph part (the positive control: it
+    holds the preparation's own allocations), and the device memory the
+    preparation leaves allocated is the option-off preparation's. Each arm is
+    a fresh model; a throwaway preparation first takes the process's one-time
+    allocations, and the retained bytes are read with the spies' records
+    dropped, after a collection and with PyTorch's cuBLAS workspaces cleared
+    (``_released``). On the A40 each arm then retains 479,232 bytes, the
+    encoder's extended positional-encoding buffer. The test runs alone in a
+    child pytest process (``support.isolation``)."""
+    if ran_in_child(request):
+        return
+
     def delta(env):
-        torch.cuda.synchronize()
+        _released()
         before = torch.cuda.memory_allocated()
         env.runner.prepare_execution_memory()
-        torch.cuda.synchronize()
+        _released()
         return torch.cuda.memory_allocated() - before
 
+    delta(on_cuda(n=2).option_off())
     on = on_cuda(n=2)
-    on_delta = delta(on)
-    off = on_cuda(n=2).option_off()
-    assert on_delta == delta(off), "the option allocated device memory in preparation"
+    stacks = _allocations_during(on.runner.prepare_execution_memory)
+    assert stacks, "the allocator traced no allocation of the preparation"
+    from_option = [s for s in stacks if any(TRANSACTION_GRAPH_SOURCE in f for f in s)]
+    assert not from_option, ("the option allocated device memory", from_option[:3])
+    off, on_delta = delta(on_cuda(n=2).option_off()), delta(on_cuda(n=2))
+    assert on_delta == off, ("the option's preparation retains more", on_delta, off)
 
 
 @pytest.mark.gpu
 # @spec TXG-LIFE-004, TXG-LIFE-005, TXG-LIFE-006, TXG-LIFE-013
-def test_lifecycle_captures_releases_and_serves_on_cuda(on_cuda):
+def test_lifecycle_captures_releases_and_serves_on_cuda(on_cuda, request):
+    """Released: the allocator's reserved bytes (cells, binding-owned buffers,
+    margin and the profiling graph pool's segments) return to their level
+    before the capture, and the driver's free memory within 8 MiB of it, with
+    the process's first-capture costs taken by ``_warm_the_process``. The test
+    runs alone in a child pytest process (``support.isolation``)."""
+    if ran_in_child(request):
+        return
+    _warm_the_process(on_cuda)
     env = on_cuda(n=2)
     core = env.core
     core.prepare()
     core.bind_profiling()
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    free_before = torch.cuda.mem_get_info()[0]
+    reserved_before, free_before = _released()
     core.profiling_capture()
     assert len(t.record(env)[Record.PROFILING][Record.CELLS]) == 2 * env.n
     core.clear()
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    assert torch.cuda.mem_get_info()[0] >= free_before - (8 << 20), (
-        "the profiling capture and its margin were not released"
+    reserved_after, free_after = _released()
+    assert reserved_after <= reserved_before, (
+        "the profiling capture and its margin were not released to the allocator",
+        reserved_before,
+        reserved_after,
+    )
+    assert free_after >= free_before - (8 << 20), (
+        "the profiling capture and its margin were not released",
+        free_before,
+        free_after,
     )
     core.bind_serving()
     core.serving_capture()
@@ -750,7 +837,13 @@ def test_lifecycle_captures_releases_and_serves_on_cuda(on_cuda):
 
 @pytest.mark.gpu
 # @spec TXG-LIFE-012
-def test_failed_cell_capture_on_cuda_returns_its_memory(on_cuda, monkeypatch):
+def test_failed_cell_capture_on_cuda_returns_its_memory(on_cuda, monkeypatch, request):
+    """Measured as in ``test_lifecycle_captures_releases_and_serves_on_cuda``,
+    with the propagated error still held (it keeps no reference to the
+    call's tensors or graphs)."""
+    if ran_in_child(request):
+        return
+    _warm_the_process(on_cuda)
     env = on_cuda(n=2)
     core = env.core
     core.prepare()
@@ -764,19 +857,22 @@ def test_failed_cell_capture_on_cuda_returns_its_memory(on_cuda, monkeypatch):
         if calls["n"] == 2:
             raise RuntimeError("injected fault in cell capture")
 
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    free_before = torch.cuda.mem_get_info()[0]
+    reserved_before, free_before = _released()
     monkeypatch.setattr(torch.cuda.CUDAGraph, "capture_end", capture_end)
     error = h.call_with(core.profiling_capture)
     monkeypatch.setattr(torch.cuda.CUDAGraph, "capture_end", original)
     assert error is not None
     assert any("injected fault" in str(e) for e in t.chain(error))
-    gc.collect()
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    assert torch.cuda.mem_get_info()[0] >= free_before - (8 << 20), (
-        "the failed call's graphs or buffers remain"
+    reserved_after, free_after = _released()
+    assert reserved_after <= reserved_before, (
+        "the failed call's graphs or buffers remain in the allocator",
+        reserved_before,
+        reserved_after,
+    )
+    assert free_after >= free_before - (8 << 20), (
+        "the failed call's graphs or buffers remain",
+        free_before,
+        free_after,
     )
     core.clear()
     env.state.shutdown()

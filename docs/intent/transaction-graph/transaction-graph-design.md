@@ -513,7 +513,8 @@ reads of nested counters are deltas from a baseline taken after startup.
 Capturing one cell runs, on core's capture stream, an eager reference of the body on capture rows
 that the transaction rejects (so no page is stored), three warm-ups with the nested bindings
 running eagerly (Flat capture), the capture, and one
-replay whose outputs and pages must equal the reference bit for bit before the cell is published.
+replay whose outputs, and whose null page and capture rows' pages in every component pool, must
+equal the reference bit for bit before the cell is published.
 Capture rows use non-null free pages `1 … k`, which the populations bound guarantees in both
 pools. A CHUNK capture row carries a zero envelope header (`ROW_STATUS_ENVELOPE`); an echo capture
 row carries the stream carrier token (`ROW_STATUS_ROLE_MISMATCH`). Capture rows carry the server's
@@ -543,7 +544,8 @@ prefix and drops the configured pre-encode outputs; each row's encoder length is
 at zero, and zero when the row produced no new frames. Decode reads at most the first `L + 1`
 encoder frames. These are per-row device values within one chunk cell. Replay equals the
 option-off transaction for: a one-chunk session (fresh and final in one row); a final tail among
-regular continuing rows; a final chunk followed by REPLAY drains and a FLUSH; and an oversized
+regular continuing rows; a final chunk followed by REPLAY drains and a FLUSH row, as a direct
+engine client schedules it; and an oversized
 final tail, whose row is rejected while the other rows commit and whose request then fails alone
 (`session`, SESS-MODEL-003). These rules are the acoustic transition's 160 ms behaviour with the
 option off; this component states them because its cells must reproduce them, and they add no
@@ -1131,7 +1133,7 @@ procedure and rules; and U(1)'s audio, plan and procedure. A change after that v
 - Under a fixed budget the startup log carries the uncharged-memory WARNING with the figures; with
   the profiling capture suppressed where the configuration requires it, startup fails.
 - Each refusal refuses its configuration: the option under `--enforce-eager`, at a geometry other
-  than 80 or 160 ms, with native burst, every other row of Configuration checks, and a core without
+  than 80 or 160 ms, with native burst at 160 ms (at 80 ms the lookahead check refuses it first), every other row of Configuration checks, and a core without
   #67583's hooks (`registration`).
 - **Recovery.** A test-only fault injected after the first launch of a split step latches the
   binding, the engine reports dead (`EngineDeadError` to the client), and a fresh engine process

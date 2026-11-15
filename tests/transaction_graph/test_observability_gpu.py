@@ -4,7 +4,6 @@ CUDA (TXG-OBS-001 to TXG-OBS-008, TXG-CFG-002)."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 import pytest
@@ -163,14 +162,14 @@ def test_a_second_engine_starts_with_clean_counters(on_cuda):
     assert sum(counters["replays"].values()) == 0
 
 
-# @spec TXG-OBS-008
-def test_reader_runs_on_the_worker_under_a_multiprocess_engine(tmp_path):
-    from support import model_harness as h
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.v1.engine.async_llm import AsyncLLM
+def _multiprocess_reader_run() -> dict:
+    import tempfile
+    from pathlib import Path
 
-    card = h.write_runnable_card(tmp_path / "card")
-    args = AsyncEngineArgs(
+    from support import model_harness as h
+
+    card = h.write_runnable_card(Path(tempfile.mkdtemp(prefix="txg-obs-")) / "card")
+    settings = dict(
         model=str(card),
         config_format="nemotron_asr_streaming",
         load_format="dummy",
@@ -188,16 +187,30 @@ def test_reader_runs_on_the_worker_under_a_multiprocess_engine(tmp_path):
         async_scheduling=False,
         gpu_memory_utilization=0.3,
     )
+    # A callable sent through collective_rpc is pickled, which core allows
+    # only with insecure serialization on.
+    return {
+        "mode": "async",
+        "settings": settings,
+        "reads": ["counters"],
+        "env": {"VLLM_ALLOW_INSECURE_SERIALIZATION": "1"},
+    }
 
-    async def read():
-        llm = AsyncLLM.from_engine_args(args)
-        try:
-            return await llm.collective_rpc(
-                api.graph_module().transaction_graph_counters
-            )
-        finally:
-            llm.shutdown()
 
-    readings = asyncio.run(read())
+#: This module's engine run (``support.engine_child``).
+ENGINE_RUNS = {"multiprocess-reader": _multiprocess_reader_run}
+
+
+@pytest.mark.installed_engine("multiprocess-reader")
+# @spec TXG-OBS-008
+def test_reader_runs_on_the_worker_under_a_multiprocess_engine(tmp_path):
+    """``AsyncLLM`` (its engine core in another process) in a child process
+    started before the session's tests (``support.engine_child``); the
+    reader is sent to the worker through ``AsyncLLM.collective_rpc``."""
+    from support.engine_child import reply
+
+    result = reply("multiprocess-reader", _multiprocess_reader_run, tmp_path)
+    assert result["ok"], (result.get("error") or {}).get("traceback", result)
+    readings = result["reads"]["counters"]
     assert len(readings) == 1
     assert readings[0]["counters"]["captured_cells"] == 2 * N

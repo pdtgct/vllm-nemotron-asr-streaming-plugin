@@ -143,6 +143,7 @@ def test_a_declined_step_reserves_nothing_and_changes_no_page(on_cuda):
 # @spec TXG-EXEC-003
 def test_a_pre_launch_failure_propagates_without_latching(on_cuda, monkeypatch, where):
     from support import model_harness as h
+    from support import txgcap_harness as t
 
     env = on_cuda(startup=True, lookahead=0, n=N)
     events = []
@@ -166,10 +167,13 @@ def test_a_pre_launch_failure_propagates_without_latching(on_cuda, monkeypatch, 
     d.add_stream("s1", [{}])
     if where == "prepare":
         spy_phase(monkeypatch, events, api.PHASES[0], fail=injected)
-    before = h.pool_tensor(env.bindings).clone()
+    # The pages at the step's start: core's slot initialization of the new
+    # request's slot (``activate_requests``) precedes the model's step.
+    start = t.pool_at_step_start(env.bindings)
     with pytest.raises(RuntimeError, match="injected"):
         d.step()
-    assert torch.equal(before, h.pool_tensor(env.bindings)), "a page changed"
+    assert "pool" in start, "the step never reached activate_requests"
+    assert torch.equal(start["pool"], h.pool_tensor(env.bindings)), "a page changed"
     assert env.binding.failed is False
     assert not [e for e in events if e[0] == "replay"]
     record = records[-1]
@@ -297,16 +301,8 @@ def test_execute_uses_the_runners_current_stream(on_cuda, monkeypatch):
     events = []
     env.compare(events=events)
     env.spy_replays(events)
-    created = []
-    real_stream = torch.cuda.Stream
-
-    class Counting(real_stream):
-        def __new__(cls, *args, **kwargs):
-            created.append(1)
-            return real_stream.__new__(real_stream, *args, **kwargs)
-
     side = torch.cuda.Stream()
-    monkeypatch.setattr(torch.cuda, "Stream", Counting)
+    created = g.spy_stream_creation(monkeypatch)
     d = g.Driver(env)
     d.add_stream("s1", [{}, {}])
     d.add_file("f1", 3000)

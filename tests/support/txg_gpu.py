@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import os
+import sys
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -374,6 +376,38 @@ def build_option_on(
     return env
 
 
+#: The plugin package's directory, as a frame's file name contains it.
+PLUGIN_PACKAGE = os.sep + "vllm_nemotron_asr_streaming" + os.sep
+
+
+def spy_stream_creation(monkeypatch) -> list[str]:
+    """Replace ``torch.cuda.Stream`` so that each new device stream the model
+    creates is recorded (by the creating plugin file) in the returned list.
+
+    Not recorded: a ``Stream(stream_id=…)`` wrapper of an existing stream,
+    which ``torch.cuda.current_stream`` builds on every call (and
+    ``torch.cuda.graph`` on every capture), and a stream created with no frame
+    of the plugin's package on the stack (core's capture context creates the
+    capture stream it passes to the hook; a test creates its own). The
+    replacement returns plain ``torch.cuda.Stream`` objects."""
+    created: list[str] = []
+    real = torch.cuda.Stream
+
+    class Recording(real):
+        def __new__(cls, *args, **kwargs):
+            if "stream_id" not in kwargs:
+                frame = sys._getframe(1)
+                while frame is not None:
+                    if PLUGIN_PACKAGE in frame.f_code.co_filename:
+                        created.append(frame.f_code.co_filename)
+                        break
+                    frame = frame.f_back
+            return real.__new__(real, *args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "Stream", Recording)
+    return created
+
+
 def memcpy_counts(profile) -> dict[str, int]:
     """Memcpy events of a ``torch.profiler`` run by direction."""
     counts = {"HtoD": 0, "DtoH": 0, "DtoD": 0}
@@ -534,8 +568,11 @@ class Driver:
             if slot is not None:
                 self._free.append(slot[0])
             self.finished.append(r)
-        if not new and not cached:
+        if not new and not cached and not finished:
             return None
+        # A step that schedules nothing but reports finished requests still
+        # runs, as core's cleanup-only step: the model state releases the
+        # requests whose slots the next step may reissue.
         before = len(self.env.runner.commit_log)
         result = self.env.runner.real_step(output)
         if len(self.env.runner.commit_log) > before:

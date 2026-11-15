@@ -580,26 +580,38 @@ def test_host_staging_inside_an_outer_capture_raises_cuda(on_cuda, monkeypatch):
 
 
 @pytest.mark.gpu
-# @spec TXG-CAP-004, TXG-CAP-011
+@pytest.mark.parametrize("page", [1, 0], ids=["capture-row-page", "null-page"])
+# @spec TXG-CAP-004, TXG-CAP-008, TXG-CAP-011
 def test_corrupted_validation_replay_fails_and_publishes_nothing_cuda(
-    on_cuda, monkeypatch
+    on_cuda, monkeypatch, page
 ):
+    """Every replay in the call (the segment graphs' and the cells') writes a
+    value no earlier replay wrote into one page of the profiling pool, so the
+    page after each cell's validation replay differs from the page at the
+    start of the call's transaction-graph part: page 1, which the capture rows
+    gather, or the null page, which no capture may store to either. The pool
+    is one flat byte tensor (``model_harness.real_bindings``); a page is
+    ``model_harness.slot_bytes``."""
     env = on_cuda(n=2)
     core = env.core
     core.prepare()
     bindings = core.bind_profiling()
     original = torch.cuda.CUDAGraph.replay
+    replays = []
 
     def replay(self):
         original(self)
-        tensor = h.pool_tensor(bindings)
-        tensor.view(-1)[: tensor[0].numel()].fill_(0)
-        tensor[1].fill_(7)
+        replays.append(1)
+        h.slot_bytes(bindings, page).fill_(len(replays) % 255 + 1)
 
     monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", replay)
     error = h.call_with(core.profiling_capture)
     monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", original)
     assert error is not None, "the mismatching validation replay was accepted"
+    assert "validation replay" in t.text(error), t.text(error)
+    from support import txg_api
+
+    assert not txg_api.binding_of(env.model).cells, "a cell was published"
     core.clear()
 
 
@@ -628,14 +640,6 @@ def test_capture_stores_no_page_cuda(on_cuda):
 # @spec TXG-CAP-009
 def test_cells_use_cores_stream_and_pool_cuda(on_cuda, monkeypatch):
     env = on_cuda(n=2)
-    created = []
-    original_stream = torch.cuda.Stream
-
-    class CountingStream(original_stream):
-        def __new__(cls, *args, **kwargs):
-            created.append(1)
-            return super().__new__(cls, *args, **kwargs)
-
     pools = []
     original_graph = torch.cuda.graph
 
@@ -649,9 +653,11 @@ def test_cells_use_cores_stream_and_pool_cuda(on_cuda, monkeypatch):
     env.core.profiling_capture()
     env.core.clear()
     env.core.bind_serving()
-    monkeypatch.setattr(torch.cuda, "Stream", CountingStream)
-    monkeypatch.setattr(torch.cuda, "graph", SpyGraph)
+    from support import txg_gpu
     from vllm.platforms import current_platform
+
+    created = txg_gpu.spy_stream_creation(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "graph", SpyGraph)
 
     env.core.serving_capture()
     cells = [p for p in pools if p[0] == current_platform.get_global_graph_pool()]

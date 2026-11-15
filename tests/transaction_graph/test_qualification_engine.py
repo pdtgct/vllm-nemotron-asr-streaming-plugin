@@ -4,9 +4,15 @@
 Installed-engine checks (``card``: the published checkpoint named by
 ``NEMOTRON_CARD_DIR``): startup refusals (TXG-QUAL-023), the uncharged
 WARNING and the required-but-suppressed profiling capture (TXG-QUAL-022),
-and core's graph-memory estimate against ``B_hook`` (TXG-QUAL-021). They run
-the engine core in process (``VLLM_ENABLE_V1_MULTIPROCESSING=0``) so a test
-can read the worker and patch core.
+and core's graph-memory estimate against ``B_hook`` (TXG-QUAL-021). Each
+engine runs in a fresh child process with its engine core and worker in that
+process (``support.engine_child``: ``LLMEngine`` with
+``VLLM_ENABLE_V1_MULTIPROCESSING=0``; ``AsyncLLM`` always runs the engine core
+out of process in the stage 1 build), so a check reads the worker's log
+records and figures, patches core, and sees the worker's own startup error.
+The engines start, one at a time, before any test of the session runs
+(marker ``installed_engine``), so none shares the device with memory the
+in-process tests left in the pytest process.
 
 Harness checks (the runnable synthetic card, ``support.txgcap_harness``):
 the expected fallbacks of ``K > N`` and ``E > N`` steps with outputs equal to
@@ -18,8 +24,6 @@ qualification-run obligations.
 
 from __future__ import annotations
 
-import asyncio
-import logging
 import os
 from typing import Any
 
@@ -35,9 +39,9 @@ pytestmark = [pytest.mark.gpu, pytest.mark.engine]
 N = 64
 
 
-def engine_args(**overrides: Any) -> Any:
-    from vllm.engine.arg_utils import AsyncEngineArgs
-
+def engine_settings(**overrides: Any) -> dict[str, Any]:
+    """The ``AsyncEngineArgs`` keywords of the hook configuration with the
+    option at ``N`` (``hf`` entries set to ``...`` are removed)."""
     card = os.environ.get("NEMOTRON_CARD_DIR")
     if not card:
         pytest.skip("NEMOTRON_CARD_DIR not set")
@@ -58,7 +62,13 @@ def engine_args(**overrides: Any) -> Any:
         hf_overrides=hf,
     )
     settings.update(overrides)
-    return AsyncEngineArgs(**settings)
+    return settings
+
+
+def engine_args(**overrides: Any) -> Any:
+    from vllm.engine.arg_utils import AsyncEngineArgs
+
+    return AsyncEngineArgs(**engine_settings(**overrides))
 
 
 def create_config(args: Any) -> Any:
@@ -75,7 +85,13 @@ def create_config(args: Any) -> Any:
 REFUSALS = {
     "enforce-eager": dict(enforce_eager=True),
     "320-ms": dict(hf={"num_lookahead_tokens": 3}),
-    "native-burst": dict(hf={"experimental_native_burst": True}),
+    # At lookahead 1, where native burst is otherwise valid: at lookahead 0
+    # the model configuration hook refuses native burst first (REG-LA-007),
+    # before the configuration hook evaluates the transaction-graph checks
+    # (REG-VAL-008); each hook lists its own failed checks (REG-VAL-003).
+    "native-burst": dict(
+        hf={"experimental_native_burst": True, "num_lookahead_tokens": 1}
+    ),
     "not-a-list": dict(hf={t.OPTION: N}),
     "bool": dict(hf={t.OPTION: [True]}),
     "duplicate": dict(hf={t.OPTION: [N, N]}),
@@ -130,111 +146,74 @@ def test_startup_is_refused_on_a_core_without_the_model_state_hooks(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# Installed engine in process
+# Installed engine, one child process per engine (``support.engine_child``)
 
 
-@pytest.fixture
-def in_process(monkeypatch):
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    loop = asyncio.new_event_loop()
-    engines = []
-
-    def start(args):
-        from vllm.v1.engine.async_llm import AsyncLLM
-
-        from vllm_nemotron_asr_streaming import register
-
-        register()
-
-        async def make():
-            return AsyncLLM.from_engine_args(args)
-
-        llm = loop.run_until_complete(make())
-        engines.append(llm)
-        return llm
-
-    def rpc(llm, fn):
-        return loop.run_until_complete(llm.collective_rpc(fn))[0]
-
-    yield start, rpc
-    for llm in engines:
-        try:
-            llm.shutdown()
-        except Exception:  # noqa: BLE001 - already shut down by the test
-            pass
-    loop.close()
+def _run(settings: dict[str, Any], *, patch=None, reads=()) -> dict[str, Any]:
+    return {"mode": "llm", "settings": settings, "patch": patch, "reads": list(reads)}
 
 
-class Capture(logging.Handler):
-    def __init__(self):
-        super().__init__(logging.DEBUG)
-        self.records: list[logging.LogRecord] = []
+#: The engine runs of this module's checks, by name. The conftest starts the
+#: selected ones before any test runs (``support.engine_child.prestart``).
+ENGINE_RUNS = {
+    "fixed-budget": lambda: _run(
+        engine_settings(kv_cache_memory_bytes=8 << 30), reads=("record",)
+    ),
+    "suppressed-profiling": lambda: _run(engine_settings(), patch="suppress-profiling"),
+    "b-hook-1": lambda: _run(engine_settings(hf={t.OPTION: ...}), reads=("estimate",)),
+    "b-hook-2": lambda: _run(engine_settings(hf={t.OPTION: ...}), reads=("estimate",)),
+    "option-on": lambda: _run(engine_settings(), reads=("estimate", "record")),
+}
 
-    def emit(self, record):
-        self.records.append(record)
+
+def engine(name: str, tmp_path) -> dict[str, Any]:
+    from support.engine_child import reply
+
+    return reply(name, ENGINE_RUNS[name], tmp_path)
+
+
+def started(reply):
+    assert reply["ok"], (reply.get("error") or {}).get("traceback", reply)
+    return reply
 
 
 @pytest.mark.card
+@pytest.mark.installed_engine("fixed-budget")
 # @spec TXG-QUAL-022
-def test_a_fixed_budget_logs_the_uncharged_warning_with_its_figures(in_process):
-    start, rpc = in_process
-    handler = Capture()
-    logger = logging.getLogger("vllm_nemotron_asr_streaming")
-    logger.addHandler(handler)
-    try:
-        llm = start(engine_args(kv_cache_memory_bytes=8 << 30))
-    finally:
-        logger.removeHandler(handler)
+def test_a_fixed_budget_logs_the_uncharged_warning_with_its_figures(tmp_path):
+    reply = started(engine("fixed-budget", tmp_path))
     warnings = [
-        r.getMessage()
-        for r in handler.records
-        if r.levelno == logging.WARNING and "not charged" in r.getMessage()
+        message
+        for level, message in reply["records"]
+        if level == "WARNING" and "not charged" in message
     ]
-    assert len(warnings) == 1, [r.getMessage() for r in handler.records]
-    record = rpc(llm, _record_of_worker)
-    serving = record[Record.SERVING]
+    assert len(warnings) == 1, reply["records"]
+    serving = reply["reads"]["record"][Record.SERVING]
     for value in (serving[Record.CALL_TOTAL], serving[Record.TXN_TOTAL]):
         assert t.mentions_bytes(warnings[0], value), (value, warnings[0])
 
 
 @pytest.mark.card
+@pytest.mark.installed_engine("suppressed-profiling")
 # @spec TXG-QUAL-022
-def test_a_suppressed_required_profiling_capture_fails_startup(in_process, monkeypatch):
-    from vllm.v1.worker.gpu import model_runner
-
-    start, _ = in_process
-    monkeypatch.setattr(
-        model_runner.GPUModelRunner, "profile_cudagraph_memory", lambda self: 0
-    )
-    error = h.call_with(start, engine_args())
-    assert error is not None, "startup succeeded without the required estimate"
-    assert t.OPTION in t.text(error), t.text(error)
-
-
-def _record_of_worker(worker):
-    from support import txg_api
-
-    return txg_api.counters(worker)["capture_record"]
-
-
-def _estimate_of_worker(worker):
-    return int(getattr(worker, "cudagraph_memory_estimate", 0)), int(
-        getattr(worker, "available_kv_cache_memory_bytes", 0)
-    )
+def test_a_suppressed_required_profiling_capture_fails_startup(tmp_path):
+    reply = engine("suppressed-profiling", tmp_path)
+    assert not reply["ok"], "startup succeeded without the required estimate"
+    error = reply["error"]
+    assert t.OPTION in "\n".join(error["messages"]), error["traceback"]
 
 
 @pytest.mark.card
+@pytest.mark.installed_engine("b-hook-1", "b-hook-2", "option-on")
 # @spec TXG-QUAL-021
-def test_cores_estimate_charges_the_profiling_transaction_total(in_process, capsys):
-    start, rpc = in_process
-    baseline = []
-    for _ in range(2):
-        llm = start(engine_args(hf={t.OPTION: ...}))
-        baseline.append(rpc(llm, _estimate_of_worker))
-        llm.shutdown()
-    llm = start(engine_args())
-    estimate, kv = rpc(llm, _estimate_of_worker)
-    record = rpc(llm, _record_of_worker)
+def test_cores_estimate_charges_the_profiling_transaction_total(tmp_path, capsys):
+    baseline = [
+        started(engine(name, tmp_path))["reads"]["estimate"]
+        for name in ("b-hook-1", "b-hook-2")
+    ]
+    reply = started(engine("option-on", tmp_path))
+    estimate, kv = reply["reads"]["estimate"]
+    record = reply["reads"]["record"]
     spread = abs(baseline[0][0] - baseline[1][0])
     transaction = record[Record.PROFILING][Record.TXN_TOTAL]
     assert estimate - max(b[0] for b in baseline) >= transaction - spread, (
