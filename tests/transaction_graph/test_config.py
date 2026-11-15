@@ -193,6 +193,10 @@ def test_populations_condition(value):
     found = mentioning(errors, KEY)
     assert len(found) == 1, errors
     assert repr(value) in found[0] or str(value) in found[0], found
+    if value == [65]:
+        # The batching limit is engine configuration that ``largest_population``
+        # does not see; only the configuration check can refuse this value.
+        return
     with pytest.raises(ValueError):
         api.largest_population(hf_config(value))
 

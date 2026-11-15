@@ -3,10 +3,10 @@
 
 The model implements five encoder geometries, identified by their right
 context (the lookahead in encoder frames). This module holds the one table
-relating right context, cadence label and geometry index, and reads the
-served lookahead set and the default lookahead from a served
-configuration. The checks that refuse a bad selection run in the
-model-configuration hook (``streaming_config``), after every
+relating right context, cadence label and geometry index, and
+``served_lookahead``, the one reader of the server's lookahead: a server
+serves exactly one geometry. The checks that refuse a bad selection run in
+the model-configuration hook (``streaming_config``), after every
 ``--hf-overrides`` key has been applied.
 
 Importing this module imports no vLLM.
@@ -14,7 +14,6 @@ Importing this module imports no vLLM.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Any
 
 #: (right context, cadence label, geometry index). The geometry index is the
@@ -70,69 +69,41 @@ def right_context_for_label(label: str) -> int:
         ) from None
 
 
-def served_lookahead_source(hf_config: Any) -> str:
-    """Name the configuration field the served set is read from."""
-    if getattr(hf_config, "supported_num_lookahead_tokens", None) is not None:
-        return "supported_num_lookahead_tokens"
-    return "card_num_lookahead_tokens"
+_ABSENT = object()
 
 
-# @spec REG-LA-001
-def served_lookaheads(hf_config: Any) -> list[int]:
-    """Return the served lookahead set.
-
-    It is ``supported_num_lookahead_tokens`` when the configuration has it
-    (set by ``--hf-overrides``, or stored by an already-translated
-    configuration), and ``card_num_lookahead_tokens`` otherwise. The result
-    is not validated here; an absent set is empty.
-    """
-    value = getattr(hf_config, "supported_num_lookahead_tokens", None)
-    if value is None:
-        value = getattr(hf_config, "card_num_lookahead_tokens", None)
-    if value is None:
-        return []
-    if isinstance(value, Sequence) and not isinstance(value, str):
-        return list(value)
-    raise ValueError(
-        f"{served_lookahead_source(hf_config)} must be a list of integers, "
-        f"got {value!r}"
+def _implemented_message(field: str, value: object) -> str:
+    return (
+        f"{field} {value!r} is not an implemented right context "
+        f"(one of {', '.join(str(r) for r in IMPLEMENTED_RIGHT_CONTEXTS)})"
     )
 
 
-def default_lookahead(hf_config: Any) -> int | None:
-    """Return the configuration's default lookahead, or ``None`` when unset."""
-    return getattr(hf_config, "num_lookahead_tokens", None)
+# @spec REG-LA-001
+def served_lookahead(hf_config: Any) -> int:
+    """Return the server's one lookahead (right context).
 
-
-def validate_selected_lookahead(
-    *,
-    selected: object,
-    supported: object,
-    require_160ms_profile: bool = False,
-) -> None:
-    """Check a configuration's selected right context.
-
-    ``selected`` has to be an implemented right context and, when
-    ``supported`` is given, one of its members. The native-burst 160 ms
-    profile needs right context 1; the served set is not required to be
-    exactly ``(1,)``.
+    It is ``num_lookahead_tokens`` when the configuration has it (set by
+    ``--hf-overrides``, or stored by an already-translated configuration),
+    and ``card_default_num_lookahead_tokens`` otherwise. A present value is
+    used as it stands: ``None``, a ``bool``, a non-integer or a value that is
+    not an implemented right context raises ``ValueError`` naming the field,
+    as does a configuration that has neither field.
     """
-    if (
-        isinstance(selected, bool)
-        or not isinstance(selected, int)
-        or selected not in IMPLEMENTED_RIGHT_CONTEXTS
-    ):
-        raise ValueError(
-            f"lookahead {selected!r} is not an implemented right context "
-            f"{IMPLEMENTED_RIGHT_CONTEXTS}"
-        )
-    if supported is not None and selected not in list(supported):  # type: ignore[call-overload]
-        raise ValueError(
-            f"lookahead {selected} is not in the served set {sorted(supported)}"  # type: ignore[call-overload]
-        )
-    if require_160ms_profile and selected != NATIVE_BURST_LOOKAHEAD:
-        raise ValueError(
-            "native burst's 160ms profile needs att_context_right=1, and "
-            "1 must be in the served lookahead set. The served set is not "
-            "required to be exactly (1,)."
-        )
+    for field in ("num_lookahead_tokens", "card_default_num_lookahead_tokens"):
+        value = getattr(hf_config, field, _ABSENT)
+        if value is _ABSENT:
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value not in IMPLEMENTED_RIGHT_CONTEXTS
+        ):
+            raise ValueError(_implemented_message(field, value))
+        return int(value)
+    raise ValueError(
+        "the server's lookahead is not set: the configuration has neither "
+        "num_lookahead_tokens nor card_default_num_lookahead_tokens. Set it "
+        "with --hf-overrides '{\"num_lookahead_tokens\": <N>}', N one of "
+        f"{', '.join(str(r) for r in IMPLEMENTED_RIGHT_CONTEXTS)}"
+    )

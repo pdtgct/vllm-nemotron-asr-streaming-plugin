@@ -170,6 +170,7 @@ async def _drain(queue: asyncio.Queue) -> None:
 
 
 # @spec SESS-RT-001, SESS-RT-002, SESS-RT-003, SESS-PACK-008, SESS-EP-001
+# @spec SESS-GEOM-001, SESS-GEOM-002
 async def pack_realtime(
     audio_stream: AsyncIterator[Any],
     input_stream: asyncio.Queue,
@@ -177,13 +178,17 @@ async def pack_realtime(
 ) -> AsyncIterator[dict[str, Any]]:
     """Pack ``audio_stream`` for core's realtime route.
 
-    Yields one prompt per unit at the served default lookahead and the default
-    locale, then the final tail when ``audio_stream`` ends. ``input_stream`` is
-    drained, unused, for the life of the stream. A ``PackerCapacityError``
-    propagates, so the stream never ends with a normal close.
+    Yields one prompt per unit at the server's geometry (``served_lookahead``)
+    and the default locale, then the final tail when ``audio_stream`` ends.
+    ``input_stream`` is drained, unused, for the life of the stream. A
+    ``PackerCapacityError`` propagates, so the stream never ends with a normal
+    close.
     """
     from vllm_nemotron_asr_streaming.locales import default_locale
-    from vllm_nemotron_asr_streaming.lookahead import GEOMETRIES, default_lookahead
+    from vllm_nemotron_asr_streaming.lookahead import (
+        geometry_index,
+        served_lookahead,
+    )
 
     table = hf_config.prompt_dictionary
     locale = default_locale(table)
@@ -192,11 +197,10 @@ async def pack_realtime(
             "the locale table has several locales and no 'auto'; the realtime "
             f"route cannot choose one: {sorted(table)}"
         )
-    right_context = default_lookahead(hf_config)
-    geometry = {r: gi for r, _label, gi in GEOMETRIES}[right_context]
+    right_context = served_lookahead(hf_config)
     packer = Packer(
         right_context=right_context,
-        geometry_index=geometry,
+        geometry_index=geometry_index(right_context),
         locale_row=table[locale],
         carrier_token_id=hf_config.audio_chunk_token_id,
     )

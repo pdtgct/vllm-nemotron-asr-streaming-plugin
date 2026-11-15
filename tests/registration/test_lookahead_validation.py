@@ -396,6 +396,7 @@ def test_a_missing_lookahead_is_listed_with_the_other_failures(
         make_model_config(
             path,
             overrides={"language_locales": {"en": "fr-FR"}},
+            lookahead=None,
             max_model_len=77,
         )
     message = str(excinfo.value)

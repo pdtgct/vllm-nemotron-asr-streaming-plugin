@@ -40,8 +40,8 @@ macOS loader chain and is differentially tested locally.
 from __future__ import annotations
 
 import math
-from collections.abc import Collection, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass, field, fields
 
 import torch
 
@@ -272,6 +272,12 @@ class PlanContext:
     endpoint_threshold_frames: torch.Tensor
     endpoint_residue_frames: torch.Tensor
     is_file: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, dtype=torch.bool)
+    )
+    #: Per-row planned-rejection bits (TXG-COV-010): a row that planning
+    #: failed stays in the plan, bound non-CHUNK, with its bit set. Empty
+    #: when no row failed at planning.
+    planned_rejection: torch.Tensor = field(
         default_factory=lambda: torch.zeros(0, dtype=torch.bool)
     )
 
@@ -518,7 +524,7 @@ class SessionRegistry:
         num_geometries: int,
         now_ns: int,
         resident_request_ids: Sequence[str] | None = None,
-        served_geometries: Collection[int] | None = None,
+        server_geometry: int | None = None,
     ) -> tuple[PreparedRowBinding, ...]:
         """Mint one binding per observed row, atomically per step.
 
@@ -537,13 +543,13 @@ class SessionRegistry:
         wall clock (the same cross-process basis vLLM's own scheduler
         uses for ``Request.arrival_time``).
 
-        ``served_geometries``: the served geometry set. A CHUNK row whose
-        first unit names a geometry outside it, or whose later unit names a
-        geometry other than the one its stream started with, is registered
-        (so the lease stays valid) but bound as a non-CHUNK row: the
-        transaction's role cross-check then fails that row alone, ending its
-        request with an error instead of running an unserved geometry
-        (SESS-MODEL-001, SESS-MODEL-002).
+        ``server_geometry``: the server's one geometry index. A CHUNK row
+        whose first unit names another geometry, or whose later unit names a
+        geometry other than the server's or the one its stream started with,
+        is registered (so the lease stays valid) but bound as a non-CHUNK
+        row: it fails at planning, alone, ending its request with an error
+        instead of running at a foreign geometry (SESS-MODEL-001,
+        SESS-MODEL-002, FILE-PROMPT-007). ``None`` checks no geometry.
         """
         if now_ns <= 0:
             raise ValueError("now_ns must be a positive wall-clock nanosecond stamp")
@@ -620,9 +626,9 @@ class SessionRegistry:
                 new_sessions[row.request_id] = session
                 new_blocks[row.block_id] = row.request_id
                 # SESS-MODEL-002: the first unit fixes the stream's geometry;
-                # one outside the served set fails the row.
+                # one other than the server's fails the row.
                 unserved = row.reject or (
-                    served_geometries is not None and geometry not in served_geometries
+                    server_geometry is not None and geometry != server_geometry
                 )
                 bindings.append(
                     PreparedRowBinding(
@@ -664,7 +670,11 @@ class SessionRegistry:
                     num_prompts=num_prompts,
                     num_geometries=num_geometries,
                 )
-                if row.reject or header_geometry != session.geometry_id:
+                if (
+                    row.reject
+                    or header_geometry != session.geometry_id
+                    or (server_geometry is not None and header_geometry != server_geometry)
+                ):
                     # SESS-MODEL-001: a stream's geometry is fixed by its
                     # first unit; a later unit for another geometry fails the
                     # row (bound as non-CHUNK, so the role cross-check masks
@@ -735,6 +745,7 @@ class SessionRegistry:
         return tuple(bindings)
 
 
+# @spec TXG-COV-010
 def prepare_plan_context(
     registry: SessionRegistry,
     rows: Sequence[ObservedRow],
@@ -745,9 +756,14 @@ def prepare_plan_context(
     num_geometries: int,
     now_ns: int,
     step: int,
-    served_geometries: Collection[int] | None = None,
+    server_geometry: int | None = None,
 ) -> PlanContext:
-    """One hook invocation: prune, mint bindings, build the columns."""
+    """One hook invocation: prune, mint bindings, build the columns.
+
+    A row that planning failed (a foreign geometry, or a row the caller
+    marked ``reject``) stays at its position, bound non-CHUNK, with its
+    planned-rejection bit set (TXG-COV-010).
+    """
     bindings = registry.bind_rows(
         rows,
         placeholder_id=placeholder_id,
@@ -755,8 +771,12 @@ def prepare_plan_context(
         num_geometries=num_geometries,
         now_ns=now_ns,
         resident_request_ids=resident_request_ids,
-        served_geometries=served_geometries,
+        server_geometry=server_geometry,
     )
+    failed = [
+        row.reject or (row.advances_chunk(placeholder_id) and not binding.is_chunk)
+        for row, binding in zip(rows, bindings)
+    ]
     return PlanContext(
         step=step,
         request_ids=tuple(b.request_id for b in bindings),
@@ -789,6 +809,9 @@ def prepare_plan_context(
             dtype=torch.int64,
         ),
         is_file=torch.tensor([row.is_file for row in rows], dtype=torch.bool),
+        planned_rejection=torch.tensor(
+            failed if any(failed) else [], dtype=torch.bool
+        ),
     )
 
 
@@ -867,4 +890,13 @@ def build_row_plan(
         endpoint_threshold_frames=context.endpoint_threshold_frames,
         endpoint_residue_frames=context.endpoint_residue_frames,
         is_file=context.is_file,
+        **_planned_rejection_field(context),
     )
+
+
+def _planned_rejection_field(context: PlanContext) -> dict[str, torch.Tensor]:
+    """The plan's ``planned_rejection`` argument, when ``RowPlan`` has the
+    field (the transaction's planned-rejection mask, TXG-MASK-006)."""
+    if "planned_rejection" not in {f.name for f in fields(RowPlan)}:
+        return {}
+    return {"planned_rejection": context.planned_rejection}

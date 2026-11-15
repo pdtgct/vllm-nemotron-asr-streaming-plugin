@@ -224,9 +224,9 @@ def validate_native_burst_config(
 ) -> None:
     """Reject native selection outside a single-device synchronous engine.
 
-    The 160 ms profile (lookahead 1) is required only when
-    ``require_160ms_profile`` is set. The card's supported set is never
-    required to be exactly ``(1,)``.
+    With ``hf_config``, the server's lookahead (``served_lookahead``) must be
+    valid, and the 160 ms profile (lookahead 1) is required when
+    ``require_160ms_profile`` is set.
     """
     parallel = config.parallel_config
     if (
@@ -251,15 +251,16 @@ def validate_native_burst_config(
         )
     if hf_config is not None:
         from vllm_nemotron_asr_streaming.lookahead import (
-            served_lookaheads,
-            validate_selected_lookahead,
+            NATIVE_BURST_LOOKAHEAD,
+            served_lookahead,
         )
 
-        validate_selected_lookahead(
-            selected=getattr(hf_config, "att_context_right", None),
-            supported=served_lookaheads(hf_config) or None,
-            require_160ms_profile=require_160ms_profile,
-        )
+        lookahead = served_lookahead(hf_config)
+        if require_160ms_profile and lookahead != NATIVE_BURST_LOOKAHEAD:
+            raise ValueError(
+                "native burst's 160ms profile needs the server's lookahead "
+                f"{NATIVE_BURST_LOOKAHEAD}, got {lookahead}"
+            )
 
 
 def validate_native_burst_sampling(params: Any, *, park_id: int, capacity: int) -> None:
@@ -370,15 +371,14 @@ def native_burst_invariant_rows(
 
 
 def native_burst_token_budget(config: Any) -> int:
+    from vllm_nemotron_asr_streaming.lookahead import geometry_index, served_lookahead
     from vllm_nemotron_asr_streaming.nemotron_asr.manifests import CADENCES, author_emission_manifest
-    from vllm_nemotron_asr_streaming.nemotron_asr.nemotron_asr import _served_geometry_ids
 
     manifest = author_emission_manifest(config)["per_geometry"]
     labels = tuple(CADENCES)
-    return max(
-        int(manifest[labels[index]]["max_emission_tokens"])
-        for index in _served_geometry_ids(config)
-    )
+    # The server's one geometry (REG-LA-009).
+    index = geometry_index(served_lookahead(config))
+    return int(manifest[labels[index]]["max_emission_tokens"])
 
 
 def validate_native_burst_history(

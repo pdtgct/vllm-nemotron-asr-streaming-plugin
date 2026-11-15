@@ -138,9 +138,12 @@ class NemotronASRConfig(PreTrainedConfig):
         self.eou_token_id = eou_token_id
         self.file_carrier_token_id = file_carrier_token_id
         self.continuation_token_id = continuation_token_id
-        #: The right contexts the published card declares. The served set
-        #: and the default lookahead are launch options, resolved in the
-        #: model-configuration hook, so no default is stored here.
+        #: The right contexts the published card declares. The server's one
+        #: lookahead is resolved by ``lookahead.served_lookahead`` from the
+        #: ``num_lookahead_tokens`` override or the card's default,
+        #: ``card_default_num_lookahead_tokens``. That default rides
+        #: ``kwargs`` and is set only when the configuration has it, so an
+        #: absent default stays absent (no ``None`` default is stored here).
         self.card_num_lookahead_tokens = (
             None
             if card_num_lookahead_tokens is None
