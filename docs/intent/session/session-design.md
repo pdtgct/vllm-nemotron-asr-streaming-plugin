@@ -248,13 +248,25 @@ This component calls it the *server's geometry*: one right context `r` and its g
 - **No discovery.** The factory publishes no cadence, and a frontend neither passes one nor reads
   one. The frontend sends samples in pieces of any size; the packer alone segments them.
 
-**Geometry check in the model.** The model fails the row of any unit whose `geometry_id` is not
-the server's geometry index, whether it is a stream's first unit or a later one. A failed row ends
-the request with finish reason `error`, which a session reports as `abnormal_end`. Neither plugin
-path can send such a unit, because both pack at the server's geometry; the check protects direct
-clients of the engine. This plan-time row failure is what the HLD's constraint calls refusing a
-request for another cadence; it is not a stream-admission refusal, which `open` reports as
-`SessionRefused` with a `StreamAdmissionResult` reason.
+**Geometry check in the model.** The model state fails, at planning, the row of any unit whose
+`geometry_id` is not the server's geometry index, whether it is a stream's first unit or a later
+one. It fails the row through the row-failure path (the `transaction-graph` design, Option and
+configuration) before the step's CHUNK bucket forms: the row stays at its scheduled position as
+a non-CHUNK row that the transaction rejects, and its request fails in `postprocess_state`. A
+failed row ends the request with finish reason `error`, which a session reports as
+`abnormal_end`. Neither plugin path can send such a unit, because both pack at the server's
+geometry; the check protects direct clients of the engine. This plan-time row failure is the
+HLD constraint's rule for a row at another geometry; it is not a stream-admission refusal, which
+`open` reports as `SessionRefused` with a `StreamAdmissionResult` reason. The transaction's
+device geometry status remains a cross-check behind it.
+
+**Row status in the model.** No row status is recoverable. When a scheduled stream row's
+collected status resolves to any nonzero value, with transaction graphs on or off, the model
+state's `postprocess_state` fails that request alone through `state_slots.fail_requests`, and the
+step and its other rows continue. The request ends with finish reason `error`, which the session
+maps to `abnormal_end` (SESS-ENG-009 for a unit outstanding, SESS-EXP-001 for an idle lease).
+Admission rejections are a different path: core reports them as rejection outputs, and the
+session handles them by SESS-ENG-003 to SESS-ENG-007.
 
 ## Compatibility with frontends
 

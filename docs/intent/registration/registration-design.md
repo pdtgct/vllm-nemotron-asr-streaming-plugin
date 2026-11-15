@@ -356,7 +356,7 @@ The model prepares in three places, by runner configuration:
 | `capture_cudagraphs()` | Not called. | Captures the segment graphs (below). |
 
 The profile transaction's maximum shape is `max_num_seqs` rows at the server's geometry and each
-configured CHUNK cell. It sizes the option-off transaction's transient use and its use of core's
+configured CHUNK-bucket graph population; transaction graphs add no shape to it. It sizes the option-off transaction's transient use and its use of core's
 workspace, which core locks after the serving capture.
 
 - **One owner per stage.** `prepare_step` records whether the step is a profiling dummy step; the
@@ -391,10 +391,11 @@ workspace, which core locks after the serving capture.
   rows) is allowed. It never prepares lazily during serving. Normal startup cannot admit a request
   before preparation, because core profiles and initializes caches before it constructs the scheduler.
 - **Serving guard for graphs.** Before a serving step uses graphed execution, the model checks that every
-  expected graph entry is captured in its graph wrapper (the wrapper's entry holds a graph), not
+  expected segment-graph entry is captured in its graph wrapper (the wrapper's entry holds a graph), not
   only listed in the model's inventory and not merely that preparation ran, and raises otherwise rather
   than capturing during serving, where the memory is not budgeted. `post_warmup` makes the same check
-  once before the worker serves (below).
+  once before the worker serves (below). A transaction-graph cell without its graph follows the
+  `transaction-graph` design's own rules (TXG-COV-006, TXG-EXEC-013), not this guard.
 - **Budget.** Core measures the profile only when it computes the budget itself. When the operator
   sets `kv_cache_memory_bytes`, core still runs the profiling step, so preparation happens, but
   takes the given budget as is; the operator then leaves room for the model's execution memory and,
@@ -414,7 +415,9 @@ workspace, which core locks after the serving capture.
   configured option that enlarges its execution memory or graphs: `max_num_seqs`,
   `encoder_execution_arm` and `decode_dispatch_arm` when graphed execution is configured,
   `chunk_bucket_graph_populations` when it is non-empty, and `transaction_graph_populations` when
-  the option is on. Core adds a note naming them to a failure of its temporary profiling pool, of a
+  the option is on. Whether transaction graphs are on is decided only by the `transaction-graph`
+  design's `transaction_graphs_on` (TXG-CFG-014), which every check, hook and dependency gate here
+  calls, so a malformed value such as `{}` is on, and refused, everywhere. Core adds a note naming them to a failure of its temporary profiling pool, of a
   capture and of its capacity planning.
 
 ### Segment-graph capture on the hook
@@ -422,26 +425,27 @@ workspace, which core locks after the serving capture.
 Under the hook configuration the segment graphs follow #67583's capture lifecycle. The
 `transaction-graph` design owns the transaction-graph part of each hook; the segment-graph part
 below runs first in every capture call, after the transaction-graph entry checks (the
-`transaction-graph` design, Rules of the capture call), which run at the call's entry when
-`transaction_graph_populations` is non-empty. A call that an entry check refuses captures no
+`transaction-graph` design, Rules of the capture call), which run at the call's entry while
+transaction graphs are on. A call that an entry check refuses captures no
 segment graph.
 
 | Hook | Segment-graph behaviour |
 | --- | --- |
 | `needs_cudagraph_capture()` | True when the configuration selects a hook-captured graph (Engine settings) and the platform is CUDA. Configuration only, the same value for the model state's lifetime. |
 | `capture_cudagraphs(profile_only=True)` | Runs only when core's graph-memory estimate runs, over core's temporary profiling state pools and into the estimate's throwaway pool. Captures the segment graphs for the server's geometry, then the transaction-graph part; with transaction graphs off, it ends with the charged margin. Logs the capture line. |
-| `clear_cudagraphs()` | Releases every segment graph, its buffers and the margin the profiling capture created; keeps the profiling figures as host integers. Core calls it also when the profiling capture raised or was never reached, so it tolerates nothing captured. Core also clears every registered static graph wrapper after the estimate, so no profiling entry survives either way. |
+| `clear_cudagraphs()` | Releases every segment graph and its buffers, after the transaction-graph part, and, with transaction graphs off, the margin the profiling capture created (with them on, the transaction-graph part releases it); keeps the profiling figures as host integers. Core calls it also when the profiling capture raised or was never reached, so it tolerates nothing captured. Core also clears every registered static graph wrapper after the estimate, so no profiling entry survives either way. |
 | `capture_cudagraphs(profile_only=False)` | The serving capture: rebuilds the segment graphs by the same procedure, into core's global graph pool, then the transaction-graph part; then the memory comparison. Logs the capture line. |
 | `post_warmup()` | Before the worker serves: every expected segment-graph entry holds its graph; then the transaction-graph verification. Allocates nothing and replays nothing. Under `--enforce-eager` it makes the same segment-graph check. |
 | `shutdown()` | Releases every segment graph and binding-owned buffer; tolerates a model state whose initialization did not complete. |
 
 **Ordering.** A serving capture while profiling segment graphs exist, or a profiling capture after
-a serving capture, is a lifecycle defect and raises at the call's entry, before capturing; when
-`transaction_graph_populations` is non-empty, the error names it.
+a serving capture was attempted, whether or not it succeeded, is a lifecycle defect and raises at
+the call's entry, before capturing; while transaction graphs are on, the error names
+`transaction_graph_populations`.
 
 **A second serving capture.** A serving capture while serving segment graphs exist raises at the
 call's entry, stating that recapture over live state pools is not supported and that the recovery
-is an engine restart, and naming `transaction_graph_populations` when it is non-empty.
+is an engine restart, and naming `transaction_graph_populations` while transaction graphs are on.
 Core reaches it only through an elastic expert-parallel reconfiguration, which the plugin refuses.
 
 ### Segment-graph memory
@@ -449,7 +453,11 @@ Core reaches it only through an elastic expert-parallel reconfiguration, which t
 The capture rules are one procedure per capture call, the same with transaction graphs on or off;
 with the option off the call holds only the segment graphs. The `transaction-graph` design
 (Graph memory) states the procedure in full for a call that also holds cells; this section states
-it for the option-off call, which does not depend on that component.
+it for the option-off call, which does not depend on that component. The measurement, the charged
+margin's allocation and retained charge, the required-capture predicate and the aggregate
+comparison below have one implementation, owned here because the option-off call needs it; the
+transaction-graph part calls it for its own spans (REG-MEM-027). With transaction graphs on, the
+capture line's retained figure is the span of the call's segment-graph part.
 
 - **Measurement.** A call's retained bytes are the drop in driver free memory
   (`torch.cuda.mem_get_info`) across it, each reading taken after synchronizing the capture stream
@@ -470,8 +478,8 @@ it for the option-off call, which does not depend on that component.
   the effective `kv_cache_memory_bytes` is unset or 0, `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS`
   is not 0 and the extensible KV cache is off. Not required: one WARNING that the segment graphs
   were not charged to the budget, with the reason, the retained bytes and that the budget must
-  leave room for them. Required but absent: startup fails, naming the configuration that should
-  have run the estimate.
+  leave room for them. Required but absent: startup fails at the call's entry, before any segment
+  graph is captured, naming the configuration that should have run the estimate.
 - **Capture line.** Each capture of the segment graphs logs one INFO line naming the runner
   configuration and capture (profiling dummy step under `--enforce-eager`; profiling or serving
   capture under the hook configuration), the arms, the geometry, `max_num_seqs`, the retained
@@ -512,9 +520,11 @@ the dummy output.
 
 - `prepare_step` reads only the scheduler output, including its state-slot handles; the bindings
   give no row access there.
-- The model binds rows inside the step, after core begins the step and activates its requests:
+- During scheduled execution, the model binds rows inside the step, after core begins the step and
+  activates its requests:
   `bind_rows` for the step's ordered requests and their handles, then
-  `StateSlotRows.component_pools` and `slot_indices_cpu`.
+  `StateSlotRows.component_pools` and `slot_indices_cpu`. Transaction-graph capture reaches the
+  pools only through the startup access the `transaction-graph` design governs (TXG-CAP-008).
 - Before committing state, the model re-reads `component_pools`, which core refuses outside the live
   step, so a commit outside the live step fails before it writes.
 - The model's projection of pools into named state tensors takes the component pools and the
@@ -528,7 +538,9 @@ the dummy output.
   cached row's scheduled tokens from that record. A position past the recorded prompt holds a token
   the sampler produced on the device; the host does not read it (that would synchronize with the
   device), and no sampled token is a CHUNK carrier, so the row is planned as a non-CHUNK row. The
-  record is dropped when the request finishes.
+  record is dropped when the request finishes. For a file request this classifies only the
+  scheduled token's origin: the file step rule (`transcription`, FILE-ROW-002) decides whether the
+  row executes as CHUNK, before transaction classification.
 
 ## Supported tasks
 
@@ -573,7 +585,7 @@ is imported:
 Three groups of rows are conditional. The graph-runtime rows (`graph_capture`, `BatchDescriptor`,
 `set_forward_context`, `current_platform`, `resolve_obj_by_qualname`, `capture_pool` and
 `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS`) are imported when graphed execution is configured; the
-transaction-graph rows when `transaction_graph_populations` is non-empty (the `transaction-graph`
+transaction-graph rows while transaction graphs are on (TXG-CFG-014; the `transaction-graph`
 design, Permitted dependencies, lists their use); the batch-invariant row when that mode is. The
 import-time check covers the rest, the six hooks of `ModelState` included. vLLM's model-registration, config
 parser, tokenizer and renderer registries, model configuration hooks (`VerifyAndUpdateConfig`,

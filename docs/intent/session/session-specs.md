@@ -116,8 +116,9 @@ packer implementation.
 
 ## Geometry check in the model
 
-- [ ] **SESS-MODEL-001**: If a unit after a stream's first carries a `geometry_id` other than the server's geometry index (SESS-GEOM-001), then the model shall fail that row alone, ending the request with finish reason `error`; the outputs of the stream's earlier units are unaffected.
-- [ ] **SESS-MODEL-002**: If a stream's first unit carries a `geometry_id` other than the server's geometry index (SESS-GEOM-001), then the model shall fail that row, ending the request with finish reason `error` (reachable only by direct engine clients; the session factory and `buffer_realtime_audio` pack every unit at the server's geometry).
+- [ ] **SESS-MODEL-001**: If a unit after a stream's first carries a `geometry_id` other than the server's geometry index (SESS-GEOM-001), then the model state shall fail that row alone at planning, through the row-failure path (TXG-COV-010, TXG-FAIL-008), before the step's CHUNK bucket forms, ending the request with finish reason `error`; the outputs of the stream's earlier units are unaffected.
+- [ ] **SESS-MODEL-002**: If a stream's first unit carries a `geometry_id` other than the server's geometry index (SESS-GEOM-001), then the model state shall fail that row at planning, through the row-failure path (TXG-COV-010, TXG-FAIL-008), before the step's CHUNK bucket forms, ending the request with finish reason `error` (reachable only by direct engine clients; the session factory and `buffer_realtime_audio` pack every unit at the server's geometry).
+- [ ] **SESS-MODEL-003**: When a scheduled stream row's collected status resolves to a nonzero value of any status class, with transaction graphs on or off, the model state's `postprocess_state` shall fail that request alone by passing it to `state_slots.fail_requests`, and shall not fail the step or any other row; the request ends with finish reason `error`, which a session reports as `abnormal_end` (SESS-ENG-009, SESS-EXP-001), and admission rejections keep SESS-ENG-003 to SESS-ENG-007.
 
 ## Core `/v1/realtime`
 

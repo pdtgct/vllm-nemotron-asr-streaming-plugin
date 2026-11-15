@@ -55,7 +55,7 @@ A guard field is *present* when its value is not `None` (and, for `use_beam_sear
 - [x] **FILE-PROMPT-003**: The model's multimodal processor shall declare `samples` and `file_header` as `keep_on_cpu` fields.
 - [x] **FILE-PROMPT-004**: When `embed_multimodal` receives a file item, it shall return a one-row placeholder embedding without reading the item's samples and without applying the stream unit's carrier-width check.
 - [ ] **FILE-PROMPT-006**: If a file item's `file_header` carries a geometry index other than the server's geometry index (SESS-GEOM-001), then the model's processor shall refuse the item at input processing with a `ValueError` naming both indices.
-- [ ] **FILE-PROMPT-007**: If a file item whose `file_header` carries a geometry index other than the server's geometry index reaches the model state at the request's first schedule, then the model state shall fail that request's row alone through the row-failure path, and shall not fail the step.
+- [ ] **FILE-PROMPT-007**: If a file item whose `file_header` carries a geometry index other than the server's geometry index reaches the model state at the request's first schedule, then the model state shall fail that request's row alone at planning, through the row-failure path (TXG-COV-010, TXG-FAIL-008), before the step's CHUNK bucket forms, and shall not fail the step.
 
 ## Request-owned host buffer
 
@@ -85,7 +85,7 @@ not yet emitted, as the model state holds it (Queue counts).
 - [ ] **FILE-ROW-011**: When a file row runs as a CHUNK row while the echo of its last emitted label is armed, the transaction shall set the row's echo-mismatch status unless the row's scheduled token equals that label.
 - [ ] **FILE-ROW-012**: When a file row runs as a CHUNK row while the echo of its last emitted label is armed and its queue count is zero, the transaction shall not set the row's undrained-queue status.
 - [ ] **FILE-ROW-013**: The transaction shall treat the continuation token as an illegal decision on every row whose file-mask bit is clear, including on steps where the continuation token ID is supplied.
-- [ ] **FILE-ROW-014**: When a file row runs as a CHUNK row, the transaction shall set its role-mismatch status if its scheduled token is the stream carrier, or if no echo is pending and its scheduled token is neither the file-carrier token nor the continuation token.
+- [ ] **FILE-ROW-014**: The transaction shall set a file row's role-mismatch status, in any role, if its scheduled token is the stream carrier, and, when the row runs as a CHUNK row, also if no echo is pending and its scheduled token is neither the file-carrier token nor the continuation token.
 
 ## Queue counts
 
@@ -101,11 +101,11 @@ hold with transaction graphs on and off.
 - [ ] **FILE-QC-006**: The model state shall apply a collected `QueueCount` only in `postprocess_state`, after `collect_commit_status` returns, and only to the file progress of a file request that the step being post-processed scheduled, whose request ID equals the count's and whose recorded admission generation equals the count's; it shall not apply any other count. A count so applied is *accepted*.
 - [ ] **FILE-QC-007**: When the model state takes a file request at its first schedule, it shall set the file's queue count to 0, and the file's first step shall be planned with that count.
 - [ ] **FILE-QC-008**: When a step's report for a file row is not clean, the model state shall leave the file's queue count as it was before that step.
-- [ ] **FILE-QC-009**: When a step planned a file row, no count was accepted for that file (FILE-QC-006), and the row's report was not a rejection (there was no report, or its status resolved to 0), the model state shall mark the file's queue count unknown.
-- [ ] **FILE-QC-010**: If a file request that has had at least one step is scheduled while its queue count is unknown, then the model state shall fail that row alone through the row-failure path before planning the step, so that the request ends with finish reason `error`.
+- [ ] **FILE-QC-009**: When a step planned a file row, no count was accepted for that file (FILE-QC-006), and the row's report was not a rejection (there was no report, or its status resolved to 0), the model state shall mark the file's queue-count validity unknown without changing its retained numeric count.
+- [ ] **FILE-QC-010**: If a file request that has had at least one step is scheduled while its queue-count validity is unknown, then the model state shall fail that row alone through the row-failure path (TXG-COV-010, TXG-FAIL-008) before planning the row's file action, so that the request ends with finish reason `error`.
 - [ ] **FILE-QC-011**: The model state shall not read the label book on the host to plan a step, and shall not change a file's queue count while planning a step.
-- [ ] **FILE-QC-012**: When a step planned a file row and, after that step's collection, no count was accepted for that file (FILE-QC-006) or the row's status resolved to a nonzero value, including the geometry-only status, the model state shall fail that file request alone by passing it to `state_slots.fail_requests` in `postprocess_state`, keeping its queue count as it was before the step, and shall not fail the step or any other row.
-- [ ] **FILE-QC-013**: When a file progress that has no recorded admission generation is post-processed for the step that ran its first row, the model state shall record the admission generation of that row's clean report, the report bound to the request incarnation taken at its first schedule, and shall record no generation from any other report.
+- [ ] **FILE-QC-012**: When a step planned a file row and, after that step's collection, no count was accepted for that file (FILE-QC-006) or the row's status resolved to a nonzero value of any status class, the model state shall fail that file request alone by passing it to `state_slots.fail_requests` in `postprocess_state`, keeping its queue count as it was before the step, and shall not fail the step or any other row.
+- [ ] **FILE-QC-013**: When a file progress that has no recorded admission generation is post-processed for the step that ran its first row, the model state shall record the admission generation of that row's clean report, the report bound to the request incarnation taken at its first schedule, and shall record no generation from any other report; for that first clean report, `postprocess_state` shall record its admission generation before applying FILE-QC-006 or evaluating FILE-QC-012.
 
 ## Tokens
 

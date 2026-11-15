@@ -241,8 +241,8 @@ components carry these responsibilities toward it:
   echo on a chunk row, continuation emission where a stream row would park) stays per row, selected
   by a per-row file mask. `transaction-graph` captures those selects in every cell and takes the
   mask as a graph input, so steps that mix file and stream rows replay like any other. A file's
-  samples reach the device by their own host-to-device copy, and the per-step read of its label
-  counts is either removed or counted by `transaction-graph`.
+  samples reach the device by their own host-to-device copy, and its queue count reaches planning
+  through the step's commit status (`transcription`), so planning reads no label book.
 - `registration`'s configuration validation refuses native burst while the option is on.
 
 The acoustic internals under `vllm_nemotron_asr_streaming/nemotron_asr/` (encoder, RNN-T decoder,
@@ -338,8 +338,8 @@ the leaf designs cite them where they depend on them.
   fixed by its `num_lookahead_tokens`. The default is the checkpoint's own default lookahead
   (`default_num_lookahead_tokens` in the card's encoder configuration: 3, which is 320 ms), and
   `num_lookahead_tokens` in `--hf-overrides` selects another. The model warms execution and captures graphs for
-  that geometry only. Every stream and every whole file runs at it, and admission refuses a
-  request for any other cadence. The session factory's `open` takes only a locale, every session
+  that geometry only. Every stream and every whole file runs at it: the processor refuses a file
+  item at any other geometry, and the model state fails, at planning, any row that carries one. The session factory's `open` takes only a locale, every session
   runs at that geometry, and a frontend neither passes nor reads a cadence. The plugin
   is released together with a `vllm-riva-frontend` release that opens streams by locale only;
   v0.4.0b1 reads the factory's served cadences when it starts and passes a cadence to `open`, so
@@ -422,15 +422,16 @@ implementations differ:
 
 Acceptance is tiered; a claim names the tier it has met and the build (stage 1 or stage 2) it was
 met on. Stage 1 can meet every tier on core's routes. The CPU seam conformance suite needs only the frontend and
-its `vllm-riva-frontend-dev` test distribution installed at the pinned release tag; served legs through a frontend (`Recognize`, the factory's stream
-admission) need stage 2.
+its `vllm-riva-frontend-dev` test distribution installed at the pinned release tag. Only legs served through a
+frontend (`Recognize`, a frontend's streaming endpoint) need stage 2; the session factory driven
+directly through `AsyncLLM`, with stream admission, runs on stage 1.
 
 1. **CPU conformance.** Unit and contract tests, including the frontend's seam conformance suite run
    against this plugin's real factory, pass without a GPU.
 2. **Installed-engine cycle.** On the target build with the plugin installed: plugin load →
    stream started → audio → final transcript → slot retired, for one and for concurrent sessions.
-   On stage 1 the stream is a `/v1/realtime` session; on stage 2 it is also a factory session
-   admitted with stream admission. In the default configuration the startup log reports the
+   On stage 1 the stream is a `/v1/realtime` session; on stage 2 it is also a frontend session through
+   the factory, admitted with stream admission. In the default configuration the startup log reports the
    segment graphs' retained memory and capture time; both are measured at each geometry before
    that geometry is claimed.
 3. **Equivalence.** On public clips from 20 s to over 400 s, whole-file transcripts (core

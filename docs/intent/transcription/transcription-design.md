@@ -305,9 +305,9 @@ request's EOS.
 A file row differs from a stream row of the same role only in per-row selects on its file-mask
 bit:
 - **Role check.** A file row's scheduled token is the token it emitted last (the file carrier on
-  its first step, then a label or the continuation token), never the stream carrier. Its CHUNK row
-  is a role mismatch if its token is the stream carrier, or if no echo is pending and its token is
-  neither the file carrier nor the continuation token.
+  its first step, then a label or the continuation token), never the stream carrier. A file row in
+  any role is a role mismatch if its token is the stream carrier; its CHUNK row is also one if no
+  echo is pending and its token is neither the file carrier nor the continuation token.
 - **Armed echo on a CHUNK row.** A file CHUNK row follows a drained queue whose last label's echo
   may still be armed. The echo is validated as a REPLAY row's is, and the chunk then replaces it;
   the pending echo does not count as an undrained queue for a file CHUNK row.
@@ -367,32 +367,35 @@ step, with transaction graphs on or off; only file rows use it.
    same request ID and the admission generation that file progress has recorded; any other count
    is not applied. A file progress is created at take with no recorded generation, and records one
    only from the clean report of its own first step's row: the row this step scheduled for that
-   file progress, the incarnation taken at this request's first schedule. A count from an earlier
-   request with a reused request ID, or from an older generation, therefore never reaches a later
-   file's progress.
+   file progress, the incarnation taken at this request's first schedule. `postprocess_state`
+   records that generation before it applies counts or fails files, so the first clean count is
+   accepted. A count from an earlier request with a reused request ID, or from an older
+   generation, therefore never reaches a later file's progress.
 
 A file's count, through its life:
 - **Fresh.** Taking the file at its first schedule sets its count to 0, and its first step plans
   with that count. A fresh row is always the file's first step.
 - **Clean step.** The accepted count replaces it: a drain reports one fewer, and a chunk or tail
   reports the labels it queued minus the one it emitted, or 0 if it queued none.
-- **Rejected row.** A report whose resolved status is not 0, including the geometry-only status,
+- **Rejected row.** A report whose resolved status is not 0, of any status class,
   leaves the count as it was: a rejected row's scatter is masked, so its label book did not
   change. The file request fails (below).
 - **No outcome.** When a step planned a file row and no count was accepted for it, and its report
   was not a rejection (no staged commit, no report for the row, a clean report without a count, or
-  a count whose identity does not match), the count becomes unknown. Planning advanced the file's
-  position before the transaction, so the host cannot tell where the file stands.
+  a count whose identity does not match), the count's validity becomes unknown; the retained
+  number is kept, never replaced by an unknown value. Planning advanced the file's position before
+  the transaction, so the host cannot tell where the file stands.
 - **Failure after collection.** After collection, every file request whose planned row had no
   count accepted, whether its report was rejected or carried no usable count, fails alone:
   `postprocess_state` passes it to `state_slots.fail_requests` (core's
   `StateSlotBindings.fail_requests`) with the step's other failures, and the step does not fail.
-  The request ends with finish reason `error`. Stream rows keep their own recovery rules; only
-  file rows are failed this way. A file's header is immutable and planning advances its position,
+  The request ends with finish reason `error`. Stream rows fail the same way (the `session`
+  design, Row status in the model); no row status is recoverable. A file's header is immutable and planning advances its position,
   so a rejected file row could only repeat the rejection, or continue past audio or a
   finalization that never committed.
-- **Unknown at planning.** A continuing file row whose count is unknown is failed through the
-  row-failure path before the step is planned (the path a malformed file item takes), ending the
+- **Unknown at planning.** A continuing file row whose count's validity is unknown is failed
+  through the row-failure path (the `transaction-graph` design, Option and configuration) before
+  its file action is planned (the path a malformed file item takes), ending the
   request with finish reason `error`. Failure after collection normally ends such a request first;
   this check is the backstop, and the model state never reads the label book to recover a count.
 
@@ -484,8 +487,9 @@ submission (Request guards), so neither can truncate a transcript.
 - **Where malformed file items are refused.** The processor checks a file item's header against
   its samples and the served configuration (geometry index equal to the server's, locale row
   inside the locale table, sample count equal to the samples' length), so a malformed request
-  fails at input processing. The model state repeats the checks and fails only that row if one
-  gets through; it never fails the step.
+  fails at input processing. The model state repeats the checks at planning and fails only that
+  row if one gets through, through the row-failure path, before the step's CHUNK bucket forms;
+  it never fails the step.
 - **Device route.** File samples leave the host buffer only through `FileHostBuffers.stage` and
   reach the device only through `file_rows.copy_chunk_to_device`, which the step planner calls to
   make a device copy of the one chunk. In the model's forward, before the transaction runs,
@@ -513,7 +517,7 @@ submission (Request guards), so neither can truncate a transcript.
 | Token IDs and file mask | Passed to the transaction on every step | Passed only on steps that hold a file row | A transaction whose inputs change form with file presence cannot be captured once for both; the IDs are configuration constants |
 | Source of a file's queue count | The device count in the commit status, carried by the commit plan, staged into a pinned host buffer and collected with the status | A synchronous read of the label book after each advancing step; a host-side decrement after a drain | The read is a device synchronization on every step that advances a file; the decrement assumes the drain committed, so a rejected drain would leave the host one short; the status is already consumed once per step |
 | Collection seam for counts | An amended return value of `collect_commit_status` (`CommitCollection`: statuses, failed set, queue counts) | A consume-once accessor beside `consume_committed_progress` | One call yields statuses, failures and counts from one consumption of the reports, so a count cannot be applied from another step's collection and the model holds no count state that every return path (including the one with no staged commit) must clear; the changed type makes each caller handle the counts, and there is one production caller |
-| A file row with no accepted count after collection | Fail that file request alone in postprocessing (`state_slots.fail_requests`), keeping its prior count; stream recovery unchanged | Keep the request and its prior count; roll the position back and retry the step | A file's header is immutable and planning advances its position, so a rejected file row can only repeat the rejection or skip audio or finalization; rolling back would duplicate the planner's position state for one failure case |
+| A file row with no accepted count after collection | Fail that file request alone in postprocessing (`state_slots.fail_requests`), keeping its prior count; stream rows fail the same way (SESS-MODEL-003) | Keep the request and its prior count; roll the position back and retry the step | A file's header is immutable and planning advances its position, so a rejected file row can only repeat the rejection or skip audio or finalization; rolling back would duplicate the planner's position state for one failure case |
 | A continuing file row with no count at planning | Fail that row before planning, as a backstop | Read the label book; assume the prior count | A read reintroduces the synchronization; planning advanced the file's position before the step whose outcome is unknown, so the prior count may be wrong |
 | Where to refuse beam search and completion limits | `get_generation_prompt`, with two request fields added to `SpeechToTextParams` | The model state's `add_request`; row failure; a logits processor | `add_request` cannot raise without ending the engine; row failure becomes a server error (HTTP 500 with vllm#67144, HTTP 200 with partial text without it); a logits processor cannot see the prompt |
 | Budget | No admission check; `B` is sizing guidance only | A worst-case refusal; a typical-output bound | The model imposes no input-length limit; core's actual-token stop is the bound, and reporting a server-caused `length` as an error is core work (Open 1) |
