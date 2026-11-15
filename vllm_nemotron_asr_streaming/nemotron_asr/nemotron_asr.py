@@ -573,9 +573,40 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         #: The profiling capture's charged margin while transaction graphs
         #: are off (REG-MEM-020), held until ``clear_cudagraphs``.
         self._charged_margin: Any = None
-        #: The transaction-graph binding while transaction graphs are on
-        #: (TXG-CFG-001); ``None`` while they are off.
-        self._transaction_graph_binding: Any = None
+        #: The transaction-graph binding, built while transaction graphs are
+        #: on (TXG-CFG-001); read through ``_transaction_graph_binding``,
+        #: which is ``None`` while they are off.
+        self._txg_binding: Any = None
+        if transaction_graphs_on(hf_config):
+            self._txg_binding = self._build_transaction_graph_binding(vllm_config)
+
+    def _build_transaction_graph_binding(self, vllm_config: Any) -> Any:
+        """The binding for an accepted option value. A value the option's
+        configuration checks refuse yields none: the model state's
+        construction refuses that configuration (TXG-CFG-011), and no ``N``
+        is computed from it (TXG-CFG-004)."""
+        from vllm_nemotron_asr_streaming.nemotron_asr.transaction_graph import (
+            TransactionGraphBinding,
+        )
+
+        try:
+            return TransactionGraphBinding(self, vllm_config)
+        except ValueError:
+            return None
+
+    # @spec TXG-CFG-014, TXG-LIFE-011
+    @property
+    def _transaction_graph_binding(self) -> Any:
+        """The transaction-graph binding while transaction graphs are on,
+        else ``None``: every transaction-graph part of the hooks and of a
+        step goes through this one read, which asks the one on predicate of
+        the served configuration."""
+        state = self.__dict__
+        binding = state.get("_txg_binding")
+        config = state.get("config")
+        if binding is None or config is None or not transaction_graphs_on(config):
+            return None
+        return binding
 
     def _state_pools(self, projection: Any) -> Any:
         return projection.state_batch.pools
@@ -1151,11 +1182,17 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         self._check_capture_order(profile_only)
         requirement = None
         if not profile_only:
-            if self._profiling_figures is None:
+            if binding is not None:
+                # TXG-MEM-007: decided from the worker's effective cache
+                # configuration when the serving capture begins, and recorded
+                # whether or not a profiling capture ran.
                 requirement = graph_memory.profiling_requirement(self._vllm_config)
-                if binding is not None:
-                    binding.check_profiling_requirement(requirement)
-                elif requirement.required:
+                binding.check_profiling_requirement(
+                    requirement, profiling_ran=self._profiling_figures is not None
+                )
+            elif self._profiling_figures is None:
+                requirement = graph_memory.profiling_requirement(self._vllm_config)
+                if requirement.required:
                     raise RuntimeError(
                         "the serving capture found no profiling capture in this "
                         "worker although one was required: "
@@ -1169,6 +1206,10 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             # attempted, whether or not it succeeds (REG-MEM-024). A call
             # refused at its entry captured nothing and is no attempt.
             self._serving_capture_attempted = True
+        if binding is not None:
+            # The entry checks passed: the call's transient peak starts here,
+            # before the segment-graph part captures anything (TXG-MEM-002).
+            binding.begin_capture(profile_only=profile_only, device=device)
         capture = PROFILING_CAPTURE if profile_only else SERVING_CAPTURE
         try:
             call_free_before, segment_free_after, seconds = (
@@ -1750,38 +1791,62 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             if persistent_state_projection is None:
                 raise RuntimeError("native burst requires a native runner projection")
             native_handoff.prepare(persistent_state_projection)
+        binding = self._transaction_graph_binding
+        # @spec TXG-COV-012: where transaction graphs are on, a step's
+        # transaction runs with endpointing only when a row of the step
+        # carries an endpoint policy, which no plugin path sets
+        # (SESS-EP-001, FILE-ENG-002); the cells are captured with
+        # endpointing off. With transaction graphs off the transaction is
+        # unchanged.
+        endpointing = binding is None or bool(
+            plan.endpoint_mode.numel() and plan.endpoint_mode.any()
+        )
+        transaction: dict[str, Any] = dict(
+            channel_pools=list(pools.channel),
+            time_pools=list(pools.convolution),
+            len_pools=list(pools.valid_length),
+            h_pool=pools.predictor_h,
+            c_pool=pools.predictor_c,
+            queue_pool=pools.replay_queue,
+            book_pool=pools.replay_book,
+            frontend_raw_pool=pools.frontend_raw,
+            frontend_mel_pool=pools.frontend_mel,
+            frontend_counter_pool=pools.frontend_counters,
+            endpoint_history_pool=pools.endpoint_history if endpointing else None,
+            endpoint_book_pool=pools.endpoint_book if endpointing else None,
+            eou_token_id=int(self.config.eou_token_id) if endpointing else None,
+            adapter=self._emission_adapter,
+            decode_resolver=self._decode_resolver,
+            encoder_transition=self._encoder_execution.transition,
+            bucket_transition=getattr(self, "_chunk_bucket_binding", None),
+            placeholder_id=int(self.config.audio_chunk_token_id),
+            park_id=int(self.config.eos_token_id),
+            commit_sink=commit_sink,
+            staging=self._ensure_host_staging(),
+            graph_covers_decode=graph_covers_decode,
+            native_burst_handoff=native_handoff,
+            file_carrier_id=int(self.config.file_carrier_token_id),
+            continuation_id=int(self.config.continuation_token_id),
+            geometry_order=persistent_state_projection.geometry_order,
+        )
         try:
+            row_ids = input_ids.long()
+            if binding is not None:
+                # @spec TXG-COV-003, TXG-EXEC-012: a scheduled step replays
+                # its cells; a step ``execute`` declines (already counted)
+                # runs wholly as the option-off transaction below. ``execute``
+                # is looked up on the binding at call time.
+                result = binding.execute(
+                    self.core, row_ids, inputs_embeds, plan, **transaction
+                )
+                if result is not None:
+                    return result
             result = advance_model_rows(
                 self.core,
-                input_ids.long(),
+                row_ids,
                 inputs_embeds,
                 plan,
-                channel_pools=list(pools.channel),
-                time_pools=list(pools.convolution),
-                len_pools=list(pools.valid_length),
-                h_pool=pools.predictor_h,
-                c_pool=pools.predictor_c,
-                queue_pool=pools.replay_queue,
-                book_pool=pools.replay_book,
-                frontend_raw_pool=pools.frontend_raw,
-                frontend_mel_pool=pools.frontend_mel,
-                frontend_counter_pool=pools.frontend_counters,
-                endpoint_history_pool=pools.endpoint_history,
-                endpoint_book_pool=pools.endpoint_book,
-                eou_token_id=int(self.config.eou_token_id),
-                adapter=self._emission_adapter,
-                decode_resolver=self._decode_resolver,
-                encoder_transition=self._encoder_execution.transition,
-                bucket_transition=getattr(self, "_chunk_bucket_binding", None),
-                placeholder_id=int(self.config.audio_chunk_token_id),
-                park_id=int(self.config.eos_token_id),
-                commit_sink=commit_sink,
-                staging=self._ensure_host_staging(),
-                graph_covers_decode=graph_covers_decode,
-                native_burst_handoff=native_handoff,
-                file_carrier_id=int(self.config.file_carrier_token_id),
-                continuation_id=int(self.config.continuation_token_id),
-                geometry_order=persistent_state_projection.geometry_order,
+                **transaction,
             )
             return result
         except BaseException:

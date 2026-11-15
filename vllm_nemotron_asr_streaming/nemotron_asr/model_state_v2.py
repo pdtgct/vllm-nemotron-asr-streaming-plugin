@@ -265,13 +265,22 @@ class NemotronASRModelState(ModelState):
         # transcript labels, not text generation.
         return ("transcription", "realtime")
 
+    # @spec TXG-LIFE-003, TXG-LIFE-009
     def initialize_state_slots(self, bindings: StateSlotBindings) -> None:
-        super().initialize_state_slots(bindings)
         layer = self.model._persistent_state_layer.prefix
+        # While transaction graphs are on: serving bindings that differ from
+        # the layout the serving capture recorded are refused before they
+        # replace the current ones.
+        transaction_graphs = self.model._transaction_graph_binding
+        if transaction_graphs is not None and layer in bindings.views:
+            transaction_graphs.check_bindings(bindings, layer)
+        super().initialize_state_slots(bindings)
         if set(bindings.views) != {layer}:
             raise ValueError("Nemotron requires exactly its aggregate state group")
         # All resident writes run on the runner stream. Inner graphs also replay
         # there; no auxiliary state-writing stream is created by this consumer.
+        if transaction_graphs is not None:
+            transaction_graphs.record_bindings(bindings, layer)
 
     # @spec REG-MEM-001, REG-STATE-002, REG-STATE-007, REG-STATE-008
     def prepare_step(

@@ -14,6 +14,11 @@ the CUDA runtime (CPU conformance runs) a reading is unavailable: it returns
 reads free memory only and resets no allocator peak statistic, because under
 ``--enforce-eager`` the capture runs inside core's memory-profiling window,
 which reads them.
+
+The transient peak of a capture call (``begin_transient_peak``,
+``transient_peak``) does reset the allocator's peak statistics. Only the
+transaction-graph part calls it (TXG-MEM-002), and only in core's capture
+hooks, which run after core's memory-profiling window has exited.
 """
 
 from __future__ import annotations
@@ -69,6 +74,42 @@ def retained(before: int | None, after: int | None) -> int | None:
     if before is None or after is None:
         return None
     return before - after
+
+
+def _cuda_device(device: torch.device) -> torch.device | None:
+    return device if device.type == "cuda" else None
+
+
+# @spec TXG-MEM-002
+def begin_transient_peak(device: torch.device) -> int | None:
+    """Reset the allocator's peak statistics on ``device`` and return its
+    reserved bytes at that moment, the base of a capture call's transient
+    peak. ``None`` on a host without the CUDA runtime."""
+    cuda_device = _cuda_device(device)
+    try:
+        torch.cuda.reset_peak_memory_stats(cuda_device)
+        return int(torch.cuda.memory_reserved(cuda_device))
+    except Exception:
+        if torch.cuda.is_available():
+            raise
+        return None
+
+
+# @spec TXG-MEM-002
+def transient_peak(device: torch.device, reserved_at_start: int | None) -> int | None:
+    """A capture call's transient peak: the allocator's peak reserved bytes
+    since :func:`begin_transient_peak`, less the reserved bytes it returned
+    (``None`` when that reading is unavailable)."""
+    if reserved_at_start is None:
+        return None
+    cuda_device = _cuda_device(device)
+    try:
+        peak = int(torch.cuda.max_memory_reserved(cuda_device))
+    except Exception:
+        if torch.cuda.is_available():
+            raise
+        return None
+    return peak - reserved_at_start
 
 
 @dataclass
@@ -213,9 +254,11 @@ __all__ = [
     "ChargedMargin",
     "ProfilingRequirement",
     "allocate_margin",
+    "begin_transient_peak",
     "format_bytes",
     "free_memory",
     "profiling_requirement",
     "retained",
     "serving_excess",
+    "transient_peak",
 ]

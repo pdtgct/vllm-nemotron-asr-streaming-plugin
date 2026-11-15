@@ -40,7 +40,9 @@ never a second legacy forward path).
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
@@ -1656,12 +1658,52 @@ class _GatheredCaches:
         )
 
 
+#: Whether a transaction-graph flat capture is in progress in this context:
+#: a cell's warm-ups and its outer capture (TXG-CAP-001). Every nested encoder
+#: and decoder launch site of a cell reads it and runs eagerly while it is
+#: set, and host-to-device staging raises (TXG-CAP-002).
+_FLAT_CAPTURE: ContextVar[bool] = ContextVar("nemotron_flat_capture", default=False)
+
+
+def flat_capture_active() -> bool:
+    """Whether a transaction-graph flat capture is in progress."""
+    return _FLAT_CAPTURE.get()
+
+
+# @spec TXG-CAP-001
+@contextmanager
+def flat_capture() -> Iterator[None]:
+    """The scope of a cell's warm-ups and outer capture: nested segment
+    bindings run eagerly inside it, and no host-to-device staging copy may
+    be issued."""
+    token = _FLAT_CAPTURE.set(True)
+    try:
+        yield
+    finally:
+        _FLAT_CAPTURE.reset(token)
+
+
+# @spec TXG-CAP-002
+def _refuse_staging_in_capture(device: torch.device) -> None:
+    """Raise when a host-to-device staging copy is issued inside a graph
+    capture: the captured copy would replay a frozen pinned source."""
+    if _FLAT_CAPTURE.get() or (
+        device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+    ):
+        raise RuntimeError(
+            "host-to-device staging inside a CUDA graph capture: a captured "
+            "copy would replay a frozen pinned source. A captured body reads "
+            "its host inputs only as device tensors given to it"
+        )
+
+
 def _h2d(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     """Host-authority tensor to the compute device without a hot-path
     synchronization: pinned staging + non-blocking copy on CUDA (a
     fresh ``pin_memory()`` allocation every call — the un-pooled
     fallback :class:`HostStaging` exists to avoid), plain move
     elsewhere."""
+    _refuse_staging_in_capture(device)
     if device.type == "cuda":
         return t.pin_memory().to(device, non_blocking=True)
     return t.to(device)
@@ -1780,6 +1822,7 @@ class HostStaging:
                 ``capacity``, or ``slot_name`` names no known slot.
 
         """
+        _refuse_staging_in_capture(device)
         n = int(cpu_tensor.shape[0])
         if n > self.capacity:
             raise ValueError(
@@ -1823,6 +1866,7 @@ class HostStaging:
                 or ``geometry`` is outside the per-geometry arena.
 
         """
+        _refuse_staging_in_capture(device)
         n = int(cpu_tensor.shape[0])
         if n > self.capacity:
             raise ValueError(
