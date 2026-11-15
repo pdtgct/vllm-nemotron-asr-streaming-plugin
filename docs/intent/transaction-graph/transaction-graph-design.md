@@ -89,9 +89,11 @@ collected for it. A step whose every row failed at planning (an **all-failed ste
 outcome, not an empty step: the model state first checks the failed latch (a latched worker
 raises, as for any step that schedules a row), then runs no transaction, returns the
 rejected-row output for each row and fails the requests in `postprocess_state`. It replays no
-cell, counts no fallback and adds one `(0, P)` entry to the `(K, E)` histogram. Coverage,
-classification, the arena upload and the reservation apply only to steps that reach transaction
-execution; in a mixed step the planning-failed rows count in `E`, and the inventory stays `2N`
+cell, reserves nothing, counts no fallback and adds one `(0, P)` entry to the `(K, E)` histogram.
+The bypass makes no verification check: post-warmup verification protects cell replay, which the
+bypass never reaches, so an unlatched worker takes it whether or not verification has passed.
+Coverage, classification, the arena upload and the reservation apply only to steps that reach
+transaction execution; in a mixed step the planning-failed rows count in `E`, and the inventory stays `2N`
 cells.
 
 ### Configuration checks
@@ -172,13 +174,35 @@ more geometries adds cells under their own index without changing the key.
 | Kind | Rows it replays |
 | --- | --- |
 | `chunk` | CHUNK rows, fresh and continuing alike: regular chunks, final tails (including an empty final tail), silent chunks, a stream's first chunk, a file's first step |
-| `echo` | every other row: REPLAY (label drain), park echo and FLUSH; a forced EOU row arises only with endpointing, which no cell covers |
+| `echo` | every other row: REPLAY (label drain), park echo and FLUSH; a forced-EOU candidate is never replayed (Endpoint arguments, below) |
 
 The model captures one chunk cell and one echo cell at every count from 1 to `N`: `2N` cells.
-Every cell is captured with endpointing off (`endpoint_enabled` false). No plugin path sets an
-endpoint policy (`session`, Endpointing; `transcription`, FILE-ENG-002), so a forced EOU row
-reaches only the option-off transaction, and the eager sub-plan identity (Split equivalence)
-covers forced EOU rows with endpointing on and off.
+
+**Endpoint arguments.** The forward gives every transaction it runs on a real step the endpoint
+history and book pools and the EOU token ID, with the option on or off, so the transaction always
+runs with `endpoint_enabled` true, as in `B_hook`. Every cell is captured that way and runs the
+*policy-free endpoint bookkeeping* exactly as the option-off transaction does: each CHUNK row's
+endpoint-book `armed` and `has_output` flags follow its observed output, and each fresh row's
+endpoint pages are initialized and stored, whether or not the row carries an endpoint policy.
+Two row classes stay outside the cells and fall back with reason `signature`:
+- **Endpoint-policy rows.** A row whose request sets an endpoint policy (field `endpoint_policy`);
+  a row plan has *endpointing* on when one of its rows does. Policy evaluation is elementwise in
+  the body, but no plugin path sets a policy (`session`, Endpointing; `transcription`,
+  FILE-ENG-002), so no qualification run exercises it.
+- **Forced-EOU candidates** (field `forced_eou`). The body forces EOU for a non-CHUNK row whose
+  scheduled token is the EOU token and whose book has no pending echo, an empty queue and an
+  unfinished stream, also when the row carries no policy. The pending echo, queue and finished state live on the
+  device, which classification does not read, so the host marks every non-CHUNK row whose
+  scheduled token it records as the EOU token, a superset of the rows the body forces. A position
+  past a request's recorded prompt holds a sampled token, which the host does not read; a
+  policy-free row samples the EOU token only as the decision of a forced EOU, which arms its
+  echo, so that token returns as a REPLAY row, never on the forced-EOU path. A row with a policy
+  falls back by its policy whatever its token.
+
+Each of these fields is part of the cell signature and false at capture (Signature). Only a direct
+engine stream client produces either class; such a step runs as the option-off transaction, where
+a policy-free row on the forced-EOU path is forced exactly as in `B_hook`. The eager
+sub-plan identity (Split equivalence) covers forced-EOU rows with endpointing on and off.
 
 ### Coverage and classification
 
@@ -194,19 +218,21 @@ counted under `(reason, kind, count)`:
 | --- | --- |
 | `chunk-uncovered` | `K > N` |
 | `echo-uncovered` | `E > N` |
-| `signature` | a needed cell's structural inputs differ from the captured ones (named kind and field); a step with an endpoint policy whose needed cells classification found falls back here with field `endpoint_enabled`, which only a direct engine stream client can cause; an earlier reason takes precedence |
+| `signature` | a needed cell's structural inputs differ from the captured ones (named kind and field); a step whose needed cells classification found falls back here with field `endpoint_policy` when a row carries an endpoint policy and with field `forced_eou` when a row is a forced-EOU candidate (Endpoint arguments), which only a direct engine stream client can cause; an earlier reason takes precedence |
 | `multi-geometry`, `uncaptured`, `empty` | a CHUNK row of another geometry, a needed cell with no graph, or no real rows; unreachable from the production planner: it binds every foreign-geometry row, a direct engine client's included, as a planning-failed non-CHUNK row; startup captures every cell; and neither a cleanup-only step nor a step whose every row failed at planning reaches the transaction. `multi-geometry` and `empty` are reachable only through a row plan built outside the production planner. Multi-geometry classification is defensive and never authorizes execution at another geometry: the declined step runs option-off at the server's geometry, whose device geometry status rejects the row |
 | `memory-profile`, `native-burst` | modes never covered; both unreachable: the profile transaction runs on a profiling dummy step, which never calls `execute`, and native burst is refused while the option is on |
 
 `execute` counts each declined step once; the caller that then runs the option-off transaction
 adds no count, and a dummy step, which never calls `execute`, is never counted.
 
-On plugin-packed input, which is endpoint-off, the signature is constant after startup, so a
-nonzero `signature` count there is a defect to investigate, not a tolerated rate. A direct engine
-stream client that sets an endpoint policy causes an expected `signature` fallback. The first `signature`
+On plugin-packed input, which carries no endpoint policy and schedules no EOU token, the signature
+is constant after startup, so a nonzero `signature` count there is a defect to investigate, not a
+tolerated rate. A direct engine stream client that sets an endpoint policy or schedules the EOU
+token causes an expected `signature` fallback. The first `signature`
 fallback per `(kind, field)` logs one WARNING naming the field.
 
-With `N = P_max` every reachable split is covered. A smaller `N` trades coverage of large
+With `N = P_max` every reachable split whose signatures match is covered, which on
+plugin-packed input is every split. A smaller `N` trades coverage of large
 steps for graph memory (Fit analysis).
 
 ### Step arena, static inputs and step outputs
@@ -216,7 +242,9 @@ addresses. `P_max` is the largest step population, `min(max_num_seqs, max_num_ba
 - **Step arena.** One device buffer with a chunk section and an echo section. Each section holds,
   for `N` rows, every int64 and bool vector its kind's body reads: the row's position in the step,
   its composed block index, `is_fresh` and the fresh row's initial book row, `is_file`, geometry,
-  admitted and prior prompt rows, per-row cadence frames and the planned-rejection bit. A cell at
+  admitted and prior prompt rows, per-row cadence frames, the planned-rejection bit and, in the
+  chunk section, the endpoint mode, threshold and residue frames that the endpoint bookkeeping
+  reads (Endpoint arguments). A cell at
   count `k` reads the first `k` rows of its section. Two pinned host buffers
   alternate per step, each fenced by an event so that it is rewritten only after its previous
   upload completed. Each step packs both sections and uploads the whole arena in one
@@ -252,9 +280,11 @@ stage, and the two launches of one step touch disjoint row positions and disjoin
 
 A call declined at step 4 or 6 increments its fallback counter and returns for the option-off
 transaction. A call before verification passed raises at step 2, naming the lifecycle defect and
-running neither path. An exception at step 1, 3 or 7 is worker-fatal; at step 4, 5, 6 or 8 to 10
-it follows the option-off transaction's structural-failure contract; from step 11 on it is
-worker-fatal. All
+running neither path, without latching the binding; whether the worker survives that error is the
+environment's choice, which the plugin does not guarantee. An exception at step 1, 3 or 7 is
+worker-fatal; at step 4, 5, 6 or 8 to 10 it follows the option-off transaction's structural-failure
+contract, cancelling any reservation held, except that a cancel that itself raises latches the
+binding and is worker-fatal; from step 11 on it is worker-fatal. All
 structural validation, both signatures, every allocation and the reservation therefore precede
 the first launch.
 
@@ -273,6 +303,16 @@ the first launch.
   order, the views `progress_step[:P]` and `remaining_step[:P]`, and no capture records. It is
   made before the first launch and staged once after the last, with `status_step[:P]`; the sink's
   single in-flight reservation is never split per kind.
+- **Reservation disposition.** Every reservation, a covered step's or the option-off
+  transaction's, is resolved by exactly one successful stage or one cancel. The stage is no-fail
+  in that it validates and allocates nothing, but a fault in its copies or its event can still
+  raise. It publishes the reservation to the sink's collection only after it has issued its
+  copies and recorded its completion event, and the ticket counts as resolved only once the stage
+  returns. A stage that
+  raises before publication therefore leaves the reservation held and cancellable, and the failure
+  path's cancel releases it; a cancel after a successful stage is a no-op. Treating a stage that
+  raised as resolved would leave the sink's one in-flight reservation held, and every later
+  reserve would fail.
 
 ## Split equivalence
 
@@ -441,10 +481,14 @@ computes what the nested graph replays compute.
 ### Signature
 
 A cell's signature covers every structural input its body bakes in: kind, count, geometry,
-control token IDs, `endpoint_enabled`, the decode and encoder-transition callable identities
-(chunk cells), resident pool layouts (address, shape, strides, dtype), lazily bound encoder
-buffers (chunk cells), the carrier width, and the layouts of the step arena, static inputs and
-step outputs. The host computes it before the upload.
+control token IDs, `endpoint_enabled`, the evidence-capture flag (the transaction's `capture`
+argument), the emission adapter's callable identity, the decode, encoder-transition and
+bucket-transition callable identities (chunk cells), resident pool layouts (address, shape,
+strides, dtype), lazily bound encoder buffers (chunk cells), the carrier width, and the layouts of
+the step arena, static inputs and step outputs. It also covers the two row classes the cells
+exclude (Endpoint arguments): whether any of the cell's rows carries an endpoint policy
+(`endpoint_policy`) and whether any is a forced-EOU candidate (`forced_eou`), both false at
+capture. The host computes it before the upload.
 
 Callables compare by `(id(__self__), id(__func__))` for a bound method and `id` otherwise. The
 dense decode binding caches one callable per graph key and the encoder binding one transition per
@@ -455,9 +499,10 @@ per call would need another identity mechanism.
 
 The body's host control flow depends only on the cell key and the signature: `endpoint_enabled`,
 the kind (a chunk cell runs one bucket over all its rows, an echo cell none), the count, the
-geometry's lookahead and hop (chunk cells only), decode output widths, and the capture-record flag
-(always off on the replay path). Any further host-dependent branch joins the signature or the
-cell key before its cell is captured. Per-row protocol state (first chunk, final tail, sample
+geometry's lookahead and hop (chunk cells only), decode output widths, and the evidence-capture
+flag (always off on the replay path); `endpoint_enabled` is true on every step (Endpoint
+arguments). Any further host-dependent branch joins the signature or the cell key before its cell
+is captured. Per-row protocol state (first chunk, final tail, sample
 count, fresh and file bits, per-row cadence) is device data. Host-side checks inside the body
 (result-structure validation, nested invocation counters) are frozen under replay, so serving
 reads of nested counters are deltas from a baseline taken after startup.
@@ -478,9 +523,10 @@ them eagerly, so it also compares the two nested paths. The self-check covers re
 exactness for accepted rows rests on Split equivalence and Qualification, at both geometries,
 including every case of Exactness obligations for masked rows and Lookahead rows at 160 ms.
 
-Before the first cell of a capture call, a scatter warm-up launches, for each resident pool, one
-row with a rejected status that names the first non-null free page; the kernel's status predicate
-returns before it reads the page ID or any resident address.
+Before the first cell of a capture call, a scatter warm-up launches, for each component pool and
+each projected resident-pool view a transaction passes to the kernel, one row with a rejected
+status that names the first non-null free page; the kernel's status predicate returns before it
+reads the page ID or any resident address.
 
 Cells are captured largest first: chunk cells from `N` down to 1, then echo cells from `N` down
 to 1. Memory that a larger cell's capture allocated and freed is then available to the smaller
@@ -537,7 +583,7 @@ oracle).
 | `capture_cudagraphs(profile_only=True)` | Runs only when core's estimate runs. The profiling capture: segment graphs, the scatter warm-up, every cell, then the charged margin (Graph memory), over the profiling pools, into the pool core passes (the estimate's throwaway pool). |
 | `clear_cudagraphs()` | Releases every graph, buffer, signature, recorded layout and the margin the profiling capture created, this component's part before the segment graphs. It keeps the capture record, whose profiling totals are host integers. Core calls it also when the profiling capture raised or was never reached, so it tolerates nothing captured. |
 | `capture_cudagraphs(profile_only=False)` | Runs whenever `needs_cudagraph_capture()` is true and `enforce_eager` is off. Its entry checks run first, in this order: Ordering, A second serving capture, `registration`'s segment-graph entry check (REG-MEM-024), then whether a profiling capture was required (When core's estimate does not run). The serving capture: the same procedure, without the margin, over the serving pools, into core's global graph pool; then the memory comparison. Records the plain-value pool layout for post-warmup verification. |
-| `post_warmup()` | Called once per run of the worker's warmup; at startup after the serving capture and before the worker serves. Post-warmup verification. Allocates nothing and replays nothing. |
+| `post_warmup()` | Called once per run of the worker's warmup; at startup after the serving capture and before the worker serves. Post-warmup verification. Allocates no device memory and replays nothing. |
 | scheduled steps | `execute` per step (Execute order). |
 | dummy steps | Carry no `bind_rows` authorization; never replay and never call `execute`. |
 | `shutdown()` | Called at the start of the runner's shutdown, also after a failed startup: releases every cell and binding-owned buffer, before the segment graphs, and logs the counter summary. Tolerates a model state whose initialization did not complete and a binding that never captured. A killed worker, or one whose construction failed, never calls it. |
@@ -564,11 +610,17 @@ and the transaction-graph parts of the other hooks do nothing.
   buffers), synchronizes
   the capture stream and propagates the original error with its diagnostics (Capture failure
   messages; `registration`'s Capture failure). Nothing the call created then remains, independent of
-  a later `clear_cudagraphs` or `shutdown`.
+  a later `clear_cudagraphs` or `shutdown`. The propagated error holds no reference to the call's
+  tensors or graphs: the cleanup, which receives the error, clears the local variables of the
+  finished frames in its traceback and in the tracebacks of its cause and context, keeping the
+  messages and traceback lines as diagnostics. Otherwise a retained error would keep the
+  discarded memory alive.
 - **Inventory.** With the option off the call captures no cell; with the option on it captures
   `2N` cells or raises.
 - **Ordering.** A serving capture while profiling cells exist, or a profiling capture after a
-  serving capture was attempted, whether or not it succeeded, is a lifecycle defect and raises.
+  serving capture was attempted, whether or not it succeeded, is a lifecycle defect and raises. A
+  serving capture is *attempted* once a serving call has passed every entry check below, the
+  required-capture decision included.
 - **Entry checks.** The ordering checks (Ordering, A second serving capture), then `registration`'s
   segment-graph entry check (REG-MEM-024) and, in the serving capture, the decision of When core's
   estimate does not run, in that order, are made at the call's entry, before the segment-graph part
@@ -582,26 +634,40 @@ and the transaction-graph parts of the other hooks do nothing.
 Core enables JIT monitoring (Triton compilation and autotuning, among others) after the startup
 warmup. A scheduled step, replayed or option-off, compiles nothing those monitors observe, for
 these warmed domains:
-- **Masked-scatter kernel.** The plugin's one Triton kernel specializes on each resident pool's
-  device, dtype, page size, strides and launch configuration and on 16-byte pointer alignment; the
-  row count is its grid. The scatter warm-up warms every pool layout, and the transaction passes
-  only whole allocations or 16-byte-aligned views.
+- **Masked-scatter kernel.** The plugin's one Triton kernel specializes on each resident-pool
+  argument's device, dtype, page size, strides and launch configuration and on whether its pointer
+  is 16-byte aligned; the row count is its grid. The scatter receives only the pools' fixed views:
+  the component pools and the projected resident-pool views over them, whose addresses, and so
+  whose alignment, are the same at warm-up, capture and serving. The scatter warm-up launches
+  every component pool and every projected view a transaction passes, and each cell's eager
+  reference launches the views its kind's body passes, so every argument a scheduled step passes,
+  covered or fallback, was launched before core enables JIT monitoring. The scatter's record of
+  warmed arguments includes each argument's alignment, so a view at an alignment not yet launched
+  is never taken as warmed. Padding the views to 16-byte alignment is a measured optimization, not
+  an obligation (Deferred 11).
 - **Bodies at every count.** Each cell's eager reference and warm-ups run its kind's body at its
   count, so both kinds are warmed at every count from 1 to `N`.
 - **Segment graphs.** The encoder at every CHUNK count to `max_num_seqs` and the decoder at its
   tiers (`registration`).
 
 The claim excludes first-use costs the monitors do not observe, such as lazy CUDA module loading.
-A test runs each reachable fallback class (`chunk-uncovered`, `echo-uncovered`, `signature`) after
-startup under `jit_monitor_mode` `error` and requires no monitored compilation.
+A test runs each reachable fallback class (`chunk-uncovered`, `echo-uncovered`, and `signature`
+with the fields `endpoint_policy` and `forced_eou` among its cases) after startup under
+`jit_monitor_mode` `error` and requires no monitored compilation, and compares the scatter's
+host-side `(address, shape, strides, dtype)` arguments with those launched at startup.
 
 ### A second serving capture
 
 An elastic expert-parallel reconfiguration reruns the worker's warmup, which calls the serving
-capture again over the live pools while streams hold slots. A serving capture while serving cells
-exist raises, naming the option and stating that recapture over live pools is not supported; the
-recovery is an engine restart. `registration` also refuses elastic expert parallelism, so the
-path is unreachable in a supported configuration.
+capture again over the live pools while streams hold slots. A serving capture after a serving
+capture was attempted (Rules of the capture call), whether or not the attempt succeeded, raises at
+its entry, naming the option and stating that recapture over live pools is not supported; the
+recovery is an engine restart. The refusal is keyed on the attempt, not on cells existing,
+because a failed attempt discards its cells and segment graphs, and a retry would then capture a
+second time in the worker. Like the other entry refusals, it changes nothing: the binding's latch
+and any existing graphs stay as they were until `shutdown`, and core treats the propagated error
+as worker-fatal. `registration` also refuses elastic expert parallelism, so the path is
+unreachable in a supported configuration.
 
 ### Repeated bindings
 
@@ -752,8 +818,10 @@ using only plain values and host state:
    arena, static inputs and outputs, model parameters and buffers, nested bindings' scratch);
 5. the process constants.
 
-A mismatch latches the binding as failed and raises, so startup fails. Verification does not
-replay a graph (no step authorizes the pools there) and does not enlarge the workspace.
+A mismatch latches the binding as failed and raises, so startup fails. Verification replays no
+graph (no step authorizes the pools there), allocates no device memory and does not enlarge the
+workspace. Its one allocation is a bounded host shadow page of the state layout, over which check
+2 re-runs the model's projection to obtain the current role table.
 
 ## Failure containment
 
@@ -770,17 +838,24 @@ the planning-failed set, independently of collection.
 failure there (Execute order) raises with resident state at the baseline and a reserved ticket
 cancelled, and does not latch the binding, except the worker-fatal process-constant and
 graph-object failures: the arena and static inputs are rewritten in full on every step, so nothing
-outlives the failure. A delayed device fault that surfaces during a pre-launch copy is not such a
-failure; it takes the asynchronous-fault path below. Not latching does not promise that the engine
-survives the propagated exception.
+outlives the failure. Not latching does not promise that the engine survives the propagated
+exception. If cancelling the held reservation itself raises, the sink's state is no longer known,
+so the binding latches and the failure propagates as worker-fatal. A delayed device fault that
+surfaces during a pre-launch copy is not a pre-launch failure; it takes the path of Delayed device
+faults, below.
 
 **From the first launch on**, any failure is worker-fatal: a failed launch, a failure between the
 launches, the escaped-row copy or the commit stage. The binding latches, attempts to cancel the
-reservation (the worker is not reused, so the outcome is irrelevant) and propagates the exception.
+reservation (the worker is not reused, so the outcome is irrelevant; a stage that raised before
+publication leaves the reservation cancellable) and propagates the exception.
 No launch is retried and no half of a split step falls back, because the first launch may already
 have scattered. Core's engine loop reports the engine dead (`EngineDeadError` to clients).
-Asynchronous device faults surface at the next synchronizing call, normally the sink's
-collection, and take the same path; faults are not attributed to cells.
+
+**Delayed device faults.** An asynchronous device fault surfaces at a later synchronizing call,
+normally the sink's collection, after the stage. It propagates as worker-fatal, without retry,
+fallback or attribution to a cell. At the collection it neither latches the binding nor cancels
+the reservation, which the successful stage already resolved; core's engine loop then reports the
+engine dead.
 
 **Recovery.** The latch lives in one worker process: every later step there that schedules a row
 raises "transaction graphs failed on this worker; a fresh engine is required", an all-failed
@@ -962,8 +1037,8 @@ build. Every comparison is against `B_hook`.
 On `Q` and `M`, every covered step, of one kind or split, equals the option-off transaction of the
 same row plan bit for bit; the transcripts equal the option-off run's; and the run records zero
 fallbacks of any kind. Both served runs also record zero fallbacks. Every zero-fallback claim is
-scoped to plugin-packed input: a direct engine client can send a foreign-geometry row or an
-endpoint policy, which planning fails or which falls back.
+scoped to plugin-packed input: a direct engine client can send a foreign-geometry row, which
+planning fails, or an endpoint policy or a scheduled EOU token, which falls back.
 
 ### Step rule
 
@@ -1074,30 +1149,37 @@ lifecycle (a hook's behaviour, an ordering rule, a failure path) updates the mod
 change. It models one worker with a small `N` and bounded steps:
 - **Actions:** every hook call of the Capture lifecycle table, in core's startup order, with each
   cell capture able to fail, the memory comparison able to overrun, `clear_cudagraphs` also after
-  a failed or skipped capture, a second serving capture attempt, and `shutdown` from any state;
-  scheduled steps (one-kind replay, split replay, counted fallback, pre-launch failure, failure at
-  the first launch, between the launches or at the stage); all-failed bypass steps on an unlatched
-  and a latched worker; cleanup-only steps; dummy steps; and whether a profiling
-  capture is required (including a budget fixed or an extensible cache disabled after
-  construction) and runs, as a nondeterministic choice.
+  a failed or skipped capture, a second serving capture attempt after a successful and after a
+  failed serving capture, and `shutdown` from any state; scheduled steps (one-kind replay, split
+  replay, counted fallback, pre-launch failure, a failing cancel of the held reservation before
+  the first launch, failure at the first launch, between the launches or at the stage, a stage
+  that raises before and one that raises after publication, and a declined step's option-off
+  reservation, scatter and stage each able to fail, as one nondeterministic choice per declined
+  step); a step before post-warmup verification, after whose propagated error the engine may die;
+  all-failed bypass steps on an unlatched worker, before and after verification, and on a latched
+  worker; cleanup-only steps; dummy steps; and whether a profiling capture is required (including
+  a budget fixed or an extensible cache disabled after construction) and runs, as a
+  nondeterministic choice.
 - **Invariants:** no replay outside a scheduled step after a passed verification, other than a
   capture's validation replay of rejected rows inside its own capture call; no step replay over
   profiling pools; nothing from the profiling pools, the margin included, retained after
   `clear_cudagraphs`; at most one serving capture; a serving capture with no profiling capture
   before it is either reported uncharged because none was required or fails startup; a serving
-  overrun fails startup; each reservation has at most one terminal disposition, staged or cancelled
-  exactly once on every nonfatal path and left unresolved after a worker-fatal failure only if its
-  cancellation failed; a step whose first launch ran never falls back and never stages after a
+  overrun fails startup; each reservation, a covered step's or a declined step's option-off one,
+  is resolved by exactly one successful stage or one cancel (a stage that raised before
+  publication leaves it cancellable, a cancel after a successful stage is a no-op) and is left
+  unresolved after a worker-fatal failure only if its cancellation failed; a step whose first launch ran never falls back and never stages after a
   failure; after a latch, no step that schedules a row completes, an all-failed bypass step
   included (a cleanup-only step may); an all-failed bypass step replays no cell, counts no
   fallback and holds no reservation;
   after any failure in a capture call, nothing that call created remains captured, segment graphs
   included; after `shutdown`, nothing
   remains captured.
-- **Liveness under fairness**, for cooperative teardown only (a worker that runs the runner's
-  shutdown): every latched or failed worker reaches `shutdown`, and every startup either serves or
-  fails with a reported error. Core gives no shutdown-hook guarantee for a killed worker or a failed
-  construction, and the model claims none.
+- **Liveness under fairness:** under cooperative teardown (a worker that runs the runner's
+  shutdown), every latched or failed worker reaches `shutdown`; and every startup whose
+  construction succeeded and that is neither shut down cooperatively nor killed before it serves
+  eventually serves or fails with a reported error. Core gives no shutdown-hook guarantee for a
+  killed worker or a failed construction, and the model claims none.
 
 ## README
 
@@ -1203,26 +1285,30 @@ by locale only.
 | Freshness | A per-row select inside the chunk cell | A cell dimension (`chunk-fresh`, `chunk-continuing`); separate launches for fresh and continuing rows | A dimension triples cells and sends every step with both to fallback; separating fresh from continuing rows changes the encoder's batch dimension and so its numerics |
 | Fresh-row state | Gather every row, then select the initial state as the first consumer, for every gathered tensor | The variable-length continuing index; a masked-load kernel that skips fresh rows' loads; a select of the book row only, relying on core's new-generation slot initialization (Deferred 10) | The variable-length index is data-dependent and cannot be captured; a masked-load kernel adds a JIT specialization for no change in values; the book-row-only select is cheaper but rests on an unverified coincidence of the fresh flag with a core new-generation bind |
 | Launch boundary | Validation, signatures, allocations and the reservation before the first launch; worker-fatal after it | A reservation per launch; option-off fallback of the second half after a failed first launch | The first launch may already have scattered; a second-half fallback would commit a step neither path produced, and two reservations break the sink's one-in-flight rule |
+| Reservation disposition | Exactly one successful stage or one cancel resolves a reservation, a covered step's or the option-off transaction's; a stage that raises before publication leaves it cancellable; a cancel after a successful stage is a no-op | Treating a called stage as the disposition whether or not it returns; limiting the rule and its model check to covered steps | A stage that raised and counted as the disposition would leave the sink's one in-flight reservation held, so every later reserve fails; every declined step uses the option-off reservation, so the rule and its check must cover it too |
 | Host inputs | One step arena with a section per kind, one upload, double-buffered pinned host side | One arena per cell (two uploads); per-call staging; captured host-to-device copies | One upload per step; captured copies replay a frozen source; per-call staging adds launches |
 | Static inputs and outputs | Shared step-level buffers (Step arena, static inputs and step outputs) | Per-cell buffers with a host-side permutation; reordering the plan CHUNK-first | One buffer set; outputs stay in core's row order with no extra kernels |
 | Capture order | Largest first, chunk cells then echo cells, on core's one stream and pool | Smallest first; interleaved kinds; a stream per cell | Freed graph-pool blocks are reusable only on the stream that allocated them, and a larger capture's freed intermediates fit a smaller one |
+| Masked-scatter alignment | Every resident-pool argument a step passes after startup equals, in address, shape, strides and dtype, one launched by the serving capture's scatter warm-up or a cell's eager reference; the warm-up launches the component pools and the projected views, and its record includes alignment | Padding the state layout so that every view is 16-byte aligned; an aligned base pointer plus an element offset in the Triton kernel | The pools' views have fixed addresses, so warm-up, capture and serving share one alignment specialization whatever a view's offset; padding every component would change the model's state layout and break the projection that reads adjacent scalar fields (the replay book, the frontend counters) as one matrix, for no correctness gain; changing the kernel's addressing would change the option-off transaction's kernel without measured need. Padding remains a measured optimization (Deferred 11) |
 | Graph-memory accounting | Core's estimate through the profiling capture; no model pool | A model-owned admission inventory and graph pool | Core's estimate already measures the same graphs before planning; a model admission needs its own fit rule and release check |
 | Profiling capture content | The serving capture's procedure and cells over the profiling pools, plus the charged margin | A synthetic upper bound; extrapolation from one cell | The same procedure gives the same allocation sequence; extrapolation is unsound because cells do not share memory predictably |
 | Serving against profiling | Aggregate call totals; startup fails when the serving total exceeds the profiling total, which includes one flat charged margin | A per-cell margin; a per-cell inequality; a warning only; an uncharged tolerance | Rounding arises per allocator segment over the whole call, so a per-cell margin overcharges at large `N` and undercharges at small `N`; per-cell growth is order-dependent under reuse; a warning serves with uncharged memory where core estimated; an uncharged tolerance hides real overruns. The margin is memory core charges, so the strict comparison still bounds serving memory |
 | Missing profiling capture | Required from the effective cache configuration at the serving capture (When core's estimate does not run); otherwise logged as uncharged | Allow every absence; refuse the option under a fixed budget | An unexplained absence means core skipped a charge the configuration promises; refusing fixed budgets would break every such deployment once the option is default-on |
 | Option-off baseline | `B_hook`: the default segment arms under the hook configuration, no CHUNK-bucket graphs | The eager encoder; the `--enforce-eager` graphed configuration | `B_hook` is the default at the same geometry, so the option is the only difference; the eager encoder would credit the option with the encoder graphs' gain |
 | CHUNK-bucket graphs | Refused under the option | Accept the binding inside or beside the cells | The binding graphs an already-gathered bucket, which a chunk cell captures in full; it is experimental, covers three counts at 160 ms, and would only change fallback steps |
+| Endpoint arguments | The forward passes the endpoint pools and EOU token on every step, option on or off; cells run with `endpoint_enabled` true and the policy-free endpoint bookkeeping; a step with an endpoint-policy row or a forced-EOU candidate, marked conservatively on the host, falls back by `signature` | Cells with `endpoint_enabled` false and the endpoint arguments passed only for a step with a policy row; forcing EOU only for a row that carries a policy; cells that also cover policy rows and forced EOU | Passing the arguments only for policy steps makes the option change the transaction: policy-free rows' endpoint pages would differ from `B_hook`'s, and a policy-free row that schedules the EOU token would be rejected instead of forced, against TXG-EQ-001. Forcing EOU only for policy rows changes `B_hook` itself, a session-protocol decision outside this component. Policy evaluation and forced EOU arise only from a direct engine client and have no qualification evidence, so they wait for cells of their own (Deferred 6) |
 | File rows | Rows of stream roles in the same cells, chosen by a per-row file mask | Separate file cells; leave file rows uncovered | Separate cells cost memory for work the streams already do; uncovered file rows would make every step a file shares run option-off |
 | File samples | Outside the arena (File samples) | Pack samples into the arena | See File samples |
 | Planning-failed rows | Kept in the row plan at their scheduled positions as non-CHUNK rows with a planned-rejection bit, counted in `P` and `E`; failed from a planning-failed set in `postprocess_state`; a step whose every row failed runs no transaction | Exclude them from the row plan and compact the surviving rows | The model state already keeps a failed file row in its step plan and binds a foreign-geometry unit as non-CHUNK, so the retained row is the existing model. It keeps every input, binding and output at the runner's position, with no remap and no restoration of output cardinality; the masked scatter leaves the pages untouched; an explicit bit, not a role-check coincidence, rejects fresh rows too; and the host set delivers the failure even when no status is collected. Exclusion would need a position map on both sides of the transaction and an out-of-band output for each excluded row |
 | Queue-count ownership | The body writes each row's count; `transcription` owns the transport to file planning | This component owns the transport | The transport runs with the option off and replaces `transcription`'s synchronous read; owning it here would make `transcription` depend on this component, which the HLD's component rule forbids |
 | Configuration checks | One function, two callers (Where the checks run) | Model construction only | Fails in the API server before workers start |
 | `--enforce-eager` | Explicit request refused; once default-on, the default resolves off with a log line | Silently off; always refused | An explicit request is never ignored; refusing a default would break every eager deployment |
-| Second serving capture | Refused, recovery by restart | Recapture over live pools | Recapture would bake new addresses while streams hold slots, with no estimate for the memory |
+| Second serving capture | Refused at entry once a serving capture was attempted, whether or not it succeeded; worker-fatal, with the latch and existing graphs unchanged until shutdown; recovery by restart | Recapture over live pools; refusal only while serving cells or segment graphs exist; latching the binding at the refusal | Recapture would bake new addresses while streams hold slots, with no estimate for the memory. A failed attempt discards its cells and segment graphs, so a refusal keyed on their existence would admit a retry. The refusal changes nothing, like the other entry refusals; latching there would break that uniformity for no gain, since core treats the error as worker-fatal |
+| All-failed bypass and verification | The bypass checks the latch only; an unlatched all-failed step takes it whether or not post-warmup verification passed | Requiring verification before the bypass, as `execute` does | Verification protects cell replay; the bypass replays no cell and reserves nothing, so a guard would make the option raise where the option-off path succeeds |
 | Failure recovery | Worker-fatal latch; engine restart; tested end to end | Roll back pages; retry option-off after a launch error | The launches scatter, so partial mutation is unknowable; rollback needs hot-path snapshots of every touched page |
 | Signature mismatch | Count, warn once per field, run option-off | Recapture on demand; raise | Recapture needs uncharged memory and stalls; the option-off transaction is the exact reference |
 | Process constants | Worker-fatal on change | Part of the signature | Every cell and the segment graphs were captured under the same settings, so a fallback would be stale too |
-| Post-warmup check | Plain-value layout, graph presence, identities, buffer addresses, constants; no replay | A validation replay; a first-step check | No step authorizes the pools in `post_warmup`; a first-step check lets the engine report ready before a mismatch is found |
+| Post-warmup check | Plain-value layout, graph presence, identities, buffer addresses, constants; no replay and no device allocation, the projected layout re-derived over one host shadow page | A validation replay; a first-step check | No step authorizes the pools in `post_warmup`; a first-step check lets the engine report ready before a mismatch is found |
 | Qualification workload | Independently paced streams and files at the transaction level, replayed and option-off per step, with preregistered parameters and minimum case coverage, plus served runs | Phase-aligned schedules with filler rows | Aligned schedules produce steps serving never produces and hide mixed steps; the transaction-level driver keeps the page-by-page comparison; minimum coverage stops a run from passing without the cases it must exercise |
 | Step-rule plans | One recorded plan per composition, replayed from one restored snapshot | Timing free-running steps; a plan sequence advanced across steps | Free-running steps differ between legs, so medians would compare different work; an advancing sequence cannot sustain 23 steps of label drains or FLUSH rows on fixed slots |
 | Step-rule inventory | The deployed inventory under a profiled budget; a reduced inventory is diagnostic only | Capture only the cells the legs replay | A pass on an inventory that cannot start says nothing about the deployed engine; the inventory changes memory, capture order and pool reuse |
@@ -1243,9 +1329,10 @@ by locale only.
    the encoder graphs' memory at the cost of slower fallback steps and a different baseline, and
    the `dense-graphed` encoder, with its own flat-capture and exactness evidence.
 5. **More geometries.** Cells at 320, 560 and 1120 ms, each with exactness and latency evidence.
-6. **Endpointing.** Cells are captured with endpointing off, and an endpoint-enabled step is a
-   `signature` fallback. Whether endpoint-enabled steps get cells of their own (a cell dimension)
-   once a policy binding exists.
+6. **Endpoint policies and forced EOU.** Cells run the policy-free endpoint bookkeeping, and a
+   step with an endpoint-policy row or a forced-EOU candidate is a `signature` fallback. Whether
+   such steps get cells, with exactness evidence for policy evaluation and forced EOU, once a
+   policy binding exists.
 7. **Admission's use of U(1).** Which component turns U(1) and the ladder into a stream count.
 8. **Lazily bound encoder buffers.** Whether a long stream rebinds them after warm-up, causing a
    permanent `signature` fallback; to be probed on long streams at both geometries.
@@ -1255,6 +1342,9 @@ by locale only.
     select only the book row (prompt, geometry) for fresh rows. It is unverified that the model's
     fresh flag always coincides with a core new-generation bind; a test of that coincidence and
     the body non-regression check settle it.
+11. **Scatter alignment padding.** Whether padding the resident-pool views to 16-byte alignment
+    speeds the masked scatter enough to justify changing the state layout; a measured
+    optimization, not a correctness requirement (Warm-up domains).
 
 ## References
 

@@ -416,8 +416,9 @@ workspace, which core locks after the serving capture.
   the graphed arms keep their inventory, staging, readiness checks and serving path. Each entry's
   wrapper is a stand-in that holds a non-device graph from construction and runs the entry's
   runnable eagerly on every call; nothing is captured, pooled or synchronized. Outputs equal the
-  eager arms'. Only `--enforce-eager` reaches this case, because the hook configuration requires a
-  CUDA platform.
+  eager arms'. The model logs one INFO line naming each graphed arm the stand-in serves, so a run
+  that asked for graphed arms shows that it executes them eagerly. Only `--enforce-eager` reaches
+  this case, because the hook configuration requires a CUDA platform.
 - **Memory contributors.** The model's `PersistentStateSpec` lists in `memory_contributors` each
   configured option that enlarges its execution memory or graphs: `max_num_seqs`,
   `encoder_execution_arm` and `decode_dispatch_arm` when graphed execution is configured,
@@ -442,17 +443,23 @@ segment graph.
 | `capture_cudagraphs(profile_only=True)` | Runs only when core's graph-memory estimate runs, over core's temporary profiling state pools and into the estimate's throwaway pool. Captures the segment graphs for the server's geometry, then the transaction-graph part; with transaction graphs off, it ends with the charged margin. Logs the capture line. |
 | `clear_cudagraphs()` | Releases every segment graph and its buffers, after the transaction-graph part, and, with transaction graphs off, the margin the profiling capture created (with them on, the transaction-graph part releases it); keeps the profiling figures as host integers. Core calls it also when the profiling capture raised or was never reached, so it tolerates nothing captured. Core also clears every registered static graph wrapper after the estimate, so no profiling entry survives either way. |
 | `capture_cudagraphs(profile_only=False)` | The serving capture: rebuilds the segment graphs by the same procedure, into core's global graph pool, then the transaction-graph part; then the memory comparison. Logs the capture line. |
-| `post_warmup()` | Before the worker serves: every expected segment-graph entry holds its graph; then the transaction-graph verification. Allocates nothing and replays nothing. Under `--enforce-eager` it makes the same segment-graph check. |
+| `post_warmup()` | Before the worker serves: every expected segment-graph entry holds its graph; then the transaction-graph verification. The segment-graph check allocates nothing; neither part allocates device memory or replays a graph. Under `--enforce-eager` it makes the same segment-graph check. |
 | `shutdown()` | Releases every segment graph and binding-owned buffer; tolerates a model state whose initialization did not complete. |
 
-**Ordering.** A serving capture while profiling segment graphs exist, or a profiling capture after
-a serving capture was attempted, whether or not it succeeded, is a lifecycle defect and raises at
-the call's entry, before capturing; while transaction graphs are on, the error names
+A serving capture is *attempted* once a serving call has passed every check at its entry (the
+transaction-graph entry checks while transaction graphs are on, the checks below, and the
+required-capture decision), whether or not the call then succeeds.
+
+**Ordering.** A capture call of either kind while profiling segment graphs exist, or a profiling
+capture after a serving capture was attempted, whether or not it succeeded, is a lifecycle defect
+and raises at the call's entry, before capturing; while transaction graphs are on, the error names
 `transaction_graph_populations`.
 
-**A second serving capture.** A serving capture while serving segment graphs exist raises at the
-call's entry, stating that recapture over live state pools is not supported and that the recovery
-is an engine restart, and naming `transaction_graph_populations` while transaction graphs are on.
+**A second serving capture.** A serving capture after a serving capture was attempted, whether or
+not the attempt succeeded, raises at the call's entry, stating that recapture over live state
+pools is not supported and that the recovery is an engine restart, and naming
+`transaction_graph_populations` while transaction graphs are on. The refusal is keyed on the
+attempt, not on segment graphs existing, because a failed attempt discards the graphs it captured.
 Core reaches it only through an elastic expert-parallel reconfiguration, which the plugin refuses.
 
 ### Segment-graph memory
@@ -511,7 +518,11 @@ capture line's retained figure is the span of the call's segment-graph part.
   `transaction_graph_populations` empty, together with `--enforce-eager`; under a fixed budget,
   also a smaller `--kv-cache-memory-bytes`; for a serving capture
   under a profiled budget, also a lower `--gpu-memory-utilization`. The serving-over-profiling
-  failure names both call totals, `r` and the excess, with the same remedies.
+  failure names both call totals, `r` and the excess, with the same remedies. Whatever the
+  failure, the propagated error holds no reference to the tensors or graphs the capture created:
+  the cleanup clears the local variables of the finished frames in its traceback and in the
+  tracebacks of its cause and context, keeping the messages and traceback lines, so that a
+  retained error does not keep the discarded memory alive.
 
 ## Model-state interface
 
