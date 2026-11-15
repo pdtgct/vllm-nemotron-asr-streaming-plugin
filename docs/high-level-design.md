@@ -419,8 +419,8 @@ implementations differ:
 ## Success Metrics
 
 Acceptance is tiered; a claim names the tier it has met and the build (stage 1 or stage 2) it was
-met on. Stage 1 can meet every tier on core's routes. The CPU seam conformance suite needs only the
-frontend package installed; served legs through a frontend (`Recognize`, the factory's stream
+met on. Stage 1 can meet every tier on core's routes. The CPU seam conformance suite needs only a checkout
+of the frontend repository at the pinned release tag; served legs through a frontend (`Recognize`, the factory's stream
 admission) need stage 2.
 
 1. **CPU conformance.** Unit and contract tests, including the frontend's seam conformance suite run

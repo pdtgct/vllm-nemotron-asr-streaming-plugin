@@ -266,15 +266,19 @@ are qualified as a pair. This factory meets a mismatched frontend as follows:
 - A frontend that bypasses that discovery and calls `open` with a `cadence` gets `TypeError` from
   argument binding (Protocol), so it opens no session.
 
-**Counterpart pin and conformance run.** The `conformance` extra in `pyproject.toml` is the one
-place that pins the counterpart release, as an exact `vllm-riva-frontend` version; the README's
-compatibility line repeats that version. Tier 1 installs the extra and runs the counterpart
-suite's CPU seam conformance tests through this repository's pytest suite
-(`tests/session/test_frontend_conformance.py`), against the factory that `create_session_factory`
-returns for `Nemotron3_5AsrStreamingForRNNT`, built on this repository's engine double. The tier 1
-record names the counterpart version and the command it ran. A run in which the frontend package
-is missing or those tests are skipped does not meet tier 1. The suite's parts that need a real
-engine client on the stage 2 build (the GPU lane) are not tier 1; they belong to tier 2.
+**Counterpart pin and conformance run.** This repository's tier 1 configuration is the one
+place that pins the counterpart release, as an exact `vllm-riva-frontend` release tag; the
+README's compatibility line repeats it. The frontend's seam conformance suite
+(`tests/session/test_seam_conformance.py`) is not part of its installed package: it imports the
+frontend's test support modules and takes the factory under test through a `real_seam` fixture
+that skips by default. Tier 1 therefore runs the suite from a checkout of the frontend repository
+at the pinned tag, with the checkout's `tests/` directory on the import path, and this
+repository's conftest overrides `real_seam` with an adapter of the shape of the suite's fake seam
+over the factory that `create_session_factory` returns for `Nemotron3_5AsrStreamingForRNNT`, built
+on this repository's engine double. The tier 1 record names the tag and the command it ran. A run
+in which the checkout is missing, the fixture is not overridden, or the suite's tests are skipped
+does not meet tier 1. The suite's parts that need a real engine client on the stage 2 build (the
+GPU lane) are not tier 1; they belong to tier 2.
 
 ## Core `/v1/realtime`
 
@@ -335,7 +339,7 @@ part of that later design.
 | Cadence at `open` | None: `open(*, locale)`, every session at the server's geometry | `open(*, cadence, locale)` refusing a cadence the server does not serve; an optional `cadence` accepted only when it names the server's geometry | The server serves one geometry fixed at startup, so a per-stream cadence chooses nothing; an optional, checked argument keeps a protocol surface no caller needs and keeps frontends coded to pass it |
 | Geometry discovery | The factory publishes no cadence | A singleton `served_cadences`; a `default_cadence` for the frontend to read | No frontend decision depends on the geometry: the packer, not the frontend, segments audio. A published value invites frontends to branch on server configuration |
 | Geometry source | `lookahead.served_lookahead`, which returns the right context, with the index from the implemented table, called by the factory, the realtime hook, the model's check and the file prompt (REG-LA-009) | Each caller reads the configuration itself | Separate readers can disagree on the field or its fallback, and the equivalence goal needs files and streams at the same lookahead |
-| Release coupling | Plugin and frontend release as a pair; the `conformance` extra pins the counterpart, and tier 1 runs its CPU seam conformance tests | Version negotiation in the protocol; a shim accepting both `open` signatures | Negotiation adds a protocol surface and a matrix of release pairs to test for one argument; a shim keeps the cadence argument alive |
+| Release coupling | Plugin and frontend release as a pair; tier 1 pins the counterpart's release tag and runs its seam conformance suite from a checkout at that tag | Version negotiation in the protocol; a shim accepting both `open` signatures | Negotiation adds a protocol surface and a matrix of release pairs to test for one argument; a shim keeps the cadence argument alive |
 
 ## Open Questions & Future Decisions
 
