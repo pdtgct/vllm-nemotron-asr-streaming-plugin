@@ -43,7 +43,7 @@ decoder state in an RFC 1 state slot, so the same transition serves:
 
 Frontends built as RFC 2 endpoint plugins do not import this package. They discover a session
 factory through the entry-point group `vllm_riva_frontend.session_factories` and use it through a
-structural protocol: open a session at a cadence and locale, feed audio, flush for the final
+structural protocol: open a session at the server's cadence and a locale, feed audio, flush for the final
 transcript, abort, and release once the slot has retired. The factory owns every engine-facing
 task it starts, so a frontend's drain and stop can reason about them. The factory uses the RFC 1
 client path (`AsyncLLM.generate(..., stream_admission=True)`, `wait_stream_retired`), which
@@ -63,13 +63,30 @@ core's `/v1/realtime`, so the two streaming paths cannot segment audio different
 
 A streaming step is one model-defined transaction over resident state slots: host validation of
 the row plan, a device body (gathers, frontend, encoder, RNN-T decode, projection) and predicated
-scatters back into the state pages. The encoder and decoder regions can already replay their own
-CUDA graphs, yet the step stays bound by host dispatch between them: per-op dispatch, kernel
-launches and allocator work. With the opt-in `transaction_graph_populations` option the model
-replays the whole device body and its scatters as one CUDA graph per declared *cell* (an exact row
-population and transaction kind at the one served geometry), so a covered step costs one upload,
-one graph launch and the commit stage. Any step that no cell covers, or whose signature differs
-from its cell's, runs the eager transaction, which is the reference, and is counted as a fallback.
+scatters back into the state pages. Only a step's CHUNK rows run the encoder and decoder, grouped
+by their exact count; its REPLAY and FLUSH rows (label drain, echo validation and the end step)
+run only masked validation, projection and scatter. By default the encoder and decoder replay
+their own *segment graphs* (section 5), yet the step stays bound by host dispatch around them:
+per-op dispatch, kernel launches and allocator work. With the opt-in
+`transaction_graph_populations` option the model also replays the rest of the device body and its
+scatters from CUDA graphs. Each step splits by row kind: its CHUNK rows replay a *chunk graph*
+captured at exactly their count, and its other rows replay an *echo graph* captured at exactly
+their count, which runs no encoder. A step of one kind costs one upload, one graph launch and the
+commit stage; a step with both kinds costs two launches under one reservation and one commit
+stage. Whether a CHUNK row starts a fresh stream is a per-row mask inside the chunk graph, as is
+whether a row belongs to a whole file, so freshness and files add no graphs. A *cell* is one
+captured graph: its geometry, kind and exact row count. The option declares the step populations
+the deployment expects, and the model captures a chunk cell and an echo cell at every count from 1
+to the largest of them. A step is covered only when every kind it
+contains has a cell at its count (a 31-row step with 20 CHUNK rows needs the chunk cell at 20 and
+the echo cell at 11); any other step, or one whose signature differs from its cells', runs wholly
+as the option-off transaction, which is the reference, and is counted as a fallback. The host
+validates the whole step, both signatures and the one reservation before the first launch, so a
+launch or device failure after the first launch is worker-fatal, never a retry or a rollback; a
+row that per-row validation rejects is a status bit with a masked scatter, as in the option-off
+transaction. The masks select
+among values the graph computes for every row: a fresh row never reads its recycled state page,
+as in the option-off transaction.
 
 The model captures these graphs through #67583's model-state capture hook, into core's graph pool
 and on core's capture stream: when core runs its graph-memory estimate, first over core's
@@ -77,8 +94,36 @@ profiling state pools so that the estimate charges their memory before state pag
 and then, always, over the serving pools. The
 plugin keeps no graph pool of its own. The option runs without `--enforce-eager` and is refused
 with it, because core runs no capture hook under `--enforce-eager`; the outer runner still
-captures nothing (`cudagraph_mode` NONE). The option serves exactly one geometry, 80 ms or
-160 ms, and it is off by default.
+captures nothing (`cudagraph_mode` NONE). In its first release the option is offered at the
+80 ms and 160 ms geometries, and it is off by default.
+
+### 5. Graphed segments by default
+
+By default the model runs the fastest segment execution measured on the earlier in-tree copy of
+this model: the `eager-graphed` encoder, which captures the uncompiled encoder transition at every
+exact CHUNK count from 1 to `max_num_seqs`, and the `dense-graphed` RNN-T decoder, captured at
+padded population tiers. The encoder's first pointwise convolution runs with batch and frames
+folded into one axis (`_stream_conv` in `vllm_nemotron_asr_streaming/nemotron_asr/encoder.py`)
+in every arm. On that copy the
+encoder's replay equalled its eager path bit for bit; the decoder arm's transcripts equalled the
+eager arm's, which shows equal decisions, not bitwise equal decoder state. Neither arm has yet
+served from this plugin's installed engine; the acceptance tiers establish that.
+
+The cost is graph memory retained at startup. Encoder graphs grow with the square of
+`max_num_seqs`: at the 160 ms geometry the graph tensors were 6,337,144 bytes per captured row, so
+counts 1 to n retain about 6.3 MB × n(n + 1)/2, which is 12.3 GiB at n = 64 and 48.7 GiB at
+n = 128; the other geometries, including the 320 ms default, are unmeasured. The decoder's tiers cut KV capacity by about 0.9 GiB in the one
+measurement at the 560 and 1120 ms geometries. Graphs are captured only for the server's one
+geometry (Constraints). The README's serve command therefore sets `--max-num-seqs` to a value
+the tier 2 measurement verified to fit the A40 at the default geometry, not one derived from the
+formula. In both runner configurations the model logs the segment graphs' retained memory and
+capture time, `max_num_seqs` and the geometry before core plans capacity. A capture that cannot
+allocate fails startup with the model's message, naming those figures and a complete remedy: a
+smaller `max_num_seqs`, or the overrides that select the eager arms together with the runner
+setting they need (`--enforce-eager`, transaction graphs off). A later capacity failure is core's
+own, and the logged line is its diagnosis. The `registration` design may project the total from
+the first captured counts and fail before capturing the rest. The eager arms (`eager` encoder, `dense-eager` decoder) remain selectable through
+`--hf-overrides` and are the reference that the graphed arms are tested against.
 
 ## Target Users
 
@@ -101,14 +146,17 @@ captures nothing (`cudagraph_mode` NONE). The option serves exactly one geometry
   decode limits, the frontend's body limit, `max_model_len`, host memory), not the model's.
 - With one whole-file request in flight beside concurrent streams, the streams' p95 final latency
   stays within 10 % of the same run without it.
-- With transaction graphs on, transcripts and resident state equal the eager transaction's bit for
-  bit, and the served step is faster than with the option off by the threshold of Success
+- With transaction graphs on, transcripts and resident state equal the option-off transaction's
+  bit for bit, and the served step is faster than with the option off by the threshold of Success
   Metrics, tier 5.
 - Transaction graphs become the default configuration. They ship opt-in until the default-on gate
-  in the `transaction-graph` design passes and Pete approves the change; every design choice keeps
+  in the `transaction-graph` design passes and the maintainers approve the change; every design choice keeps
   that path open (cells keyed by geometry, no configuration that only an opt-in feature tolerates).
   Once the option is on by default, `--enforce-eager` turns it off with a log line; an explicit
   request for it under `--enforce-eager` is refused.
+- The default configuration runs graphed segments (Approach, section 5). Tiers 1 to 4 are
+  qualified with the default segment arms, for each runner configuration claimed; tier 5 adds
+  transaction graphs to them.
 - Every claim in this repository's README names the acceptance tier it has met (Success Metrics).
 
 ## Non-Goals
@@ -124,10 +172,10 @@ captures nothing (`cudagraph_mode` NONE). The option serves exactly one geometry
 - Changing the offline plugin
   ([`Sohaib-Ahmed21/vllm-nemotron-asr-plugin`](https://github.com/Sohaib-Ahmed21/vllm-nemotron-asr-plugin))
   or its architecture key.
-- Transaction graphs at the 320, 560 or 1120 ms geometries, or at more than one geometry in one
-  engine, in their first release. Default-on needs both, because the default served set has
-  four geometries; they are the next increment, each with its own exactness and latency
-  evidence.
+- Transaction graphs at the 320, 560 or 1120 ms geometries in their first release. Default-on
+  needs them, because the checkpoint's default geometry is 320 ms and a server may be started at
+  any of the five; each is the next increment, with its own exactness and latency evidence.
+- Serving more than one geometry from one engine.
 
 ## Tenets
 
@@ -166,24 +214,27 @@ Components, each a leaf design under `docs/intent/`:
 | --- | --- |
 | `registration` | the `vllm.general_plugins` entry point, the architecture key, the config parser (`--config-format nemotron_asr_streaming`) and post-override validation, engine-flag refusals, the enumerated model-adapter dependencies |
 | `session` | the session factory and lease on the RFC 1 client path, the packer and its use by `buffer_realtime_audio`, transcript projection, the error contract |
-| `transcription` | `SupportsTranscription`, the request guards in `get_generation_prompt`, and the model seams it adds: the whole-file row role, the request-owned host buffer and its cleanup when the request ends, the continuation token, at most one chunk per step |
-| `transaction-graph` | the `transaction_graph_populations` option and its configuration checks, the cells and their classification, capture and release through #67583's model-state capture hook, replay and counted eager fallback, post-warmup verification, failure containment, graph-memory guards, the replay and fallback counters and the per-worker capture record, and the README's serve command for the option |
+| `transcription` | `SupportsTranscription`, the request guards in `get_generation_prompt`, and the model seams it adds: whole-file metadata on the stream row roles, the request-owned host buffer and its cleanup when the request ends, the continuation token, at most one chunk per step |
+| `transaction-graph` | the `transaction_graph_populations` option and its configuration checks, the chunk and echo cells and the split of a step between them, capture and release through #67583's model-state capture hook, replay and counted option-off fallback, post-warmup verification, failure containment, graph-memory guards, the replay and fallback counters and the per-worker capture record, and the README's serve command for the option |
 
-`transaction-graph` uses the other components; none of them calls into it. The other components
-carry these responsibilities toward it:
+`transaction-graph` uses the other components. None of them depends on it, except that
+`registration` calls its configuration checks and its capture-hook entry points. The other
+components carry these responsibilities toward it:
 - `registration` accepts both runner configurations of Constraints (Engine settings) and routes
   the model's own graph capture by configuration: under `--enforce-eager`, on the first
   profiling dummy step; under the hook configuration, in the capture hook. Its permitted
-  model-adapter dependencies include the hook's modules.
+  model-adapter dependencies include the hook's modules. It sets the default segment arms when it
+  translates the card, and resolves the server's one geometry at startup.
 - `transcription` runs each whole-file step as a row of an existing stream role: draining queued
-  labels as REPLAY, a regular chunk or the final tail as CHUNK, and the end step (EOS) as FLUSH.
+  labels as REPLAY, a regular chunk or the final tail as CHUNK, and the end step (EOS) as FLUSH or,
+  when the queue drains on the last label, as that REPLAY row.
   The file-specific device work (the role check against the file's last emitted token, an armed
   echo on a chunk row, continuation emission where a stream row would park) stays per row, selected
   by a per-row file mask. `transaction-graph` captures those selects in every cell and takes the
   mask as a graph input, so steps that mix file and stream rows replay like any other. A file's
   samples reach the device by their own host-to-device copy, and the per-step read of its label
   counts is either removed or counted by `transaction-graph`.
-- `session` keeps native burst off while the option is on.
+- `registration`'s configuration validation refuses native burst while the option is on.
 
 The acoustic internals under `vllm_nemotron_asr_streaming/nemotron_asr/` (encoder, RNN-T decoder,
 the CHUNK / FLUSH / EOU transition, precision policy) are documented by their module docstrings;
@@ -217,15 +268,17 @@ the leaf designs cite them where they depend on them.
     `capture_cudagraphs`, and none on the profiling dummy step. This configuration is accepted
     only when it selects at least one graph that the hook captures. With segment graphs alone it
     is an accepted configuration, and acceptance tiers 1 and 2 are claimed for it only once they
-    have been met on it.
+    have been met on it. Likewise a tier met only with the eager segment arms is a historical record
+    for the default configuration until it is met again with the graphed arms.
 
   Settings that core resolves to the required value for a model that declares persistent state
   (an unset `async_scheduling` or prefix-caching option) are accepted unset; the `registration`
   design states the rule for each setting.
-- **Model-owned execution memory.** The model's retained execution memory (its own captured
-  encoder and decoder graphs and their buffers) and the peak transient memory of its execution
+- **Model-owned execution memory.** The model's long-lived working memory outside any graph, the
+  peak transient memory of its execution and, under `--enforce-eager`, its captured segment graphs
   must be in place or exercised before core's memory profiling measures the budget that the state
-  pool and the KV cache must fit. Core binds state slots only after it allocates the state pool
+  pool and the KV cache must fit; graphs captured through the hook follow the next two
+  constraints. Core binds state slots only after it allocates the state pool
   and the KV cache. #67583 divides this between two hooks, and the model keeps them apart:
   long-lived working memory outside any graph is allocated in `prepare_execution_memory`, which
   every profiled budget counts; graphs captured through `capture_cudagraphs` are counted only by
@@ -239,40 +292,44 @@ the leaf designs cite them where they depend on them.
   its serving capture, or graphs with at least their memory, and the model keeps nothing derived
   from the profiling pools once `clear_cudagraphs` returns. Core locks the workspace after the
   serving capture, so all workspace-backed memory is sized by the time that capture returns.
-- **Graph memory is charged before capacity is fixed when core estimates it.** Transaction graphs bake in resident
-  state-pool addresses and retain on the order of gigabytes (about 2 GB for nine cells in the
-  prototype's measurement), far more than the segment graphs, so their memory must be in core's
-  graph-memory estimate before the state pages are planned whenever core runs that estimate.
-  When it does not (a budget fixed through `--kv-cache-memory-bytes`, the estimate disabled, or a
-  platform without it), core subtracts no graph memory from the budget, whether that budget is
-  fixed or profiled, as for every graph the model captures, so the budget must leave room. The
-  model then logs that its transaction graphs were not charged and the graph memory the serving
-  capture retained, and a serving capture that cannot allocate fails startup with a message
-  naming the option, the cell whose capture failed, the graph memory the cells captured so far
-  retained, and the budget setting. The CuMem
-  allocator and sleep mode are already refused for every persistent-state model (core, and
-  `registration`'s REG-ENG-003).
+- **Graph memory is charged before capacity is fixed when core estimates it.** At the measured
+  geometry the default encoder graphs retain about 12.3 GiB at 64 rows (Approach, section 5).
+  Transaction graphs bake in resident state-pool addresses and retain more: the prototype's nine
+  homogeneous cells retained about 2 GB, and under the split each chunk cell repeats the encoder's
+  intermediates beside the segment graphs kept for fallback: chunk cells for counts 1 to 63 may
+  add on the order of another 12 GiB at the 160 ms geometry, so their memory, and tier 5's fit on
+  the A40, are unmeasured and open. Every
+  graph the model captures through the hook must therefore be in core's graph-memory estimate
+  before the state pages are planned whenever core runs that estimate, and a serving capture that
+  retains more than its profiling capture fails startup. Under `--enforce-eager` the segment
+  graphs are captured on the profiling dummy step, inside the profiled budget (Model-owned
+  execution memory), and this constraint does not apply to them.
+  When the model captures through the hook and core does not run its estimate (a budget fixed
+  through `--kv-cache-memory-bytes`, the estimate disabled, or a platform without it), core
+  subtracts no graph memory from the budget, so the budget must leave room. The model then logs
+  that its graphs were not charged and the graph memory the serving capture retained, and a
+  serving capture that cannot allocate fails startup with a message naming the option or segment
+  arm, the graph whose capture failed (its cell, or its geometry, count or tier), the graph memory
+  captured so far, and the budget setting. The CuMem allocator and sleep mode are already refused
+  for every persistent-state model (core, and `registration`'s REG-ENG-003).
 - **Engine surface.** Session operations use only `AsyncLLM` / `EngineClient` public and
   RFC-proposed calls, never `engine_core` or scheduler internals. The model adapter's own
   dependencies (model-state interface, state-slot bindings, scheduler output types) are an
   enumerated, permitted set kept in the `registration` design.
-- **A served set of lookaheads.** The implementation's five geometries (80, 160, 320, 560 and
-  1120 ms; right context 0, 1, 3, 6 and 13 frames) share one state layout, so the per-slot state
-  page is the same at every lookahead. The checkpoint's card declares lookaheads 0, 3, 6 and 13,
-  and a server serves that set unless the deployment overrides it; an override may also add the
-  implemented 160 ms geometry (lookahead 1), which the card does not declare. A server declares the set it serves
-  (`supported_num_lookahead_tokens`), warms execution for each, and each stream chooses its cadence
-  from that set when it is admitted and keeps it for the stream's life. A cadence outside the
-  served set is refused at admission. Whole files run at the server's default cadence (the
-  configured `num_lookahead_tokens`, which must be in the served set); the `transcription` design
-  settles whether a request may choose another. A frontend opens each stream at a cadence from the
-  served set: the client's choice where its protocol carries one, else the server's default;
-  `vllm-riva-frontend` v0.4.0b1 opens every stream at 560 ms and refuses a server that does not
-  serve it, so transaction graphs behind a frontend need a frontend release that takes the cadence
-  from the client or the server's default. The experimental native-burst mode requires the configured lookahead to be 1 (160 ms); it
-  does not restrict the served set to that cadence. Transaction graphs do restrict it: with them
-  on, the served set is exactly one geometry, lookahead 0 or 1 (80 or 160 ms), and native burst is
-  off. Whole files then run at that geometry too, and every stream opens at it.
+- **One geometry per server, chosen at startup.** The implementation has five geometries (80, 160,
+  320, 560 and 1120 ms; right context 0, 1, 3, 6 and 13 frames), all tested, sharing one state
+  layout. The checkpoint's card declares lookaheads 0, 3, 6 and 13; the server also accepts the
+  implemented 160 ms geometry (lookahead 1), which the card does not declare. A server serves
+  exactly one of the five, fixed at startup, as a model loaded in Hugging Face Transformers is
+  fixed by its `num_lookahead_tokens`. The default is the checkpoint's own default lookahead
+  (`default_num_lookahead_tokens` in the card's encoder configuration: 3, which is 320 ms), and
+  `num_lookahead_tokens` in `--hf-overrides` selects another. The model warms execution and captures graphs for
+  that geometry only. Every stream and every whole file runs at it, and admission refuses a
+  request for any other cadence. The session factory publishes it as both its default cadence and
+  its only served cadence, and a frontend opens every stream at it. `vllm-riva-frontend`
+  v0.4.0b1 predates this rule: it opens every stream at 560 ms and refuses a server that does not
+  serve it, so a server behind that release must be started at 560 ms. The experimental native-burst mode requires the
+  160 ms geometry. Transaction graphs require the 80 or 160 ms geometry and native burst off.
 - **Completeness.** The model and the session factory treat a transcript as complete only after
   EOS following the final flush; a session that ends any other way fails. How core's own routes
   report a request that ends without EOS is core's behaviour, not the plugin's:
@@ -313,12 +370,15 @@ the leaf designs cite them where they depend on them.
 | Architecture key | `Nemotron3_5AsrStreamingForRNNT`, selected through a registered config parser; the Hub card's `Nemotron3_5AsrForRNNT` stays the offline plugin's key | Register the card's key: zero-configuration serving, but it would override the offline plugin when both are installed and remove whole-file service from released-vLLM users. Consolidation onto one key is planned with the offline plugin's author (below) |
 | Relationship to the offline plugin | Independent package now; planned merge with the offline plugin into one package under the card's key, choosing the implementation at startup by whether the engine provides the RFC 1 primitive | Replace the offline implementation outright: breaks released-vLLM users until RFC 1 ships. Keep two packages permanently: users must choose between two packages for one model |
 | Complete files | This model's own stateful path (`SupportsTranscription`), at most one chunk per step | A full-file forward pass: stalls the batch and is bounded by encoder positions. Delegating files to the offline plugin: a second implementation on the same server and the same ~400 s bound |
-| Core API | Only the model API of #67374, #67375 and #67583 (Pete, 2026-11-12 and 2026-11-14); the plugin adapts to it | Make #67583 optional and detect it at startup: two core APIs to detect and test, and transaction graphs, the default-on goal, absent on one of them. Ask core for compatibility interfaces with #65544's API: core would carry API that no proposal needs. Support both APIs in the plugin: two code paths for one model, and #65544 is superseded |
+| Core API | Only the model API of #67374, #67375 and #67583; the plugin adapts to it | Make #67583 optional and detect it at startup: two core APIs to detect and test, and transaction graphs, the default-on goal, absent on one of them. Ask core for compatibility interfaces with #65544's API: core would carry API that no proposal needs. Support both APIs in the plugin: two code paths for one model, and #65544 is superseded |
 | Frontend coupling | Structural protocol plus an entry-point group owned by the frontend; neither package imports the other | A shared interface package: a third release to coordinate for a small protocol |
 | Whole-step graph replay | A `transaction-graph` component in this repository, designed against #67583's model-state capture hook; the whole-transaction prototype at `pdtgct/vllm` `76376a0b36` (design `docs/design/nemotron_asr_transaction_graph.md`) is its measured evidence base, not its source | Import the prototype's modules from a vLLM build: they are in no core proposal, and core would carry model code. Transplant the prototype's patches: they target an in-tree copy of the model that has diverged from this one, and they carry a model-owned memory admission that the hook makes unnecessary |
 | Graph-memory accounting | Core's graph-memory estimate, through the capture hook: the profiling capture over core's profiling state pools, then the serving capture into core's graph pool | A model-owned admission inventory and graph pool, retained through the profiling window and checked against the serving capture: core's estimate already measures the same graphs before planning, and the inventory needs its own fit rule and release check. Extrapolating from one captured cell: unsound, because cells do not share memory predictably |
-| Served geometry under transaction graphs | First release: exactly one, 80 or 160 ms, configured as both the served set and the default lookahead; cells are keyed by geometry so that more geometries add cells, not a redesign | All published geometries at once: the 320 to 1120 ms geometries have no exactness or latency evidence for transactions the replay accepts, and several geometries per engine multiply cells and graph memory; both are needed for default-on and follow as measured increments |
-| Whole-file rows under transaction graphs | Run as rows of the stream roles REPLAY, CHUNK and FLUSH, in the same cells, with the file-specific selects captured in every cell and chosen by a per-row file mask; the `transaction-graph` design proves each against the option-off transaction of the same row plan | Leave file rows uncovered: every step a file shares with streams would run eagerly, so streams lose the saving whenever a file is in flight. Separate file cells: more cells and graph memory for device work that is already the streams' |
+| Served geometry | One per server, any of the five implemented geometries, fixed at startup; the checkpoint's default lookahead unless `num_lookahead_tokens` overrides it | A served set with a cadence chosen per stream: every geometry is warmed and captured, multiplying graph memory (the default encoder graphs retain about 12.3 GiB at 64 rows at the one measured geometry), and a model loaded in Hugging Face Transformers already fixes its lookahead the same way. Only the card's four lookaheads: drops the tested 160 ms geometry. A fixed plugin default such as 160 ms: overrides what the checkpoint declares |
+| Transaction graphs by geometry | First release: the 80 and 160 ms geometries; cells are keyed by geometry so that more geometries add cells, not a redesign | All five at once: the 320 to 1120 ms geometries have no exactness or latency evidence for transactions the replay accepts; they are needed for default-on and follow as measured increments |
+| Steps that mix CHUNK and other rows under transaction graphs | Split by kind: a chunk graph at the step's CHUNK count and an echo graph at its other rows' count, two launches under one reservation; freshness and file membership are per-row masks | One graph per exact (row count, CHUNK count): one launch, but P + 1 graphs per row count (98 for counts 1, 31 and 63; about 594 for 1 to 33). Pad the other rows into a chunk graph: changes the encoder's batch dimension, so bitwise equality is unlikely. Run mixed steps without transaction graphs: with independently paced streams almost every step is mixed (an illustrative independent-row estimate gives about 57 %, 81 % and 97 % at 8, 16 and 32 rows when 90 % of rows are CHUNK; the served mix is unmeasured), so the option would cover almost nothing |
+| Default segment execution | `eager-graphed` encoder and `dense-graphed` decoder: the fastest pair measured on the in-tree copy, with equal transcripts (on A100 at 160 ms and 64 streams under overload, encoder graphs with the batch-folded convolution cut regular service time about 52 %, without per-component attribution; the decoder graphs cut median final latency 58 % on A100 with 4 streams at 160 ms and the eager encoder, and 2 to 5 times on A40 with 32 streams at 560 and 1120 ms); bounded by `max_num_seqs`, which the serve command sets | The eager arms: the slowest measured pair, kept as the reference. The compiled `dense-graphed` encoder: lower host time per call, but its serving result was mixed (median response time rose). The `compact-eager` decoder: beaten by `dense-graphed` |
+| Whole-file rows under transaction graphs | Run as rows of the stream roles REPLAY, CHUNK and FLUSH, in the same cells, with the file-specific selects captured in every cell and chosen by a per-row file mask; the `transaction-graph` design proves each against the option-off transaction of the same row plan | Leave file rows uncovered: every step a file shares with streams would run option-off, so streams lose the saving whenever a file is in flight. Separate file cells: more cells and graph memory for device work that is already the streams' |
 | Graph memory when core does not estimate it | Allowed: the budget must leave room, the model logs the uncharged graph memory, and an allocation failure in the serving capture fails startup with the figures | Refuse the option under a fixed budget: a default-on option would then break every deployment that fixes its budget |
 
 ### Same model, two implementations
@@ -340,7 +400,7 @@ implementations differ:
 | Execution | one encoder pass over the whole file, per-request RNN-T decoder state; no live audio continuation | encoder caches and decoder state carried in a state slot from chunk to chunk |
 | Live streaming (`/v1/realtime`, frontends) | no | designed for it |
 | Whole-file length | encoder frames ≤ min(5000, `max_model_len`): files above about 164 s are refused at the default `max_model_len` of 2048, above about 400 s at 5000 | no model limit by design; one state slot walks the file in bounded steps |
-| Lookahead | accepted by the model per request; its transcription API sets only the language, so the processor default applies | per stream, from the server's served set; whole files at the server's default |
+| Lookahead | accepted by the model per request; its transcription API sets only the language, so the processor default applies | the server's one geometry, fixed at startup, for streams and files alike |
 | Engine settings | Model Runner V2, `--enforce-eager`, TP = PP = 1; no quantization or speculative decoding | synchronous scheduling, no prefix caching, an outer runner that captures no graphs (Constraints) |
 
 ## Success Metrics
@@ -355,7 +415,9 @@ admission) need stage 2.
 2. **Installed-engine cycle.** On the target build with the plugin installed: plugin load →
    stream started → audio → final transcript → slot retired, for one and for concurrent sessions.
    On stage 1 the stream is a `/v1/realtime` session; on stage 2 it is also a factory session
-   admitted with stream admission.
+   admitted with stream admission. In the default configuration the startup log reports the
+   segment graphs' retained memory and capture time; both are measured at each geometry before
+   that geometry is claimed.
 3. **Equivalence.** On public clips from 20 s to over 400 s, whole-file transcripts (core
    transcription route and `Recognize`) equal the streaming transcript, and at a matched lookahead
    equal the offline plugin's within its supported length.
@@ -365,21 +427,27 @@ admission) need stage 2.
    - the graphs are captured through #67583's capture hook with `cudagraph_mode` NONE, without
      `--enforce-eager` and without a model-owned graph pool;
    - "option-off" below means the same engine configuration with only the option changed: both
-     runs use the hook configuration with the same segment-graph selection, which the
-     `transaction-graph` design names;
-   - on the qualification workload (test-clean streams at the served geometry, at populations
-     the declared cells cover) every covered step's outputs and resident state equal the
+     runs use the hook configuration with the default segment graphs (Approach, section 5);
+   - the model captures a chunk cell and an echo cell at every count up to the largest declared
+     step population, so every split of any step up to that population is covered;
+   - on the qualification workload (independently paced test-clean streams at the server's
+     geometry, at row counts the declared cells cover; synthetic schedules serve only as
+     exactness tests) every covered step's outputs and resident state equal the
      option-off transaction's bit for bit, the transcripts equal the option-off run's, and the
      run records zero fallbacks of any kind; the same holds on a mixed workload of those
      streams with whole-file requests in flight, at declared populations that count stream and
      file rows together and that include silent chunks, an empty final tail, label drain and the
-     end step; equality is against the option-off transaction of the same row plan; steps that
-     no cell covers (an undeclared population) are tested separately, with their expected fallback count and outputs equal to
+     end step; equality is against the option-off transaction of the same row plan, for steps of
+     one kind and for split steps alike; steps that
+     no cell covers (a CHUNK or other-row count above the largest declared population) or whose
+     signature differs from its cells' are tested separately, with their expected fallback count and outputs equal to
      the option-off run's;
-   - at populations 1, 31 and 63 the median option-on step is faster than the smaller of two
+   - for steps of one kind at populations 1, 31 and 63, and separately for split steps at
+     populations 31 and 63, the median option-on step is faster than the smaller of two
      bracketing option-off medians by at least the larger of 5 ms and the difference between
-     those two medians, in each of two blocks; the `transaction-graph` design gives the
-     procedure;
+     those two medians, in each of two blocks, with a separate pass result for each group; the
+     `transaction-graph` design preregisters the procedure, the split compositions and their
+     aggregation;
    - the single-stream admission demand measured through `AsyncLLM` in a multiprocess engine,
      from audio feed to slot park, improves by its own pre-registered rule, given in the
      `transaction-graph` design;
@@ -391,8 +459,8 @@ admission) need stage 2.
      core's estimate charged the profiling capture before the state pages were planned and that
      the serving capture retained no more; under a fixed budget the startup log reports the
      uncharged graph memory; each refusal in Constraints refuses its configuration (the option
-     under `--enforce-eager`, more than one served geometry, native burst, a core without
-     #67583's hooks);
+     under `--enforce-eager`, at a geometry other than 80 or 160 ms, with native burst, on a core
+     without #67583's hooks);
    - TLA+ models of the capture lifecycle on the hook, versioned in this repository as a system
      model and updated with every change to that lifecycle, check without violations.
 
