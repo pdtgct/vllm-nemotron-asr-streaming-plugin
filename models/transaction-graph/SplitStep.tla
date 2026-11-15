@@ -43,9 +43,14 @@
 \*  no-op (TXG-EXEC-010). A declined step's option-off transaction makes its
 \*  own reservation, then the scatters, then its stage, and takes one
 \*  nondeterministic outcome per step: it completes, or its reservation,
-\*  its scatter or its stage raises; after a scatter or stage failure its
-\*  failure path cancels the reservation, and the exception propagates
-\*  without latching. A request may be aborted after the first launch.
+\*  its scatter or its stage raises, the stage before or after it publishes
+\*  the reservation. After a scatter or stage failure its failure path
+\*  cancels the reservation and the exception propagates without latching,
+\*  unless that cancel itself raises: the reservation then stays unresolved
+\*  and the cancel's failure propagates as worker-fatal (TXG-TXN-008), so
+\*  the worker fails, with its binding's latch unchanged (the option-off
+\*  transaction holds no binding to latch), and runs no later step. A
+\*  request may be aborted after the first launch.
 \*  Between steps: a repeated initialize_state_slots with a changed layout
 \*  latches; a delayed device fault surfaces at the sink's collection,
 \*  which neither latches nor cancels the staged reservation
@@ -58,10 +63,10 @@
 \*  CUDA semantics, row contents, page contents, signatures, exact fallback
 \*  reasons beyond their class, counters other than the per-step fallback
 \*  increments and histogram entries, the option-off transaction's resident
-\*  pages after a failed scatter, a cancel by the option-off transaction
-\*  that itself raises (no spec states its consequence), the sink's own
-\*  refusal of a second reservation, concurrency between steps
-\*  (synchronous scheduling serializes them), and the capture lifecycle
+\*  pages after a failed scatter, the sink's own refusal of a second
+\*  reservation (the model stops later steps by the latch or by the failed
+\*  worker, never by that refusal), concurrency between steps (synchronous
+\*  scheduling serializes them), and the capture lifecycle
 \*  (CaptureLifecycle.tla).
 \*
 \* INVARIANTS (SplitStep.cfg). A check of one step's record applies to the
@@ -75,9 +80,10 @@
 \*    total, by a successful stage or by a cancel (a stage that raised,
 \*    before or after publication, is not a resolution, and a cancel after
 \*    a successful stage is a no-op); on every nonfatal path it is resolved
-\*    exactly once; after a worker-fatal failure it is unresolved only if
-\*    its cancellation failed; and no later step that schedules a row then
-\*    completes.
+\*    exactly once; a reservation whose cancel raised stays unresolved, and
+\*    that failure is worker-fatal; after a worker-fatal failure it is
+\*    unresolved only if its cancellation failed; and no later step that
+\*    schedules a row then completes.
 \*  FirstLaunchNeverFallsBack (TXG-MODEL-013, TXG-FAIL-002): a step whose
 \*    first launch ran never falls back, never runs the option-off
 \*    transaction and, after a failure, never stages (only a failure after
@@ -102,15 +108,19 @@
 \*    once, holds no reservation from execute, launches no cell and runs the
 \*    option-off transaction; dummy, cleanup-only and bypass steps increment
 \*    none.
-\*  PreLaunchFailureContained (TXG-EXEC-003, TXG-EXEC-015): a nonfatal
-\*    failure, and a failure of a declined step's option-off transaction,
-\*    launches nothing, sets no latch and leaves no reservation unresolved.
+\*  PreLaunchFailureContained (TXG-EXEC-003, TXG-EXEC-015, TXG-TXN-008): a
+\*    nonfatal failure, and a failure of a declined step's option-off
+\*    transaction, launches nothing and sets no latch; it leaves no
+\*    reservation unresolved, except an option-off scatter or stage failure
+\*    whose cancel raised (the only such failure whose cancel can raise).
 \*  WorkerFatalFailuresLatch (TXG-FAIL-002, TXG-EXEC-003, TXG-EXEC-013,
-\*    TXG-CAP-016): a changed process constant, a missing graph object, a
-\*    failed cancel of the held reservation before the first launch and
-\*    every failure from the first launch on latch the binding, and nothing
-\*    else does; a delayed device fault is worker-fatal without being
-\*    attributed to a cell (TXG-FAIL-004).
+\*    TXG-CAP-016, TXG-TXN-008): a changed process constant, a missing graph
+\*    object, a failed cancel of the held reservation before the first
+\*    launch and every failure from the first launch on latch the binding,
+\*    and nothing else does; a delayed device fault is worker-fatal without
+\*    being attributed to a cell (TXG-FAIL-004); and a declined step's
+\*    option-off failure whose cancel raised is worker-fatal without
+\*    latching: the worker fails, its latch as it was at the step's entry.
 \*  ExactCellsReplayed (TXG-COV-009, TXG-EXEC-001, TXG-CELL-002): a step
 \*    launches only the chunk cell at exactly K and the echo cell at exactly
 \*    E, the chunk cell first, never a cell for a count above N.
@@ -196,10 +206,15 @@ NewRec(t, af, l, v) == [
     outcome |-> "running"]
 IdleRec == NewRec("none", FALSE, FALSE, FALSE)
 
+\* A step's failure is worker-fatal: a fatal failure, or any failure whose
+\* cancel raised (TXG-EXEC-010), a declined step's option-off one included
+\* (TXG-TXN-008).
+Fatal(r) == r.failure \in FatalFailures \/ r.cancelFailed
+
 \* What later steps and checks need of a finished step.
 Sums == [type : Types, fatal : BOOLEAN, replayed : BOOLEAN,
          outcome : {"running", "completed", "raised"}]
-Summary(r) == [type |-> r.type, fatal |-> r.failure \in FatalFailures,
+Summary(r) == [type |-> r.type, fatal |-> Fatal(r),
                replayed |-> r.launches > 0, outcome |-> r.outcome]
 
 PCs == {"idle", "verify", "constants", "classify", "prepare", "signature",
@@ -228,7 +243,7 @@ TypeOK ==
     /\ phase \in Phases
     /\ verified \in BOOLEAN /\ latched \in BOOLEAN
     /\ error \in {"none", "verification", "layout-changed", "async-fault",
-                  "engine-dead", "step"}
+                  "engine-dead", "step", "cancel-failed"}
     /\ pc \in PCs
     /\ shape \in Shapes \cup {<<0, 0>>}
     /\ launched \subseteq CellKeys
@@ -508,23 +523,44 @@ CancelAfterFatal ==
 
 \* TXG-COV-003, TXG-TXN-008: the declined step runs as the option-off
 \* transaction (the caller adds no fallback increment): its reservation,
-\* the scatters, then its stage, with one nondeterministic outcome per step.
-\* It completes, staging its reservation once; its reservation raises,
-\* holding nothing; or its scatter or its stage raises (the stage before it
-\* publishes), and its failure path cancels the reservation (TXG-EXEC-010).
-\* The exception propagates without latching.
+\* the scatters, then its stage, with one nondeterministic outcome
+\* <<failure, published, cancel raises>> per step. It completes, staging
+\* its reservation once; its reservation raises, holding nothing; or its
+\* scatter or its stage raises, the stage before or after it publishes the
+\* reservation (not a successful stage either way, TXG-EXEC-010), and its
+\* failure path cancels the reservation. The exception propagates without
+\* latching, unless that cancel raises (OptionOffCancelRaises).
+OptionOffOutcomes ==
+    {<<"none", TRUE, FALSE>>, <<"off-reserve", FALSE, FALSE>>}
+    \cup ({"off-scatter"} \X {FALSE} \X BOOLEAN)
+    \cup ({"off-stage"} \X BOOLEAN \X BOOLEAN)
+
+\* TXG-TXN-008, TXG-EXEC-010: the failure path's cancel itself raises. The
+\* reservation stays unresolved and the cancel's failure, with the original
+\* failure as its context, propagates as worker-fatal: the worker fails and
+\* runs no later step. The option-off transaction holds no binding, so the
+\* latch is left as it was.
+OptionOffCancelRaises ==
+    /\ phase' = "failed"
+    /\ error' = FirstError("cancel-failed")
+    /\ UNCHANGED <<verified, latched, fault>>
+
 OptionOffTransaction ==
     /\ pc = "option-off"
-    /\ \E f \in {"none"} \cup OptionOffFailures :
-         Finish(CASE f = "none" ->
-                       [rec EXCEPT !.optionOff = TRUE, !.made = TRUE, !.staged = @ + 1,
-                                   !.published = TRUE, !.outcome = "completed"]
-                  [] f = "off-reserve" ->
-                       [rec EXCEPT !.optionOff = TRUE, !.failure = f, !.outcome = "raised"]
-                  [] OTHER ->
-                       [rec EXCEPT !.optionOff = TRUE, !.made = TRUE, !.cancelled = @ + 1,
-                                   !.failure = f, !.outcome = "raised"])
-    /\ Keep
+    /\ \E o \in OptionOffOutcomes :
+         LET f == o[1]
+             cancelRaises == o[3]
+         IN /\ Finish(CASE f = "none" ->
+                             [rec EXCEPT !.optionOff = TRUE, !.made = TRUE, !.staged = @ + 1,
+                                         !.published = TRUE, !.outcome = "completed"]
+                        [] f = "off-reserve" ->
+                             [rec EXCEPT !.optionOff = TRUE, !.failure = f, !.outcome = "raised"]
+                        [] OTHER ->
+                             [rec EXCEPT !.optionOff = TRUE, !.made = TRUE, !.published = o[2],
+                                         !.cancelled = IF cancelRaises THEN @ ELSE @ + 1,
+                                         !.cancelFailed = cancelRaises,
+                                         !.failure = f, !.outcome = "raised"])
+            /\ IF cancelRaises THEN OptionOffCancelRaises ELSE Keep
 
 StepProgress ==
     \/ VerificationCheckFails \/ VerificationCheckPasses
@@ -629,9 +665,10 @@ Resolutions(r) == r.staged + r.cancelled
 ReservationDisposition ==
     /\ \A r \in AllRecs : Resolutions(r) <= 1 /\ (Resolutions(r) > 0 => r.made)
     /\ \A r \in Finished :
-         r.made =>
-            /\ r.failure \notin FatalFailures => Resolutions(r) = 1
-            /\ (r.failure \in FatalFailures /\ Resolutions(r) = 0) => r.cancelFailed
+         /\ r.made =>
+               /\ ~Fatal(r) => Resolutions(r) = 1
+               /\ (Fatal(r) /\ Resolutions(r) = 0) => r.cancelFailed
+         /\ r.cancelFailed => (r.made /\ Resolutions(r) = 0)
     /\ \A i, j \in 1..Len(log) :
          (i < j /\ log[i].fatal /\ log[j].type = "rows")
             => log[j].outcome /= "completed"
@@ -677,7 +714,8 @@ PreLaunchFailureContained ==
         r.failure \in NonfatalFailures \cup OptionOffFailures \cup {"latched"} =>
             /\ r.launches = 0
             /\ ~r.latches
-            /\ r.made => r.cancelled = 1
+            /\ (r.made /\ ~r.cancelFailed) => r.cancelled = 1
+            /\ r.cancelFailed => (r.optionOff /\ r.failure \in {"off-scatter", "off-stage"})
 
 WorkerFatalFailuresLatch ==
     /\ \A r \in AllRecs :
@@ -686,6 +724,10 @@ WorkerFatalFailuresLatch ==
          /\ r.failure = "prelaunch-cancel" => (r.launches = 0 /\ r.cancelFailed)
     /\ \A r \in Finished : r.failure = "async-fault" => phase \in {"failed", "shutdown", "killed"}
     /\ fault /= "none" => phase \in {"failed", "shutdown", "killed"}
+    /\ \A r \in Finished :
+         (r.optionOff /\ r.cancelFailed)
+            => /\ ~r.latches /\ latched = r.latchedAtEntry
+               /\ phase \in {"failed", "shutdown", "killed"}
 
 ExactCellsReplayed ==
     /\ \A key \in launched :

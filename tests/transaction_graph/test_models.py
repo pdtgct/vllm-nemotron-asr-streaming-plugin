@@ -47,8 +47,10 @@ ACTION_STEMS = [
     # A stage that raises before and one that raises after publication.
     "stageraises",
     "publish",
-    # A declined step's option-off reservation, scatter and stage failures.
+    # A declined step's option-off reservation, scatter and stage failures,
+    # and its failure path's cancel that itself raises (TXG-TXN-008).
     "optionofffailures",
+    "optionoffcancelraises",
     # A step before post-warmup verification, after which the engine may die.
     "premature",
     "enginedies",

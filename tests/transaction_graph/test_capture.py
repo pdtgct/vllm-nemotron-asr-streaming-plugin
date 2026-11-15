@@ -454,16 +454,57 @@ def startup_scatter_arguments(calls, serving_pool):
     return {c["layout"] for c in calls if t.within(serving_pool, c["pool"])}
 
 
-def assert_scatter_arguments_were_launched_at_startup(env, core, spy):
-    """TXG-CAP-013 at ``N = 2``: every resident-pool argument a scheduled
-    step passes to the masked scatter, covered or in any reachable fallback
-    class, has the address, shape, strides and dtype of an argument launched
-    at startup."""
+def run_fallback_classes_at_any_n(env, core, *, first_slot: int = 1) -> list[str]:
+    """``t.run_fallback_classes`` at any ``N``, with ``max_num_seqs >= N + 1``
+    and ``N + 3`` slots from ``first_slot``: one covered step and one step of
+    every reachable fallback class (``chunk-uncovered`` and
+    ``echo-uncovered`` at ``N + 1`` rows, ``signature`` with the fields
+    ``endpoint_policy`` and ``forced_eou``). Fails unless the counters show
+    each one."""
+    from support import txg_api
+
+    n = env.n
+    slots: dict[str, int] = {}
+
+    def step(*rows, cached: tuple[str, ...] = ()) -> None:
+        for row in rows:
+            slots.setdefault(row.req_id, first_slot + len(slots))
+        ids = [r.req_id for r in rows] + list(cached)
+        core.step(*rows, cached=cached, handles={r: slots[r] for r in ids})
+
+    streams = tuple(f"cap13-k{i}" for i in range(n + 1))
+    before = t.fallback_reasons(env)
+    step(t.stream_unit(env, "cap13-covered"))
+    assert t.fallback_reasons(env) == before, "the covered step fell back"
+    # K = N + 1, then the same requests with no new audio: E = N + 1.
+    step(*[t.stream_unit(env, r) for r in streams])
+    step(cached=streams)
+    step(t.with_endpoint_policy(t.stream_unit(env, "cap13-policy")))
+    step(t.eou_request(env, streams[0]))
+    after = t.fallback_reasons(env)
+    grown = {key for key, value in after.items() if value != before.get(key, 0)}
+    expected = {
+        ("chunk-uncovered", txg_api.CHUNK, n + 1),
+        ("echo-uncovered", txg_api.ECHO, n + 1),
+        ("signature", txg_api.CHUNK, 1),
+        ("signature", txg_api.ECHO, 1),
+    }
+    assert grown == expected, (grown, after)
+    return ["chunk-uncovered", "echo-uncovered", "endpoint_policy", "forced_eou"]
+
+
+def assert_scatter_arguments_were_launched_at_startup(
+    env, core, spy, *, run_classes=t.run_fallback_classes
+):
+    """TXG-CAP-013: every resident-pool argument a scheduled step passes to
+    the masked scatter, covered or in any reachable fallback class (run by
+    ``run_classes``, at ``N = 2`` by default), has the address, shape,
+    strides and dtype of an argument launched at startup."""
     serving_pool = h.pool_tensor(core.serving_bindings)
     startup = startup_scatter_arguments(spy.calls, serving_pool)
     assert startup, "the serving capture launched no scatter over the serving pool"
     mark = len(spy.calls)
-    classes = t.run_fallback_classes(env, core)
+    classes = run_classes(env, core)
     later = spy.calls[mark:]
     assert later, f"no scatter was launched by {classes}"
     foreign = [c for c in later if not t.within(serving_pool, c["pool"])]
@@ -635,16 +676,22 @@ def test_transaction_graphs_allocate_nothing_from_cores_workspace(on_cuda):
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("n", [2, 3])
 # @spec TXG-CAP-013
 def test_the_masked_scatter_receives_only_arguments_launched_at_startup_cuda(
-    on_cuda, monkeypatch
+    on_cuda, monkeypatch, n
 ):
     """The spy records host-side layouts only (no device read), so it runs
-    inside the real captures."""
-    env = on_cuda(n=2, max_num_seqs=3, capacity=12)
+    inside the real captures. The echo section of the step arena starts
+    ``152 * N`` bytes in, 16-byte aligned only for even ``N``, so the odd
+    ``N = 3`` also runs the captures and every fallback class with that
+    section misaligned."""
+    env = on_cuda(n=n, max_num_seqs=n + 1, capacity=12)
     spy = t.ScatterSpy(env.events).install(monkeypatch)
     env.core.startup()
-    assert_scatter_arguments_were_launched_at_startup(env, env.core, spy)
+    assert_scatter_arguments_were_launched_at_startup(
+        env, env.core, spy, run_classes=run_fallback_classes_at_any_n
+    )
 
 
 @pytest.mark.gpu

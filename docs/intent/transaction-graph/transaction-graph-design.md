@@ -312,7 +312,8 @@ the first launch.
   raises before publication therefore leaves the reservation held and cancellable, and the failure
   path's cancel releases it; a cancel after a successful stage is a no-op. Treating a stage that
   raised as resolved would leave the sink's one in-flight reservation held, and every later
-  reserve would fail.
+  reserve would fail. The one unresolved case is a cancel that itself raises: the sink's state is then unknown,
+  so the failure is worker-fatal and no later step runs on that worker.
 
 ## Split equivalence
 
