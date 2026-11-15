@@ -11,12 +11,13 @@ changing the tests that use it.
 | `__init__` | `register` (entry point `vllm_nemotron_asr_streaming:register`), `ARCHITECTURE` |
 | `plugin` | `register()` |
 | `identity` | `ARCHITECTURE`, `OFFLINE_ARCHITECTURE`, `LAZY_MODEL` |
-| `card_parser` | `NemotronAsrStreamingConfigParser` (a `ConfigParserBase`, registered as `nemotron_asr_streaming`); `translate_card(config, processor) -> dict`; `schema_errors(config, processor) -> list[str]` |
+| `card_parser` | Translation records `card_default_num_lookahead_tokens` from the card's `default_num_lookahead_tokens` and the default arms `encoder_execution_arm` `eager-graphed`, `decode_dispatch_arm` `dense-graphed`. `NemotronAsrStreamingConfigParser` (a `ConfigParserBase`, registered as `nemotron_asr_streaming`); `translate_card(config, processor) -> dict`; `schema_errors(config, processor) -> list[str]` |
 | `tokenizer_mode` | `NemotronAsrStreamingTokenizer` with classmethod `from_pretrained(path_or_repo, *args, **kwargs)`, registered in `TokenizerRegistry` as `nemotron_asr_streaming`; the refusal for an appended token at a wrong ID says "unexpected ID" |
 | `streaming_config` | `Nemotron3_5AsrStreamingConfig(VerifyAndUpdateConfig)` with static `verify_and_update_model_config` and `verify_and_update_config` |
-| `lookahead` | `GEOMETRIES` (right context, label, geometry index): (0, `80ms`, 0), (1, `160ms`, 1), (3, `320ms`, 2), (6, `560ms`, 3), (13, `1120ms`, 4); `cadence_label`, `geometry_index`, `right_context_for_label`, `served_lookaheads(hf_config)`, `default_lookahead(hf_config)` |
+| `lookahead` | `GEOMETRIES` (right context, label, geometry index): (0, `80ms`, 0), (1, `160ms`, 1), (3, `320ms`, 2), (6, `560ms`, 3), (13, `1120ms`, 4); `cadence_label`, `geometry_index`, `right_context_for_label`, `served_lookahead(hf_config) -> int` (the server's one lookahead: `num_lookahead_tokens` when present, else `card_default_num_lookahead_tokens`; REG-LA-001, REG-LA-009). No served set and no separate default reader exist. |
 | `locales` | `locale_language(name)`, `default_locale(table)`, `resolve_file_locale(table, *, language, exact_locale, language_locales)`, `supported_languages()` |
-| `engine_flags` | `persistent_state_config_errors(vllm_config) -> list[str]` |
+| `engine_flags` | `persistent_state_config_errors(vllm_config) -> list[str]`; `ADAPTER_DEPENDENCIES` (module -> names, members written dotted, e.g. `ModelState.post_warmup`, `PersistentStateSpec.memory_contributors`); `MODEL_STATE_GRAPH_HOOKS` (the six model-state hooks) |
+| `transaction_graph_config` | Imports no vLLM. `transaction_graphs_on(hf_config)`, `largest_population(hf_config)`, `transaction_graph_config_errors(vllm_config) -> list[str]` (TXG-CFG-001, TXG-CFG-003) |
 | `transcription` | `build_file_prompt(stt_params) -> dict` |
 | `model` | `Nemotron3_5AsrStreamingForRNNT` (`get_generation_prompt`, `get_speech_to_text_config`, `supported_languages`, `buffer_realtime_audio`, `realtime_max_tokens`, `get_model_state_cls`) |
 
@@ -33,19 +34,24 @@ lazily.
 | --- | --- |
 | `session` | `create_session_factory(engine_client, model_config)`, `SessionRefused`, `SessionFailed`, `PackerCapacityError` |
 | `session.packer` | `Unit` (`prompt_token_ids`, `row` float32 of width 17,927, `chunk_sequence`, `final_tail`); `Packer(*, right_context, geometry_index, locale_row, carrier_token_id, clock_ms, first_chunk_sequence=0)` with `append(samples) -> list[Unit]`, `close() -> Unit`, `set_locale_row(row)`, `buffered` |
-| `session.factory` | `StreamingSessionFactory(engine_client, hf_config, *, backoff_initial_s=0.05, backoff_max_s=1.0)`; `sessions` maps caller ID to a record whose `admission` is `pending`, `accepted` or `refused` |
+| `session.factory` | `StreamingSessionFactory(engine_client, hf_config, *, backoff_initial_s=0.05, backoff_max_s=1.0)`; `open(*, locale)`; `sessions` maps caller ID to a record whose `admission` is `pending`, `accepted` or `refused`; `_faults` holds the cleanup faults the next `drain` returns (the seam conformance adapter reads both) |
 
 ## Model internals (`vllm_nemotron_asr_streaming.nemotron_asr`)
 
 | Module or object | Public names and constraints |
 | --- | --- |
 | `manifests` | `REALTIME_MAX_TOKENS`, the one definition of the per-unit emission bound |
-| `file_rows` | `FileAction` (DRAIN, CHUNK, TAIL, END); `plan_file_step(*, queue_len, position, total_samples, chunk_samples, tail_done) -> FileStepPlan(action, start, length)`; `StepRow(request_id, geometry_index, deadline, file_plan)`; `plan_chunk_groups(rows)`, which orders through `order_chunk_groups(groups)`; `FileHostBuffers` (`take`, `stage`, `header`, `free_finished`, `__contains__`); `copy_chunk_to_device(view, *, device)` |
-| model state | `file_buffers` (a `FileHostBuffers`); `prepare_step` takes a file request's buffer at first schedule; `plan_step(scheduler_output, *, queue_lens=None, stream_rows=None)` returns `.rows` and `.groups`, runs once per step, and stages each advancing FILE row through `file_buffers.stage` |
+| `file_rows` | `FileAction` (DRAIN, CHUNK, TAIL, END); `plan_file_step(*, queue_len, position, total_samples, chunk_samples, tail_done) -> FileStepPlan(action, start, length)`; `StepRow(request_id, geometry_index, deadline, file_plan)`; `FileHostBuffers` (`take`, `stage`, `header`, `free_finished`, `__contains__`); `copy_chunk_to_device(view, *, device)` |
+| model state | `file_buffers` (a `FileHostBuffers`); `prepare_step` takes a file request's buffer at first schedule; `plan_step(scheduler_output, *, stream_rows=None)` returns `.rows` (planning-failed rows stay, `failed=True`), runs once per step, and stages each advancing FILE row through `file_buffers.stage`; a file's `_FileProgress` carries `queue_count`, `queue_count_unknown` and `admission_generation` (FILE-QC-008 to FILE-QC-013) |
+| `commit_sink` | `CommitPlan.queue_counts` (device `int32` `(P,)`); `SessionStatusReport.queue_count`; `QueueCount(request_id, admission_generation, count)`; `CommitCollection(statuses, failed, queue_counts)`, which the model's `collect_commit_status` returns (FILE-QC-001 to FILE-QC-007) |
+| `encoder_execution` | `uncaptured_transition(geometry=, count=)`, the encoder binding's uncaptured transition at one CHUNK count (TXG-CAP-003) |
+| `transaction_graph`, `advance` seams | Listed in `tests/support/txg_api.py`, the one module through which tests reach transaction-graph names: the cell key `(geometry_index, kind, count)`, `classify`, `cell_keys`, `arena_rows`, `transaction_graph_counters` with the capture-record keys (`Record`) and the fallback key `(reason, kind, count)`, `model._transaction_graph_binding` (`cells`, `failed`, `verified`, `execute`, which returns `None` when it declines a step), `RowPlan.planned_rejection` and `RowPlan.is_fresh`, and the phase functions `prepare_model_rows`, `model_rows_body`, `commit_model_rows`. The binding's `execute` and the phase functions are looked up at call time. |
 
 Routing constraints the tests observe:
 - `FileHostBuffers.stage` is the only way FILE samples leave the host buffer, and
   `file_rows.copy_chunk_to_device` is the only host-to-device copy of FILE samples; both are
   looked up at call time.
-- FILE rows' encoder chunks run through `advance.advance_chunk_bucket`, once per geometry group,
-  like stream rows.
+- FILE rows' encoder chunks run through `advance.advance_chunk_bucket` with the step's other CHUNK
+  rows, at the server's one geometry.
+
+Tests assert the information a spec requires in a log line or error, not its exact wording.

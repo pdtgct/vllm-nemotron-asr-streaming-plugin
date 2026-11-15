@@ -60,21 +60,23 @@ def run_hook(chunks, hf=None, queue=None):
     )
 
 
-# @spec SESS-RT-001
-@pytest.mark.parametrize("default", ALL_LOOKAHEADS)
-def test_hook_packs_at_the_default_lookahead_with_a_final_tail(default):
-    s = 1280 * (default + 1)
+# @spec SESS-RT-001, SESS-GEOM-001
+@pytest.mark.parametrize("served", ALL_LOOKAHEADS)
+def test_hook_packs_at_the_servers_geometry_with_a_final_tail(served):
+    s = 1280 * (served + 1)
     total = s * 2 + 300
     audio = ramp(total)
     chunks = [audio[i : i + 777] for i in range(0, total, 777)]
-    hf = make_hf_config(lookaheads=ALL_LOOKAHEADS, default_lookahead=default)
+    # The card declares another set and another default: the server's
+    # lookahead alone decides.
+    hf = make_hf_config(lookaheads=[3], lookahead=served, card_default=3)
     prompts = run(run_hook(chunks, hf))
     units = [unit(p) for p in prompts]
     assert len(units) == 3
     assert [u.chunk_sequence for u in units] == [0, 1, 2]
     assert [u.final_tail for u in units] == [0, 0, 1]
     assert [u.valid_samples for u in units] == [s, s, 300]
-    assert {u.geometry_id for u in units} == {GEOMETRY_INDEX[default]}
+    assert {u.geometry_id for u in units} == {GEOMETRY_INDEX[served]}
     assert {u.token_ids and tuple(u.token_ids) for u in units} == {
         (hf.blank_token_id + 2,)
     }
@@ -83,7 +85,7 @@ def test_hook_packs_at_the_default_lookahead_with_a_final_tail(default):
 
 # @spec SESS-RT-001
 def test_hook_with_exact_multiple_ends_with_an_empty_final_tail():
-    hf = make_hf_config(default_lookahead=0)
+    hf = make_hf_config(lookahead=0)
     units = [unit(p) for p in run(run_hook([ramp(1280 * 2)], hf))]
     assert [u.valid_samples for u in units] == [1280, 1280, 0]
     assert units[-1].final_tail == 1
@@ -92,7 +94,7 @@ def test_hook_with_exact_multiple_ends_with_an_empty_final_tail():
 # @spec SESS-RT-001
 def test_hook_yields_each_unit_as_soon_as_it_is_complete():
     async def scenario():
-        hf = make_hf_config(default_lookahead=0)
+        hf = make_hf_config(lookahead=0)
         first_seen = asyncio.Event()
 
         async def audio_stream():
@@ -117,7 +119,7 @@ def test_hook_yields_each_unit_as_soon_as_it_is_complete():
 def test_hook_prompts_match_the_session_packer_segmentation():
     from vllm_nemotron_asr_streaming.session.packer import Packer
 
-    hf = make_hf_config(default_lookahead=3)
+    hf = make_hf_config(lookahead=3)
     audio = ramp(5120 * 2 + 9)
     units = [unit(p) for p in run(run_hook([audio], hf))]
     packer = Packer(
@@ -165,7 +167,7 @@ def test_hook_raises_value_error_naming_the_locales_when_none_is_default(build):
 # @spec SESS-RT-003
 def test_hook_drains_the_input_queue_without_using_it():
     async def scenario():
-        hf = make_hf_config(default_lookahead=0)
+        hf = make_hf_config(lookahead=0)
         queue: asyncio.Queue = asyncio.Queue()
         for i in range(50):
             queue.put_nowait([i, i + 1])
@@ -195,7 +197,7 @@ def test_hook_drains_the_input_queue_without_using_it():
 # @spec SESS-RT-003
 def test_hook_output_does_not_depend_on_the_queue_contents():
     async def scenario(garbage):
-        hf = make_hf_config(default_lookahead=0)
+        hf = make_hf_config(lookahead=0)
         queue: asyncio.Queue = asyncio.Queue()
         if garbage:
             for i in range(20):
@@ -224,14 +226,14 @@ def test_hook_lets_the_packer_capacity_error_propagate(monkeypatch):
 
     monkeypatch.setattr(Packer, "append", exhausted)
     with pytest.raises(PackerCapacityError):
-        run(run_hook([ramp(1280 * 8)], make_hf_config(default_lookahead=0)))
+        run(run_hook([ramp(1280 * 8)], make_hf_config(lookahead=0)))
 
 
 # @spec SESS-EP-001
 def test_hook_prompts_carry_no_endpoint_policy():
     from support.fake_engine import contains_key
 
-    hf = make_hf_config(default_lookahead=0)
+    hf = make_hf_config(lookahead=0)
     prompts = run(run_hook([ramp(1280 * 2 + 5)], hf))
     assert prompts and not any(contains_key(p, "endpoint") for p in prompts)
 

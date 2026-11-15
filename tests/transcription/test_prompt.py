@@ -153,17 +153,106 @@ def test_identical_samples_hash_differently(model_cls, stt_params):
     assert same.get_mm_hashes("model", "blake3")["audio"] == hashes[0]
 
 
+# @spec FILE-PROMPT-002
+@pytest.mark.engine
+def test_header_geometry_comes_from_the_one_served_lookahead_function(
+    model_cls, stt_params, prompt_fields, monkeypatch
+):
+    """``get_generation_prompt`` calls ``lookahead.served_lookahead`` on the
+    served configuration (REG-LA-009): replacing it changes the header."""
+    from vllm_nemotron_asr_streaming import lookahead, transcription
+
+    params = stt_params(n_samples=500, right_context=6)
+    calls = []
+
+    def served(hf_config):
+        calls.append(hf_config)
+        return 13
+
+    monkeypatch.setattr(lookahead, "served_lookahead", served, raising=False)
+    # a module that imported the name binds the same function
+    monkeypatch.setattr(transcription, "served_lookahead", served, raising=False)
+    _, header = prompt_fields(model_cls.get_generation_prompt(params))
+    assert header[0] == 4  # lookahead 13, index 4 (SESS-PACK-005's order)
+    assert calls and all(c is params.model_config.hf_config for c in calls)
+
+
 # ---------------------------------------------------------------------------
-# FILE-GRD-006: no refusal on a file's length (FILE-BUD-001 and 003 are retired)
+# FILE-PROMPT-006: the processor refuses a header of another geometry
+
+
+def _processor(hf_config):
+    from types import SimpleNamespace
+
+    from vllm_nemotron_asr_streaming.nemotron_asr.processor import (
+        NemotronASRMultiModalProcessor,
+    )
+
+    # the hook under test reads only the served configuration
+    processor = object.__new__(NemotronASRMultiModalProcessor)
+    processor.info = SimpleNamespace(get_hf_config=lambda: hf_config)
+    return processor
+
+
+def _process(processor, header, n=100):
+    from vllm.multimodal.parse import MultiModalDataParser
+
+    items = MultiModalDataParser(target_sr=16000).parse_mm_data(
+        {"audio": np.zeros(n, np.float32)}
+    )
+    return processor._apply_hf_processor_main(items, {"file_header": header})
+
+
+# @spec FILE-PROMPT-006, FILE-PROMPT-002
+@pytest.mark.engine
+@pytest.mark.parametrize("right_context, geometry", GEOMETRIES)
+def test_processor_refuses_a_header_of_another_geometry(
+    served_config, right_context, geometry
+):
+    import re
+
+    processor = _processor(served_config(right_context=right_context))
+    out = _process(processor, [geometry, 0, 100])
+    (header,) = out["file_header"]
+    assert header.dtype.is_floating_point is False
+    assert str(header.dtype) == "torch.int64" and header.tolist() == [geometry, 0, 100]
+    for other in sorted({0, 1, 2, 3, 4} - {geometry}):
+        with pytest.raises(ValueError) as refused:
+            _process(processor, [other, 0, 100])
+        numbers = set(re.findall(r"\d+", str(refused.value)))
+        assert {str(other), str(geometry)} <= numbers, str(refused.value)
+
+
+# @spec FILE-PROMPT-006
+@pytest.mark.engine
+def test_processor_header_check_uses_the_served_lookahead_function(
+    served_config, monkeypatch
+):
+    from vllm_nemotron_asr_streaming import lookahead
+    from vllm_nemotron_asr_streaming.nemotron_asr import processor as module
+
+    config = served_config(right_context=6)
+    served = lambda hf_config: 1  # noqa: E731
+    monkeypatch.setattr(lookahead, "served_lookahead", served, raising=False)
+    monkeypatch.setattr(module, "served_lookahead", served, raising=False)
+    processor = _processor(config)
+    _process(processor, [1, 0, 100])  # index 1, lookahead 1: accepted
+    with pytest.raises(ValueError):
+        _process(processor, [3, 0, 100])
+
+
+# ---------------------------------------------------------------------------
+# FILE-GRD-006: no refusal on a file's length
 
 
 # @spec FILE-GRD-006
 @pytest.mark.engine
 @pytest.mark.parametrize("right_context", [0, 6, 13])
 def test_no_file_is_refused_for_its_length(model_cls, stt_params, right_context):
-    # the retired worst-case check refused this file at max_model_len = 100:
-    # its worst case is far above 100 tokens. The model now imposes no
-    # input-length limit; core's actual-token stop is the only bound.
+    # a worst-case token-count check would refuse this file at
+    # max_model_len = 100: its worst case is far above 100 tokens. The model
+    # imposes no input-length limit; core's actual-token stop is the only
+    # bound.
     s = chunk_samples(right_context)
     for n in (0, 1, s, 40 * s + 17, 3_600 * 16_000):
         prompt = model_cls.get_generation_prompt(

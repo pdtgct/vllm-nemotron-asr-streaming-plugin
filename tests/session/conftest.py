@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixtures for the session segment."""
+"""Fixtures for the session segment.
+
+The frontend's seam conformance suite is registered for pytest's assertion
+rewriting here, before ``test_frontend_conformance`` imports it (SESS-FAC-007).
+"""
 
 from __future__ import annotations
 
 import pytest
-from support.fake_engine import FakeEngine, make_hf_config
+
+pytest.register_assert_rewrite("vllm_riva_frontend_dev.seam_conformance")
+
+from support.fake_engine import FakeEngine, make_hf_config  # noqa: E402
 
 
 @pytest.fixture

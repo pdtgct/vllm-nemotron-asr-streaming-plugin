@@ -1,17 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The model adapter's vLLM dependencies (REG-010, REG-014, REG-015, REG-016).
+"""The model adapter's vLLM dependencies (REG-010, REG-014, REG-015, REG-016,
+REG-018).
 
 The permitted set is the registration design's dependency table
 (``docs/intent/registration/registration-design.md``, "Model-adapter
 dependencies"); the tests read it from there, so the design and the checks
-cannot drift apart. Conditional rows are the graph runtime (REG-014) and the
-batch-invariant module (REG-015); every other row is unconditional (REG-010).
+cannot drift apart. Conditional rows are the graph runtime (REG-014), the
+batch-invariant module (REG-015) and the transaction-graph members
+(REG-018); every other row is unconditional (REG-010).
+
+A table entry is a name of its module, or a dotted member path: the six
+``ModelState`` hooks are ``ModelState.<hook>``, the ``memory_contributors``
+argument is ``PersistentStateSpec.memory_contributors``, and the
+transaction-graph rows are ``StateSlotBindings.<member>``.
+``engine_flags.ADAPTER_DEPENDENCIES`` lists the unconditional entries in that
+form.
 
 Absence of a dependency is simulated in a fresh interpreter: the plugin's
 modules are imported once (so core's own modules are loaded and keep the
 names they bound), then the plugin's modules are dropped from
-``sys.modules``, the names are removed from core's modules, and the plugin
-is imported again. Only the plugin's own imports can then notice.
+``sys.modules``, the names are removed from core's modules (a lazily resolved
+module attribute, such as ``vllm.envs``' variables, is made to raise; a class
+member is deleted; an argument is removed by standing in a class whose
+constructor lacks it), and the plugin is imported again. Only the plugin's
+own imports can then notice.
 """
 
 from __future__ import annotations
@@ -34,10 +46,30 @@ GRAPH_RUNTIME = (
     ("vllm.forward_context", "set_forward_context"),
     ("vllm.platforms", "current_platform"),
     ("vllm.utils.import_utils", "resolve_obj_by_qualname"),
+    ("vllm.compilation.cudagraph_pool", "capture_pool"),
+    ("vllm.envs", "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"),
 )
 
 #: REG-015: the conditional batch-invariant dependency (a whole module).
 BATCH_INVARIANT = "vllm.model_executor.determinism.batch_invariant"
+
+#: REG-018: the conditional transaction-graph dependencies.
+TRANSACTION_GRAPH = (
+    ("vllm.v1.worker.gpu.state_slots", "StateSlotBindings.startup_pool_access"),
+    ("vllm.v1.worker.gpu.state_slots", "StateSlotBindings.pool_layout"),
+)
+
+#: REG-010: the members and the argument the unconditional rows name.
+HOOK_MODULE = "vllm.v1.worker.gpu.model_states.interface"
+HOOKS = (
+    "prepare_execution_memory",
+    "needs_cudagraph_capture",
+    "capture_cudagraphs",
+    "clear_cudagraphs",
+    "post_warmup",
+    "shutdown",
+)
+ARGUMENT = ("vllm.v1.kv_cache_interface", "PersistentStateSpec.memory_contributors")
 
 #: The interfaces the design excludes from the table ("vLLM's
 #: model-registration, config parser, tokenizer and renderer registries, model
@@ -102,6 +134,32 @@ CLIENT_SURFACE = {
 }
 
 
+def _cell_names(cell: str) -> tuple[str, ...]:
+    """Backticked identifiers (dotted paths allowed) of a table cell. Names
+    after "with its" are members of the name before it (``ModelState``, with
+    its hooks ...; ``PersistentStateSpec`` (with its ``memory_contributors``
+    argument))."""
+
+    def names(text: str) -> list[str]:
+        return [
+            n
+            for n in re.findall(r"`([^`]+)`", text)
+            if all(part.isidentifier() for part in n.split("."))
+        ]
+
+    head, _, members = cell.partition("with its")
+    owners = names(head)
+    result = list(owners)
+    if members:
+        assert owners, f"members without an owner in: {cell}"
+        owner_part = members.split(")", 1)
+        member_names = names(owner_part[0])
+        result.extend(f"{owners[-1]}.{m}" for m in member_names)
+        if len(owner_part) > 1:
+            result.extend(names(owner_part[1]))
+    return tuple(result)
+
+
 def design_table(repo_root: Path) -> list[tuple[str, tuple[str, ...]]]:
     """Return the design table's rows as ``(module, names)``; ``names`` is
     empty for a row that permits the whole module."""
@@ -113,10 +171,12 @@ def design_table(repo_root: Path) -> list[tuple[str, tuple[str, ...]]]:
         if len(cells) != 2 or not cells[0].startswith("`"):
             continue
         module = re.findall(r"`([^`]+)`", cells[0])[0]
-        names = tuple(n for n in re.findall(r"`([^`]+)`", cells[1]) if n.isidentifier())
-        rows.append((module, names))
+        rows.append((module, _cell_names(cells[1])))
     assert rows, "the design has no dependency table"
     return rows
+
+
+CONDITIONAL = set(GRAPH_RUNTIME) | set(TRANSACTION_GRAPH)
 
 
 def unconditional_rows(repo_root: Path) -> list[tuple[str, str]]:
@@ -125,16 +185,22 @@ def unconditional_rows(repo_root: Path) -> list[tuple[str, str]]:
         if module == BATCH_INVARIANT:
             continue
         for name in names:
-            if (module, name) not in GRAPH_RUNTIME:
+            if (module, name) not in CONDITIONAL:
                 pairs.append((module, name))
     return pairs
 
 
-def test_design_table_has_the_conditional_rows_of_reg_014_and_reg_015(repo_root):
+def test_design_table_has_the_rows_the_tests_assume(repo_root):
+    """Self-check of the table reading: the conditional rows of REG-014,
+    REG-015 and REG-018, and the hooks and argument of REG-010."""
     rows = design_table(repo_root)
     pairs = {(m, n) for m, names in rows for n in names}
     assert set(GRAPH_RUNTIME) <= pairs
+    assert set(TRANSACTION_GRAPH) <= pairs
     assert (BATCH_INVARIANT, ()) in rows
+    assert {(HOOK_MODULE, f"ModelState.{h}") for h in HOOKS} <= pairs
+    assert ARGUMENT in pairs
+    assert all(names for module, names in rows if module != BATCH_INVARIANT), rows
 
 
 # --------------------------------------------------------------------------
@@ -418,7 +484,11 @@ def _listed(table: dict[str, set[str] | None], module: str, name: str | None) ->
 
 def _resolve(module: str, name: str | None):
     target = importlib.import_module(module)
-    return target if name is None else getattr(target, name)
+    if name is None:
+        return target
+    for part in name.split("."):
+        target = getattr(target, part)
+    return target
 
 
 def outside_table(repo_root: Path, root: Path) -> list[str]:
@@ -433,6 +503,8 @@ def outside_table(repo_root: Path, root: Path) -> list[str]:
         if not names:
             whole_modules[module] = None
         for name in names:
+            if (module, name) == ARGUMENT:
+                continue  # an argument, not an object a module can export
             try:
                 permitted_objects.append(_resolve(module, name))
             except (ImportError, AttributeError):
@@ -578,8 +650,43 @@ def test_scanner_flags_exactly_the_unlisted_dependencies(repo_root, tmp_path, ca
 #: from core and import it again. ``remove(module, name)`` removes an
 #: attribute (``name=None`` blocks a whole module).
 _REIMPORT = """
-import importlib, sys, os
+import importlib, inspect, sys, os
 import vllm_nemotron_asr_streaming.model  # load core's modules once
+
+def _make_lacking(target, name):
+    # A lazily resolved module attribute (PEP 562 ``__getattr__``, as
+    # ``vllm.platforms.current_platform`` and ``vllm.envs`` variables are):
+    # make the module's ``__getattr__`` raise for it.
+    original = target.__dict__.get("__getattr__")
+    def lacking(attr, original=original):
+        if attr == name:
+            raise AttributeError(attr)
+        if original is None:
+            raise AttributeError(attr)
+        return original(attr)
+    target.__getattr__ = lacking
+    target.__dict__.pop(name, None)
+
+def _strip_argument(target, class_name, argument):
+    # Stand in a class whose constructor lacks ``argument`` (a core that
+    # predates it); every other behaviour is the original class's.
+    original = getattr(target, class_name, None)
+    if original is None:
+        return
+    signature = inspect.signature(original)
+    kept = [p for p in signature.parameters.values() if p.name != argument]
+    def __init__(self, *args, **kwargs):
+        if argument in kwargs:
+            raise TypeError(f"unexpected keyword argument {argument!r}")
+        self.__dict__["_inner"] = original(*args, **kwargs)
+    def __getattr__(self, attr):
+        if attr == argument:
+            raise AttributeError(attr)
+        return getattr(self.__dict__["_inner"], attr)
+    stand_in = type(class_name, (), {"__init__": __init__, "__getattr__": __getattr__})
+    stand_in.__signature__ = signature.replace(parameters=kept)
+    stand_in.__module__ = original.__module__
+    setattr(target, class_name, stand_in)
 
 def remove(module, name=None):
     if name is None:
@@ -589,17 +696,22 @@ def remove(module, name=None):
             delattr(sys.modules[parent], child)
         return
     target = importlib.import_module(module)
-    if module == "vllm.platforms" and name == "current_platform":
-        original = target.__getattr__
-        def lacking(attr, original=original):
-            if attr == "current_platform":
-                raise AttributeError(attr)
-            return original(attr)
-        target.__getattr__ = lacking
-        target.__dict__.pop("current_platform", None)
+    if "." in name:
+        class_name, member = name.split(".", 1)
+        owner = getattr(target, class_name, None)
+        if owner is None:
+            return
+        if member in vars(owner) and callable(vars(owner)[member]):
+            delattr(owner, member)
+        elif member in inspect.signature(owner).parameters:
+            _strip_argument(target, class_name, member)
+        elif hasattr(owner, member):
+            delattr(owner, member)
         return
-    if hasattr(target, name):
+    if name in target.__dict__:
         delattr(target, name)
+    elif hasattr(target, name):
+        _make_lacking(target, name)
 
 def forget_plugin():
     for key in [k for k in sys.modules if k.startswith("vllm_nemotron_asr_streaming")]:
@@ -611,17 +723,37 @@ def import_model():
     except Exception as exc:
         return type(exc).__name__, str(exc)
     return None, None
+
+def removed(module, name):
+    # Whether ``remove`` took effect (a self-check of the helper).
+    try:
+        target = importlib.import_module(module)
+    except ImportError:
+        return True
+    obj = target
+    parts = name.split(".")
+    for index, part in enumerate(parts):
+        if index == len(parts) - 1 and index > 0:
+            if part in inspect.signature(obj).parameters:
+                return False
+        if not hasattr(obj, part):
+            return True
+        obj = getattr(obj, part)
+    return False
 """
 
 #: Builds the model on CPU without weights, as core's loader constructs it.
 #: ``configure`` runs before any name is removed (it loads core's
 #: configuration and engine modules); ``construct`` runs after, with the
-#: ``state_name`` blocker isolated.
+#: ``state_name`` blocker isolated. The base configuration selects the eager
+#: arms (no graphed execution); ``overrides`` select others.
 _CONSTRUCT = """
 import tempfile
 from pathlib import Path
 
-def configure(overrides=None):
+EAGER = {"encoder_execution_arm": "eager", "decode_dispatch_arm": "dense-eager"}
+
+def configure(overrides=None, after=None):
     from support.card import write_card
     from vllm.config import (
         CacheConfig, DeviceConfig, ModelConfig, SchedulerConfig, VllmConfig,
@@ -630,10 +762,7 @@ def configure(overrides=None):
 
     register()
     card = write_card(Path(tempfile.mkdtemp()) / "card")
-    hf_overrides = {
-        "num_lookahead_tokens": 6,
-        "supported_num_lookahead_tokens": [0, 1, 3, 6, 13],
-    }
+    hf_overrides = {"num_lookahead_tokens": 0, **EAGER}
     hf_overrides.update(overrides or {})
     model_config = ModelConfig(
         model=str(card),
@@ -643,7 +772,7 @@ def configure(overrides=None):
         dtype="float32",
         max_model_len=2048,
     )
-    return VllmConfig(
+    vllm_config = VllmConfig(
         model_config=model_config,
         device_config=DeviceConfig(device="cpu"),
         cache_config=CacheConfig(enable_prefix_caching=False),
@@ -651,6 +780,12 @@ def configure(overrides=None):
             async_scheduling=False, max_num_seqs=2
         ),
     )
+    # Settings the engine hook would refuse under ``--enforce-eager`` (the
+    # transaction-graph option) are applied after it ran, so construction
+    # reaches the dependency gate.
+    for key, value in (after or {}).items():
+        setattr(vllm_config.model_config.hf_config, key, value)
+    return vllm_config
 
 def construct(vllm_config):
     from vllm.config.vllm import set_current_vllm_config
@@ -711,9 +846,32 @@ emit(raised=raised, message=message)
     missing = [
         f"{module}.{name}"
         for module, name in pairs
-        if module not in out["message"] or name not in out["message"]
+        if module not in out["message"] or name.split(".")[-1] not in out["message"]
     ]
     assert not missing, f"not named in the import error: {missing}"
+
+
+@pytest.mark.engine
+# @spec REG-010, REG-014, REG-018
+def test_the_removal_helper_removes_every_table_entry(run_fresh, repo_root):
+    """Self-check: ``remove`` takes effect for every entry it is asked to
+    remove, lazily resolved module attributes, class members and the
+    argument included, so the import tests fail or pass for the dependency
+    under test."""
+    pairs = (
+        unconditional_rows(repo_root) + list(GRAPH_RUNTIME) + list(TRANSACTION_GRAPH)
+    )
+    out = run_fresh(
+        _REIMPORT
+        + f"""
+results = {{}}
+for module, name in {json.dumps(pairs)}:
+    remove(module, name)
+    results[module + ":" + name] = removed(module, name)
+emit(results=results)
+"""
+    )
+    assert all(out["results"].values()), [k for k, v in out["results"].items() if not v]
 
 
 @pytest.mark.engine
@@ -723,6 +881,8 @@ emit(raised=raised, message=message)
         ("vllm.v1.kv_cache_interface", "PersistentStateSpec"),
         ("vllm.v1.worker.gpu.sample.output", "SamplerOutput"),
         ("vllm.utils.torch_utils", "direct_register_custom_op"),
+        *((HOOK_MODULE, f"ModelState.{hook}") for hook in HOOKS),
+        ARGUMENT,
     ],
     ids=lambda p: p[1],
 )
@@ -731,6 +891,7 @@ def test_one_missing_unconditional_dependency_fails_model_import_naming_it(
     run_fresh, pair
 ):
     module, name = pair
+    leaf = name.split(".")[-1]
     out = run_fresh(
         _REIMPORT
         + f"""
@@ -741,7 +902,7 @@ emit(raised=raised, message=message)
 """
     )
     assert out["raised"], f"model import accepted a missing {module}.{name}"
-    assert module in out["message"] and name in out["message"], out["message"]
+    assert module in out["message"] and leaf in out["message"], out["message"]
 
 
 # --------------------------------------------------------------------------
@@ -770,8 +931,8 @@ emit(raised=raised, message=message)
 def test_missing_graph_runtime_does_not_prevent_eager_model_construction(
     run_fresh, repo_root
 ):
-    """The card default (encoder ``eager``, decoder ``dense-eager``, no CHUNK
-    populations) configures no graphed execution."""
+    """The eager arms (encoder ``eager``, decoder ``dense-eager``, no CHUNK
+    populations) configure no graphed execution."""
     out = run_fresh(
         _REIMPORT
         + _CONSTRUCT
@@ -787,18 +948,31 @@ emit(raised=raised, message=message)
     assert out["raised"] is None, out["message"]
 
 
+#: Configurations that configure graphed execution (registration design,
+#: Segment arms): the default arms, each graphed arm alone, CHUNK buckets.
+GRAPHED_CONFIGURATIONS = {
+    "default arms": {
+        "encoder_execution_arm": "eager-graphed",
+        "decode_dispatch_arm": "dense-graphed",
+    },
+    "graphed decoder": {"decode_dispatch_arm": "dense-graphed"},
+    "graphed encoder": {"encoder_execution_arm": "eager-graphed"},
+}
+
+
 @pytest.mark.engine
+@pytest.mark.parametrize("configuration", list(GRAPHED_CONFIGURATIONS))
 @pytest.mark.parametrize("pair", GRAPH_RUNTIME, ids=lambda p: p[1])
 # @spec REG-014
 def test_missing_graph_runtime_fails_graphed_construction_naming_it(
-    run_fresh, repo_root, pair
+    run_fresh, repo_root, pair, configuration
 ):
     module, name = pair
     out = run_fresh(
         _REIMPORT
         + _CONSTRUCT
         + f"""
-vllm_config = configure({{"decode_dispatch_arm": "dense-graphed"}})
+vllm_config = configure({GRAPHED_CONFIGURATIONS[configuration]!r})
 remove({module!r}, {name!r})
 raised, message = construct(vllm_config)
 emit(raised=raised, message=message)
@@ -807,6 +981,70 @@ emit(raised=raised, message=message)
     )
     assert out["raised"], "graphed construction accepted a missing graph runtime"
     assert name in out["message"], out["message"]
+
+
+# --------------------------------------------------------------------------
+# REG-018: transaction-graph rows
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.engine
+@pytest.mark.parametrize(
+    "after", [None, {"transaction_graph_populations": []}], ids=["absent", "empty"]
+)
+# @spec REG-018
+def test_missing_transaction_graph_members_do_not_prevent_import_or_construction(
+    run_fresh, repo_root, after
+):
+    """Transaction graphs off: the default arms construct without the
+    members."""
+    out = run_fresh(
+        _REIMPORT
+        + _CONSTRUCT
+        + f"""
+vllm_config = configure({GRAPHED_CONFIGURATIONS["default arms"]!r}, after={after!r})
+for module, name in {json.dumps(TRANSACTION_GRAPH)}:
+    remove(module, name)
+forget_plugin()
+imported = import_model()
+raised, message = construct(vllm_config)
+emit(imported=imported, raised=raised, message=message)
+""",
+        env=_tests_path_env(repo_root),
+    )
+    assert out["imported"] == [None, None], out["imported"]
+    assert out["raised"] is None, out["message"]
+
+
+@pytest.mark.engine
+@pytest.mark.parametrize("value", [[2], {}], ids=["list", "malformed-on"])
+@pytest.mark.parametrize("pair", TRANSACTION_GRAPH, ids=lambda p: p[1])
+# @spec REG-018
+def test_missing_transaction_graph_member_fails_construction_while_on(
+    run_fresh, repo_root, pair, value
+):
+    """Transaction graphs on (TXG-CFG-001; ``{}`` is on): construction
+    raises naming the missing member."""
+    module, name = pair
+    out = run_fresh(
+        _REIMPORT
+        + _CONSTRUCT
+        + f"""
+vllm_config = configure(
+    {GRAPHED_CONFIGURATIONS["default arms"]!r},
+    after={{"transaction_graph_populations": {value!r}}},
+)
+# The option runs under the hook configuration only; leave the dependency
+# gate as the first thing construction can refuse.
+vllm_config.model_config.enforce_eager = False
+remove({module!r}, {name!r})
+raised, message = construct(vllm_config)
+emit(raised=raised, message=message)
+""",
+        env=_tests_path_env(repo_root),
+    )
+    assert out["raised"], "construction accepted a missing transaction-graph member"
+    assert name.split(".")[-1] in out["message"], out["message"]
 
 
 # --------------------------------------------------------------------------

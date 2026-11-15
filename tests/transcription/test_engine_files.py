@@ -44,7 +44,6 @@ import pytest
 pytestmark = [pytest.mark.gpu, pytest.mark.card]
 
 RIGHT_CONTEXT = 6
-CADENCE = "560ms"
 CHUNK = 1280 * (RIGHT_CONTEXT + 1)
 MAX_MODEL_LEN = 16_384
 MAX_NUM_SEQS = 2
@@ -245,13 +244,13 @@ async def transcribe_stream(
     piece: int = 4000,
     recorder: RecordingEngine | None = None,
 ) -> str:
-    """Feed the same samples through a session at the default cadence."""
+    """Feed the same samples through a session at the server's geometry
+    (SESS-GEOM-001: ``open`` takes only a locale)."""
     from vllm_nemotron_asr_streaming.session import create_session_factory
 
     client = recorder if recorder is not None else engine
     factory = create_session_factory(client, engine.model_config)
-    assert CADENCE in factory.served_cadences
-    lease = await factory.open(cadence=CADENCE, locale=factory.default_locale)
+    lease = await factory.open(locale=factory.default_locale)
     try:
         for start in range(0, len(samples), piece):
             await lease.feed(samples[start : start + piece], on_accepted=lambda n: None)
@@ -377,7 +376,7 @@ def test_engine_stages_copies_and_encodes_at_most_one_chunk_per_file_step(
     VLLM_ENABLE_V1_MULTIPROCESSING=0 (InprocClient, worker in this process), so
     the wrapped boundaries see the real worker.
 
-    Layout constraints the probes rely on (Phase 6 must keep them):
+    Layout constraints the probes rely on (the implementation keeps them):
     - ``FileHostBuffers.stage`` is the single host-to-device route for FILE
       samples, and the device copy is ``file_rows.copy_chunk_to_device(view,
       *, device)``, looked up as a module attribute at call time;

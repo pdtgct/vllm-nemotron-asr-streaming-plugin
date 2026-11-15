@@ -5,6 +5,7 @@ admission, matches outcomes by input position and retries rejections."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 
 import numpy as np
 import pytest
@@ -24,7 +25,6 @@ from support.fake_engine import (
 
 pytestmark = pytest.mark.engine
 
-CADENCE = "80ms"
 LOCALE = "en-US"
 UNIT = 1280
 
@@ -37,7 +37,7 @@ def audio(n: int, start: int = 0) -> np.ndarray:
 
 async def opened(build, engine=None, **kw):
     engine, factory = build(engine, **kw)
-    return engine, factory, await factory.open(cadence=CADENCE, locale=LOCALE)
+    return engine, factory, await factory.open(locale=LOCALE)
 
 
 async def feed(lease, samples):
@@ -289,7 +289,8 @@ def test_session_never_builds_admission_contexts_or_numbers_inputs(build):
     assert call.stream_admission is True
     for item in engine.inputs:
         assert type(item) is StreamingInput
-        flat = repr(vars(item))
+        # StreamingInput is a slots dataclass: read its fields, not __dict__.
+        flat = repr(dataclasses.asdict(item))
         assert "StreamAdmissionContext" not in flat and "update_seq" not in flat
     assert engine.only().input_exhausted, "exhausting the generator is the close"
     assert engine.unexpected == [], "no other engine entry point was used"

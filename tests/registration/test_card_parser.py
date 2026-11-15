@@ -148,7 +148,7 @@ def test_already_translated_configuration_is_used_unchanged(
     assert config.d_model == written["d_model"]
 
 
-# @spec REG-CARD-003, REG-LA-001
+# @spec REG-CARD-003
 def test_already_translated_keeps_its_stored_lookahead_keys(
     tmp_path, write_translated, parse_card
 ):
@@ -206,6 +206,20 @@ def test_missing_card_lookahead_set_is_named(tmp_path, parse_card):
         _translate(config)
     path = write_card(tmp_path / "c", config=config)
     with pytest.raises(ValueError, match="supported_num_lookahead_tokens"):
+        parse_card(path)
+
+
+# @spec REG-CARD-005
+def test_missing_card_default_lookahead_is_named(tmp_path, parse_card):
+    """Translation requires the card's default lookahead; a copy elsewhere
+    (``processor_config.json``, a top-level key) does not stand in for it."""
+    config = _card()
+    del config["encoder_config"]["default_num_lookahead_tokens"]
+    config["default_num_lookahead_tokens"] = 3
+    with pytest.raises(ValueError, match="default_num_lookahead_tokens"):
+        _translate(config)
+    path = write_card(tmp_path / "c", config=config)
+    with pytest.raises(ValueError, match="default_num_lookahead_tokens"):
         parse_card(path)
 
 
@@ -318,15 +332,18 @@ def test_card_facts_recorded_and_card_defaults_dropped():
     config = card_config(
         sliding_window=57,
         supported_num_lookahead_tokens=[1],
-        default_num_lookahead_tokens=3,
+        default_num_lookahead_tokens=6,
         num_lookahead_tokens=6,
         default_prompt_id=9,
     )
     result = _translate(config)
     assert result["architectures"] == [ARCH]
     assert sorted(result["card_num_lookahead_tokens"]) == sorted(CARD_LOOKAHEADS)
+    # The encoder configuration's default, not the top-level copy.
+    assert result["card_default_num_lookahead_tokens"] == 3
     assert result["max_position_embeddings"] == 2**24
-    assert result["decode_dispatch_arm"] == "dense-eager"
+    assert result["encoder_execution_arm"] == "eager-graphed"
+    assert result["decode_dispatch_arm"] == "dense-graphed"
     for key in (
         "model_type",
         "is_encoder_decoder",
@@ -340,6 +357,15 @@ def test_card_facts_recorded_and_card_defaults_dropped():
     assert result["num_prompts"] == NUM_PROMPTS
 
 
+@pytest.mark.parametrize("default", [0, 6, 13])
+# @spec REG-CARD-008
+def test_card_default_comes_from_the_encoder_configuration_only(default):
+    """``processor_config.json``'s copy of the default is not read."""
+    config = _card(default_num_lookahead_tokens=default)
+    result = _translate(config, processor_config(default_num_lookahead_tokens=3))
+    assert result["card_default_num_lookahead_tokens"] == default
+
+
 # @spec REG-CARD-008
 def test_translated_configuration_object_has_no_default_lookahead_or_window(
     card_dir, parse_card
@@ -348,6 +374,9 @@ def test_translated_configuration_object_has_no_default_lookahead_or_window(
     assert getattr(config, "sliding_window", None) is None
     assert getattr(config, "num_lookahead_tokens", None) is None
     assert getattr(config, "supported_num_lookahead_tokens", None) is None
+    assert config.card_default_num_lookahead_tokens == 3
+    assert config.encoder_execution_arm == "eager-graphed"
+    assert config.decode_dispatch_arm == "dense-graphed"
 
 
 # @spec REG-CARD-009
@@ -409,6 +438,13 @@ _BAD_TRANSLATED = {
     "card_num_lookahead_tokens-fourteen": lambda t, b: t.update(
         card_num_lookahead_tokens=[14]
     ),
+    # 1 is implemented but not in the synthetic card's set [3, 0, 6, 13].
+    "card_default_num_lookahead_tokens-outside": lambda t, b: t.update(
+        card_default_num_lookahead_tokens=1
+    ),
+    "card_default_num_lookahead_tokens-unimplemented": lambda t, b: t.update(
+        card_default_num_lookahead_tokens=2
+    ),
 }
 
 _BAD_TABLES = {
@@ -437,6 +473,27 @@ def test_schema_errors_name_each_bad_field(case):
 # @spec REG-CARD-011
 def test_schema_errors_accept_the_translation_of_a_valid_card():
     assert _schema_errors(_translate(), processor_config()) == []
+
+
+# @spec REG-CARD-011
+def test_an_absent_card_default_passes_the_schema():
+    """The default is checked only when present (an already-translated
+    configuration may store none)."""
+    translated = _translate()
+    del translated["card_default_num_lookahead_tokens"]
+    assert _schema_errors(translated, processor_config()) == []
+
+
+@pytest.mark.parametrize("default", [1, 2, 14])
+# @spec REG-CARD-011
+def test_parser_refuses_a_card_default_outside_the_card_set(
+    tmp_path, parse_card, default
+):
+    path = write_card(
+        tmp_path / "c", config=_card(default_num_lookahead_tokens=default)
+    )
+    with pytest.raises(ValueError, match="default_num_lookahead_tokens"):
+        parse_card(path)
 
 
 # @spec REG-CARD-011
@@ -695,5 +752,11 @@ def test_published_card_translates(real_card_dir, parse_card, control_fields):
     assert sorted(result["card_num_lookahead_tokens"]) == sorted(
         raw["encoder_config"]["supported_num_lookahead_tokens"]
     )
+    assert (
+        result["card_default_num_lookahead_tokens"]
+        == raw["encoder_config"]["default_num_lookahead_tokens"]
+    )
+    assert result["encoder_execution_arm"] == "eager-graphed"
+    assert result["decode_dispatch_arm"] == "dense-graphed"
     assert result["att_context_left"] == raw["encoder_config"]["sliding_window"] - 1
     assert config.hidden_size == 17927

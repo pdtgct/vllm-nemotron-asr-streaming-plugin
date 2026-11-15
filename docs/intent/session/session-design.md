@@ -169,9 +169,15 @@ usual cause), and the next call raises it. An idle end by `EngineDeadError` fail
 - **Cleanup tasks.** A session whose owner is gone (a cancelled or failed `open`, a `release` that
   timed out) gets one tracked cleanup task running the retirement wait with no deadline of its own.
   Cleanup tasks run until they finish or the factory is torn down.
-- **Cleanup faults.** A cleanup task whose retirement wait raises `EngineDeadError`, or ends with an
-  unexpected exception, records the exception as a cleanup fault and logs it. No caller is waiting
-  for an orphaned session, so faults are reported through `drain`.
+- **Cleanup faults.** A cleanup fault is an exception no caller can receive, logged and kept until
+  one `drain` returns it, even after its session record is removed. There are three kinds: a
+  cleanup task's retirement wait raising `EngineDeadError` or an unexpected exception; a
+  `generate()` task ending with an exception after its session was handed to a cleanup or holding
+  task, or whose cancellation handler raises while an uncancelled `abort` awaits it (that `abort`
+  then returns normally); and an exception of a cleanup or holding task itself. A refusal `open`
+  raises, a generation failure reported to the lease's owner, and the cancellation of tasks
+  `teardown_all` cancels are not faults. This matches the frontend's fault contract, which the seam
+  conformance suite (SESS-FAC-007) checks.
 - **`drain(deadline)`** awaits the cleanup tasks until `deadline`, an absolute time on
   `time.monotonic()`, and returns the cleanup faults recorded since the previous `drain`, clearing
   them; tasks still running stay owned by the factory.

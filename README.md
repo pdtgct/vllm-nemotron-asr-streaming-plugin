@@ -145,11 +145,39 @@ which comes first.
 
 ## Install and test
 
+Install the package with its PEP 735 `test` dependency group. The group pins `vllm-riva-frontend`
+and its seam conformance suite, `vllm-riva-frontend-dev`, at one commit of the frontend repository;
+the `test` extra installs only pytest.
+
 ```bash
-pip install -e '.[test]'
+# pip 25.1 or later
+pip install -e . --group test
+# or uv
+uv sync --group test
+```
+
+Either command installs the two frontend distributions from the pinned commit as non-editable VCS
+installs, as tier 1 acceptance requires.
+
+Run the suite:
+
+```bash
 pytest
 ```
 
 Tests are tiered: unmarked tests need only this package; `engine` tests need the stage 1 vLLM build
 on `PYTHONPATH`; `gpu` tests need an installed engine on CUDA; `card` tests need `NEMOTRON_CARD_DIR` set to
 a local copy of the published card, which is never committed.
+
+Tier 1 acceptance runs the seam conformance tests and the pin tests together, with
+`NEMOTRON_CONFORMANCE_ACCEPTANCE=1`:
+
+```bash
+NEMOTRON_CONFORMANCE_ACCEPTANCE=1 PYTHONPATH=<stage 1 vLLM tree> \
+    python -m pytest -q -p no:cacheprovider \
+    tests/session/test_frontend_conformance.py tests/session/test_conformance_pin.py
+```
+
+The acceptance run fails when either frontend distribution is an editable or local install, or was
+installed from a commit other than the pinned one. Tier 1 is met only by an acceptance run in which
+no test fails or is skipped.

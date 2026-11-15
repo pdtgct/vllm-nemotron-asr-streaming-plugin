@@ -51,6 +51,13 @@ NUM_PROMPTS = 16
 #: Lookaheads the synthetic card declares, matching the published card.
 CARD_LOOKAHEADS = [3, 0, 6, 13]
 
+#: The synthetic card's default lookahead (``encoder_config.
+#: default_num_lookahead_tokens``, 320 ms), matching the published card. Card
+#: translation requires it (REG-CARD-005) and records it as
+#: ``card_default_num_lookahead_tokens``; ``processor_config.json``'s copy is
+#: not read (REG-CARD-008).
+CARD_DEFAULT_LOOKAHEAD = 3
+
 
 def card_config(**overrides: Any) -> dict[str, Any]:
     """Return a Hub-card ``config.json`` dictionary."""
@@ -86,7 +93,7 @@ def card_config(**overrides: Any) -> dict[str, Any]:
             "subsampling_conv_channels": 16,
             "subsampling_conv_kernel_size": 3,
             "subsampling_conv_stride": 2,
-            "default_num_lookahead_tokens": 3,
+            "default_num_lookahead_tokens": CARD_DEFAULT_LOOKAHEAD,
             "supported_num_lookahead_tokens": list(CARD_LOOKAHEADS),
         },
     }
@@ -101,7 +108,7 @@ def processor_config(**overrides: Any) -> dict[str, Any]:
         "blank_token": "<blank>",
         "num_prompts": NUM_PROMPTS,
         "prompt_dictionary": dict(LOCALES),
-        "default_num_lookahead_tokens": 3,
+        "default_num_lookahead_tokens": CARD_DEFAULT_LOOKAHEAD,
         "supported_num_lookahead_tokens": list(CARD_LOOKAHEADS),
         "feature_extractor": {"sampling_rate": 16000, "feature_size": 128},
     }

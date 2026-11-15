@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FILE-BUF, FILE-ROW step rule, FILE-ENG-004: pure-CPU tests of file_rows."""
+"""FILE-BUF and the FILE-ROW step rule (pure-CPU tests of file_rows), and the
+transaction's decision legality for file and stream rows (FILE-ROW-013)."""
 
 from __future__ import annotations
 
-import random
-from dataclasses import dataclass
-
 import numpy as np
 import pytest
+import torch
 
 
 def make_header(n: int, geometry: int = 3, row: int = 0) -> np.ndarray:
@@ -263,83 +262,9 @@ def test_empty_file_runs_only_tail_and_end():
 
 
 # ---------------------------------------------------------------------------
-# FILE-ENG-004
-
-
-@dataclass
-class Group:
-    geometry_index: int
-    deadlines: tuple[int, ...]
-
-    @property
-    def unit_deadlines(self) -> tuple[int, ...]:  # either name the code may read
-        return self.deadlines
-
-
-def expected_order(groups: list[Group]) -> list[Group]:
-    inf = float("inf")
-    return sorted(
-        groups,
-        key=lambda g: (min(g.deadlines) if g.deadlines else inf, g.geometry_index),
-    )
-
-
-# @spec FILE-ENG-004
-def test_groups_run_by_earliest_stream_deadline():
-    from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import order_chunk_groups
-
-    groups = [Group(0, (900, 1000)), Group(3, (100,)), Group(2, (500, 300))]
-    got = order_chunk_groups(list(groups))
-    assert [g.geometry_index for g in got] == [3, 2, 0]
-
-
-# @spec FILE-ENG-004
-def test_file_only_groups_run_after_every_group_with_a_stream_row():
-    from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import order_chunk_groups
-
-    groups = [Group(0, ()), Group(1, (10**12,)), Group(4, ()), Group(2, (5,))]
-    got = order_chunk_groups(list(groups))
-    assert [g.geometry_index for g in got] == [2, 1, 0, 4]
-
-
-# @spec FILE-ENG-004
-def test_ties_break_by_geometry_index():
-    from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import order_chunk_groups
-
-    groups = [Group(4, (7,)), Group(1, (7,)), Group(3, (7, 2)), Group(0, (2,))]
-    got = order_chunk_groups(list(groups))
-    assert [g.geometry_index for g in got] == [0, 3, 1, 4]
-
-
-# @spec FILE-ENG-004
-@pytest.mark.parametrize("seed", range(20))
-def test_order_matches_the_rule_on_random_groups(seed):
-    from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import order_chunk_groups
-
-    rng = random.Random(seed)
-    indices = rng.sample(range(5), rng.randint(1, 5))
-    groups = [
-        Group(i, tuple(rng.randint(0, 6) for _ in range(rng.choice([0, 0, 1, 3]))))
-        for i in indices
-    ]
-    got = order_chunk_groups(list(groups))
-    assert sorted(g.geometry_index for g in got) == sorted(indices)
-    assert got == expected_order(groups)
-
-
-# @spec FILE-ENG-004
-def test_empty_step_has_no_groups():
-    from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import order_chunk_groups
-
-    assert list(order_chunk_groups([])) == []
-
-
-# ---------------------------------------------------------------------------
 # FILE-ENG-001, FILE-BUF-002, FILE-ROW-002: the production step logic,
-# instrumented. Layout additions: file_rows.plan_file_step returning a
-# FileStepPlan(action, start, length) in samples, file_rows.StepRow and
-# file_rows.plan_chunk_groups(rows) -> list of groups with geometry_index,
-# deadlines and request_ids.
+# instrumented. Layout addition: file_rows.plan_file_step returning a
+# FileStepPlan(action, start, length) in samples.
 
 CHUNK = 8960  # 560 ms
 
@@ -403,92 +328,71 @@ def test_each_step_advances_and_stages_at_most_one_chunk(total, queued):
     assert [p.length for p in advancing][-1] == t
 
 
-def _row(request_id, geometry, deadline=None, plan=None):
-    from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import StepRow
+# ---------------------------------------------------------------------------
+# FILE-ROW-013: decision legality in the transaction's emission check
 
-    return StepRow(
-        request_id=request_id,
-        geometry_index=geometry,
-        deadline=deadline,
-        file_plan=plan,
+
+def _emission_case(continuation: int, eos: int, blank: int):
+    """Two clean rows of one step: row 0 a stream row in the EOU role (whose
+    decision only the legality rule constrains), row 1 a file CHUNK row whose
+    chunk queued nothing; both decide the continuation token."""
+    from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
+        ROLE_CHUNK,
+        ROLE_EOU,
+        AdvanceResult,
+        EmissionContext,
+        EmissionProjection,
     )
 
+    cap, n = 8, 2
+    context = EmissionContext(
+        roles=torch.tensor([ROLE_EOU, ROLE_CHUNK]),
+        input_ids=torch.tensor([eos, blank + 4]),
+        chunk_rows=torch.tensor([1]),
+        queue=torch.zeros(n, cap, dtype=torch.int32),
+        book=torch.zeros(n, 7, dtype=torch.int32),
+        prompt_index=torch.zeros(n, dtype=torch.int64),
+        row_status=torch.zeros(n, dtype=torch.int32),
+        file_rows=torch.tensor([False, True]),
+    )
+    result = AdvanceResult(
+        token_ids=torch.zeros(1, 4, dtype=torch.int32),
+        token_lengths=torch.zeros(1, dtype=torch.int32),
+        row_status=torch.zeros(1, dtype=torch.int32),
+    )
+    rows = torch.zeros(n, 4)
+    rows[:, 0] = float(continuation)
+    projection = EmissionProjection(
+        rows=rows,
+        queue=context.queue.clone(),
+        book=context.book.clone(),
+        row_status=context.row_status.clone(),
+    )
+    return result, context, projection
 
-def _file_plan(action_name, length=CHUNK):
-    from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import (
-        FileAction,
-        FileStepPlan,
+
+# @spec FILE-ROW-013
+def test_continuation_is_illegal_on_a_stream_row_even_with_its_id_supplied():
+    """Layout constraint: ``advance._mrv1_projection_invariant_rows`` is the
+    transaction's emission check; its result marks the rows whose decision or
+    scratch the check rejects."""
+    from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
+        _mrv1_projection_invariant_rows,
     )
 
-    action = getattr(FileAction, action_name)
-    return FileStepPlan(
-        action=action, start=0, length=length if action_name in ("CHUNK", "TAIL") else 0
+    blank = 40
+    continuation, eos = blank + 5, blank + 1
+    result, context, projection = _emission_case(continuation, eos, blank)
+    bad = _mrv1_projection_invariant_rows(
+        result,
+        context,
+        projection,
+        torch.zeros(2, dtype=torch.int32),
+        park_id=eos,
+        blank_id=blank,
+        eou_token_id=blank + 3,
+        continuation_id=continuation,
     )
-
-
-# @spec FILE-ENG-003, FILE-ENG-001
-def test_mixed_step_plans_file_and_stream_rows_in_one_geometry_group():
-    from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import plan_chunk_groups
-
-    rows = [
-        _row("file", 3, plan=_file_plan("CHUNK")),
-        _row("s-same", 3, deadline=500),
-        _row("s-other", 1, deadline=100),
-    ]
-    groups = plan_chunk_groups(rows)
-    by_geometry = {g.geometry_index: g for g in groups}
-    assert set(by_geometry) == {1, 3}
-    assert set(by_geometry[3].request_ids) == {"file", "s-same"}
-    assert set(by_geometry[1].request_ids) == {"s-other"}
-    # the file row adds no deadline; the stream rows order the groups
-    assert tuple(by_geometry[3].deadlines) == (500,)
-    assert [g.geometry_index for g in groups] == [1, 3]
-
-
-# @spec FILE-ENG-001, FILE-ROW-002
-@pytest.mark.parametrize("action", ["DRAIN", "END"])
-def test_draining_or_ending_file_row_adds_no_chunk(action):
-    from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import plan_chunk_groups
-
-    groups = plan_chunk_groups(
-        [_row("file", 3, plan=_file_plan(action)), _row("s", 2, deadline=9)]
-    )
-    assert [g.geometry_index for g in groups] == [2]
-    assert all("file" not in g.request_ids for g in groups)
-
-
-# @spec FILE-ENG-004, FILE-ENG-003
-def test_plan_chunk_groups_orders_through_order_chunk_groups(monkeypatch):
-    """plan_chunk_groups is the production grouping: it composes the ordering."""
-    from vllm_nemotron_asr_streaming.nemotron_asr import file_rows
-
-    seen = []
-
-    def spy(groups):
-        groups = list(groups)
-        seen.append(groups)
-        return list(reversed(groups))  # a sentinel order
-
-    monkeypatch.setattr(file_rows, "order_chunk_groups", spy)
-    rows = [
-        _row("s1", 1, deadline=5),
-        _row("s2", 4, deadline=9),
-        _row("file", 2, plan=_file_plan("CHUNK")),
-    ]
-    result = file_rows.plan_chunk_groups(rows)
-    assert len(seen) == 1
-    assert {g.geometry_index for g in seen[0]} == {1, 4, 2}
-    assert result == list(reversed(seen[0]))
-
-
-# @spec FILE-ENG-004, FILE-ENG-003
-def test_file_only_group_runs_after_stream_groups():
-    from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import plan_chunk_groups
-
-    groups = plan_chunk_groups(
-        [
-            _row("file", 0, plan=_file_plan("TAIL", 100)),
-            _row("s", 4, deadline=10**9),
-        ]
-    )
-    assert [g.geometry_index for g in groups] == [4, 0]
+    # the stream row (file bit clear) may not decide the continuation token;
+    # the file CHUNK row that queued nothing must
+    assert bad.tolist() == [True, False]

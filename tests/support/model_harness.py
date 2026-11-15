@@ -29,8 +29,8 @@ Omissions from core's step, by design of a CPU harness:
   branches, and core's ``Sampler`` (a GPU module): real steps call
   ``compute_sample_logits`` but sample nothing; dummy sampling uses the
   caller's recording sampler (``RecordingSampler``).
-* ``finish_step`` creates a CUDA event; on CPU it runs with an event double
-  (``_CpuEvent``), everything else in it is core's.
+* ``finish_step`` creates a CUDA event; on CPU it runs with a silent
+  ``support.fake_cuda.FakeEvent``, everything else in it is core's.
 * ``StepRequestStates`` stands in for the runner's ``RequestState``; the model
   state reads only ``req_id_to_index``.
 
@@ -107,35 +107,50 @@ def build_vllm_config(
     max_num_batched_tokens: int = 64,
     overrides: dict[str, Any] | None = None,
     device: str = "cpu",
+    enforce_eager: bool = True,
 ) -> Any:
+    """The engine configuration of a server at lookahead ``right_context``.
+
+    The server serves one geometry (REG-LA-001), so no served lookahead set
+    (``supported_num_lookahead_tokens``, refused by REG-LA-008) is passed;
+    ``overrides`` are further ``--hf-overrides`` keys. ``enforce_eager=False``
+    builds the hook configuration (REG-ENG-005: ``-cc.mode none`` and
+    ``-cc.cudagraph_mode none``), which transaction graphs require
+    (TXG-CFG-009); ``support.core_order.CoreOrder`` then runs core's capture
+    hooks. The CPU tests keep the eager runner."""
     from vllm.config import (
         CacheConfig,
+        CompilationConfig,
         DeviceConfig,
         ModelConfig,
         SchedulerConfig,
         VllmConfig,
     )
+    from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
     from vllm_nemotron_asr_streaming import register
 
     register()
-    hf_overrides: dict[str, Any] = {
-        "num_lookahead_tokens": right_context,
-        "supported_num_lookahead_tokens": [0, 1, 3, 6, 13],
-    }
+    hf_overrides: dict[str, Any] = {"num_lookahead_tokens": right_context}
     hf_overrides.update(overrides or {})
     model_config = ModelConfig(
         model=str(card_dir),
         config_format="nemotron_asr_streaming",
         hf_overrides=hf_overrides,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         dtype="float32",
         max_model_len=2048,
     )
+    compilation: dict[str, Any] = {}
+    if not enforce_eager:
+        compilation["compilation_config"] = CompilationConfig(
+            mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE
+        )
     return VllmConfig(
         model_config=model_config,
         device_config=DeviceConfig(device=device),
         cache_config=CacheConfig(enable_prefix_caching=False),
+        **compilation,
         scheduler_config=SchedulerConfig.default_factory(
             async_scheduling=False,
             max_num_seqs=max_num_seqs,
@@ -272,12 +287,16 @@ class AdvanceSpy:
 
     def __init__(self, events: Events | None = None) -> None:
         self.calls: list[Any] = []
+        #: The keyword arguments of each call, in order (``calls`` holds the
+        #: row plans).
+        self.kwargs: list[dict[str, Any]] = []
         self.events = events if events is not None else Events()
         self.before: Callable[[dict[str, Any]], None] | None = None
         self._real: Any = None
 
     def __call__(self, core, input_ids, inputs_embeds, plan, **kwargs):
         self.calls.append(plan)
+        self.kwargs.append(dict(kwargs))
         self.events.append(("advance", plan))
         if self.before is not None:
             self.before(kwargs)
@@ -617,25 +636,50 @@ def _layer(slot: int | tuple[int, int]) -> dict[str, Any]:
 
 
 def stream_envelope(
-    config: Any,
+    config: Any = None,
     *,
     geometry: int = 3,
     prompt: int = 0,
     sequence: int = 0,
-    final: bool = True,
+    final: bool = False,
+    valid_samples: int | None = None,
+    seed: int = 0,
 ) -> torch.Tensor:
-    """One stream unit's carrier row (SESS-PACK-001): header then samples.
-    ``final`` marks the session's last unit (its final tail)."""
+    """One stream unit's carrier row (SESS-PACK-001): header then samples, the
+    header in ``manifests.ENVELOPE_HEADER_FIELDS`` order (version 2, valid
+    samples, geometry, final tail, prompt, chunk sequence, admission stamp),
+    as the session packer builds it.
+
+    ``final`` sets the final-tail slot. A final tail carries fewer samples
+    than a full chunk, so a caller that builds one passes ``valid_samples``
+    below the chunk width; the default is a full chunk. The admission stamp
+    is the current wall clock modulo the envelope's period. ``config`` is
+    accepted for the callers that pass it and is not read."""
+    import time
+
     from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
+        ADMISSION_EPOCH_MODULUS_MS,
         CADENCES,
+        ENVELOPE_HEADER_FIELDS,
         RAW_SAMPLES_PER_CHUNK,
     )
 
-    samples = RAW_SAMPLES_PER_CHUNK[tuple(CADENCES)[geometry]]
-    row = torch.zeros(7 + samples, dtype=torch.float32)
-    row[:7] = torch.tensor([2, samples, geometry, 0, prompt, sequence, int(final)])
-    row[7:] = torch.from_numpy(
-        np.random.default_rng(sequence).standard_normal(samples).astype(np.float32)
+    del config
+    width = RAW_SAMPLES_PER_CHUNK[tuple(CADENCES)[geometry]]
+    valid = width if valid_samples is None else int(valid_samples)
+    values = {
+        "version": 2,
+        "valid_samples": valid,
+        "geometry_id": geometry,
+        "final_tail": int(final),
+        "prompt_index": prompt,
+        "chunk_sequence": sequence,
+        "admission_ms_mod": int(time.time() * 1000) % ADMISSION_EPOCH_MODULUS_MS,
+    }
+    row = torch.zeros(7 + width, dtype=torch.float32)
+    row[:7] = torch.tensor([float(values[n]) for n in ENVELOPE_HEADER_FIELDS])
+    row[7 : 7 + valid] = torch.from_numpy(
+        np.random.default_rng(seed + sequence).standard_normal(valid).astype(np.float32)
         * 0.1
     )
     return row
@@ -766,34 +810,41 @@ def dummy_batch(state: Any, num_reqs: int, num_tokens: int, *, is_padding=True):
     return InputBatch.make_dummy(num_reqs, num_tokens, buffers, is_padding=is_padding)
 
 
-class _CpuEvent:
-    """Stands for ``torch.cuda.Event`` in ``finish_step`` on CPU."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def record(self, stream: Any = None) -> None:
-        pass
-
-    def synchronize(self) -> None:
-        pass
-
-    def query(self) -> bool:
-        return True
-
-
 # ---------------------------------------------------------------------------
 # The runner
 
 
+def collection_parts(result: Any) -> tuple[dict[str, int], set[str], tuple]:
+    """``(statuses, failed, queue_counts)`` of the ``CommitCollection`` that
+    ``collect_commit_status`` returns (FILE-QC-005; fields ``statuses``,
+    ``failed`` and ``queue_counts``). Any other return value is refused, so
+    no test can pass on a model that returns another shape."""
+    if not all(
+        hasattr(result, name) for name in ("statuses", "failed", "queue_counts")
+    ):
+        raise TypeError(
+            "collect_commit_status must return a CommitCollection, got "
+            f"{type(result).__name__}"
+        )
+    return result.statuses, result.failed, tuple(result.queue_counts)
+
+
+def replace_collection(result: Any, **changes: Any) -> Any:
+    """A copy of a ``CommitCollection`` with fields replaced (for
+    ``Runner.collect_hook``)."""
+    return dataclasses.replace(result, **changes)
+
+
 class Runner:
-    """Drives the model and model state in core's order."""
+    """Core's model runner calls on the model and model state, one at a time
+    (``support.core_order.CoreOrder`` puts them in core's startup order)."""
 
     def __init__(self, vllm_config: Any, model: Any, state: Any) -> None:
         self.vllm_config = vllm_config
         self.model = model
         self.state = state
         self.bindings: Any = None
+        self._execution_memory_prepared = False
         self.req_states = StepRequestStates()
         self._prompts: dict[str, list[int]] = {}
         # The token the model emitted for each request on its previous step:
@@ -801,14 +852,36 @@ class Runner:
         self._sampled: dict[str, int] = {}
         #: ``(statuses, failed)`` of every real step's commit, in order.
         self.commit_log: list[tuple[dict[str, int], set[str]]] = []
+        #: The ``QueueCount`` values of every real step's collection, in
+        #: order (FILE-QC-005), as ``collect_commit_status`` returned them.
+        self.queue_count_log: list[tuple[Any, ...]] = []
+        #: Optional ``hook(collection) -> collection``: replaces what the
+        #: model state receives (fault injection). The logs above record the
+        #: model's own collection, before the hook.
+        self.collect_hook: Callable[[Any], Any] | None = None
         collect = model.collect_commit_status
 
         def recording_collect() -> Any:
             result = collect()
-            self.commit_log.append((dict(result[0]), set(result[1])))
+            statuses, failed, counts = collection_parts(result)
+            self.commit_log.append((dict(statuses), set(failed)))
+            self.queue_count_log.append(tuple(counts))
+            if self.collect_hook is not None:
+                result = self.collect_hook(result)
             return result
 
         model.collect_commit_status = recording_collect
+
+    # -- preparation ---------------------------------------------------------
+
+    @torch.inference_mode()
+    def prepare_execution_memory(self) -> None:
+        """core's ``prepare_execution_memory``: the model state's hook, once;
+        every later call (also after the first raised) is a no-op."""
+        if self._execution_memory_prepared:
+            return
+        self._execution_memory_prepared = True
+        self.state.prepare_execution_memory()
 
     # -- state slots ---------------------------------------------------------
 
@@ -918,6 +991,9 @@ class Runner:
         return batch, hidden, embeds
 
     def profile_run(self, **kwargs: Any) -> tuple[Any, torch.Tensor, Any]:
+        """core's ``profile_run``: ``prepare_execution_memory`` first, then
+        the profiling dummy step."""
+        self.prepare_execution_memory()
         return self.dummy_step(is_profile=True, **kwargs)
 
     @torch.inference_mode()
@@ -1014,8 +1090,10 @@ class Runner:
     def _finish(self, output: Any) -> Any:
         if self.bindings is None:
             return None
+        from support.fake_cuda import FakeEvent
+
         core = core_bindings(self.bindings)
-        with mock.patch.object(torch.cuda, "Event", _CpuEvent):
+        with mock.patch.object(torch.cuda, "Event", FakeEvent):
             return core.finish_step(output, None)
 
     def _real_batch(self, output: Any, computed: dict[str, int] | None) -> Any:
