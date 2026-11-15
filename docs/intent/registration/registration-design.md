@@ -421,7 +421,10 @@ workspace, which core locks after the serving capture.
 
 Under the hook configuration the segment graphs follow #67583's capture lifecycle. The
 `transaction-graph` design owns the transaction-graph part of each hook; the segment-graph part
-below runs first in every capture call.
+below runs first in every capture call, after the transaction-graph entry checks (the
+`transaction-graph` design, Rules of the capture call), which run at the call's entry when
+`transaction_graph_populations` is non-empty. A call that an entry check refuses captures no
+segment graph.
 
 | Hook | Segment-graph behaviour |
 | --- | --- |
@@ -433,10 +436,12 @@ below runs first in every capture call.
 | `shutdown()` | Releases every segment graph and binding-owned buffer; tolerates a model state whose initialization did not complete. |
 
 **Ordering.** A serving capture while profiling segment graphs exist, or a profiling capture after
-a serving capture, is a lifecycle defect and raises.
+a serving capture, is a lifecycle defect and raises at the call's entry, before capturing; when
+`transaction_graph_populations` is non-empty, the error names it.
 
-**A second serving capture.** A serving capture while serving segment graphs exist raises,
-stating that recapture over live state pools is not supported; the recovery is an engine restart.
+**A second serving capture.** A serving capture while serving segment graphs exist raises at the
+call's entry, stating that recapture over live state pools is not supported and that the recovery
+is an engine restart, and naming `transaction_graph_populations` when it is non-empty.
 Core reaches it only through an elastic expert-parallel reconfiguration, which the plugin refuses.
 
 ### Segment-graph memory
@@ -473,9 +478,17 @@ it for the option-off call, which does not depend on that component.
   bytes and the capture time. Under `--enforce-eager`, and under the hook configuration when core
   runs its estimate, the line precedes core's capacity planning; otherwise it follows it. A later
   capacity failure is core's own, and the logged line is its diagnosis.
-- **Capture failure.** A capture that cannot allocate, or any other failure while capturing,
-  discards what that call or step captured, synchronizes and raises an error chained from the
-  original. The message names the arms, the geometry, `max_num_seqs`, the graph whose capture
+- **Capture failure.** A segment-graph capture that cannot allocate, or any other failure while
+  capturing segment graphs, discards what that call or step captured, synchronizes and raises an
+  error chained from the original, with the message below. Under the hook configuration the
+  cleanup covers the whole call: a failure after the segment graphs were captured, in the
+  transaction-graph part or in the aggregate memory comparison, also discards every segment graph
+  and segment-graph buffer the call created and synchronizes the capture stream, and the original
+  error then propagates unchanged with its own diagnostics (the `transaction-graph` design, Capture
+  failure messages, for the transaction-graph part; the serving-over-profiling failure, below, for
+  the aggregate comparison), not with this message. Entry-check refusals keep their own messages
+  (Ordering, A second serving capture). The message of a segment-graph capture failure names the
+  arms, the geometry, `max_num_seqs`, the graph whose capture
   failed (encoder CHUNK count, decoder tier, or CHUNK-bucket geometry and count), the bytes
   retained so far, the capture time so far, the budget setting and a complete remedy: a smaller
   `--max-num-seqs`; or `--hf-overrides` selecting `encoder_execution_arm` `eager` and

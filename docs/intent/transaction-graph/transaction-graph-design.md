@@ -56,7 +56,9 @@ requirement for every covered step. It is not a lean, because nothing trades aga
 
 `transaction_graph_populations` is a key of the served configuration, given as a flat
 `--hf-overrides` key (or stored by an already-translated configuration). Its value is a list of
-distinct step populations that the deployment expects. An absent key or an empty list is off.
+distinct step populations that the deployment expects. An absent key or exactly an empty list is
+off. Any other value turns the option on and is validated (Configuration checks) before `N` is
+computed, so a malformed value such as `63` or `null` is refused, never silently off.
 The largest entry, `N`, fixes the cell inventory: a chunk cell and an echo cell at every count
 from 1 to `N`. The other entries change no capture; they are validated and recorded in the
 configuration identity, so `[63]` and `[1, 31, 63]` capture the same cells. Example (80 ms):
@@ -71,18 +73,19 @@ step's **CHUNK count** `K` is its number of CHUNK rows; its **echo count** is `E
 
 ### Configuration checks
 
-With the option on, the configuration must satisfy every condition below. Each failure is a
-configuration error that names `transaction_graph_populations`, the condition and the rejected
-value.
+With the option on, the configuration must satisfy every condition below. A failure of a
+transaction-graph-specific condition (Populations, Geometry, Native burst, Segment arms, and
+`enforce_eager` in Runner) is a configuration error that names `transaction_graph_populations`,
+the condition and the rejected value. The shared runner and platform conditions are reported as
+`registration` states them (REG-ENG-005, REG-ENG-006).
 
 | Condition | Rule |
 | --- | --- |
 | Populations | A list of `int` values (not `bool`), distinct, each in `1 … min(max_num_seqs, max_num_batched_tokens)`; under `num_gpu_blocks_override`, each at most `override − 1` (the non-null pages). |
 | Geometry | The server's one geometry, as `registration` resolves it at startup (the `num_lookahead_tokens` override, else the checkpoint's default lookahead), is lookahead 0 or 1 (80 or 160 ms). The checkpoint default, 3 (320 ms), is refused with the remedy `num_lookahead_tokens` 0 or 1. |
 | Native burst | `experimental_native_burst` is false or absent. |
-| Segment arms | The default arms: `encoder_execution_arm` `eager-graphed` and `decode_dispatch_arm` `dense-graphed`, set or defaulted; `chunk_bucket_graph_populations` empty or unset. |
-| Runner | `enforce_eager` off; `cudagraph_mode` NONE (unset is accepted before core resolves it); compilation off (`-cc.mode none`). |
-| Platform | CUDA. |
+| Segment arms | The arms the model will run are the default arms: `encoder_execution_arm` `eager-graphed` and `decode_dispatch_arm` `dense-graphed`, configured or written by card translation (REG-CARD-008). An unset key resolves to an eager arm (`eager` encoder, `compact-eager` decoder) and is refused. The `dense-graphed` encoder and a non-empty `chunk_bucket_graph_populations` are refused under the hook configuration by `registration` (REG-ENG-005), not by this function. |
+| Runner | `enforce_eager` off. `cudagraph_mode` NONE, compilation off and a CUDA platform are the hook configuration, which `registration` validates (REG-ENG-005 in the configuration hook, REG-ENG-006 at model-state construction); this function does not repeat those conditions. |
 
 **`--enforce-eager`.** Core runs no capture hook under `--enforce-eager`, so a non-empty value
 with `--enforce-eager` is refused, naming both. Once the option is the default, the default
@@ -151,9 +154,10 @@ The model captures one chunk cell and one echo cell at every count from 1 to `N`
 ### Coverage and classification
 
 `classify` reads the CPU row plan and returns the cells the step needs, or the reason the step
-has none. A step with `K` CHUNK rows and `E` other rows is **covered** when `K = 0` or the chunk
-cell at `K` exists, `E = 0` or the echo cell at `E` exists, and each needed cell's signature
-matches the step. The total population need not be a declared entry: a 33-row step split 30/3 is
+has none. A scheduled step with at least one real row, in neither the memory-profile nor the
+native-burst mode, with `K` CHUNK rows and `E` other rows is **covered** when `K = 0` or the chunk
+cell at `K` holds a graph, `E = 0` or the echo cell at `E` holds a graph, and each needed cell's
+signature matches the step. An empty step or an ineligible mode is never covered. The total population need not be a declared entry: a 33-row step split 30/3 is
 covered when `N ≥ 30`. A step that is not covered runs wholly as the option-off transaction and is
 counted under `(reason, kind, count)`:
 
@@ -268,11 +272,19 @@ rows or a host branch on the step's composition), if the decoder tier is keyed b
 `K`, or if two rows could share a page; the tests below detect each.
 
 **Tests.**
-- *Sub-plan identity, eager.* Over enumerated and random plans, `T(R)` equals the merge of
-  `T(R|C)` and `T(R|O)` in every output and every page: `K` and `E` from 0 to a bound, CHUNK rows
-  interleaved with other rows, every subset pattern of fresh and file rows, rejected rows of every
-  status class in each kind, endpointing on and off, at 80 and 160 ms. Runs without graphs, on
-  CUDA and on CPU.
+- *Sub-plan identity, eager.* `T(R)` equals the merge of `T(R|C)` and `T(R|O)` in every output
+  and every page, at 80 and 160 ms with endpointing on and off, over: every accepted plan of 1 to
+  4 rows with every assignment of each row's kind, fresh bit and file bit (4,680 plans, so CHUNK
+  rows interleave with other rows in every order); every plan of 1 or 2 rows in which one row
+  carries each rejection status class reachable for that row's full configuration (kind, fresh bit,
+  file bit); and 500 random plans per geometry and endpointing setting with `P` uniform on 1 to 16,
+  each row's kind and bits drawn independently and its status accepted with probability 3/4, else
+  drawn from the classes reachable for its configuration, by a generator seeded from the
+  preregistered seed list, a failing plan being reported with its seed. A rejected row comes from a
+  fixture whose step reports exactly the intended status. Combinations that no fixture can produce
+  are excluded and recorded: for example, a fresh CHUNK row cannot have an undrained queue (its
+  initial book's queue is empty), and a fresh non-CHUNK row cannot have a pending-echo mismatch (it
+  has no armed echo). Runs without graphs, on CUDA and on CPU.
 - *Cell equals sub-plan.* At every count from 1 to `N`, for both kinds, a replay equals `T` of the
   same sub-plan with block indices, row orders, prompts and masks that differ from the capture
   rows.
@@ -415,7 +427,8 @@ reads of nested counters are deltas from a baseline taken after startup.
 ### Capture procedure and the replay-cell oracle
 
 Capturing one cell runs, on core's capture stream, an eager reference of the body on capture rows
-that the transaction rejects (so no page is stored), three eager warm-ups, the capture, and one
+that the transaction rejects (so no page is stored), three warm-ups with the nested bindings
+running eagerly (Flat capture), the capture, and one
 replay whose outputs and pages must equal the reference bit for bit before the cell is published.
 Capture rows use non-null free pages `1 … k`, which the populations bound guarantees in both
 pools. A CHUNK capture row carries a zero envelope header (`ROW_STATUS_ENVELOPE`); an echo capture
@@ -462,14 +475,23 @@ per-operation value is set.
 ## Capture lifecycle on the hook
 
 This component owns the transaction-graph part of #67583's hooks; `registration` owns the
-segment graphs' part, which runs first in each capture call.
+segment graphs' part, which runs first in each capture call after this component's entry checks
+(Rules of the capture call).
+
+**Profiling and serving cells.** The profiling capture creates *profiling cells* over core's
+temporary profiling pools; they exist only until `clear_cudagraphs` and no step ever replays them.
+The serving capture creates *serving cells* over the serving pools; they are the only cells a
+scheduled step replays, and only after post-warmup verification has passed. The one replay outside
+a step is each capture's validation replay of rejected capture rows, inside its own
+`capture_cudagraphs` call and its startup-access window (Capture procedure and the replay-cell
+oracle).
 
 | Hook | Transaction-graph behaviour |
 | --- | --- |
 | `needs_cudagraph_capture()` | True exactly when the platform is CUDA and the configuration selects a hook-captured graph: the `eager-graphed` encoder, the `dense-graphed` decoder or a non-empty `transaction_graph_populations` (REG-MEM-019). Configuration only, the same value for the model state's lifetime. Under `--enforce-eager` the runner does not ask. |
 | `prepare_execution_memory()` | Called once before the profiling forward pass, before any state pool exists, in both runner configurations. This component allocates nothing there: its buffers belong to the captures, which the estimate charges. |
 | profiling forward pass | Runs under the hook configuration too (`prepare_step` with `is_profile=True`); `registration` runs its profile transaction there or in `prepare_execution_memory`, over model-owned storage, at the maximum shape. No cell is captured or replayed. |
-| `initialize_state_slots(bindings)` | Records the bindings: profiling bindings, then serving bindings. Cells exist only after the serving capture, over the bindings current at that capture; Repeated bindings reconciles later calls. |
+| `initialize_state_slots(bindings)` | Records the bindings: profiling bindings, then serving bindings. Profiling cells exist from the profiling capture until `clear_cudagraphs`; serving cells, the only cells a step may replay, exist only from the serving capture on, over the bindings current at that capture; Repeated bindings reconciles later calls. |
 | `capture_cudagraphs(profile_only=True)` | Runs only when core's estimate runs. The profiling capture: segment graphs, the scatter warm-up, every cell, then the charged margin (Graph memory), over the profiling pools, into the pool core passes (the estimate's throwaway pool). |
 | `clear_cudagraphs()` | Releases every graph, buffer, signature, recorded layout and the margin the profiling capture created. It keeps the capture record, whose profiling totals are host integers. Core calls it also when the profiling capture raised or was never reached, so it tolerates nothing captured. |
 | `capture_cudagraphs(profile_only=False)` | Runs whenever `needs_cudagraph_capture()` is true and `enforce_eager` is off. It first evaluates whether a profiling capture was required (When core's estimate does not run). The serving capture: the same procedure, without the margin, over the serving pools, into core's global graph pool; then the memory comparison. Records the plain-value pool layout for post-warmup verification. |
@@ -493,13 +515,21 @@ and the transaction-graph parts of the other hooks do nothing.
   a `torch.cuda.CUDAGraph`; the model creates no stream and no pool of its own.
 - **Device work.** Before the call returns or raises, it synchronizes the capture stream, so
   every eager reference, warm-up, capture and validation replay it started has finished.
-- **Cleanup on failure.** When any step of the call raises, the call measures what it retained so
-  far, discards its cells and buffers, synchronizes, and raises (Capture failure messages). A
-  later `clear_cudagraphs` or `shutdown` then finds nothing to release.
+- **Cleanup on failure.** When any failure occurs in the call after its entry checks pass, in the
+  segment-graph part, in this component's part or in the aggregate memory comparison, the call
+  measures what it retained so far, then, before propagating, discards every object the call
+  created (segment graphs and their buffers, cells, binding-owned buffers, the margin), synchronizes
+  the capture stream and propagates the original error with its diagnostics (Capture failure
+  messages; `registration`'s Capture failure). Nothing the call created then remains, independent of
+  a later `clear_cudagraphs` or `shutdown`.
 - **Inventory.** With the option off the call captures no cell; with the option on it captures
   `2N` cells or raises.
 - **Ordering.** A serving capture while profiling cells exist, or a profiling capture after a
   serving capture, is a lifecycle defect and raises.
+- **Entry checks.** The ordering checks (Ordering, A second serving capture) and, in the serving
+  capture, the decision of When core's estimate does not run are made at the call's entry, before
+  the segment-graph part captures anything, so a refusal there captures nothing and its error
+  names the option.
 - **Workspace.** The option allocates nothing from core's workspace, which core locks after the
   serving capture; `registration`'s profile transaction sizes the option-off transaction's use.
 
@@ -608,13 +638,23 @@ construction (a required profiling capture).
   and whether a startup plan set it, the estimate's setting or the extensible KV cache); the
   call, transaction and per-kind totals; and that the budget must leave room for them.
 - **Unexpected absence** (required, but no profiling capture ran in the worker before the serving
-  capture). Startup fails, naming the configuration that should have run the estimate.
+  capture). Startup fails at the serving capture's entry, before any graph is captured, naming the
+  configuration that should have run the estimate.
 
 ### Capture failure messages
 
-A capture that fails raises an error chained from the original exception. It names the option,
+This section covers a failure in a capture call's transaction-graph part, after the entry checks
+pass and before the aggregate comparison. A failure in the segment-graph part carries
+`registration`'s message (REG-MEM-017); entry-check refusals carry their own messages (Rules of the
+capture call; When core's estimate does not run); the serving-over-profiling failure has its own
+message, below. Whatever the part, the call's cleanup is the whole-call rule (Rules of the capture
+call).
+
+A failure in the transaction-graph part raises an error chained from the original exception. It names the option,
 its value and `N`; the capture (profiling, before the state pages are planned, or serving); the
-failing cell (geometry label, kind, count); the totals retained so far and the transient peak;
+phase that failed (binding-buffer allocation, scatter warm-up, a cell's eager reference, warm-ups,
+capture or validation replay, or the margin allocation); the failing cell (geometry label, kind,
+count) only when the phase belongs to a cell; the totals retained so far and the transient peak;
 the budget setting (profiled with the estimate, fixed at the given `kv_cache_memory_bytes`, or
 profiled with the estimate disabled); the allocator settings; and the remedy for its case:
 - profiling capture: a smaller largest population, a smaller `max_num_seqs`, or the option off;
@@ -622,8 +662,9 @@ profiled with the estimate disabled); the allocator settings; and the remedy for
   `--gpu-memory-utilization`, which helps only when the allocated state pages and KV cache fill
   the budget and so leave too little device memory for the capture's transient peak;
 - serving capture, fixed budget: a `--kv-cache-memory-bytes` smaller by at least the projected
-  remainder (per kind, the mean growth of its cells so far times its cells not yet captured, stated
-  as an estimate), or a profiling-capture remedy.
+  remainder (per kind with at least one cell captured in the call, the mean growth of those cells
+  times its cells not yet captured, stated as an estimate; for a kind with no captured cell the
+  estimate is stated as unavailable), or a profiling-capture remedy.
 
 The serving-over-profiling failure names both call totals, `m`, `r`, the excess and the
 allocator settings, and gives as remedies a fixed `--kv-cache-memory-bytes` that leaves room for
@@ -643,7 +684,9 @@ capture failure and on a planned-capacity failure names the option.
 Every buffer the option uses is allocated during the serving capture; a step allocates only the
 caller-owned escaped row tensor, before its first launch. Tests check that replayed steps leave
 the allocator's reserved and allocated bytes unchanged apart from those tensors, so the serving
-thread runs no memory reading, synchronize, garbage collection or cache release for the option.
+thread runs no memory reading, device or stream synchronize, garbage collection or cache release
+for the option. The one host wait it makes is on a pinned host arena's event, which waits only for
+that arena's previous upload (Step arena).
 
 ## Post-warmup verification
 
@@ -675,7 +718,11 @@ a step neither raises nor latches.
 
 **Before the first launch**, work touches only binding-owned buffers and host bookkeeping; a
 failure there (Execute order) raises with resident state at the baseline and a reserved ticket
-cancelled, except the worker-fatal process-constant and graph-object failures.
+cancelled, and does not latch the binding, except the worker-fatal process-constant and
+graph-object failures: the arena and static inputs are rewritten in full on every step, so nothing
+outlives the failure. A delayed device fault that surfaces during a pre-launch copy is not such a
+failure; it takes the asynchronous-fault path below. Not latching does not promise that the engine
+survives the propagated exception.
 
 **From the first launch on**, any failure is worker-fatal: a failed launch, a failure between the
 launches, the escaped-row copy or the commit stage. The binding latches, attempts to cancel the
@@ -767,11 +814,14 @@ capture time, for `N` = 16, 32 and 64 at `max_num_seqs` 64.
 
 **Choosing `N`.** Run the served `Q` workload of Qualification with `N = max_num_seqs` when it
 fits, otherwise the largest `N` that fits, and read the `(K, E)` histogram from the counters.
-Declare as `N` the smallest count for which steps with `K ≤ N` and `E ≤ N` make up at least 99 % of
-served steps, provided it fits; the README records the histogram, the chosen `N` and its memory.
+For tier 5, declare as `N` the smallest count of at least 63 that fits and for which steps with
+`K ≤ N` and `E ≤ N` make up at least 99 % of served steps; if none fits, tier 5 is not claimed. A
+deployment may choose a smaller `N` by the same 99 % rule; it is reported separately as a
+deployment choice and carries no tier 5 claim. The README records the histogram, the chosen `N`
+and its memory.
 "Fits" means both captures and their peaks succeed under a profiled budget and the KV budget
 admits `max_num_seqs` slots. A step outside the inventory executes `B_hook` after classification.
-The step rule's population 63 presumes `N ≥ 63`, so the tier 5 run declares such an `N`.
+The step rule's population 63 presumes `N ≥ 63`, which is why the tier 5 inventory has that floor.
 
 ## Calibration
 
@@ -889,9 +939,9 @@ tier 5, and compares against a `B_hook` process of the same `max_num_seqs` and s
 - The clock is the host time from the transaction call to `torch.cuda.synchronize()` after it.
 - For block `b`, `Δ_b = min(median OFF1_b, median OFF2_b) − median ON_b` and
   `drift_b = |median OFF1_b − median OFF2_b|`; the option is material for a population and
-  composition when `Δ_b ≥ max(5 ms, drift_b)` in both blocks.
-- **Aggregation.** The one-kind group passes when the option is material at 1, 31 and 63. The split
-  group passes when it is material for all four compositions. Each group reports its own result;
+  composition exactly when `Δ_b ≥ max(5 ms, drift_b)` in both blocks.
+- **Aggregation.** The one-kind group passes exactly when the option is material at 1, 31 and 63.
+  The split group passes exactly when it is material for all four compositions. Each group reports its own result;
   no result is pooled across compositions or groups.
 
 ### Option-off body
@@ -903,7 +953,7 @@ the commit preceding the phase split, after hook capture of the segment arms has
 released plugin cannot run `B_hook`, because that capture is a `registration` change), and NEW,
 the commit under qualification. It uses the step rule's one-kind plans at populations 1, 31 and
 63: two blocks of legs OLD1, NEW, OLD2, each a fresh process with 2 warm-up and 21 counted steps.
-With `drift_b = |median OLD1_b − median OLD2_b|`, it passes when
+With `drift_b = |median OLD1_b − median OLD2_b|`, it passes exactly when
 `median NEW_b − min(median OLD1_b, median OLD2_b) ≤ max(1 ms, drift_b)` in both blocks. The
 record reports the difference at each population. A failure is reported at the gate and puts
 Deferred 10's alternative to measurement; tier 5 is claimed only after the check passes on the
@@ -924,7 +974,7 @@ discarded and repeats 1 to 3 are counted; `U` and `M` are their maximum and medi
 - **Rule 2 (pooled):** the same formula on each arm's maximum over its 15 counted samples.
 - **Rule 3 (medians):** in all five brackets,
   `Z = min(M_OFF1, M_OFF2) − M_ON − max(5 ms, |M_OFF2 − M_OFF1|) > 0`.
-- **Rule 4 (overall):** the gain is established when rules 1, 2 and 3 all pass.
+- **Rule 4 (overall):** the gain is established exactly when rules 1, 2 and 3 all pass.
 
 ### Preregistration
 
@@ -941,7 +991,7 @@ procedure and rules; and U(1)'s audio, plan and procedure. A change after that v
   measured and reported.
 - An installed-engine check with a profiled budget shows that core's logged graph-memory estimate
   includes the profiling capture (it exceeds `B_hook`'s estimate by at least the profiling
-  transaction total plus `r`, within the run-to-run spread of two `B_hook` startups, which the check
+  transaction total, both estimates including one charged margin, within the run-to-run spread of two `B_hook` startups, which the check
   reports) and that the serving call total is at most the profiling call total. The KV budget
   difference against `B_hook` is reported, not bounded, because transient peaks also differ.
 - Under a fixed budget the startup log carries the uncharged-memory WARNING with the figures; with
@@ -971,13 +1021,15 @@ change. It models one worker with a small `N` and bounded steps:
   the first launch, between the launches or at the stage); dummy steps; and whether a profiling
   capture is required (including a budget fixed or an extensible cache disabled after
   construction) and runs, as a nondeterministic choice.
-- **Invariants:** no replay outside a scheduled step after a passed verification; no replay over
+- **Invariants:** no replay outside a scheduled step after a passed verification, other than a
+  capture's validation replay of rejected rows inside its own capture call; no step replay over
   profiling pools; nothing from the profiling pools, the margin included, retained after
   `clear_cudagraphs`; at most one serving capture; a serving capture with no profiling capture
   before it is either reported uncharged because none was required or fails startup; a serving
   overrun fails startup; each reservation is staged or cancelled exactly once; a step whose first
   launch ran never falls back and never stages after a failure; after a latch, no step completes;
-  after any capture failure, nothing remains captured from that call; after `shutdown`, nothing
+  after any failure in a capture call, nothing that call created remains captured, segment graphs
+  included; after `shutdown`, nothing
   remains captured.
 - **Liveness under fairness**, for cooperative teardown only (a worker that runs the runner's
   shutdown): every latched or failed worker reaches `shutdown`, and every startup either serves or

@@ -342,8 +342,9 @@ step, with transaction graphs on or off; only file rows use it.
 
 1. **Commit plan.** `CommitPlan.queue_counts` is a device int32 tensor of shape `(rows,)`: in
    binding order, each row's queue count after the step, from its proposed label book. The
-   streaming transaction fills it from its step output `remaining_step[:P]` (the
-   `transaction-graph` design, Queue counts); the option-off transaction writes the same counts.
+   streaming transaction fills it from its per-row remaining-count output, with transaction graphs
+   on or off; under transaction graphs that output is the view `remaining_step[:P]` (the
+   `transaction-graph` design, Queue counts).
    `reserve` refuses, before it pins the lease, a field whose shape or dtype differs, as it does
    for `progress`. Like `progress` the field is optional in the type; a plan without it yields no
    counts.
