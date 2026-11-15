@@ -276,7 +276,9 @@ the leaf designs cite them where they depend on them.
     Every graph the model runs, segment graphs and transaction graphs alike, is then captured in
     `capture_cudagraphs`, and none on the profiling dummy step. This configuration is accepted
     only when it selects at least one graph that the hook captures; the `registration` design
-    names which selections those are. With segment graphs alone it
+    names which selections those are. The hook is the capture path for every graph optimization the
+    model adopts: a graphed arm refused under the hook configuration is refused only until its hook
+    capture is specified and measured, and no design forecloses hook capture of a graph. With segment graphs alone it
     is an accepted configuration, and acceptance tiers 1 and 2 are claimed for it only once they
     have been met on it. Likewise a tier met only with the eager segment arms is a historical record
     for the default configuration until it is met again with the graphed arms.
