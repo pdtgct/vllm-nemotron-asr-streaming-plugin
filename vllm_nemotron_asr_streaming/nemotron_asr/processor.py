@@ -44,6 +44,7 @@ from vllm.multimodal.processing.processor import (
     MultiModalProcessingResult,
     PlaceholderFeaturesInfo,
 )
+from vllm_nemotron_asr_streaming.lookahead import geometry_index, served_lookahead
 
 #: One second of 16 kHz audio — a safe dummy chunk for warmup profiling
 #: (the featurizer only needs a valid non-empty waveform; the realtime
@@ -55,13 +56,20 @@ _DUMMY_SAMPLES = 16_000
 FILE_HEADER_KEY = "file_header"
 
 
+# @spec FILE-PROMPT-006
 def validate_file_header(
-    header: object, sample_counts: Sequence[int], num_prompts: int | None = None
+    header: object,
+    sample_counts: Sequence[int],
+    num_prompts: int | None = None,
+    *,
+    server_geometry: int | None = None,
 ) -> np.ndarray:
     """Check a file header at input processing, so a malformed request is a
     ``ValueError`` (a 400) and never reaches the worker step.
 
-    The header is ``(geometry index, locale row, sample count)``.
+    The header is ``(geometry index, locale row, sample count)``. With
+    ``server_geometry`` (the server's geometry index, SESS-GEOM-001), a header
+    of another geometry is refused, naming both indices.
     """
     from vllm_nemotron_asr_streaming.nemotron_asr.manifests import CADENCES
 
@@ -75,6 +83,11 @@ def validate_file_header(
     if not 0 <= geometry < len(CADENCES):
         raise ValueError(
             f"file_header geometry {geometry} is not in [0, {len(CADENCES)})"
+        )
+    if server_geometry is not None and geometry != server_geometry:
+        raise ValueError(
+            f"file_header geometry index {geometry} is not the server's geometry "
+            f"index {server_geometry}"
         )
     if row < 0 or (num_prompts is not None and row >= num_prompts):
         raise ValueError(
@@ -166,11 +179,14 @@ class NemotronASRMultiModalProcessor(
             # A complete-file prompt: the samples and the file header travel
             # as two host-resident fields; the model state takes them into a
             # request-owned buffer at the request's first schedule.
+            hf_config = self.info.get_hf_config()
             values = torch.as_tensor(
                 validate_file_header(
                     header,
                     [a.shape[0] for a in arrays],
-                    int(self.info.get_hf_config().num_prompts),
+                    int(hf_config.num_prompts),
+                    # FILE-PROMPT-006, REG-LA-009: the server's geometry.
+                    server_geometry=geometry_index(served_lookahead(hf_config)),
                 ),
                 dtype=torch.int64,
             )

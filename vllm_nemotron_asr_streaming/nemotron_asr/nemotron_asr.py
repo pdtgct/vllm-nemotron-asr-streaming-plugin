@@ -25,6 +25,8 @@ import torch
 from torch import nn
 
 from vllm.logger import init_logger
+from vllm_nemotron_asr_streaming import engine_flags
+from vllm_nemotron_asr_streaming.engine_flags import graphed_execution_configured
 from vllm.model_executor.models.interfaces import SupportsTranscription
 from vllm.model_executor.layers.state import PersistentStateLayerBase
 from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
@@ -44,6 +46,8 @@ from vllm_nemotron_asr_streaming.nemotron_asr.batch_invariance import (
 )
 from vllm_nemotron_asr_streaming.nemotron_asr.commit_sink import (
     BoundedCommitSink,
+    CommitCollection,
+    QueueCount,
     resolve_status_reports,
 )
 from vllm_nemotron_asr_streaming.nemotron_asr.convert import (
@@ -52,7 +56,6 @@ from vllm_nemotron_asr_streaming.nemotron_asr.convert import (
 from vllm_nemotron_asr_streaming.nemotron_asr.decode_dispatch import (
     SYNC_FREE_ARMS,
 )
-from vllm_nemotron_asr_streaming.nemotron_asr import decode_graph
 from vllm_nemotron_asr_streaming.nemotron_asr.encoder import (
     FastConformerEncoder,
 )
@@ -114,18 +117,17 @@ _STFT_FREQ_BINS = 512 // 2 + 1
 _WIN_LENGTH = 400
 
 
-def _served_geometry_ids(hf_config: Any) -> tuple[int, ...]:
-    """Geometry indices of the served lookahead set, the one definition the
-    factory, the realtime hook and the model share."""
+# @spec REG-LA-009, SESS-GEOM-001
+def _server_geometry(hf_config: Any) -> int:
+    """The server's one geometry index: ``geometry_index`` of
+    ``served_lookahead``, the one definition the factory, the realtime hook,
+    the file prompt and the model share."""
     from vllm_nemotron_asr_streaming.lookahead import (
         geometry_index,
-        served_lookaheads,
+        served_lookahead,
     )
 
-    geometries = tuple(geometry_index(right) for right in served_lookaheads(hf_config))
-    if not geometries:
-        raise ValueError("served configuration declares no supported encoder geometry")
-    return geometries
+    return geometry_index(served_lookahead(hf_config))
 
 
 class NemotronASRCore(nn.Module):
@@ -346,6 +348,11 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 f"({min_history} tokens)"
             )
         hf_config = vllm_config.model_config.hf_config
+        # @spec REG-014, REG-018: the graph-runtime dependencies are needed
+        # only when graphed execution is configured, the transaction-graph
+        # members only while transaction graphs are on; name every missing one
+        # now, before any arm is built or weights load.
+        engine_flags.check_conditional_dependencies(hf_config)
         # Resolve the effective (stage-overridden) selector once, before any
         # state reservation, execution construction or checkpoint loading.
         policy = resolve_precision_policy(hf_config)
@@ -454,23 +461,14 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 max_tokens=native_burst_token_budget(hf_config)
             )
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
-        served_geometry_ids = _served_geometry_ids(hf_config)
-        # @spec REG-014: the graph-runtime dependencies are needed only when
-        # graphed execution is configured; name any that is missing now,
-        # before weights load.
-        self._graphed_execution = bool(
-            getattr(hf_config, "decode_dispatch_arm", None) == "dense-graphed"
-            or getattr(hf_config, "chunk_bucket_graph_populations", ())
-            or getattr(hf_config, "encoder_execution_arm", None)
-            in {"dense-graphed", "eager-graphed"}
-        )
-        if self._graphed_execution:
-            decode_graph.platform_graph_runtime()
+        server_geometry = _server_geometry(hf_config)
+        self._server_geometry = server_geometry
+        self._graphed_execution = graphed_execution_configured(hf_config)
         self._encoder_execution = build_encoder_execution(
             self.core,
             hf_config,
             maximum_population=self._max_num_seqs,
-            warmup_geometries=served_geometry_ids,
+            warmup_geometries=(server_geometry,),
             vllm_config=vllm_config,
         )
         self._decode_graph_binding = None
@@ -480,7 +478,6 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 execution_tiers,
             )
 
-            served_geometry_set = set(served_geometry_ids)
             self._decode_graph_binding = DenseGraphBinding(
                 batch_invariant_mode=self.core.batch_invariant_mode,
                 decode_fn=decode_dense_masked_frames,
@@ -488,7 +485,7 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 joint=self.core.joint,
                 vllm_config=vllm_config,
                 frame_widths=tuple(
-                    right + 1 if index in served_geometry_set else None
+                    right + 1 if index == server_geometry else None
                     for index, (_left, right) in enumerate(CADENCES.values())
                 ),
                 tiers=execution_tiers(self._max_num_seqs),
@@ -533,6 +530,9 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         #: Set when core's model-state capture hook, not the profiling step,
         #: captures the decoder graphs (``prepare_execution_memory_hook``).
         self._graphs_by_core = False
+        #: The transaction-graph binding while transaction graphs are on
+        #: (TXG-CFG-001); ``None`` while they are off.
+        self._transaction_graph_binding: Any = None
 
     def _state_pools(self, projection: Any) -> Any:
         return projection.state_batch.pools
@@ -630,6 +630,8 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             return tensor[0]
         return tensor
 
+    # @spec SESS-RT-001, REG-LA-009: the packer packs at the server's
+    # geometry, from ``served_lookahead``.
     @classmethod
     async def buffer_realtime_audio(
         cls,
@@ -738,7 +740,7 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             num_geometries=len(CADENCES),
             now_ns=time.time_ns(),
             step=self._plan_step,
-            served_geometries=_served_geometry_ids(self.config),
+            server_geometry=_server_geometry(self.config),
         )
         self._plan_slot.stage(context)
         return context
@@ -869,7 +871,7 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
 
         expected = {
             (geometry, tier)
-            for geometry in _served_geometry_ids(self.config)
+            for geometry in (_server_geometry(self.config),)
             for tier in execution_tiers(self._max_num_seqs)
         }
         expected = {
@@ -973,7 +975,7 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             self,
             num_rows=self._max_num_seqs,
             device=device,
-            geometry_id=max(_served_geometry_ids(self.config)),
+            geometry_id=_server_geometry(self.config),
             ready_domain=True,
         )
         self._require_execution_ready(capture_pending_ok=not capture)
@@ -1099,13 +1101,26 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             self._host_staging = HostStaging(self._max_num_seqs)
         return self._host_staging
 
-    def collect_commit_status(self) -> tuple[dict[str, int], set[str]]:
+    # @spec FILE-QC-005
+    def collect_commit_status(self) -> CommitCollection:
+        """Consume the staged step once: the resolved statuses, the requests
+        to fail and one ``QueueCount`` per report resolved to status 0 that
+        carries a count; all three empty without a staged commit."""
         sink = self._commit_sink
         if sink is None or not sink.has_staged:
-            return {}, set()
+            return CommitCollection()
         reports, _records, lease_ok = sink.collect()
         statuses, failed = resolve_status_reports(
             self._registry, reports, lease_ok=lease_ok
+        )
+        queue_counts = tuple(
+            QueueCount(
+                request_id=report.request_id,
+                admission_generation=report.admission_generation,
+                count=int(report.queue_count),
+            )
+            for report in reports
+            if statuses.get(report.request_id) == 0 and report.queue_count is not None
         )
         self._committed_progress = {}
         for report in reports:
@@ -1119,7 +1134,9 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             )
             if key is not None:
                 self._committed_progress[report.request_id] = key
-        return statuses, failed
+        return CommitCollection(
+            statuses=statuses, failed=failed, queue_counts=queue_counts
+        )
 
     def consume_committed_progress(self) -> dict[str, tuple[int, int, int]]:
         progress = getattr(self, "_committed_progress", {})
@@ -1238,6 +1255,13 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             # the eager default keeps its steps cheap.
             self._require_execution_ready()
         context = self._stage_v2_projection(persistent_state_projection)
+        planning_failed = self._record_planning(persistent_state_projection, context)
+        if (
+            planning_failed
+            and len(planning_failed) == len(context.request_ids)
+            and self._native_burst_handoff is None
+        ):
+            return self._all_failed_bypass(context, inputs_embeds)
         state_batch = persistent_state_projection.state_batch
         if state_batch is None:
             raise RuntimeError("MRv2 projection omitted bounded state views")
@@ -1305,6 +1329,66 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             if native_handoff is not None:
                 native_handoff.clear()
             raise
+
+    # @spec TXG-FAIL-008
+    @staticmethod
+    def _record_planning(projection: Any, context: Any) -> tuple[str, ...]:
+        """Record the step's planning-failed requests (rows bound non-CHUNK
+        with their planned-rejection bit set, TXG-COV-010) and each row's
+        admission generation in the model state's step record, for
+        ``postprocess_state``. Returns the planning-failed request IDs."""
+        bits = context.planned_rejection.tolist()
+        failed: tuple[str, ...] = ()
+        if bits:
+            failed = tuple(
+                request_id
+                for request_id, bit in zip(context.request_ids, bits, strict=True)
+                if bit
+            )
+        record = getattr(projection, "planning_failed", None)
+        if record is not None:
+            record.update(failed)
+        generations = getattr(projection, "admission_generations", None)
+        if generations is not None:
+            generations.update(
+                (binding.request_id, int(binding.admission_generation))
+                for binding in context.bindings
+            )
+        return failed
+
+    # @spec TXG-FAIL-009, TXG-FAIL-010, TXG-COV-013
+    def _all_failed_bypass(self, context: Any, inputs_embeds: torch.Tensor) -> Any:
+        """A real step whose every row failed at planning: no transaction runs
+        (neither the binding's ``execute`` nor the option-off transaction),
+        nothing is reserved or staged, and each scheduled row gets the
+        rejected-row output in the runner's order. ``postprocess_state`` fails
+        the requests from the planning-failed set (TXG-FAIL-008).
+
+        Where transaction graphs are on, the binding's failed latch is checked
+        first, so a latched worker refuses this step as it refuses every
+        other (TXG-FAIL-003); the binding also counts the step as a bypass,
+        not a fallback (TXG-COV-013)."""
+        from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
+            rejected_row_output,
+        )
+
+        binding = getattr(self, "_transaction_graph_binding", None)
+        if binding is not None:
+            if getattr(binding, "failed", False):
+                raise RuntimeError(
+                    "transaction graphs failed on this worker; a fresh engine "
+                    "is required"
+                )
+            record_bypass = getattr(binding, "record_all_failed_step", None)
+            if record_bypass is not None:
+                record_bypass(len(context.request_ids))
+        return rejected_row_output(
+            len(context.request_ids),
+            int(self.config.hidden_size),
+            park_id=int(self.config.eos_token_id),
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+        )
 
     @staticmethod
     def _write_file_envelopes(inputs_embeds: torch.Tensor, projection: Any) -> None:

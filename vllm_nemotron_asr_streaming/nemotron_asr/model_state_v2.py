@@ -27,8 +27,9 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 from vllm_nemotron_asr_streaming.engine_flags import (
     check_engine_config,
-    hook_captured_arm,
+    selects_hook_captured_graph,
 )
+from vllm_nemotron_asr_streaming.lookahead import geometry_index, served_lookahead
 from vllm_nemotron_asr_streaming.nemotron_asr import file_rows
 from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import (
     FileAction,
@@ -50,6 +51,15 @@ from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
 #: Host-side stand-in for a scheduled token the sampler produced on the
 #: device: never a valid token id, so never the CHUNK or file carrier.
 SAMPLED_TOKEN = -1
+
+
+def _cuda_platform() -> bool:
+    """Whether vLLM's current platform is CUDA. The platform module is a
+    graph-runtime dependency (REG-014), imported only when a hook-captured
+    graph is selected."""
+    from vllm.platforms import current_platform
+
+    return bool(current_platform.is_cuda())
 
 
 @dataclass(frozen=True)
@@ -86,6 +96,15 @@ class ProjectionSnapshot:
     state_batch: StateBatch | None = None
     file_rows: dict[str, StepRow] = field(default_factory=dict)
     geometry_order: tuple[int, ...] = ()
+    #: The step's planning-failed set (TXG-FAIL-008): the model state records
+    #: the rows it fails at planning, and the model's forward adds every row
+    #: the plan binds with its planned-rejection bit (TXG-COV-010).
+    planning_failed: set[str] = field(default_factory=set)
+    #: The file requests whose file action this step planned (FILE-QC-006).
+    planned_files: tuple[str, ...] = ()
+    #: Each row's admission generation in this step's plan, recorded by the
+    #: model's forward (FILE-QC-013).
+    admission_generations: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -94,9 +113,17 @@ class _FileProgress:
 
     position: int = 0
     tail_done: bool = False
-    #: Queued labels not yet emitted, when the host knows it without reading
-    #: the device (a fresh row, or after a drain step); ``None`` otherwise.
-    known_queue: int | None = 0
+    #: Queued labels not yet emitted (FILE-QC-007: 0 at take). Only an
+    #: accepted count from the step's collection changes it (FILE-QC-006).
+    queue_count: int = 0
+    #: The count's validity is unknown: a planned row had no accepted count
+    #: and no rejection (FILE-QC-009). The retained number is kept.
+    queue_count_unknown: bool = False
+    #: The admission generation of the incarnation taken at the first
+    #: schedule, recorded from its first clean count (FILE-QC-013).
+    admission_generation: int | None = None
+    #: Steps whose file action was planned.
+    planned_steps: int = 0
 
 
 class _ResidentCommitSink:
@@ -185,10 +212,19 @@ class NemotronASRModelState(ModelState):
             self.device, graphs_by_core=self._graphs_by_core()
         )
 
+    # @spec REG-MEM-019
     def needs_cudagraph_capture(self) -> bool:
-        # Configuration only: the engine check accepts a non-eager runner only
-        # for the arm the capture hook captures (``hook_captured_arm``).
-        return hook_captured_arm(self.model.config)
+        # Configuration and platform only: the engine check accepts a
+        # non-eager runner only for a graph the capture hook captures
+        # (``selects_hook_captured_graph``). Both are read on the first call
+        # and the answer is kept for the model state's lifetime.
+        answer = getattr(self, "_needs_cudagraph_capture", None)
+        if answer is None:
+            answer = bool(
+                selects_hook_captured_graph(self.model.config) and _cuda_platform()
+            )
+            self._needs_cudagraph_capture = answer
+        return answer
 
     def capture_cudagraphs(
         self,
@@ -359,23 +395,41 @@ class NemotronASRModelState(ModelState):
             0 <= int(header[1]) < num_prompts
         ):
             raise ValueError(f"file request {req_id!r} has a bad header")
+        # FILE-PROMPT-007: a header of another geometry than the server's fails
+        # the row at planning.
+        if int(header[0]) != self._server_geometry():
+            raise ValueError(
+                f"file request {req_id!r} header geometry {int(header[0])} is "
+                f"not the server's geometry {self._server_geometry()}"
+            )
+        # FILE-QC-007: count 0 and no recorded generation at take.
         self._file_progress[req_id] = _FileProgress()
 
-    # @spec FILE-ENG-001, FILE-ENG-003, FILE-ENG-004, FILE-BUF-002, FILE-ROW-002
+    def _server_geometry(self) -> int:
+        """The server's geometry index (SESS-GEOM-001), read once."""
+        geometry = getattr(self, "_server_geometry_index", None)
+        if geometry is None:
+            geometry = geometry_index(served_lookahead(self.model.config))
+            self._server_geometry_index = geometry
+        return geometry
+
+    # @spec FILE-ENG-001, FILE-ENG-003, FILE-BUF-002, FILE-ROW-002
+    # @spec FILE-QC-010, FILE-QC-011
     def plan_step(
         self,
         scheduler_output: SchedulerOutput,
         *,
-        queue_lens: dict[str, int] | None = None,
         stream_rows: dict[str, tuple[int, int]] | None = None,
     ) -> StepPlan:
         """Plan the step's rows once: FILE rows resolve their action from the
-        label queue length, stage the one chunk (or tail) they advance through
+        file's queue count, stage the one chunk (or tail) they advance through
         ``file_buffers.stage`` and advance their position.
 
-        ``queue_lens`` maps request IDs to the label queue length the device
-        book reports (default 0); ``stream_rows`` maps stream request IDs to
-        ``(geometry_index, deadline)``.
+        Planning reads no label book and changes no queue count (FILE-QC-011).
+        A file that has had a step and whose count's validity is unknown is
+        failed alone before its file action is planned (FILE-QC-010).
+        ``stream_rows`` maps stream request IDs to ``(geometry_index,
+        deadline)``.
         """
         cached = scheduler_output.scheduled_cached_reqs
         req_ids = [r.req_id for r in scheduler_output.scheduled_new_reqs]
@@ -383,6 +437,12 @@ class NemotronASRModelState(ModelState):
         rows: list[StepRow] = []
         for req_id in req_ids:
             progress = self._file_progress.get(req_id)
+            if (
+                progress is not None
+                and progress.queue_count_unknown
+                and progress.planned_steps > 0
+            ):
+                self._failed_files.add(req_id)
             if req_id in self._failed_files:
                 rows.append(
                     StepRow(
@@ -405,8 +465,9 @@ class NemotronASRModelState(ModelState):
                 int(v) for v in self.file_buffers.header(req_id)
             )
             chunk_samples = list(RAW_SAMPLES_PER_CHUNK.values())[geometry]
+            progress.planned_steps += 1
             plan = file_rows.plan_file_step(
-                queue_len=int((queue_lens or {}).get(req_id, 0)),
+                queue_len=int(progress.queue_count),
                 position=progress.position,
                 total_samples=total,
                 chunk_samples=chunk_samples,
@@ -566,6 +627,8 @@ class NemotronASRModelState(ModelState):
             step_plan = self._plan_production_step(
                 req_ids, bindings, batch, token_rows, input_batch
             )
+            # TXG-FAIL-008: the rows the model state failed at planning.
+            planning_failed = {row.request_id for row in step_plan.rows if row.failed}
             snapshot = ProjectionSnapshot(
                 self._epoch,
                 req_ids,
@@ -583,6 +646,12 @@ class NemotronASRModelState(ModelState):
                     row.request_id: row for row in step_plan.rows if row.is_file
                 },
                 geometry_order=step_plan.geometry_order,
+                planning_failed=planning_failed,
+                planned_files=tuple(
+                    row.request_id
+                    for row in step_plan.rows
+                    if row.is_file and not row.failed
+                ),
             )
         self._snapshot = snapshot
         return {"persistent_state_projection": snapshot}
@@ -595,8 +664,10 @@ class NemotronASRModelState(ModelState):
         token_rows: list[tuple[int, ...]],
         input_batch: InputBatch,
     ) -> StepPlan:
-        """Make the step's plan once: read the label queue lengths FILE rows
-        need, resolve stream rows' geometry and deadline, then plan."""
+        """Make the step's plan once: resolve stream rows' geometry and
+        deadline, then plan. FILE rows plan from their file's queue count;
+        no label book is read (FILE-QC-011)."""
+        del bindings, batch
         assert self._scheduler_output is not None
         if not any(
             r in self._file_progress or r in self._failed_files for r in req_ids
@@ -604,31 +675,6 @@ class NemotronASRModelState(ModelState):
             # A stream-only step: no FILE row, so no planning work.
             return StepPlan(rows=[], groups=[])
         config = self.model.config
-        queue_lens: dict[str, int] = {}
-        unknown = []
-        for binding in bindings:
-            if binding.request_id not in self._file_progress:
-                continue
-            known = self._file_progress[binding.request_id].known_queue
-            if binding.fresh:
-                queue_lens[binding.request_id] = 0
-            elif known is not None:
-                queue_lens[binding.request_id] = known
-            else:
-                unknown.append(binding)
-        if unknown:
-            from vllm_nemotron_asr_streaming.nemotron_asr.rnnt import (
-                QUEUE_HEAD,
-                QUEUE_LEN,
-            )
-
-            book = batch.pools.replay_book
-            slots = torch.tensor([b.slot_id for b in unknown], device=book.device)
-            # One small read per file row after an advancing step; a drain
-            # step knows its remaining count without reading.
-            picked = book.index_select(0, slots).cpu()
-            for binding, row in zip(unknown, picked, strict=True):
-                queue_lens[binding.request_id] = int(row[QUEUE_LEN] - row[QUEUE_HEAD])
         now_ns = time.time_ns()
         stream_rows: dict[str, tuple[int, int]] = {}
         for index, req_id in enumerate(req_ids):
@@ -648,20 +694,9 @@ class NemotronASRModelState(ModelState):
             )
             assert header is not None
             stream_rows[req_id] = stream_order_key(header, now_ns=now_ns)
-        plan = self.plan_step(
-            self._scheduler_output, queue_lens=queue_lens, stream_rows=stream_rows
-        )
-        for row in plan.rows:
-            progress = self._file_progress.get(row.request_id)
-            if progress is not None and row.file_plan is not None:
-                # DRAIN emits one queued label; any other step leaves the
-                # count for the device to report.
-                if row.file_plan.action is FileAction.DRAIN:
-                    progress.known_queue = queue_lens[row.request_id] - 1
-                else:
-                    progress.known_queue = None
-        return plan
+        return self.plan_step(self._scheduler_output, stream_rows=stream_rows)
 
+    # @spec SESS-MODEL-003, TXG-FAIL-008, FILE-QC-006, FILE-QC-012
     def postprocess_state(
         self,
         idx_mapping: torch.Tensor,
@@ -671,7 +706,12 @@ class NemotronASRModelState(ModelState):
         snapshot = self._snapshot
         if snapshot is None or snapshot.dummy_run:
             return
-        _statuses, failed = self.model.collect_commit_status()
+        collection = self.model.collect_commit_status()
+        # Every collected failure (any nonzero status, SESS-MODEL-003), every
+        # planning-failed row (TXG-FAIL-008), and every file row with no
+        # accepted count (FILE-QC-012) fails its request alone.
+        failed = set(collection.failed) | set(snapshot.planning_failed)
+        failed |= self._apply_queue_counts(snapshot, collection)
         if failed:
             assert self.state_slots is not None
             self.state_slots.fail_requests(failed)
@@ -682,6 +722,56 @@ class NemotronASRModelState(ModelState):
         )
         self.model.consume_batch_stats()
         self._snapshot = None
+
+    # @spec FILE-QC-006, FILE-QC-008, FILE-QC-009, FILE-QC-012, FILE-QC-013
+    def _apply_queue_counts(
+        self, snapshot: ProjectionSnapshot, collection: Any
+    ) -> set[str]:
+        """Apply the step's collected counts to the file progress of the file
+        rows the step planned; return the files that had no count accepted.
+
+        A file progress records its admission generation from its first
+        step's count of the incarnation the step bound, before any count is
+        applied (FILE-QC-013). A count is accepted only for a planned file row
+        of the same request and recorded generation whose status resolved to
+        0 (FILE-QC-006). A rejected row keeps its count (FILE-QC-008); a row
+        with no outcome keeps the number and marks its validity unknown
+        (FILE-QC-009). No count is decremented on the host.
+        """
+        statuses = collection.statuses
+        counts = tuple(collection.queue_counts)
+        unaccepted: set[str] = set()
+        for req_id in snapshot.planned_files:
+            progress = self._file_progress.get(req_id)
+            if progress is None:
+                continue
+            status = statuses.get(req_id)
+            if progress.admission_generation is None and status == 0:
+                bound = snapshot.admission_generations.get(req_id)
+                if bound is not None and any(
+                    c.request_id == req_id and c.admission_generation == bound
+                    for c in counts
+                ):
+                    progress.admission_generation = bound
+            accepted = None
+            if status == 0 and progress.admission_generation is not None:
+                accepted = next(
+                    (
+                        c
+                        for c in counts
+                        if c.request_id == req_id
+                        and c.admission_generation == progress.admission_generation
+                    ),
+                    None,
+                )
+            if accepted is not None:
+                progress.queue_count = int(accepted.count)
+                progress.queue_count_unknown = False
+                continue
+            if status is None or status == 0:
+                progress.queue_count_unknown = True
+            unaccepted.add(req_id)
+        return unaccepted
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         raise RuntimeError("Nemotron does not support outer CUDA graph capture")

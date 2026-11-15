@@ -157,13 +157,14 @@ def missing_graph_hooks() -> list[str]:
 
 def _cuda_platform(vllm_config: Any) -> bool:
     """Whether the engine runs on a CUDA platform: vLLM's current platform is
-    CUDA and the device configuration, when it names one, is ``cuda``."""
+    CUDA. vLLM derives the device configuration's type from that platform, so
+    the platform alone decides (REG-ENG-005, REG-MEM-019)."""
+    del vllm_config
     try:
         from vllm.platforms import current_platform
     except ImportError:
         return False
-    device = getattr(getattr(vllm_config, "device_config", None), "device_type", None)
-    return bool(current_platform.is_cuda()) and device in (None, "cuda")
+    return bool(current_platform.is_cuda())
 
 
 def _mode_value(mode: Any) -> Any:

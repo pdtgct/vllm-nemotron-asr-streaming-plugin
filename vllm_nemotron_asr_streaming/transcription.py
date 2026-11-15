@@ -17,13 +17,14 @@ from typing import Any
 import numpy as np
 
 from vllm_nemotron_asr_streaming.locales import resolve_file_locale
-from vllm_nemotron_asr_streaming.lookahead import geometry_index
+from vllm_nemotron_asr_streaming.lookahead import geometry_index, served_lookahead
 
 
 # @spec FILE-IF-004, FILE-IF-005, FILE-LANG-001, FILE-LANG-002, FILE-LANG-003
 # @spec FILE-LANG-004, FILE-LANG-005, FILE-LANG-006, FILE-PROMPT-001
 # @spec FILE-PROMPT-002, FILE-PROMPT-005, FILE-GRD-001, FILE-GRD-002
 # @spec FILE-GRD-003, FILE-GRD-004, FILE-GRD-005, FILE-GRD-006, REG-CARD-015
+# @spec REG-LA-009, SESS-GEOM-001
 def build_file_prompt(stt_params: Any) -> dict[str, Any]:
     """Build the prompt of a complete-file request, or raise ``ValueError``."""
     if stt_params.task_type != "transcribe":
@@ -66,8 +67,9 @@ def build_file_prompt(stt_params: Any) -> dict[str, Any]:
     )
     row = int(table[locale])
 
-    right_context = int(hf_config.num_lookahead_tokens)
-    geometry = geometry_index(right_context)
+    # FILE-PROMPT-002, REG-LA-009: the server's one geometry, from the one
+    # lookahead function.
+    geometry = geometry_index(served_lookahead(hf_config))
     samples = np.ascontiguousarray(stt_params.audio, dtype=np.float32).reshape(-1)
     count = int(samples.shape[0])
 

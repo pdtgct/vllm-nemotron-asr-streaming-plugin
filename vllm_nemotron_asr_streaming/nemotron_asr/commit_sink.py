@@ -19,7 +19,7 @@ Torch + stdlib only: locally testable under the loader chain.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -28,9 +28,6 @@ from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
     CommitPlan,
     PreparedRowBinding,
 )
-from vllm_nemotron_asr_streaming.nemotron_asr.frontend import (
-    ROW_STATUS_GEOMETRY,
-)
 from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
     SessionRegistry,
 )
@@ -38,15 +35,43 @@ from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
 
 @dataclass(frozen=True)
 class SessionStatusReport:
-    """One row's consumed status, joined to its session identity."""
+    """One row's consumed status, joined to its session identity.
+
+    ``queue_count`` is the row's remaining label-queue count after the step
+    (FILE-QC-004): set only for a row whose status is 0, whose stage-time
+    lease revalidation held and whose plan carried counts; ``None`` otherwise.
+    """
 
     request_id: str
     admission_generation: int
     row_status: int
     progress_key: tuple[int, int, int] | None = None
     starts_chunk: bool = False
+    queue_count: int | None = None
 
 
+@dataclass(frozen=True)
+class QueueCount:
+    """One clean, current row's remaining label-queue count, bound to the
+    request incarnation (admission generation) whose step produced it."""
+
+    request_id: str
+    admission_generation: int
+    count: int
+
+
+@dataclass(frozen=True)
+class CommitCollection:
+    """One consumption of the sink's staged step (FILE-QC-005): the resolved
+    status per request, the requests to fail, and the counts of the clean
+    reports that carry one, in binding order."""
+
+    statuses: dict[str, int] = field(default_factory=dict)
+    failed: set[str] = field(default_factory=set)
+    queue_counts: tuple[QueueCount, ...] = ()
+
+
+# @spec SESS-MODEL-003, TXG-FAIL-001
 def resolve_status_reports(
     registry: SessionRegistry,
     reports: Sequence[SessionStatusReport],
@@ -55,9 +80,9 @@ def resolve_status_reports(
 ) -> tuple[dict[str, int], set[str]]:
     """Resolve registry proposals and classify terminal sessions.
 
-    A geometry-only mismatch is the PORT-SESS-002 recoverable tier.
-    Every other nonzero status, or any request/generation lease drift,
-    is terminal and must reach the scheduler.
+    Every nonzero status, of any status class, and any request/generation
+    lease drift, is terminal: the request is failed alone and must reach the
+    scheduler.
     """
     statuses: dict[str, int] = {}
     failed: set[str] = set()
@@ -71,7 +96,7 @@ def resolve_status_reports(
         if not current:
             status = -1
         statuses[report.request_id] = status
-        if status not in (0, ROW_STATUS_GEOMETRY):
+        if status != 0:
             failed.add(report.request_id)
     return statuses, failed
 
@@ -136,6 +161,10 @@ class BoundedCommitSink:
         )
         self._progress_host = torch.zeros(
             (max_rows, 3), dtype=torch.int64, pin_memory=self._cuda
+        )
+        # @spec FILE-QC-003: the remaining queue counts' host slot.
+        self._queue_count_host = torch.zeros(
+            max_rows, dtype=torch.int32, pin_memory=self._cuda
         )
         self._event: torch.cuda.Event | None = (
             torch.cuda.Event() if self._cuda else None
@@ -219,6 +248,17 @@ class BoundedCommitSink:
             plan.progress.shape != (rows, 3) or plan.progress.dtype != torch.int64
         ):
             raise ValueError("commit progress must have three int64 columns per row")
+        # @spec FILE-QC-002: refused before the lease is validated, so a
+        # malformed plan holds nothing.
+        if plan.queue_counts is not None and (
+            tuple(plan.queue_counts.shape) != (rows,)
+            or plan.queue_counts.dtype != torch.int32
+        ):
+            raise ValueError(
+                "commit queue_counts must be one int32 count per row, got shape "
+                f"{tuple(plan.queue_counts.shape)} dtype {plan.queue_counts.dtype} "
+                f"for {rows} rows"
+            )
         # Pin the lease: every binding must be CURRENT in the registry.
         self._registry.validate_lease(plan.bindings)
         self._reserved = plan
@@ -233,6 +273,10 @@ class BoundedCommitSink:
         self._status_host[:rows].copy_(row_status, non_blocking=True)
         if plan.progress is not None:
             self._progress_host[:rows].copy_(plan.progress, non_blocking=True)
+        if plan.queue_counts is not None:
+            # FILE-QC-003: one non-blocking copy into the construction-time
+            # buffer, issued before the completion event is recorded.
+            self._queue_count_host[:rows].copy_(plan.queue_counts, non_blocking=True)
         if self._event is not None:
             self._event.record()
         # Stage-time lease REVALIDATION is a recorded fact, never a
@@ -273,6 +317,11 @@ class BoundedCommitSink:
         progress = (
             self._progress_host[:rows].tolist() if plan.progress is not None else None
         )
+        counts = (
+            self._queue_count_host[:rows].tolist()
+            if plan.queue_counts is not None and self._staged_lease_ok
+            else None
+        )
         reports = [
             SessionStatusReport(
                 request_id=binding.request_id,
@@ -286,6 +335,10 @@ class BoundedCommitSink:
                     and self._staged_lease_ok
                     and progress[i][2] > 0
                     else None
+                ),
+                # @spec FILE-QC-004: whatever the row's progress key.
+                queue_count=(
+                    int(counts[i]) if counts is not None and status[i] == 0 else None
                 ),
             )
             for i, binding in enumerate(plan.bindings)
