@@ -24,6 +24,7 @@ hooks, which run after core's memory-profiling window has exited.
 from __future__ import annotations
 
 import gc
+import traceback
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +43,24 @@ def format_bytes(value: int | None) -> str:
     if value is None:
         return "not measured"
     return f"{value} bytes ({value / _MIB:.2f} MiB)"
+
+
+# @spec REG-MEM-017, TXG-LIFE-012
+def release_error_frames(error: BaseException | None) -> None:
+    """Drop the locals of every finished frame that ``error`` holds, through
+    its cause and its context alike, so that the error a failed capture
+    propagates keeps no reference to the tensors or graphs the capture
+    created. The messages, the chain and the tracebacks' file and line
+    records stay; a frame that is still executing is left alone."""
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if current.__traceback__ is not None:
+            traceback.clear_frames(current.__traceback__)
+        pending.extend((current.__cause__, current.__context__))
 
 
 # @spec REG-MEM-027
@@ -258,6 +277,7 @@ __all__ = [
     "format_bytes",
     "free_memory",
     "profiling_requirement",
+    "release_error_frames",
     "retained",
     "serving_excess",
     "transient_peak",

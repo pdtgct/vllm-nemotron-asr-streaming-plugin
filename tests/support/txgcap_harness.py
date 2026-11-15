@@ -205,6 +205,71 @@ def foreign_geometry(env: Any) -> int:
     return (env.geometry + 1) % len(LOOKAHEADS)
 
 
+def with_endpoint_policy(request: Any, *, threshold_frames: int = 2) -> Any:
+    """``request`` carrying an endpoint policy, as only a direct engine stream
+    client sets one (SESS-EP-001): its row then carries endpoint mode 1 in the
+    row plan (TXG-COV-012)."""
+    request.additional_information = {
+        "endpoint_policy": {
+            "mode": "greedy_blank",
+            "threshold_frames": threshold_frames,
+            "residue_frames": 0,
+        }
+    }
+    return request
+
+
+def eou_request(env: Any, req_id: str) -> Any:
+    """A new request with no audio whose scheduled token is the EOU token, as
+    only a direct engine stream client schedules it, for a stream the worker
+    already serves (the planner refuses a non-CHUNK row of a request it never
+    saw a CHUNK of): a non-CHUNK row that is a forced-EOU candidate
+    (TXG-COV-012)."""
+    return h.new_request(req_id, int(env.config.eou_token_id))
+
+
+def fallback_reasons(env: Any) -> dict[tuple[Any, ...], int]:
+    """The ``fallbacks`` counter, keyed ``(reason, kind, count)``."""
+    return dict(counter(env, "fallbacks"))
+
+
+def run_fallback_classes(env: Any, core: Any, *, first_slot: int = 1) -> list[str]:
+    """After startup at ``N = 2`` and ``max_num_seqs >= 3``, run one covered
+    step and one step of every reachable fallback class (TXG-CAP-013,
+    TXG-CAP-014): ``chunk-uncovered``, ``echo-uncovered`` and ``signature``
+    with the fields ``endpoint_policy`` and ``forced_eou``. Every request
+    takes a slot of its own, from ``first_slot`` (five slots). Returns the
+    classes run; fails unless the counters show each one."""
+    assert env.n == 2, "the scenario is written for N = 2"
+    slots: dict[str, int] = {}
+
+    def step(*rows: Any, cached: tuple[str, ...] = ()) -> None:
+        for row in rows:
+            slots.setdefault(row.req_id, first_slot + len(slots))
+        ids = [r.req_id for r in rows] + list(cached)
+        core.step(*rows, cached=cached, handles={r: slots[r] for r in ids})
+
+    streams = tuple(f"cap13-k{i}" for i in range(3))
+    before = fallback_reasons(env)
+    step(stream_unit(env, "cap13-covered"))
+    assert fallback_reasons(env) == before, "the covered step fell back"
+    # K = N + 1, then the same requests with no new audio: E = N + 1.
+    step(*[stream_unit(env, r) for r in streams])
+    step(cached=streams)
+    step(with_endpoint_policy(stream_unit(env, "cap13-policy")))
+    step(eou_request(env, streams[0]))
+    after = fallback_reasons(env)
+    grown = {key for key, value in after.items() if value != before.get(key, 0)}
+    expected = {
+        ("chunk-uncovered", txg_api.CHUNK, 3),
+        ("echo-uncovered", txg_api.ECHO, 3),
+        ("signature", txg_api.CHUNK, 1),
+        ("signature", txg_api.ECHO, 1),
+    }
+    assert grown == expected, (grown, after)
+    return ["chunk-uncovered", "echo-uncovered", "endpoint_policy", "forced_eou"]
+
+
 # ---------------------------------------------------------------------------
 # Builders
 
@@ -377,11 +442,31 @@ def is_scatter_warmup(call: dict[str, Any]) -> bool:
     )
 
 
+def pool_layout_of(pool: Any) -> tuple[Any, ...]:
+    """A scatter pool argument as TXG-CAP-013 compares it, from host values
+    alone: ``(address, shape, strides, dtype)``."""
+    return (pool.data_ptr(), tuple(pool.shape), tuple(pool.stride()), pool.dtype)
+
+
+def within(tensor: Any, pool: Any) -> bool:
+    """Whether ``pool``'s address (an integer, or a tensor's) lies inside
+    ``tensor``'s storage."""
+    address = pool if isinstance(pool, int) else pool.data_ptr()
+    start = tensor.data_ptr()
+    return start <= address < start + tensor.numel() * tensor.element_size()
+
+
 class ScatterSpy:
     """Logs every masked-scatter launch (the plugin's one Triton kernel,
-    ``state_scatter``) with its pool, rows, page IDs and statuses, wherever
-    the module's executors are bound by name. CPU executes the CPU loop; a
-    CUDA warm-up on a CPU pool is logged and skipped (the kernel cannot run
+    ``state_scatter``) wherever the module's executors are bound by name.
+
+    Every entry holds the pool argument's host-side layout: ``pool`` (its
+    address), ``layout`` (``(address, shape, strides, dtype)``, what
+    TXG-CAP-013 compares) and ``rows``. The page IDs (``pages``) and statuses
+    (``status``) are read only from host tensors: reading a device tensor's
+    values is a synchronization, which fails inside a graph capture, so for a
+    device launch both are ``None``. CPU executes the CPU loop; a CUDA
+    warm-up on a CPU pool is logged and skipped (the kernel cannot run
     there)."""
 
     def __init__(self, events: list) -> None:
@@ -393,12 +478,18 @@ class ScatterSpy:
         self.warmups = 0
 
     def _log(self, name: str, pool: Any, block_ids: Any, row_status: Any) -> None:
+        host = block_ids.device.type == "cpu" and row_status.device.type == "cpu"
         entry = {
             "fn": name,
             "pool": pool.data_ptr(),
+            "layout": pool_layout_of(pool),
             "rows": int(block_ids.numel()),
-            "pages": [int(v) for v in block_ids.reshape(-1).tolist()],
-            "status": [int(v) for v in row_status.reshape(-1).tolist()],
+            "pages": (
+                [int(v) for v in block_ids.reshape(-1).tolist()] if host else None
+            ),
+            "status": (
+                [int(v) for v in row_status.reshape(-1).tolist()] if host else None
+            ),
         }
         self.calls.append(entry)
         self.events.append(("scatter", entry))
@@ -407,7 +498,7 @@ class ScatterSpy:
         from vllm_nemotron_asr_streaming.nemotron_asr import state_scatter
 
         spy = self
-        execute = state_scatter._execute_masked_page_scatter_
+        execute = state_scatter.execute_masked_page_scatter_
         warmup = state_scatter.warmup_masked_page_scatter
 
         def execute_spy(pool, scratch, block_ids, row_status):
@@ -437,10 +528,8 @@ class ScatterSpy:
             except ImportError:
                 continue
         for module in targets:
-            if hasattr(module, "_execute_masked_page_scatter_"):
-                monkeypatch.setattr(
-                    module, "_execute_masked_page_scatter_", execute_spy
-                )
+            if hasattr(module, "execute_masked_page_scatter_"):
+                monkeypatch.setattr(module, "execute_masked_page_scatter_", execute_spy)
             if hasattr(module, "warmup_masked_page_scatter"):
                 monkeypatch.setattr(module, "warmup_masked_page_scatter", warmup_spy)
         return self

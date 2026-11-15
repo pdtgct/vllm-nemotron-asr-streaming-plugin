@@ -568,10 +568,20 @@ class Driver:
         self.until_parked(ids)
         self.step(only=ids)
 
-    def special(self, req_id: str, token: int) -> Any:
-        """A new request with no audio whose first token is ``token``: a fresh
-        non-CHUNK row (finished on the next step)."""
-        self._slot(req_id)
+    def special(self, req_id: str, token: int, *, fresh: bool = False) -> Any:
+        """A new request with no audio, whose scheduled token is ``token``,
+        for the parked stream ``req_id``: a non-CHUNK row, as a direct engine
+        stream client sends one (the planner refuses a non-CHUNK row of a
+        request it never saw a CHUNK of). With ``fresh`` the request's slot is
+        reissued at its next generation, so the row is a fresh non-CHUNK row.
+        The stream ends with this row (finished on the next step)."""
+        stream = self.streams[req_id]
+        assert not stream.done and self.parked(req_id), f"{req_id} is not parked"
+        stream.done = True
+        if fresh:
+            slot, generation = self.handles[req_id]
+            self._generation[slot] = generation + 1
+            self.handles[req_id] = (slot, generation + 1)
         return h.new_request(req_id, token)
 
     def run(self, steps: int, **kwargs) -> None:

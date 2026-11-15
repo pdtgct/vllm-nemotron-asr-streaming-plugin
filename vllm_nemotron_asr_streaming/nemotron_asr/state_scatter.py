@@ -44,8 +44,10 @@ _OP_REGISTERED = False
 _REGISTRATION_LOCK = threading.Lock()
 _WARMUP_LOCK = threading.Lock()
 _WARMED_SPECIALIZATIONS: set[
-    tuple[int, int, int, torch.dtype, int, int, int, int, int]
+    tuple[int, int, int, torch.dtype, int, int, int, int, int, bool, bool]
 ] = set()
+#: The pointer alignment Triton specializes a tensor argument on.
+_POINTER_ALIGNMENT: Final = 16
 
 
 if triton is not None and tl is not None:
@@ -109,11 +111,18 @@ def _launch_config(page_numel: int) -> tuple[int, int]:
     return block_size, 8
 
 
+def _pointer_aligned(tensor: torch.Tensor) -> bool:
+    return tensor.data_ptr() % _POINTER_ALIGNMENT == 0
+
+
+# @spec TXG-CAP-013
 def _cuda_specialization(
     pool: torch.Tensor,
     scratch: torch.Tensor,
-) -> tuple[int, int, int, torch.dtype, int, int, int, int, int]:
-    """Return every value that can select a distinct Triton binary."""
+) -> tuple[int, int, int, torch.dtype, int, int, int, int, int, bool, bool]:
+    """Return every value that can select a distinct Triton binary,
+    including whether each argument's pointer is 16-byte aligned: a view at
+    an alignment that was not launched is never taken as warmed."""
     device_index = pool.get_device()
     major, minor = torch.cuda.get_device_capability(pool.device)
     page_numel = _page_numel(pool)
@@ -128,6 +137,8 @@ def _cuda_specialization(
         scratch.stride(0),
         block_size,
         num_warps,
+        _pointer_aligned(pool),
+        _pointer_aligned(scratch),
     )
 
 
@@ -294,6 +305,31 @@ def warmup_masked_page_scatter(
         _WARMED_SPECIALIZATIONS.add(signature)
 
 
+# @spec TXG-CAP-006, TXG-CAP-013
+def launch_rejected_row_scatter(pool: torch.Tensor, page: int = 1) -> None:
+    """Launch one scatter row with a rejected status that names ``page`` of
+    ``pool``, and record the argument as warmed.
+
+    The kernel's status predicate returns before it reads the page ID or any
+    resident address, so nothing is loaded or stored. Unlike
+    :func:`warmup_masked_page_scatter` this launches on every call and does
+    not synchronize: a caller that warms a set of fixed views (component
+    pools and projected resident-pool views) launches each one at its own
+    address, shape, strides, dtype and alignment.
+    """
+    scratch = torch.empty((1, *pool.shape[1:]), dtype=pool.dtype, device=pool.device)
+    block_ids = torch.full((1,), int(page), dtype=torch.int64, device=pool.device)
+    row_status = torch.ones(1, dtype=torch.int32, device=pool.device)
+    _validate_masked_page_scatter(
+        pool, scratch, block_ids, row_status, require_cuda_warmup=False
+    )
+    execute_masked_page_scatter_(pool, scratch, block_ids, row_status)
+    if pool.device.type == "cuda":
+        signature = _cuda_specialization(pool, scratch)
+        with _WARMUP_LOCK:
+            _WARMED_SPECIALIZATIONS.add(signature)
+
+
 def _fake_scatter(
     pool: torch.Tensor,
     scratch: torch.Tensor,
@@ -330,7 +366,7 @@ def _ensure_cuda_op_registered() -> None:
         _OP_REGISTERED = True
 
 
-def _execute_masked_page_scatter_(
+def execute_masked_page_scatter_(
     pool: torch.Tensor,
     scratch: torch.Tensor,
     block_ids: torch.Tensor,
@@ -363,4 +399,4 @@ def masked_page_scatter_(
     call the private prevalidated executor in their no-fail commit window.
     """
     validate_masked_page_scatter(pool, scratch, block_ids, row_status)
-    _execute_masked_page_scatter_(pool, scratch, block_ids, row_status)
+    execute_masked_page_scatter_(pool, scratch, block_ids, row_status)

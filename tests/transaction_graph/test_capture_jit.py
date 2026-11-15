@@ -4,10 +4,11 @@ or falling back with a reachable reason, compiles or autotunes anything
 core's JIT monitors observe under ``jit_monitor_mode`` ``error``.
 
 The monitor is process-global once activated, so the scenario runs in a
-fresh interpreter. The ``signature`` fallback class needs a step carrying an
-endpoint policy, which only a direct engine stream client sets; that case is
-a qualification-run obligation (TXG-QUAL-007) until the envelope field that
-carries it is exposed to the harness."""
+fresh interpreter. It runs a covered step and one step of every reachable
+fallback class: ``chunk-uncovered``, ``echo-uncovered`` and ``signature`` with
+the fields ``endpoint_policy`` (a request that sets an endpoint policy) and
+``forced_eou`` (a request that schedules the EOU token), as a direct engine
+stream client produces them (``txgcap_harness.run_fallback_classes``)."""
 
 from __future__ import annotations
 
@@ -30,7 +31,6 @@ SCRIPT = textwrap.dedent(
 
     import pytest
     import torch
-    from support import txg_api as api
     from support import txg_gpu as g
     from support import txgcap_harness as t
     from support.distributed import single_process_distributed
@@ -40,27 +40,20 @@ SCRIPT = textwrap.dedent(
         tmp / "dist", "nccl"
     ):
         env = g.build_option_on(
-            tmp, n=2, max_num_seqs=3, startup=False, monkeypatch=mp
+            tmp, n=2, max_num_seqs=3, capacity=12, startup=False, monkeypatch=mp
         )
         core = env.core
         core.startup()
         from vllm.utils.jit_monitor import activate
 
         activate(mode="error")
-        ids = [f"s{i}" for i in range(3)]
-        handles = {r: i + 1 for i, r in enumerate(ids)}
-        # covered: one CHUNK row
-        core.step(t.stream_unit(env, "c0"), handles={"c0": 4})
-        # chunk-uncovered: K = N + 1
-        core.step(*[t.stream_unit(env, r) for r in ids], handles=handles)
-        # echo-uncovered: E = N + 1 (the same requests, no new audio)
-        core.step(cached=tuple(ids), handles=handles)
-        fallbacks = t.counter(env, "fallbacks")
-        reasons = {
-            dict(zip(api.FALLBACK_KEY_FIELDS, k, strict=True))["reason"]
-            for k in fallbacks
-        }
-        assert {"chunk-uncovered", "echo-uncovered"} <= reasons, fallbacks
+        classes = t.run_fallback_classes(env, core)
+        assert classes == [
+            "chunk-uncovered",
+            "echo-uncovered",
+            "endpoint_policy",
+            "forced_eou",
+        ], classes
         torch.cuda.synchronize()
     print("OK")
     """

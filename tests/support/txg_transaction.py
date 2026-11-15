@@ -360,6 +360,8 @@ class TransactionEnv:
         self.state = state
         self.excluded: list[tuple[str, str, str]] = []
         self._rejections: dict | None = None
+        #: The live serving pool views (``env_from_runner`` only).
+        self.serving: Pools | None = None
 
     # -- tokens -------------------------------------------------------------
 
@@ -673,6 +675,38 @@ def build_env(
     return _env_from_calls(
         calls, model, state, model.config, geometry, lookahead, device, capacity
     )
+
+
+def env_from_runner(
+    runner,
+    model,
+    state,
+    *,
+    lookahead: int,
+    capacity: int,
+    monkeypatch,
+    device: str = "cpu",
+) -> TransactionEnv:
+    """A :class:`TransactionEnv` over an already started ``runner`` (its
+    serving pool bound, no request scheduled yet): the same drive and fixture
+    extraction as :func:`build_env`. Every driven step must run the option-off
+    transaction, so a caller whose model has transaction graphs on makes the
+    binding decline while this runs. ``capacity`` is the serving pool's block
+    count, which the composed pools then share. The returned environment's
+    ``serving`` holds the live serving pool views of the first driven step
+    (not copies)."""
+    geometry = {0: 0, 1: 1, 3: 2, 6: 3, 13: 4}[lookahead]
+    with recording(monkeypatch):
+        calls = _drive(runner, model.config, geometry, lookahead)
+    env = _env_from_calls(
+        calls, model, state, model.config, geometry, lookahead, device, capacity
+    )
+    env.serving = pools_of(calls[0]["kwargs"])
+    for (name, live), (_, composed) in zip(
+        env.serving.flat(), env.template.flat(), strict=True
+    ):
+        assert live.shape == composed.shape, (name, live.shape, composed.shape)
+    return env
 
 
 def _drive(runner, config, geometry: int, lookahead: int) -> list[dict[str, Any]]:

@@ -50,7 +50,7 @@ import torch
 
 from vllm_nemotron_asr_streaming.nemotron_asr.profiling import phase
 from vllm_nemotron_asr_streaming.nemotron_asr.state_scatter import (
-    _execute_masked_page_scatter_,
+    execute_masked_page_scatter_,
     validate_masked_page_scatter,
     warmup_masked_page_scatter,
 )
@@ -416,6 +416,14 @@ class RowPlan:
     the body gives it a nonzero status whatever its kind, freshness, file bit
     or token, so its masked scatter stores nothing (TXG-MASK-006).
 
+    ``forced_eou_candidate``: empty (no candidate) or
+    ``(num_decodes + num_prefills,)`` bool, the HOST marking of rows that may
+    take the forced-EOU path (TXG-COV-012): every non-CHUNK row whose
+    host-recorded scheduled token is the EOU token
+    (:func:`forced_eou_candidates`). The transaction itself never reads it;
+    it decides the path on the device. Transaction graphs read it to decline
+    a step that holds a candidate.
+
     :attr:`is_fresh` is the per-row freshness mask the body selects on
     (TXG-MASK-001), derived from ``has_initial_states_p``.
 
@@ -456,6 +464,9 @@ class RowPlan:
     planned_rejection: torch.Tensor = field(
         default_factory=lambda: torch.zeros(0, dtype=torch.bool)
     )
+    forced_eou_candidate: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, dtype=torch.bool)
+    )
 
     @property
     def is_fresh(self) -> torch.Tensor:
@@ -465,6 +476,33 @@ class RowPlan:
         fresh = torch.zeros(self.num_decodes + self.num_prefills, dtype=torch.bool)
         fresh[self.num_decodes :] = ~self.has_initial_states_p
         return fresh
+
+
+# @spec TXG-COV-012
+def forced_eou_candidates(
+    scheduled_token_ids: Sequence[int],
+    is_chunk: Sequence[bool],
+    eou_token_id: int | None,
+) -> list[bool]:
+    """Mark the rows that may take the forced-EOU path, from host values
+    alone: every non-CHUNK row whose host-recorded scheduled token is the EOU
+    token.
+
+    The body forces EOU for such a row only when its book has no pending
+    echo, an empty queue and an unfinished stream, which live on the device,
+    so this is a superset of the rows the body forces. A row whose scheduled
+    token the host does not record (a position past the request's recorded
+    prompt, which holds a sampled token) is no candidate: a row without an
+    endpoint policy samples the EOU token only as the decision of a forced
+    EOU, which arms its echo, so that token comes back on a REPLAY row.
+    """
+    if eou_token_id is None:
+        return [False] * len(scheduled_token_ids)
+    eou = int(eou_token_id)
+    return [
+        (not bool(chunk)) and int(token) == eou
+        for token, chunk in zip(scheduled_token_ids, is_chunk, strict=True)
+    ]
 
 
 @dataclass
@@ -1984,6 +2022,15 @@ def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Ten
         raise ValueError(
             f"plan.planned_rejection must be empty or CPU bool shaped ({n_real},)"
         )
+    if plan.forced_eou_candidate.numel() and (
+        plan.forced_eou_candidate.device.type != "cpu"
+        or plan.forced_eou_candidate.dtype != torch.bool
+        or plan.forced_eou_candidate.dim() != 1
+        or plan.forced_eou_candidate.shape[0] != n_real
+    ):
+        raise ValueError(
+            f"plan.forced_eou_candidate must be empty or CPU bool shaped ({n_real},)"
+        )
     live = plan.live_block_ids
     if live.device.type != "cpu" or live.dtype != torch.int64 or live.dim() != 1:
         raise ValueError("plan.live_block_ids must be rank-one CPU int64")
@@ -2559,7 +2606,7 @@ class _ScatterDescriptor:
     row_status: torch.Tensor
 
 
-def _resident_pool_sequence(
+def resident_pool_sequence(
     *,
     channel_pools: Sequence[torch.Tensor],
     time_pools: Sequence[torch.Tensor],
@@ -2618,7 +2665,7 @@ def warmup_advance_model_rows_scatter(
     preserving the destination pool's actual (possibly padded) block stride.
     Runtime validation then fails closed if a later pool/layout was omitted.
     """
-    pools = _resident_pool_sequence(
+    pools = resident_pool_sequence(
         channel_pools=channel_pools,
         time_pools=time_pools,
         len_pools=len_pools,
@@ -2709,7 +2756,7 @@ class PoolLayout:
 
 @dataclass(frozen=True)
 class ResidentLayout:
-    """The resident pools' host metadata, in :func:`_resident_pool_sequence`
+    """The resident pools' host metadata, in :func:`resident_pool_sequence`
     groups. The endpoint entries are ``None`` when that pool is absent."""
 
     channel: tuple[PoolLayout, ...]
@@ -4141,12 +4188,12 @@ def commit_model_rows(
 
     # ---- commit: prevalidated, allocation-free scatters + no-fail stage ----
     # Every descriptor was already validated by the body (the complete-plan
-    # pass); the commit window calls the private prevalidated
+    # pass); the commit window calls the prevalidated
     # executor directly so no descriptor is re-validated here.
     with phase("port.scatter"):
         try:
             for op in body.scatters:
-                _execute_masked_page_scatter_(
+                execute_masked_page_scatter_(
                     op.pool, op.scratch, op.blocks, op.row_status
                 )
         except BaseException:
@@ -4154,8 +4201,20 @@ def commit_model_rows(
                 cancel_reservation()
             raise
         # ---- ONE no-fail combined stage through the reserved ticket ----
+        # @spec TXG-EXEC-010: the stage validates and allocates nothing, but a
+        # copy or event fault can still raise. A stage that raises before it
+        # publishes the reservation leaves it cancellable, so the reservation
+        # is cancelled before the failure propagates; after a successful stage
+        # a cancel does nothing. If that cancel itself raises, the reservation
+        # is unresolved: the cancel's failure propagates as worker-fatal, with
+        # the stage's failure chained as its context.
         if stage_reservation is not None:
-            stage_reservation(body.status)
+            try:
+                stage_reservation(body.status)
+            except BaseException:
+                if cancel_reservation is not None:
+                    cancel_reservation()
+                raise
         if body.native_stage is not None:
             body.native_stage()
     return body.rows

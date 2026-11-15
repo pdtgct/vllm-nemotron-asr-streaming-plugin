@@ -566,6 +566,8 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         #: ``PROFILING_STEP``, ``PROFILING_CAPTURE`` or ``SERVING_CAPTURE``.
         self._segment_graphs: str | None = None
         self._serving_capture_attempted = False
+        #: Whether the eager stand-in line (REG-MEM-028) was logged.
+        self._graph_stand_in_logged = False
         #: The profiling capture call's figures, host integers kept after
         #: ``clear_cudagraphs`` (REG-MEM-021, REG-MEM-022); ``None`` until a
         #: profiling capture ran in this worker.
@@ -581,18 +583,22 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             self._txg_binding = self._build_transaction_graph_binding(vllm_config)
 
     def _build_transaction_graph_binding(self, vllm_config: Any) -> Any:
-        """The binding for an accepted option value. A value the option's
-        configuration checks refuse yields none: the model state's
-        construction refuses that configuration (TXG-CFG-011), and no ``N``
-        is computed from it (TXG-CFG-004)."""
+        """The binding for an accepted option value. A configuration the
+        option's checks refuse (``transaction_graph_config_errors`` reports a
+        condition) yields none: the model state's construction refuses that
+        configuration (TXG-CFG-011), and no ``N`` is computed from it
+        (TXG-CFG-004). Any other failure to build the binding propagates, so
+        an accepted option value never serves without its binding."""
         from vllm_nemotron_asr_streaming.nemotron_asr.transaction_graph import (
             TransactionGraphBinding,
         )
+        from vllm_nemotron_asr_streaming.transaction_graph_config import (
+            transaction_graph_config_errors,
+        )
 
-        try:
-            return TransactionGraphBinding(self, vllm_config)
-        except ValueError:
+        if transaction_graph_config_errors(vllm_config):
             return None
+        return TransactionGraphBinding(self, vllm_config)
 
     # @spec TXG-CFG-014, TXG-LIFE-011
     @property
@@ -815,6 +821,11 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             now_ns=time.time_ns(),
             step=self._plan_step,
             server_geometry=_server_geometry(self.config),
+            eou_token_id=(
+                None
+                if getattr(self.config, "eou_token_id", None) is None
+                else int(self.config.eou_token_id)
+            ),
         )
         self._plan_slot.stage(context)
         return context
@@ -1018,14 +1029,20 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 self._profile_uncaptured(device)
             else:
                 self._capture_on_profiling_step(device)
-        except Exception:
-            self._fail_preparation(device)
+        except Exception as error:
+            self._fail_preparation(device, error)
             raise
         self._execution_memory_prepared = True
 
-    def _fail_preparation(self, device: torch.device) -> None:
+    def _fail_preparation(
+        self, device: torch.device, error: BaseException | None = None
+    ) -> None:
         """REG-MEM-004: discard the partial execution state, synchronize the
-        device and mark this worker's preparation failed."""
+        device and mark this worker's preparation failed. The finished frames
+        ``error`` holds are cleared first (REG-MEM-017), so the propagated
+        error keeps no reference to the tensors or graphs the failed
+        preparation or capture created."""
+        graph_memory.release_error_frames(error)
         self._execution_memory_failed = True
         try:
             self._encoder_execution._discard()
@@ -1116,12 +1133,12 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
     # segment-graph part below runs first in each capture call, after the
     # transaction-graph entry checks; the transaction-graph part is called
     # through ``_transaction_graph_binding``, which is ``None`` while
-    # transaction graphs are off. The calls it receives (wave 4 fills them):
+    # transaction graphs are off. The calls it receives:
     # ``check_capture_entry(profile_only=)`` (TXG-LIFE-007, TXG-LIFE-008),
     # ``check_profiling_requirement(requirement)`` (TXG-MEM-007, TXG-MEM-009),
     # ``capture(call)`` after the segment graphs (TXG-LIFE-004, TXG-LIFE-006,
     # with the margin and the comparison through ``graph_memory``),
-    # ``discard_capture()`` on a failed call (TXG-LIFE-012),
+    # ``discard_capture(error)`` on a failed call (TXG-LIFE-012),
     # ``release_profiling()`` (TXG-LIFE-005), ``verify_post_warmup()`` and
     # ``shutdown()`` (TXG-LIFE-010), each before the segment-graph part.
 
@@ -1143,8 +1160,8 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         self._working_memory_prepared = True
         try:
             self._prepare_working_memory(device)
-        except Exception:
-            self._fail_preparation(device)
+        except Exception as error:
+            self._fail_preparation(device, error)
             raise
 
     # @spec REG-MEM-017, REG-MEM-023, REG-MEM-024
@@ -1241,8 +1258,8 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 self._end_profiling_call(call)
             else:
                 self._end_serving_call(call)
-        except Exception:
-            self._discard_capture_call(stream)
+        except Exception as error:
+            self._discard_capture_call(stream, error)
             raise
 
     def _check_capture_order(self, profile_only: bool) -> None:
@@ -1253,11 +1270,12 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             if transaction_graphs_on(self.config)
             else ""
         )
-        if not profile_only and self._segment_graphs == SERVING_CAPTURE:
+        if not profile_only and self._serving_capture_attempted:
             raise RuntimeError(
-                "a serving capture while the serving segment graphs exist: "
-                "recapture over live state pools is not supported; recover with "
-                f"an engine restart{option}"
+                "a serving capture after a serving capture was attempted in this "
+                "worker, whether or not that attempt succeeded: recapture over "
+                "live state pools is not supported; recover with an engine "
+                f"restart{option}"
             )
         if profile_only and self._serving_capture_attempted:
             raise RuntimeError(
@@ -1323,14 +1341,20 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 + self._capture_remedies(serving=True)
             )
 
-    def _discard_capture_call(self, stream: Any) -> None:
-        """Discard everything a failed capture call created, the
-        transaction-graph part first, then the segment graphs, their buffers
-        and the margin, and synchronize the capture stream."""
+    # @spec REG-MEM-017, TXG-LIFE-012
+    def _discard_capture_call(self, stream: Any, error: BaseException) -> None:
+        """Discard everything a capture call that failed with ``error``
+        created, the transaction-graph part first, then the segment graphs,
+        their buffers and the margin, and synchronize the capture stream.
+        With transaction graphs on or off, the finished frames ``error``
+        holds, through its cause and its context, are cleared first, so the
+        propagated error keeps no reference to the call's tensors or graphs;
+        its messages and chain stay."""
+        graph_memory.release_error_frames(error)
         binding = self._transaction_graph_binding
         try:
             if binding is not None:
-                binding.discard_capture()
+                binding.discard_capture(error)
         finally:
             self._discard_segment_graphs()
             margin = self._charged_margin
@@ -1420,7 +1444,39 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             graph_memory.format_bytes(graph_memory.retained(free_before, free_after)),
             seconds,
         )
+        self._log_graph_stand_in(device)
         return free_before, free_after, seconds
+
+    # @spec REG-MEM-028
+    def _log_graph_stand_in(self, device: torch.device) -> None:
+        """Log one INFO line, once per worker, naming each graphed arm that
+        the eager stand-in wrapper serves on ``device`` (a platform without
+        static graphs), so a run that asked for graphed arms shows that it
+        executes them eagerly."""
+        if self._graph_stand_in_logged:
+            return
+        arms: list[str] = []
+        execution = self._encoder_execution
+        runtime = getattr(execution, "_graph_runtime", None)
+        if runtime is not None and not runtime.captures_on(device):
+            arms.append(f"encoder_execution_arm {execution.arm}")
+            if getattr(self, "_chunk_bucket_binding", None) is not None:
+                arms.append("chunk_bucket_graph_populations")
+        decoder = self._decode_graph_binding
+        runtime = getattr(decoder, "_runtime", None)
+        if runtime is not None and not runtime.captures_on(device):
+            arm = getattr(self.config, "decode_dispatch_arm", None) or "dense-graphed"
+            arms.append(f"decode_dispatch_arm {arm}")
+        if not arms:
+            return
+        self._graph_stand_in_logged = True
+        logger.info(
+            "Nemotron graphed arms run eagerly on %s, a platform or device "
+            "without static graphs: %s are served through the eager stand-in "
+            "graph wrapper; nothing is captured, pooled or synchronized",
+            device,
+            ", ".join(arms),
+        )
 
     def _capture_identity(self, capture: str) -> str:
         """The runner configuration, the capture, the arms, the server's
@@ -1792,15 +1848,11 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 raise RuntimeError("native burst requires a native runner projection")
             native_handoff.prepare(persistent_state_projection)
         binding = self._transaction_graph_binding
-        # @spec TXG-COV-012: where transaction graphs are on, a step's
-        # transaction runs with endpointing only when a row of the step
-        # carries an endpoint policy, which no plugin path sets
-        # (SESS-EP-001, FILE-ENG-002); the cells are captured with
-        # endpointing off. With transaction graphs off the transaction is
-        # unchanged.
-        endpointing = binding is None or bool(
-            plan.endpoint_mode.numel() and plan.endpoint_mode.any()
-        )
+        # @spec TXG-COV-012: every transaction of a real step receives the
+        # endpoint arguments (the endpoint history and book pools and the EOU
+        # token), with transaction graphs on or off, so it runs with
+        # ``endpoint_enabled`` true and a row without an endpoint policy takes
+        # the forced-EOU path exactly as in ``B_hook``.
         transaction: dict[str, Any] = dict(
             channel_pools=list(pools.channel),
             time_pools=list(pools.convolution),
@@ -1812,9 +1864,9 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             frontend_raw_pool=pools.frontend_raw,
             frontend_mel_pool=pools.frontend_mel,
             frontend_counter_pool=pools.frontend_counters,
-            endpoint_history_pool=pools.endpoint_history if endpointing else None,
-            endpoint_book_pool=pools.endpoint_book if endpointing else None,
-            eou_token_id=int(self.config.eou_token_id) if endpointing else None,
+            endpoint_history_pool=pools.endpoint_history,
+            endpoint_book_pool=pools.endpoint_book,
+            eou_token_id=int(self.config.eou_token_id),
             adapter=self._emission_adapter,
             decode_resolver=self._decode_resolver,
             encoder_transition=self._encoder_execution.transition,

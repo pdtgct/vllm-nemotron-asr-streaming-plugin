@@ -39,6 +39,9 @@ def mixed_scenario(env, driver, *, silent_phase: bool = True):
     d = driver
     d.add_stream("s1", [{}, {}, {}, {"samples": 600, "final": True}])
     d.add_file("f1", int(2.5 * chunk))
+    # Two streams whose slots are reissued below for the fresh non-CHUNK rows.
+    d.add_stream("p1", [{}, {}, {}, {}])
+    d.add_stream("p2", [{}, {}, {}, {}])
     d.step()
     d.until_parked(["s1"])
     d.add_stream("s2", [{}, {"samples": 0, "final": True}], prompt=1)
@@ -46,7 +49,13 @@ def mixed_scenario(env, driver, *, silent_phase: bool = True):
     d.step()  # s1's next unit (continuing CHUNK) beside s2's first (fresh CHUNK)
     d.add_stream("s3", [{}, {}, {}])
     d.add_file("f3", 700)
-    d.step(extra_new=[d.special("p1", park), d.special("p2", label)])
+    d.until_parked(["p1", "p2"])
+    d.step(
+        extra_new=[
+            d.special("p1", park, fresh=True),
+            d.special("p2", label, fresh=True),
+        ]
+    )
     d.run(120)
     if silent_phase:
         with env.silent():

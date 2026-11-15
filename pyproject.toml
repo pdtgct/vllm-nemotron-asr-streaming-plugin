@@ -50,6 +50,13 @@ addopts = "--import-mode=importlib"
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+# The vendored model package is excluded: its inherited modules do not pass
+# these rules. Modules written in this repository are linted by naming them,
+# which overrides the exclusion:
+#   ruff check vllm_nemotron_asr_streaming tests \
+#       vllm_nemotron_asr_streaming/nemotron_asr/transaction_graph.py
+#   ruff format --check vllm_nemotron_asr_streaming tests \
+#       vllm_nemotron_asr_streaming/nemotron_asr/transaction_graph.py
 extend-exclude = ["vllm_nemotron_asr_streaming/nemotron_asr"]
 
 [tool.ruff.lint]

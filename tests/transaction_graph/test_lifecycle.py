@@ -318,6 +318,72 @@ def test_second_serving_capture_is_refused_naming_restart(on_cpu):
     assert t.fake_graph_count(env) == cells, "the refusal dropped the serving cells"
 
 
+@pytest.mark.parametrize("where", ["segment", "cell-capture", "aggregate"])
+# @spec TXG-LIFE-007, TXG-LIFE-008, REG-MEM-024
+def test_a_retry_after_a_failed_serving_capture_is_refused(on_cpu, where):
+    """The refusal is keyed on the attempt, not on cells or segment graphs
+    existing: the failed call discarded both. The refusal raises at the
+    call's entry and changes nothing: it captures nothing, and the latch and
+    the (empty) inventory stay as they were."""
+    from support import txg_api
+
+    run = on_cpu(n=2)
+    env, core = run.env, run.core
+    core.prepare()
+    core.bind_profiling()
+    core.profiling_capture()
+    core.clear()
+    core.bind_serving()
+    _arm(env, where)
+    assert h.call_with(core.serving_capture) is not None, "the capture did not fail"
+    env.fake.fail.clear()
+    env.graphs.disarm()
+    binding = txg_api.binding_of(env.model)
+    gc.collect()
+    assert t.fake_graph_count(env) == 0 and env.graphs.captured() == [], (
+        "the failed call left a graph: the retry would be refused for that reason"
+    )
+    assert binding.failed is False
+    for retry in (core.serving_capture, core.profiling_capture):
+        mark = len(env.events)
+        error = assert_refused_at_entry(env, retry, mark)
+        message = t.text(error).lower()
+        assert "restart" in message, message
+        assert "scatter" not in names_since(env, mark), "the refused call launched"
+        assert binding.failed is False, "a refused capture latched the binding"
+        assert t.fake_graph_count(env) == 0 and binding.cells == {}
+    message = t.text(h.call_with(core.serving_capture)).lower()
+    assert "recapture" in message and "not supported" in message, message
+    env.state.shutdown()
+
+
+# @spec REG-MEM-024
+def test_a_retry_after_a_failed_serving_capture_is_refused_with_the_option_off(
+    on_cpu,
+):
+    run = on_cpu(n=2, populations=[])
+    env, core = run.env, run.core
+    core.prepare()
+    core.bind_profiling()
+    core.profiling_capture()
+    core.clear()
+    core.bind_serving()
+    env.graphs.fail_capture_after = env.graphs.captures_completed + 1
+    assert h.call_with(core.serving_capture) is not None, "the capture did not fail"
+    env.graphs.disarm()
+    gc.collect()
+    assert env.graphs.captured() == [], "the failed call left a segment graph"
+    for retry in (core.serving_capture, core.profiling_capture):
+        mark = len(env.events)
+        error = h.call_with(retry)
+        assert error is not None, "the retry was not refused"
+        assert "restart" in t.text(error).lower(), t.text(error)
+        assert t.captures_since(env, mark) == [], "the refused call captured a graph"
+    message = t.text(h.call_with(core.serving_capture)).lower()
+    assert "recapture" in message and "not supported" in message, message
+    env.state.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # Repeated bindings
 

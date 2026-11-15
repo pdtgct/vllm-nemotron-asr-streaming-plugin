@@ -16,7 +16,9 @@ import weakref
 import pytest
 import torch
 from support import model_harness as h
+from support import txg_eager as eager
 from support import txgcap_harness as t
+from support.core_order import CoreOrder
 from support.txg_api import Record
 
 from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
@@ -304,10 +306,18 @@ def test_scatter_warm_up_names_each_pools_first_free_page_before_the_first_cell(
         for call in warm:
             assert call["rows"] == 1 and call["pages"] == [1], call
             assert all(s != 0 for s in call["status"]), call
-        # the first cell is the count-N chunk cell, whose rows are N > 1
-        assert not [c for c in launched[len(layout) :] if t.is_scatter_warmup(c)], (
+        # After the component pools come the projected resident-pool views
+        # that are not themselves a component pool (TXG-CAP-013): each a view
+        # over the component pools, launched once. The first cell is the
+        # count-N chunk cell, whose rows are N > 1, so no other launch here
+        # has the warm-up's shape.
+        views = [c for c in launched[len(layout) :] if t.is_scatter_warmup(c)]
+        addresses = {v.data_ptr for v in layout.values()}
+        assert views and all(c["pool"] in addresses for c in views), (capture, views)
+        layouts = [c["layout"] for c in (*warm, *views)]
+        assert len(set(layouts)) == len(layouts), (
             capture,
-            "a pool was warmed more than once",
+            "an argument was warmed more than once",
         )
 
 
@@ -436,15 +446,46 @@ def test_a_capture_call_captures_no_cell_off_and_exactly_2n_on(on_cpu, on):
     assert t.fake_graph_count(env) == expected
 
 
+def startup_scatter_arguments(calls, serving_pool):
+    """The resident-pool arguments, as host-side ``(address, shape, strides,
+    dtype)``, that the masked scatter received over the serving pool: at
+    startup these are the serving capture's scatter warm-up and its cells'
+    eager references, warm-ups and captures, which pass the same views."""
+    return {c["layout"] for c in calls if t.within(serving_pool, c["pool"])}
+
+
+def assert_scatter_arguments_were_launched_at_startup(env, core, spy):
+    """TXG-CAP-013 at ``N = 2``: every resident-pool argument a scheduled
+    step passes to the masked scatter, covered or in any reachable fallback
+    class, has the address, shape, strides and dtype of an argument launched
+    at startup."""
+    serving_pool = h.pool_tensor(core.serving_bindings)
+    startup = startup_scatter_arguments(spy.calls, serving_pool)
+    assert startup, "the serving capture launched no scatter over the serving pool"
+    mark = len(spy.calls)
+    classes = t.run_fallback_classes(env, core)
+    later = spy.calls[mark:]
+    assert later, f"no scatter was launched by {classes}"
+    foreign = [c for c in later if not t.within(serving_pool, c["pool"])]
+    assert not foreign, "a step scattered outside the serving pool"
+    unwarmed = {c["layout"] for c in later} - startup
+    assert not unwarmed, (
+        "the masked scatter received arguments that startup never launched",
+        sorted(map(str, unwarmed)),
+    )
+
+
 # @spec TXG-CAP-013
-def test_the_masked_scatter_receives_only_aligned_pool_arguments(on_cpu):
-    run = on_cpu(n=2)
-    env, core = run.env, run.core
+def test_the_masked_scatter_receives_only_arguments_launched_at_startup(
+    on_cpu, monkeypatch
+):
+    run = on_cpu(n=2, max_num_seqs=3)
+    env = run.env
+    core = CoreOrder(env.runner, capture_stream=env.capture_stream, capacity=12)
     core.startup()
-    core.step(t.stream_unit(env, "s1"))
-    calls = env.scatter.calls
-    assert calls
-    assert all(c["pool"] % 16 == 0 for c in calls), [c["pool"] % 16 for c in calls]
+    # The cells compute, so the covered step's scatters are compared too.
+    eager.EagerCells(env.model).install(monkeypatch)
+    assert_scatter_arguments_were_launched_at_startup(env, core, env.scatter)
 
 
 # ---------------------------------------------------------------------------
@@ -595,12 +636,15 @@ def test_transaction_graphs_allocate_nothing_from_cores_workspace(on_cuda):
 
 @pytest.mark.gpu
 # @spec TXG-CAP-013
-def test_the_masked_scatter_receives_whole_or_aligned_pools_cuda(on_cuda, monkeypatch):
-    env = on_cuda(n=2)
+def test_the_masked_scatter_receives_only_arguments_launched_at_startup_cuda(
+    on_cuda, monkeypatch
+):
+    """The spy records host-side layouts only (no device read), so it runs
+    inside the real captures."""
+    env = on_cuda(n=2, max_num_seqs=3, capacity=12)
     spy = t.ScatterSpy(env.events).install(monkeypatch)
     env.core.startup()
-    env.core.step(t.stream_unit(env, "s1"))
-    assert spy.calls and all(c["pool"] % 16 == 0 for c in spy.calls)
+    assert_scatter_arguments_were_launched_at_startup(env, env.core, spy)
 
 
 @pytest.mark.gpu

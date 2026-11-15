@@ -14,8 +14,6 @@ resident layout per role (check 2) is exercised only through its effect in
 
 from __future__ import annotations
 
-import gc
-
 import pytest
 import torch
 from support import model_harness as h
@@ -49,8 +47,11 @@ def perturb_layout(monkeypatch, env):
 
 
 def perturb_cells(monkeypatch, env):
-    gc.collect()
-    env.fake.live_graphs()[0].reset()
+    """A cell that lost its graph: the cell's ``graph`` is ``None``."""
+    from support import txg_api
+
+    cells = txg_api.binding_of(env.model).cells
+    monkeypatch.setattr(cells[next(iter(cells))], "graph", None)
 
 
 def perturb_callable(monkeypatch, env):

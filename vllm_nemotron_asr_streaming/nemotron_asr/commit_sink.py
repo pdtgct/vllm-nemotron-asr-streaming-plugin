@@ -110,6 +110,11 @@ class CommitTicket:
     registry lease as a RECORDED FACT (never a raise — nothing may
     fail after resident state committed). Candidate records were
     frozen into the pre-commit plan. ``cancel`` is idempotent.
+
+    The ticket is resolved by exactly one successful ``stage`` or one
+    ``cancel`` (TXG-EXEC-010): it is complete only once ``stage`` has
+    returned, so a ``stage`` that raises (a copy or event fault) leaves it
+    cancellable, and a ``cancel`` after a successful ``stage`` does nothing.
     """
 
     def __init__(self, sink: BoundedCommitSink, plan: CommitPlan) -> None:
@@ -117,11 +122,12 @@ class CommitTicket:
         self._plan = plan
         self._done = False
 
+    # @spec TXG-EXEC-010
     def stage(self, row_status: torch.Tensor) -> None:
         if self._done:
             return
-        self._done = True
         self._sink._stage(self._plan, row_status)
+        self._done = True
 
     def cancel(self) -> None:
         if self._done:

@@ -57,6 +57,7 @@ from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
     ENVELOPE_VERSION,
     PreparedRowBinding,
     RowPlan,
+    forced_eou_candidates,
 )
 from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
     ADMISSION_EPOCH_MODULUS_MS,
@@ -278,6 +279,12 @@ class PlanContext:
     #: failed stays in the plan, bound non-CHUNK, with its bit set. Empty
     #: when no row failed at planning.
     planned_rejection: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, dtype=torch.bool)
+    )
+    #: Per-row forced-EOU candidate bits (TXG-COV-012): a non-CHUNK row whose
+    #: host-recorded scheduled token is the EOU token. Empty when no row is
+    #: one.
+    forced_eou_candidate: torch.Tensor = field(
         default_factory=lambda: torch.zeros(0, dtype=torch.bool)
     )
 
@@ -757,12 +764,17 @@ def prepare_plan_context(
     now_ns: int,
     step: int,
     server_geometry: int | None = None,
+    eou_token_id: int | None = None,
 ) -> PlanContext:
     """One hook invocation: prune, mint bindings, build the columns.
 
     A row that planning failed (a foreign geometry, or a row the caller
     marked ``reject``) stays at its position, bound non-CHUNK, with its
     planned-rejection bit set (TXG-COV-010).
+
+    ``eou_token_id``: the served EOU token; with it, every non-CHUNK row
+    whose scheduled token is that token is marked a forced-EOU candidate
+    (TXG-COV-012).
     """
     bindings = registry.bind_rows(
         rows,
@@ -777,6 +789,11 @@ def prepare_plan_context(
         row.reject or (row.advances_chunk(placeholder_id) and not binding.is_chunk)
         for row, binding in zip(rows, bindings)
     ]
+    candidates = forced_eou_candidates(
+        [row.scheduled_token_id for row in rows],
+        [binding.is_chunk for binding in bindings],
+        eou_token_id,
+    )
     return PlanContext(
         step=step,
         request_ids=tuple(b.request_id for b in bindings),
@@ -811,6 +828,9 @@ def prepare_plan_context(
         is_file=torch.tensor([row.is_file for row in rows], dtype=torch.bool),
         planned_rejection=torch.tensor(
             failed if any(failed) else [], dtype=torch.bool
+        ),
+        forced_eou_candidate=torch.tensor(
+            candidates if any(candidates) else [], dtype=torch.bool
         ),
     )
 
@@ -890,6 +910,7 @@ def build_row_plan(
         endpoint_threshold_frames=context.endpoint_threshold_frames,
         endpoint_residue_frames=context.endpoint_residue_frames,
         is_file=context.is_file,
+        forced_eou_candidate=context.forced_eou_candidate,
         **_planned_rejection_field(context),
     )
 

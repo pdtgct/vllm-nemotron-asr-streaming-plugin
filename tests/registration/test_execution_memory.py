@@ -2223,10 +2223,15 @@ def test_a_profiling_dummy_step_capture_failure_names_the_capture_and_remedies(
     error = h.call_with(env.runner.profile_run, core_embeds=False)
     assert error is not None
     _assert_failure_message(error, env)
-    _release(error)
     env.graphs.disarm()
     gc.collect()
-    assert env.graphs.live_graphs() == 0
+    # The propagated error, its cause and context included, is still held
+    # here with its tracebacks: it keeps no graph of the failed capture alive.
+    assert error.__traceback__ is not None
+    assert env.graphs.live_graphs() == 0, (
+        "the retained error keeps a graph of the failed capture alive"
+    )
+    _release(error)
 
 
 @pytest.mark.parametrize(
@@ -2257,13 +2262,18 @@ def test_a_hook_capture_failure_discards_the_call_and_names_the_remedies(
     )
     assert error is not None
     _assert_failure_message(error, env, extra=extra)
-    _release(error)
     env.graphs.disarm()
     gc.collect()
-    assert env.graphs.captured() == [] and env.graphs.live_graphs() == 0
+    # The propagated error, its cause and context included, is still held
+    # here with its tracebacks: it keeps no graph of the failed call alive.
+    assert error.__traceback__ is not None
+    assert env.graphs.captured() == [] and env.graphs.live_graphs() == 0, (
+        "the retained error keeps a graph of the failed call alive"
+    )
     assert ("cuda.stream.synchronize", name) in env.fake.events, (
         "the capture stream was not synchronized"
     )
+    _release(error)
 
 
 # ===========================================================================

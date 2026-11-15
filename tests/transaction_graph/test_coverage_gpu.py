@@ -104,9 +104,9 @@ def wrapped_transition(kwargs, plan):
     return kwargs, plan
 
 
-def endpoint_enabled(kwargs, plan):
-    """An endpoint policy on every row of a CHUNK-only step (the step's
-    transaction then runs with ``endpoint_enabled`` true)."""
+def endpoint_policy(kwargs, plan):
+    """An endpoint policy on every row of a CHUNK-only step: the cells run
+    the policy-free endpoint bookkeeping only, so the step falls back."""
     if not bool(plan.is_chunk.all()):
         return kwargs, plan
     n = len(plan.request_ids)
@@ -121,7 +121,7 @@ def endpoint_enabled(kwargs, plan):
 
 @pytest.mark.parametrize(
     "mutate, field",
-    [(wrapped_transition, "encoder"), (endpoint_enabled, "endpoint_enabled")],
+    [(wrapped_transition, "encoder"), (endpoint_policy, "endpoint_policy")],
     ids=["callable", "endpoint"],
 )
 # @spec TXG-COV-005, TXG-COV-012, TXG-CELL-004
@@ -150,6 +150,42 @@ def test_a_signature_mismatch_falls_back_with_one_warning(
         and "signature" in r.getMessage().lower()
     ]
     assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
+
+
+# @spec TXG-COV-012, TXG-CELL-002, TXG-CELL-004
+def test_a_forced_eou_candidate_falls_back_with_one_warning(on_cuda, caplog):
+    """A row that schedules the EOU token without an endpoint policy (a
+    direct engine stream client's) is a forced-EOU candidate: its step runs
+    as the option-off transaction, which forces EOU as ``B_hook`` does."""
+    env = on_cuda(startup=True, lookahead=0, n=4)
+    records = env.compare()
+    d = g.Driver(env)
+    d.add_stream("s1", [{}, {}, {}])
+    for name in ("q1", "q2"):
+        d.add_stream(name, [{}, {}])
+    d.step()
+    d.until_parked(["q1", "q2"])
+    caplog.set_level(logging.WARNING)
+    before, before_replays = fallbacks(env), replays(env)
+    for name in ("q1", "q2"):
+        d.step(only=[], extra_new=[d.special(name, int(env.config.eou_token_id))])
+        record = records[-1]
+        assert not record.covered and not record.problems
+        assert bool(record.plan.forced_eou_candidate.all())
+    after = fallbacks(env)
+    key = ("signature", api.ECHO, 1)
+    assert after.get(key, 0) - before.get(key, 0) == 2, after
+    assert sum(after.values()) - sum(before.values()) == 2
+    assert replays(env) == before_replays
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "forced_eou" in r.getMessage()
+    ]
+    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
+    # a later step without a candidate is covered again
+    d.step(only=["s1"])
+    assert records[-1].covered and not records[-1].problems
 
 
 # @spec TXG-CELL-005

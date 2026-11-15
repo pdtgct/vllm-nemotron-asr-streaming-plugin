@@ -338,13 +338,13 @@ def test_scatter_plan_is_validated_before_the_first_scatter(txn_env, monkeypatch
     env = txn_env(0)
     advance = api.advance_module()
     scatters = []
-    real = advance._execute_masked_page_scatter_
+    real = advance.execute_masked_page_scatter_
 
     def watch(*args, **kwargs):
         scatters.append(args[0].data_ptr())
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(advance, "_execute_masked_page_scatter_", watch)
+    monkeypatch.setattr(advance, "execute_masked_page_scatter_", watch)
     step = env.compose(fixtures(env, CC, OC, CCF))
     refused = 0
     for name, _ in step.pools.flat():
@@ -377,13 +377,13 @@ def test_option_off_commit_reserves_then_scatters_then_stages(txn_env, monkeypat
     from support.txg_fakes import RecordingSink
 
     sink = RecordingSink()
-    real = advance._execute_masked_page_scatter_
+    real = advance.execute_masked_page_scatter_
 
     def watch(*args, **kwargs):
         sink.events.append(("scatter", None))
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(advance, "_execute_masked_page_scatter_", watch)
+    monkeypatch.setattr(advance, "execute_masked_page_scatter_", watch)
     env.run(env.compose(fixtures(env, CC, OC, CFF, OCF)), commit_sink=sink)
     kinds = [kind for kind, _ in sink.events]
     assert kinds.count("reserve") == 1 and kinds.count("stage") == 1, kinds

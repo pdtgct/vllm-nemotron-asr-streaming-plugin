@@ -31,9 +31,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
-import sys
 import time
-import traceback
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
@@ -111,11 +109,14 @@ R_VERIFICATION_SECONDS = "verification_seconds"
 # The step arena (TXG-EXEC-005): ``int64``, one row per section. A section
 # holds, for ``N`` rows, one vector of ``N`` entries per scalar field, then
 # the rows' initial book rows as an ``(N, BOOK_SLOTS)`` row-major block, so
-# that a cell's view of each is contiguous. The composed block index comes
-# first: its view starts at a 16-byte-aligned address of the arena.
+# that a cell's view of each is contiguous. The last three scalar fields are
+# the endpoint mode, threshold and residue frames, which only the chunk
+# section's body reads (the policy-free endpoint bookkeeping); both sections
+# have one layout, and the echo section's three vectors are never read.
 F_BLOCK, F_POSITION, F_FRESH, F_FILE, F_REJECTED = range(5)
 F_GEOMETRY, F_ADMITTED, F_PRIOR, F_CADENCE = range(5, 9)
-SCALAR_FIELDS = 9
+F_ENDPOINT_MODE, F_ENDPOINT_THRESHOLD, F_ENDPOINT_RESIDUE = range(9, 12)
+SCALAR_FIELDS = 12
 BOOK_SLOTS = 7
 SECTION = {CHUNK: 0, ECHO: 1}
 
@@ -349,18 +350,6 @@ def _driver_version() -> str | None:
     return None
 
 
-def _clear_frames(error: BaseException | None) -> None:
-    """Drop the locals of every finished frame an exception chain holds, so
-    that the graphs and tensors of a failed capture are not kept alive by the
-    error that reports it."""
-    seen: set[int] = set()
-    while error is not None and id(error) not in seen:
-        seen.add(id(error))
-        if error.__traceback__ is not None:
-            traceback.clear_frames(error.__traceback__)
-        error = error.__cause__ or error.__context__
-
-
 def _tensors_of(label: str, value: Any) -> list[tuple[str, torch.Tensor]]:
     """Every tensor a nested binding's storage object holds."""
     found: list[tuple[str, torch.Tensor]] = []
@@ -385,6 +374,19 @@ def _tensors_of(label: str, value: Any) -> list[tuple[str, torch.Tensor]]:
 # The binding
 
 
+@dataclasses.dataclass(frozen=True)
+class _CellProgram:
+    """What one cell's body runs: the prepare phase's output for the cell's
+    capture row plan (its nested launch sites bound), the encoder transition
+    the body receives, the cell's signature and, for a chunk cell, its dense
+    decoder tier."""
+
+    prepared: Any
+    encoder_transition: Any
+    signature: tuple[tuple[str, Any], ...]
+    tier: int | None
+
+
 class _CaptureWork:
     """What one capture call's transaction-graph part holds while it runs:
     the state pools (from core's startup access), their snapshot and the
@@ -399,6 +401,7 @@ class _CaptureWork:
         self.pool_kwargs: dict[str, Any] = {}
         self.resident: Any = None
         self.capacity = 0
+        #: Pages ``1 … N`` of every component pool, in host memory.
         self.snapshot: dict[str, torch.Tensor] = {}
         self.started = time.perf_counter()
         self.transaction_before: int | None = None
@@ -463,6 +466,9 @@ class TransactionGraphBinding:
         self._capture_layout: tuple[Any, Any] | None = None
         self._constants: tuple[tuple[str, Any], ...] | None = None
         self._buffer_layout: tuple[Any, ...] = ()
+        #: The encoder's modules, listed once per capture call (the signature
+        #: reads their lazily bound buffers on every step).
+        self._encoder_modules: tuple[Any, ...] | None = None
         self._step = 0
         self._release_buffers()
         cache = getattr(vllm_config, "cache_config", None)
@@ -649,7 +655,8 @@ class TransactionGraphBinding:
         graph is captured: TXG-LIFE-007, then TXG-LIFE-008. A serving capture
         counts as attempted once it passed its entry checks
         (``begin_capture``), whether or not it then succeeded; a call refused
-        at its entry does not count."""
+        at its entry does not count. A refusal changes nothing: it leaves the
+        latch and every existing graph as they are."""
         if not profile_only and self._cells_capture == PROFILING:
             raise RuntimeError(
                 f"{KEY}: a serving capture while profiling cells exist is a "
@@ -664,12 +671,13 @@ class TransactionGraphBinding:
                 "an engine restart"
             )
         # TXG-LIFE-008, after the ordering checks of TXG-LIFE-007.
-        if not profile_only and self._cells_capture == SERVING:
+        if not profile_only and self._serving_attempted:
             raise RuntimeError(
-                f"{KEY}: a serving capture while serving cells exist. Recapture "
-                "over live state pools is not supported (the cells bake in the "
-                "pools' addresses while streams hold slots); recover with an "
-                "engine restart"
+                f"{KEY}: a serving capture after a serving capture was "
+                "attempted in this worker, whether or not that attempt "
+                "succeeded. Recapture over live state pools is not supported "
+                "(the cells bake in the pools' addresses while streams hold "
+                "slots); recover with an engine restart"
             )
 
     # @spec TXG-MEM-007, TXG-MEM-009
@@ -805,6 +813,9 @@ class TransactionGraphBinding:
         table[F_ADMITTED] = prepared.admitted_prompt
         table[F_PRIOR] = prepared.prior_prompt
         table[F_CADENCE] = prepared.cadence_frames
+        table[F_ENDPOINT_MODE] = prepared.endpoint_mode
+        table[F_ENDPOINT_THRESHOLD] = prepared.endpoint_threshold
+        table[F_ENDPOINT_RESIDUE] = prepared.endpoint_residue
         n, scalars = self.n, SCALAR_FIELDS * self.n
         for section, positions in enumerate((chunk_positions, echo_positions)):
             count = int(positions.numel())
@@ -854,10 +865,12 @@ class TransactionGraphBinding:
         encoder_transition: Any,
     ) -> None:
         """One cell's work on the first ``count`` rows of its arena section:
-        gather the rows' inputs from the step static inputs, run the body,
-        issue its prevalidated predicated scatters and write the rows'
-        outputs at their step positions. This is what a cell captures, and
-        what its eager reference and warm-ups run."""
+        gather the rows' inputs from the step static inputs, run the body
+        with the endpoint arguments (``endpoint_enabled`` true, as every
+        transaction of a real step runs), issue its prevalidated predicated
+        scatters and write the rows' outputs at their step positions. This is
+        what a cell captures, and what its eager reference and warm-ups
+        run."""
         model = self._model
         config = model.config
         assert self._arena is not None and self._row_index is not None
@@ -883,6 +896,10 @@ class TransactionGraphBinding:
             cadence_frames=field(F_CADENCE),
             bucket_rows=(rows,) if chunk else (),
             chunk_all=rows if chunk else self._row_index[:0],
+            # Only a CHUNK bucket reads the endpoint vectors.
+            endpoint_mode=field(F_ENDPOINT_MODE) if chunk else None,
+            endpoint_threshold=field(F_ENDPOINT_THRESHOLD) if chunk else None,
+            endpoint_residue=field(F_ENDPOINT_RESIDUE) if chunk else None,
         )
         body = advance.model_rows_body(
             model.core,
@@ -891,9 +908,7 @@ class TransactionGraphBinding:
             prepared,
             vectors,
             **pool_kwargs,
-            endpoint_history_pool=None,
-            endpoint_book_pool=None,
-            eou_token_id=None,
+            eou_token_id=int(config.eou_token_id),
             adapter=model._emission_adapter,
             encoder_transition=encoder_transition,
             placeholder_id=int(config.audio_chunk_token_id),
@@ -904,7 +919,7 @@ class TransactionGraphBinding:
             continuation_id=int(config.continuation_token_id),
         )
         for op in body.scatters:
-            state_scatter._execute_masked_page_scatter_(
+            state_scatter.execute_masked_page_scatter_(
                 op.pool, op.scratch, op.blocks, op.row_status
             )
         self._rows_step.index_copy_(0, positions, body.rows)
@@ -968,8 +983,13 @@ class TransactionGraphBinding:
     def _encoder_buffers(self) -> tuple[Any, ...]:
         """The lazily bound (non-persistent) buffers of the encoder: where
         each lives, and how many there are."""
+        modules = self._encoder_modules
+        if modules is None:
+            modules = tuple(self._model.core.encoder.modules())
         found = []
-        for module in self._model.core.encoder.modules():
+        for module in modules:
+            if not module._non_persistent_buffers_set:
+                continue
             for name in sorted(module._non_persistent_buffers_set):
                 tensor = module._buffers.get(name)
                 if tensor is not None:
@@ -982,6 +1002,8 @@ class TransactionGraphBinding:
         kind: str,
         *,
         endpoint_enabled: bool,
+        endpoint_policy: bool,
+        forced_eou: bool,
         capture: bool,
         tokens: tuple[Any, ...],
         carrier: tuple[Any, ...],
@@ -991,9 +1013,14 @@ class TransactionGraphBinding:
         encoder_transition: Any,
     ) -> tuple[tuple[str, Any], ...]:
         """Every structural input a cell's body bakes in, beyond its key
-        (geometry, kind, count)."""
+        (geometry, kind, count), and the two row classes the cells exclude:
+        whether any of the cell's rows carries an endpoint policy
+        (``endpoint_policy``) and whether any is a forced-EOU candidate
+        (``forced_eou``), both false at capture."""
         fields: list[tuple[str, Any]] = [
             ("endpoint_enabled", bool(endpoint_enabled)),
+            ("endpoint_policy", bool(endpoint_policy)),
+            ("forced_eou", bool(forced_eou)),
             ("capture", bool(capture)),
             ("tokens", tokens),
             ("carrier", carrier),
@@ -1069,68 +1096,68 @@ class TransactionGraphBinding:
             "frontend_raw_pool": roles.frontend_raw,
             "frontend_mel_pool": roles.frontend_mel,
             "frontend_counter_pool": roles.frontend_counters,
+            "endpoint_history_pool": roles.endpoint_history,
+            "endpoint_book_pool": roles.endpoint_book,
         }
         work.resident = advance.resident_layout(**work.pool_kwargs)
-        # The capture rows' pages, to prove that no capture stores a page.
+        # The capture rows' pages, to prove that no capture stores a page:
+        # copied to host memory once per call, so the snapshot adds no device
+        # memory beside the state pages and the KV cache.
         work.snapshot = {
-            name: pool[1 : self.n + 1].clone() for name, pool in components.items()
+            name: pool[1 : self.n + 1].to("cpu", copy=True)
+            for name, pool in components.items()
         }
 
-    # @spec TXG-CAP-006
+    # @spec TXG-CAP-006, TXG-CAP-013
     def _scatter_warmup(self, work: _CaptureWork) -> None:
-        """Launch, for each resident pool, one scatter row with a rejected
-        status that names the pool's first non-null free page. The kernel's
-        status predicate returns before it reads the page ID or any resident
-        address."""
-        for pool in work.components.values():
-            scratch = torch.empty(
-                (1, *pool.shape[1:]), dtype=pool.dtype, device=pool.device
-            )
-            blocks = torch.ones(1, dtype=torch.int64, device=pool.device)
-            status = torch.ones(1, dtype=torch.int32, device=pool.device)
-            state_scatter._validate_masked_page_scatter(
-                pool, scratch, blocks, status, require_cuda_warmup=False
-            )
-            state_scatter._execute_masked_page_scatter_(pool, scratch, blocks, status)
+        """Launch, for each component pool and then for each projected
+        resident-pool view a transaction passes to the kernel, one scatter
+        row with a rejected status that names the first non-null free page.
+        The kernel's status predicate returns before it reads the page ID or
+        any resident address. A projected view with the address, shape,
+        strides and dtype of an argument already launched is the same
+        argument and is not launched again."""
+        launched: set[tuple[Any, ...]] = set()
+        views = advance.resident_pool_sequence(**work.pool_kwargs)
+        for pool in (*work.components.values(), *views):
+            layout = _layout(pool)
+            if layout in launched:
+                continue
+            launched.add(layout)
+            state_scatter.launch_rejected_row_scatter(pool, page=1)
 
     def _reading(self, work: _CaptureWork) -> int | None:
         call = work.call
         work.last_reading = graph_memory.free_memory(call.device, call.stream)
         return work.last_reading
 
-    # @spec TXG-CAP-001, TXG-CAP-004, TXG-CAP-005, TXG-CAP-009
-    def _capture_cell(self, work: _CaptureWork, kind: str, count: int) -> None:
-        """Capture one cell: an eager reference of the body on its rejected
-        capture rows (launching the nested segment graphs), three warm-ups
-        and the capture with the nested bindings running eagerly, and one
-        validation replay whose outputs and pages equal the reference bit for
-        bit. Only then is the cell published."""
-        import vllm.compilation.cudagraph_pool as cudagraph_pool
-
+    def _cell_program(
+        self,
+        kind: str,
+        count: int,
+        *,
+        capacity: int,
+        resident: Any,
+        pools: tuple[Any, ...],
+    ) -> _CellProgram:
+        """What the cell at ``(kind, count)`` runs: the prepare phase's
+        output for its capture row plan over pools of ``capacity`` pages
+        (layout ``resident``, signature layouts ``pools``), with each nested
+        launch site bound to its dispatcher, and the cell's signature. Host
+        only: it reads no device memory and launches nothing."""
         model = self._model
         config = model.config
-        call = work.call
-        key = (self.geometry, kind, count)
         chunk = kind == CHUNK
-        self._phase_cell = key
-        self._phase = PHASE_REFERENCE
-        plan = self._capture_plan(kind, count, work.capacity)
-        # The capture rows' inputs: the stream carrier token and a zero
-        # envelope header. A CHUNK row is rejected by its header and any
-        # other row by its token, whatever page it gathers.
-        ids = self._ids_static[:count]
-        embeds = self._embeds_static[:count]
-        ids.fill_(int(config.audio_chunk_token_id))
-        embeds.zero_()
+        plan = self._capture_plan(kind, count, capacity)
         served_transition = model._encoder_execution.transition
         prepared = advance.prepare_model_rows(
             model.core,
-            ids,
-            embeds,
+            self._ids_static[:count],
+            self._embeds_static[:count],
             plan,
-            resident=work.resident,
+            resident=resident,
             decode_resolver=model._decode_resolver,
-            eou_token_id=None,
+            eou_token_id=int(config.eou_token_id),
             encoder_transition=served_transition,
             bucket_transition=None,
             has_commit_sink=False,
@@ -1145,13 +1172,12 @@ class TransactionGraphBinding:
         signature = self._signature(
             kind,
             endpoint_enabled=prepared.endpoint_enabled,
+            endpoint_policy=False,
+            forced_eou=False,
             capture=False,
             tokens=self._tokens,
             carrier=(self.hidden, CARRIER_DTYPE),
-            pools=tuple(
-                _layout(pool)
-                for pool in advance._resident_pool_sequence(**work.pool_kwargs)
-            ),
+            pools=pools,
             adapter=model._emission_adapter,
             bucket=bucket,
             encoder_transition=served_transition,
@@ -1185,6 +1211,39 @@ class TransactionGraphBinding:
                     ),
                 ),
             )
+        return _CellProgram(prepared, encoder_transition, signature, tier)
+
+    # @spec TXG-CAP-001, TXG-CAP-004, TXG-CAP-005, TXG-CAP-009, TXG-CELL-001
+    def _capture_cell(self, work: _CaptureWork, kind: str, count: int) -> None:
+        """Capture one cell: an eager reference of the body on its rejected
+        capture rows (launching the nested segment graphs), three warm-ups
+        and the capture with the nested bindings running eagerly, and one
+        validation replay whose outputs and pages equal the reference bit for
+        bit. Only then is the cell published."""
+        import vllm.compilation.cudagraph_pool as cudagraph_pool
+
+        config = self._model.config
+        call = work.call
+        key = (self.geometry, kind, count)
+        chunk = kind == CHUNK
+        self._phase_cell = key
+        self._phase = PHASE_REFERENCE
+        # The capture rows' inputs: the stream carrier token and a zero
+        # envelope header. A CHUNK row is rejected by its header and any
+        # other row by its token, whatever page it gathers.
+        self._ids_static[:count].fill_(int(config.audio_chunk_token_id))
+        self._embeds_static[:count].zero_()
+        program = self._cell_program(
+            kind,
+            count,
+            capacity=work.capacity,
+            resident=work.resident,
+            pools=tuple(
+                _layout(pool)
+                for pool in advance.resident_pool_sequence(**work.pool_kwargs)
+            ),
+        )
+        prepared = program.prepared
         positions = torch.arange(count, dtype=torch.int64)
         empty = positions[:0]
         self._upload_arena(
@@ -1192,7 +1251,9 @@ class TransactionGraphBinding:
         )
 
         def run() -> None:
-            self._run_cell(kind, count, prepared, work.pool_kwargs, encoder_transition)
+            self._run_cell(
+                kind, count, prepared, work.pool_kwargs, program.encoder_transition
+            )
 
         run()
         expected = [(name, value.clone()) for name, value in self._outputs(count)]
@@ -1224,13 +1285,14 @@ class TransactionGraphBinding:
                     f"the validation replay's {name} differ from the eager "
                     "reference of the same capture rows"
                 )
+        # The pages are compared in host memory with the call's snapshot.
         for name, pool in work.components.items():
-            if not _same_bits(pool[1 : count + 1], work.snapshot[name][:count]):
+            if not _same_bits(pool[1 : count + 1].cpu(), work.snapshot[name][:count]):
                 raise RuntimeError(
                     f"the capture rows' pages of state pool {name!r} changed: "
                     "the reference and the validation replay store no page"
                 )
-        self.cells[key] = Cell(key, self._graphs[-1], signature, tier)
+        self.cells[key] = Cell(key, self._graphs[-1], program.signature, program.tier)
 
     # @spec TXG-LIFE-004, TXG-LIFE-006, TXG-CAP-007, TXG-CAP-010, TXG-CAP-011
     # @spec TXG-MEM-001, TXG-MEM-002, TXG-MEM-004, TXG-MEM-005, TXG-MEM-006
@@ -1244,7 +1306,8 @@ class TransactionGraphBinding:
 
         A failure here raises an error chained from the original that names
         the phase and the figures; the caller discards what the call created
-        (``discard_capture``).
+        (``discard_capture``). The original error's finished frames are
+        cleared first, so it holds none of the call's tensors or graphs.
         """
         capture = PROFILING if call.profile_only else SERVING
         work = _CaptureWork(capture, call)
@@ -1252,6 +1315,7 @@ class TransactionGraphBinding:
         self._phase, self._phase_cell = PHASE_BUFFERS, None
         self._cells_capture = capture
         self.verified = False
+        self._encoder_modules = tuple(self._model.core.encoder.modules())
         try:
             with self._on_stream(call.stream):
                 self._allocate_buffers(call.device)
@@ -1311,7 +1375,7 @@ class TransactionGraphBinding:
         except Exception as error:
             message = self._failure_message(work, error)
             work.release()
-            _clear_frames(error)
+            graph_memory.release_error_frames(error)
             raise RuntimeError(message) from error
         finally:
             self._work = None
@@ -1508,6 +1572,7 @@ class TransactionGraphBinding:
                 logger.debug("a cell graph could not be reset", exc_info=True)
         del graphs
         self._release_buffers()
+        self._encoder_modules = None
         margin, self._margin = self._margin, None
         if margin is not None:
             margin.release()
@@ -1517,11 +1582,14 @@ class TransactionGraphBinding:
         self.verified = False
 
     # @spec TXG-LIFE-012
-    def discard_capture(self) -> None:
-        """A capture call failed after its entry checks: discard every cell,
-        binding-owned buffer and the margin the call created. The capture
-        record keeps its host integers."""
-        _clear_frames(sys.exc_info()[1])
+    def discard_capture(self, error: BaseException | None = None) -> None:
+        """A capture call failed after its entry checks with ``error``:
+        discard every cell, binding-owned buffer and the margin the call
+        created. The finished frames ``error`` holds, through its cause and
+        its context, are cleared first, so the propagated error keeps no
+        reference to the call's tensors or graphs; its messages and chain
+        stay. The capture record keeps its host integers."""
+        graph_memory.release_error_frames(error)
         work, self._work = self._work, None
         if work is not None:
             work.release()
@@ -1695,8 +1763,7 @@ class TransactionGraphBinding:
         # 3. all 2N cells hold their graphs, and the callable identities
         for key in cell_keys(self.n, self.geometry):
             cell = self.cells.get(key)
-            graph = None if cell is None else cell.graph
-            if graph is None or getattr(graph, "captured", True) is False:
+            if cell is None or cell.graph is None:
                 return f"the {key[1]} cell at count {key[2]} holds no graph"
         identities = self._callable_identities()
         if identities != recorded["identities"]:
@@ -1769,9 +1836,17 @@ class TransactionGraphBinding:
         reservation; the chunk cell's launch, then the echo cell's; the
         escaped-row copy, the commit stage and the counters. A failure before
         the first launch propagates with every resident page unchanged and
-        the reservation cancelled. From the first launch on it latches the
-        binding. It issues every device operation on the current stream and
-        reads no memory statistic.
+        the reservation cancelled, without latching, unless that cancel
+        itself raises, which latches. From the first launch on a failure
+        latches the binding and cancels the reservation, which a stage that
+        raised before publishing leaves cancellable. It issues every device
+        operation on the current stream and reads no memory statistic.
+
+        A step with a row that carries an endpoint policy, or with a
+        forced-EOU candidate (``plan.forced_eou_candidate``, marked on the
+        host), is a ``signature`` fallback with field ``endpoint_policy`` or
+        ``forced_eou``: the cells run the policy-free endpoint bookkeeping
+        only.
         """
         if self.failed:
             raise RuntimeError(LATCHED)
@@ -1817,16 +1892,17 @@ class TransactionGraphBinding:
                 "frontend_counter_pool",
             )
         }
-        endpoint_pools = {
-            "endpoint_history_pool": transaction.get("endpoint_history_pool"),
-            "endpoint_book_pool": transaction.get("endpoint_book_pool"),
-        }
+        # The endpoint arguments: the forward passes them on every real step
+        # (TXG-COV-012); a caller that omits them gets a transaction with
+        # ``endpoint_enabled`` false, which no cell's signature matches.
+        pool_kwargs["endpoint_history_pool"] = transaction.get("endpoint_history_pool")
+        pool_kwargs["endpoint_book_pool"] = transaction.get("endpoint_book_pool")
         prepared = advance.prepare_model_rows(
             core,
             input_ids,
             inputs_embeds,
             plan,
-            resident=advance.resident_layout(**pool_kwargs, **endpoint_pools),
+            resident=advance.resident_layout(**pool_kwargs),
             decode_resolver=transaction["decode_resolver"],
             eou_token_id=transaction.get("eou_token_id"),
             encoder_transition=transaction.get("encoder_transition"),
@@ -1846,10 +1922,11 @@ class TransactionGraphBinding:
                 f"population {self.p_max} the transaction graphs were built for"
             )
         chunk_positions, echo_positions = _section_positions(plan)
-        # The signature of each needed cell, before any upload.
-        endpoint = bool(prepared.endpoint_enabled) or bool(
-            plan.endpoint_mode.numel() and plan.endpoint_mode.any()
-        )
+        # The signature of each needed cell, before any upload. The two
+        # excluded row classes are read per kind from the CPU row plan.
+        section_rows = {CHUNK: chunk_positions, ECHO: echo_positions}
+        policy_rows = prepared.endpoint_mode != 0
+        candidates = plan.forced_eou_candidate
         tokens = (
             transaction.get("placeholder_id"),
             transaction.get("park_id"),
@@ -1858,14 +1935,19 @@ class TransactionGraphBinding:
         )
         carrier = (int(inputs_embeds.shape[1]), inputs_embeds.dtype)
         pools = tuple(
-            _layout(pool) for pool in advance._resident_pool_sequence(**pool_kwargs)
+            _layout(pool) for pool in advance.resident_pool_sequence(**pool_kwargs)
         )
         bucket = prepared.buckets[0] if len(prepared.buckets) == 1 else None
         cells = [self.cells[key] for key in step.cells]
         for cell in cells:
+            positions = section_rows[cell.kind]
             signature = self._signature(
                 cell.kind,
-                endpoint_enabled=endpoint,
+                endpoint_enabled=prepared.endpoint_enabled,
+                endpoint_policy=bool(policy_rows.index_select(0, positions).any()),
+                forced_eou=bool(
+                    candidates.numel() and candidates.index_select(0, positions).any()
+                ),
                 capture=bool(transaction.get("capture", False)),
                 tokens=tokens,
                 carrier=carrier,
@@ -1924,21 +2006,31 @@ class TransactionGraphBinding:
             cancel = getattr(reservation, "cancel", None)
             if not callable(cancel):
                 raise ValueError("commit sink returned a reservation without cancel()")
-            stage = getattr(reservation, "stage", None)
+            try:
+                stage = getattr(reservation, "stage", None)
+            except BaseException:
+                self._cancel_before_launch(cancel)
+                raise
             if not callable(stage):
-                cancel()
+                self._cancel_before_launch(cancel)
                 raise ValueError("commit sink returned a reservation without stage()")
         self._prologue_seconds += time.perf_counter() - started
         try:
             for cell in cells:
                 cell.graph.replay()
-                self._replays[cell.key] = self._replays.get(cell.key, 0) + 1
             escaped.copy_(self._rows_step[:population])
             if stage is not None:
                 stage(self._status_step[:population])
+            # The counters, after the stage; a failure here latches like any
+            # other failure from the first launch on.
+            for cell in cells:
+                self._replays[cell.key] = self._replays.get(cell.key, 0) + 1
+            self._covered["split" if len(cells) == 2 else "one_kind"] += 1
         except BaseException:
             # The first launch may already have scattered: no retry, no
-            # fallback of either kind, and this worker is not reused.
+            # fallback of either kind, and this worker is not reused. A stage
+            # that raised before it published the reservation left it
+            # cancellable; after a successful stage the cancel is a no-op.
             self.failed = True
             if cancel is not None:
                 try:
@@ -1946,8 +2038,18 @@ class TransactionGraphBinding:
                 except BaseException:  # noqa: BLE001 - the worker is not reused
                     logger.debug("the reservation was not cancelled", exc_info=True)
             raise
-        self._covered["split" if len(cells) == 2 else "one_kind"] += 1
         return escaped
+
+    def _cancel_before_launch(self, cancel: Callable[[], None]) -> None:
+        """Cancel the held reservation of a step that fails before its first
+        launch. No page was written, so the binding does not latch, unless
+        the cancel itself raises: the reservation is then unresolved, and the
+        binding latches and propagates that failure as worker-fatal."""
+        try:
+            cancel()
+        except BaseException:
+            self.failed = True
+            raise
 
 
 def _nested_launch(captured: Any, uncaptured: Any) -> Any:
