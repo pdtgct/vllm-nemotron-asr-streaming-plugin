@@ -31,7 +31,20 @@ def change(monkeypatch, which):
         return
     target, name, first, second = CONSTANTS[which]
     current = getattr(target, name)
-    monkeypatch.setattr(target, name, first if current != first else second)
+    # A plain assignment, restored by ``_restore_constants``: monkeypatch's
+    # undo deletes an attribute that torch serves through ``__getattr__``,
+    # and torch refuses the deletion.
+    setattr(target, name, first if current != first else second)
+
+
+@pytest.fixture(autouse=True)
+def _restore_constants():
+    saved = [
+        (target, name, getattr(target, name)) for target, name, *_ in CONSTANTS.values()
+    ]
+    yield
+    for target, name, value in saved:
+        setattr(target, name, value)
 
 
 def steps(env, kind):

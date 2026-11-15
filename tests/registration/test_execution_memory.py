@@ -1785,12 +1785,12 @@ def test_serving_capture_rebuilds_into_the_global_pool_and_serves(hook, arm):
     assert h.call_with(env.runner.real_step, rows_of(env, "stream")) is not None
     assert env.advance.calls == []
     streams_before = len(env.graphs.capture_streams)
-    stream = _capture(env, profile_only=False)
+    capture_stream = _capture(env, profile_only=False)
     assert len(env.graphs.captures) == 2 * expected
     assert len(env.graphs.captured()) == expected
     assert _wrapper_pools(env) == {SERVING_POOL}
     used = env.graphs.capture_streams[streams_before:]
-    assert used and {id(s) for s in used} == {id(stream)}
+    assert used and {id(s) for s in used} == {id(capture_stream)}
     replays = len(env.graphs.replays)
     output = h.scheduler_output(new=(stream(env, "s1"),), handles={"s1": 1})
     env.runner.real_step(output)

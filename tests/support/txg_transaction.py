@@ -655,14 +655,17 @@ def build_env(
             vllm_config = h.build_vllm_config(
                 card,
                 right_context=lookahead,
-                max_num_seqs=4,
+                # The graphed decoder serves at most max_num_seqs rows, so the
+                # model is sized for the largest population the composed pools
+                # hold (block 0 is the null page).
+                max_num_seqs=capacity - 1,
                 device=device,
             )
             model = h.build_model(vllm_config)
             state = h.build_model_state(vllm_config, model)
             runner = h.Runner(vllm_config, model, state)
             # The eager runner: no capture hook; real steps before post_warmup.
-            CoreOrder(runner, device=device, capacity=8, spy=False).startup(
+            CoreOrder(runner, device=device, capacity=capacity, spy=False).startup(
                 verify=False
             )
             calls = _drive(runner, model.config, geometry, lookahead)

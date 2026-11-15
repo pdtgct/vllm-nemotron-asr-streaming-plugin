@@ -411,6 +411,13 @@ workspace, which core locks after the serving capture.
   passes; the model creates no stream and no graph pool of its own. At the target heads core has
   no capture-enabled switch, so the model's graph runtime has none;
   capture legality is the model's own ordering above.
+- **Platforms without static graphs.** Where vLLM's platform reports no static graph mode
+  (`support_static_graph_mode()`), or a graph entry's device is not the platform's device type,
+  the graphed arms keep their inventory, staging, readiness checks and serving path. Each entry's
+  wrapper is a stand-in that holds a non-device graph from construction and runs the entry's
+  runnable eagerly on every call; nothing is captured, pooled or synchronized. Outputs equal the
+  eager arms'. Only `--enforce-eager` reaches this case, because the hook configuration requires a
+  CUDA platform.
 - **Memory contributors.** The model's `PersistentStateSpec` lists in `memory_contributors` each
   configured option that enlarges its execution memory or graphs: `max_num_seqs`,
   `encoder_execution_arm` and `decode_dispatch_arm` when graphed execution is configured,
@@ -622,6 +629,7 @@ adding it here and to the import-time check.
 | Default segment arms | `eager-graphed` encoder and `dense-graphed` decoder, declared at translation; overrides kept | The eager arms by default; the compiled `dense-graphed` encoder | The pair measured fastest with equal transcripts (HLD, Key Design Decisions); the eager arms stay selectable as the reference |
 | Arms under the hook configuration | The `eager-graphed` encoder and `dense-graphed` decoder (and transaction graphs); the compiled `dense-graphed` encoder and CHUNK-bucket graphs refused there | Capture every graphed arm in the hook; capture the unsupported ones on the profiling step | Capture of the compiled encoder and of CHUNK-bucket graphs through the hook is not yet specified or qualified, and the HLD forbids profiling-step capture in the hook configuration; both stay available under `--enforce-eager`. The refusal holds until their hook capture is specified and measured (Deferred 4); nothing technical prevents it |
 | Segment-graph memory under the hook | Core's estimate through the profiling capture, a flat charged margin per call and an aggregate serving-over-profiling check, the same procedure as the transaction-graph cells | A per-graph comparison; a warning only | Core's charge is aggregate and allocator rounding arises per segment over the call; a warning would serve with uncharged memory where core estimated |
+| Graphed arms without static graphs | A stand-in wrapper that runs each entry eagerly, keeping the graphed arms' inventory and serving path | Refusing graphed arms off CUDA; resolving the default arms to the eager arms there | The card's default arms are graphed, so a refusal would fail every non-CUDA run of the default configuration, and silently switching arms would leave the graphed staging and checks untested off CUDA; the stand-in keeps one path whose outputs equal the eager arms' |
 | Core hooks | Required in every configuration; a core without them is refused | Detect them and fall back to profiling-step capture | One core API to test (HLD, Key Design Decisions, Core API) |
 | Load-time checks | Client calls in `register()`; adapter symbols at model import | All checks in `register()` | `register()` and the session factory do not import the model class modules, so loading the plugin stays cheap; core's speech-to-text serving imports the model class in the API server when it starts, so importing it initializes no device and loads no weights |
 | `generate` task | Not advertised (model-state override) | Advertise for compatibility | The model emits transcript labels, not text generation |

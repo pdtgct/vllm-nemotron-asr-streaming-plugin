@@ -357,7 +357,10 @@ class _Capture(logging.Handler):
         self.records: list[logging.LogRecord] = []
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.records.append(record)
+        # The handler sits on several loggers, and a record propagating
+        # through two of them reaches it twice: keep each record once.
+        if not any(kept is record for kept in self.records):
+            self.records.append(record)
 
 
 @pytest.fixture

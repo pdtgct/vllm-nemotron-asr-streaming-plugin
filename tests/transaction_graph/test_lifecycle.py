@@ -431,9 +431,14 @@ def test_option_off_hooks_allocate_capture_verify_and_release_nothing(
     assert fake.pinned_allocations == 0, (
         "the step arena was allocated with the option off"
     )
-    assert not [c for c in scatter.calls if c["pages"] == [1] and c["rows"] == 1], (
-        "a transaction-graph scatter warm-up ran with the option off"
-    )
+    # A transaction-graph scatter warm-up writes one rejected row to page 1
+    # (TXG-LIFE-004); the default encoder's one-row profile
+    # transaction writes model-owned scratch and commits its row.
+    assert not [
+        c
+        for c in scatter.calls
+        if c["pages"] == [1] and c["rows"] == 1 and all(s != 0 for s in c["status"])
+    ], "a transaction-graph scatter warm-up ran with the option off"
 
 
 # ---------------------------------------------------------------------------
