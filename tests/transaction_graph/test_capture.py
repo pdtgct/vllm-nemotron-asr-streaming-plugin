@@ -132,7 +132,8 @@ def windows_before(env, mark, windows):
             warm = [
                 i
                 for i in range(mark, begin)
-                if env.events[i][0] == "scatter" and env.events[i][1]["pages"] == [1]
+                if env.events[i][0] == "scatter"
+                and t.is_scatter_warmup(env.events[i][1])
             ]
             starts.append(max(warm) + 1 if warm else mark)
         else:
@@ -283,7 +284,17 @@ def test_scatter_warm_up_names_each_pools_first_free_page_before_the_first_cell(
             for i in range(mark, len(env.events))
             if env.events[i][0] == "cuda.graph.capture_begin"
         )
-        warm = [e[1] for e in env.events[mark:first_cell] if e[0] == "scatter"]
+        # The segment graphs come first (TXG-LIFE-004, TXG-LIFE-006), after
+        # their own part's scatters on model-owned scratch; the first cell's
+        # eager reference and warm-ups follow the scatter warm-up.
+        after_segments = 1 + max(
+            (i for i in range(mark, first_cell) if env.events[i][0] == "capture"),
+            default=mark - 1,
+        )
+        launched = [
+            e[1] for e in env.events[after_segments:first_cell] if e[0] == "scatter"
+        ]
+        warm = launched[: len(layout)]
         assert sorted(c["pool"] for c in warm) == sorted(
             v.data_ptr for v in layout.values()
         ), (
@@ -293,6 +304,11 @@ def test_scatter_warm_up_names_each_pools_first_free_page_before_the_first_cell(
         for call in warm:
             assert call["rows"] == 1 and call["pages"] == [1], call
             assert all(s != 0 for s in call["status"]), call
+        # the first cell is the count-N chunk cell, whose rows are N > 1
+        assert not [c for c in launched[len(layout) :] if t.is_scatter_warmup(c)], (
+            capture,
+            "a pool was warmed more than once",
+        )
 
 
 # @spec TXG-CAP-007
@@ -365,7 +381,7 @@ def test_every_capture_uses_cores_stream_and_pool_and_creates_neither(on_cpu):
         begins = [e[1] for e in env.events[mark:] if e[0] == "cuda.graph.capture_begin"]
         assert begins and {p for _, p in begins} == {pool}, (capture, begins)
         assert all(stream is env.capture_stream for _, _, stream in contexts), contexts
-        pools = [e for e in env.events[mark:] if e[0] == "capture_pool.enter"]
+        pools = [e for e in env.events[mark:] if e[0] == "cuda.capture_pool.enter"]
         assert pools and all(p[1] == pool for p in pools), pools
         inside = False
         for name, _ in env.events[mark:]:

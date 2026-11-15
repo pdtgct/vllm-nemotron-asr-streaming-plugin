@@ -68,9 +68,18 @@ def perturb_buffer(monkeypatch, env):
 def perturb_constant(monkeypatch, env):
     matmul = torch.backends.cuda.matmul
     current = matmul.fp32_precision
-    monkeypatch.setattr(
-        matmul, "fp32_precision", "tf32" if current != "tf32" else "ieee"
-    )
+    # A plain assignment, restored by ``_restore_matmul_precision``:
+    # monkeypatch's undo deletes an attribute that torch serves through
+    # ``__getattr__``, and torch refuses the deletion.
+    matmul.fp32_precision = "tf32" if current != "tf32" else "ieee"
+
+
+@pytest.fixture(autouse=True)
+def _restore_matmul_precision():
+    matmul = torch.backends.cuda.matmul
+    saved = matmul.fp32_precision
+    yield
+    matmul.fp32_precision = saved
 
 
 PERTURBATIONS = {

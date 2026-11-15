@@ -65,13 +65,18 @@ def test_a_changed_process_constant_latches_and_raises(
     core.startup()
     change(monkeypatch, which)
     replays, advances = env.fake.replay_count, len(env.advance.calls)
-    error = h.call_with(core.step, *steps(env, kind))
+    rows = steps(env, kind)
+    error = h.call_with(core.step, *rows)
     assert error is not None, f"a changed {which} setting did not raise"
     assert env.fake.replay_count == replays, "a cell replayed under a changed setting"
     assert len(env.advance.calls) == advances, (
         "the step fell back under a changed setting"
     )
-    later = h.call_with(core.step, t.stream_unit(env, "later"))
+    # The later request takes a slot no earlier request holds: core refuses
+    # a held slot at the same generation before the model runs.
+    later = h.call_with(
+        core.step, t.stream_unit(env, "later"), handles={"later": len(rows) + 1}
+    )
     assert later is not None and t.FRESH_ENGINE.search(t.text(later)), later
 
 

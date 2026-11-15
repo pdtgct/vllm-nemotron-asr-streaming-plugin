@@ -244,8 +244,12 @@ def test_a_latched_binding_refuses_every_later_step(on_cpu):
         [t.stream_unit(env, "a")],  # would be covered
         [t.stream_unit(env, f"k{i}") for i in range(3)],  # would fall back (K > N)
     ]
+    # Each request takes a slot no earlier request holds (the latching step
+    # holds 1 and 2): core refuses a held slot at the same generation before
+    # the model runs.
+    slots = iter(range(3, 3 + sum(len(rows) for rows in shapes)))
     for rows in shapes:
-        handles = {r.req_id: i + 4 for i, r in enumerate(rows)}
+        handles = {r.req_id: next(slots) for r in rows}
         error = h.call_with(core.step, *rows, handles=handles)
         assert error is not None and t.FRESH_ENGINE.search(t.text(error)), error
         assert "transaction graphs failed" in t.text(error).lower(), t.text(error)

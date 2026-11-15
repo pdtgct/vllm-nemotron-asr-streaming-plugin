@@ -362,6 +362,21 @@ def set_estimate(monkeypatch: Any, enabled: bool) -> None:
 # Spies
 
 
+def is_scatter_warmup(call: dict[str, Any]) -> bool:
+    """Whether a ``ScatterSpy`` entry has the shape of a transaction-graph
+    scatter warm-up launch: one row naming page 1 with a rejected (nonzero)
+    status (TXG-CAP-006, TXG-LIFE-004). The default encoder's one-row
+    profile transaction also names page 1, of model-owned scratch, but
+    commits its row (status 0). A count-1 cell's eager reference, warm-ups
+    and capture also launch one rejected row naming page 1, so a caller that
+    needs the warm-up alone bounds its window before the first cell."""
+    return (
+        call["rows"] == 1
+        and call["pages"] == [1]
+        and all(s != 0 for s in call["status"])
+    )
+
+
 class ScatterSpy:
     """Logs every masked-scatter launch (the plugin's one Triton kernel,
     ``state_scatter``) with its pool, rows, page IDs and statuses, wherever
@@ -373,7 +388,7 @@ class ScatterSpy:
         self.events = events
         self.calls: list[dict[str, Any]] = []
         #: Raise from the ``n``-th transaction-graph scatter warm-up launch
-        #: (a one-row launch naming page 1), TXG-MEM-010's warm-up phase.
+        #: (``is_scatter_warmup``), TXG-MEM-010's warm-up phase.
         self.fail_warmup: int | None = None
         self.warmups = 0
 
@@ -397,7 +412,7 @@ class ScatterSpy:
 
         def execute_spy(pool, scratch, block_ids, row_status):
             spy._log("execute", pool, block_ids, row_status)
-            if block_ids.numel() == 1 and int(block_ids.reshape(-1)[0]) == 1:
+            if is_scatter_warmup(spy.calls[-1]):
                 number, spy.warmups = spy.warmups, spy.warmups + 1
                 if spy.fail_warmup == number:
                     from support.fake_cuda import InjectedFault

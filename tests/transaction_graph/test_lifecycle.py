@@ -46,7 +46,7 @@ def scatter_warmups(env, mark):
     return [
         i
         for i, e in enumerate(env.events[mark:])
-        if e[0] == "scatter" and e[1]["rows"] == 1 and e[1]["pages"] == [1]
+        if e[0] == "scatter" and t.is_scatter_warmup(e[1])
     ]
 
 
@@ -68,7 +68,9 @@ def assert_capture_creates_cells(env, core):
     assert env.fake.capture_attempts == 2 * env.n, env.fake.capture_attempts
     assert env.fake.replay_count >= 2 * env.n, env.fake.replay_count
     assert env.fake.pinned_allocations > 0, "no binding-owned pinned buffer"
-    assert [c for c in env.scatter.calls if c["pages"] == [1]], "no scatter warm-up"
+    assert [c for c in env.scatter.calls if t.is_scatter_warmup(c)], (
+        "no scatter warm-up"
+    )
 
 
 def assert_injected(error, phase):
@@ -108,7 +110,12 @@ def test_prepare_execution_memory_allocates_nothing_for_transaction_graphs(on_cp
     assert env.fake.pinned_allocations == 0, (
         "the step arena's pinned buffers were allocated"
     )
-    assert env.scatter.calls == []
+    # Registration's segment part runs the default encoder's one-row profile
+    # transactions here, on model-owned scratch; none is a transaction-graph
+    # scatter warm-up.
+    assert not [c for c in env.scatter.calls if t.is_scatter_warmup(c)], (
+        "a transaction-graph scatter warm-up ran in prepare_execution_memory"
+    )
     env.runner.profile_run(core_embeds=False)
     assert_capture_creates_cells(env, run.core)
 
@@ -434,11 +441,9 @@ def test_option_off_hooks_allocate_capture_verify_and_release_nothing(
     # A transaction-graph scatter warm-up writes one rejected row to page 1
     # (TXG-LIFE-004); the default encoder's one-row profile
     # transaction writes model-owned scratch and commits its row.
-    assert not [
-        c
-        for c in scatter.calls
-        if c["pages"] == [1] and c["rows"] == 1 and all(s != 0 for s in c["status"])
-    ], "a transaction-graph scatter warm-up ran with the option off"
+    assert not [c for c in scatter.calls if t.is_scatter_warmup(c)], (
+        "a transaction-graph scatter warm-up ran with the option off"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +568,9 @@ def test_cells_replay_only_in_their_own_validation_and_on_verified_steps(on_cpu)
     assert env.fake.replay_count == replays, "a cell replayed before verification"
     core.post_warmup()
     mark = len(env.events)
-    core.step(t.stream_unit(env, "s1"))
+    # s0 still holds slot 1: core refuses a held slot at the same generation
+    # before the model runs.
+    core.step(t.stream_unit(env, "s1"), handles={"s1": 2})
     replayed = [e[1] for e in env.events[mark:] if e[0] == "cuda.graph.replay"]
     assert replayed, "the verified covered step replayed no cell"
     assert not set(replayed) & profiling_ids, "a step replayed a profiling cell"
