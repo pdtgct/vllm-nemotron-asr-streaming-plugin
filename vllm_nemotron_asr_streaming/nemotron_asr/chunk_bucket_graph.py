@@ -181,9 +181,7 @@ def capture_chunk_bucket(
     )
     result_type = type(probe.result)
     owned = tuple(torch.empty_like(tensor) for tensor in _outputs(probe))
-    wrapper = runtime.wrapper_factory(
-        body, vllm_config, runtime_mode=runtime.graph_mode
-    )
+    wrapper = runtime.wrap(body, vllm_config, descriptor, env.device)
 
     def call(mode: Any) -> tuple[torch.Tensor, ...]:
         with runtime.forward_context(
@@ -197,10 +195,10 @@ def capture_chunk_bucket(
     stage(sources)
     expected_outputs = tuple(tensor.clone() for tensor in call(runtime.eager_mode))
     expected_state = tuple(tensor.clone() for tensor in _state_tensors(static_state))
-    runtime.synchronize(env.device)
+    runtime.sync(env.device)
     # @spec REG-MEM-007: capture through core's graph-capture context; core has
     # no capture-enabled switch at this build.
-    with runtime.capture_context(env.device):
+    with runtime.capture_scope(env.device):
         stage(sources)
         call(runtime.graph_mode)
     stage(sources)
@@ -211,7 +209,7 @@ def capture_chunk_bucket(
         strict=True,
     ):
         torch.testing.assert_close(actual_tensor, expected, atol=0, rtol=0)
-    runtime.synchronize(env.device)
+    runtime.sync(env.device)
 
     @torch.inference_mode()
     def transition(
@@ -326,6 +324,9 @@ class ExactChunkGraphBinding:
         self._encoder = encoder_execution
         self._decoder = decoder_binding
         self._cells = frozenset((1, n) for n in populations)
+        #: ``(geometry, population)`` of the cell :meth:`warmup` is capturing;
+        #: still set after a failed warmup, for its diagnosis.
+        self.capture_in_progress: tuple[int, int] | None = None
         self._fallback_counts: dict[tuple[int, int], int] = {}
         self._instance_id = f"{os.getpid()}:{time.monotonic_ns()}"
         self._source_sha256 = {
@@ -367,6 +368,7 @@ class ExactChunkGraphBinding:
         pending: dict[tuple[int, int], Any] = {}
         try:
             for geometry, population in sorted(self._cells):
+                self.capture_in_progress = (geometry, population)
                 invocation = build_profile_invocation(
                     self._config,
                     num_rows=population,
@@ -444,6 +446,7 @@ class ExactChunkGraphBinding:
                 )
                 del state, pools, invocation
             self._encoder.publish_chunk_graphs(pending)
+            self.capture_in_progress = None
             self._encoder._record_memory_diagnostic(
                 device, stage="after-complete-mixed-inventory"
             )

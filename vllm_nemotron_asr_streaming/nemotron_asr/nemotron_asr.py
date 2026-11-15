@@ -102,10 +102,36 @@ from vllm_nemotron_asr_streaming.nemotron_asr.rnnt import (
     decode_dense_masked_frames,
     greedy_decode_chunk,
 )
+from vllm_nemotron_asr_streaming.nemotron_asr import graph_memory
 from vllm_nemotron_asr_streaming.nemotron_asr.state_profile import build_nemotron_persistent_state_spec
+from vllm_nemotron_asr_streaming.transaction_graph_config import (
+    KEY as TRANSACTION_GRAPH_KEY,
+    transaction_graphs_on,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 logger = init_logger(__name__)
+
+#: The captures that create segment graphs (REG-MEM-015): the first profiling
+#: dummy step under ``--enforce-eager``, and core's capture hook's profiling
+#: and serving calls under the hook configuration.
+PROFILING_STEP = "profiling dummy step"
+PROFILING_CAPTURE = "profiling capture"
+SERVING_CAPTURE = "serving capture"
+
+
+def _synchronize_quietly(device: torch.device | None, stream: Any) -> None:
+    """Synchronize the capture stream (or a CUDA device) on a failure path. A
+    failure here is logged, never raised over the original error."""
+    try:
+        if stream is not None:
+            stream.synchronize()
+        elif device is not None and device.type == "cuda":
+            torch.cuda.synchronize(device)
+    except Exception:
+        logger.exception(
+            "synchronizing after a failed Nemotron preparation or capture failed"
+        )
 
 #: The largest published chunk (1120 ms) emits 14 encoder frames — the
 #: replay queue page's per-chunk worst case.
@@ -525,11 +551,28 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             )
         self._commit_sink: BoundedCommitSink | None = None
         self._host_staging: HostStaging | None = None
+        self._vllm_config = vllm_config
+        #: The first profiling dummy step's preparation succeeded
+        #: (REG-MEM-002, REG-MEM-016) or failed (REG-MEM-004) in this worker.
         self._execution_memory_prepared = False
         self._execution_memory_failed = False
+        #: Core's ``prepare_execution_memory`` ran (REG-MEM-018).
+        self._working_memory_prepared = False
         #: Set when core's model-state capture hook, not the profiling step,
-        #: captures the decoder graphs (``prepare_execution_memory_hook``).
+        #: captures the segment graphs (the hook configuration), by
+        #: ``prepare_execution_memory_hook``.
         self._graphs_by_core = False
+        #: The capture that created the live segment graphs: ``None``,
+        #: ``PROFILING_STEP``, ``PROFILING_CAPTURE`` or ``SERVING_CAPTURE``.
+        self._segment_graphs: str | None = None
+        self._serving_capture_attempted = False
+        #: The profiling capture call's figures, host integers kept after
+        #: ``clear_cudagraphs`` (REG-MEM-021, REG-MEM-022); ``None`` until a
+        #: profiling capture ran in this worker.
+        self._profiling_figures: dict[str, Any] | None = None
+        #: The profiling capture's charged margin while transaction graphs
+        #: are off (REG-MEM-020), held until ``clear_cudagraphs``.
+        self._charged_margin: Any = None
         #: The transaction-graph binding while transaction graphs are on
         #: (TXG-CFG-001); ``None`` while they are off.
         self._transaction_graph_binding: Any = None
@@ -853,9 +896,14 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
     ) -> None:
         """Validate complete model-owned inventory without creating allocations.
 
-        ``capture_pending_ok``: accept a decoder that core's capture hook has
-        not captured yet (startup only; serving steps never pass it)."""
-        if not self._encoder_execution.ready:
+        ``capture_pending_ok``: accept segment graphs that core's capture hook
+        has not captured yet (the hook configuration before its serving
+        capture; serving steps never pass it)."""
+        execution = self._encoder_execution
+        if capture_pending_ok and execution.arm in ("dense-graphed", "eager-graphed"):
+            if not execution.warmed:
+                raise RuntimeError("encoder execution inventory is incomplete")
+        elif not execution.ready:
             raise RuntimeError("encoder execution inventory is incomplete")
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
         if chunk_binding is not None and not chunk_binding.ready:
@@ -865,7 +913,7 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             if getattr(self.config, "decode_dispatch_arm", None) == "dense-graphed":
                 raise RuntimeError("decoder execution inventory is missing")
             return
-        if capture_pending_ok and self._graphs_by_core and not binding.captured_keys:
+        if capture_pending_ok and not binding.captured_keys:
             return
         from vllm_nemotron_asr_streaming.nemotron_asr.decode_graph import execution_tiers
 
@@ -897,12 +945,22 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 "never captures while serving"
             )
 
+    def _segment_graphs_pending(self) -> bool:
+        """Whether core's capture hook has yet to capture the serving segment
+        graphs (the hook configuration before its serving capture)."""
+        return self._graphs_by_core and self._segment_graphs != SERVING_CAPTURE
+
     # @spec REG-MEM-002, REG-MEM-003, REG-MEM-004, REG-MEM-005, REG-MEM-008
+    # @spec REG-MEM-016
     def _profile_dummy_step(self, device: torch.device) -> None:
         """The model's one preparation of its execution memory, run by the
         forward of a profiling dummy step (core's memory profile).
 
-        The first such step of a worker prepares; a failure discards the
+        The first such step of a worker prepares: under ``--enforce-eager`` it
+        captures the segment graphs and then, with every graph retained, runs
+        the profile transaction; under the hook configuration it runs the
+        profile transaction over the arms' uncaptured paths and captures
+        nothing (core's capture hook captures later). A failure discards the
         partial state, marks the worker failed and raises, and every later
         profiling step then raises without preparing. Later profiling steps of
         a prepared worker (kernel warm-up after the state pool exists) only
@@ -914,50 +972,70 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             )
         if self._execution_memory_prepared:
             # Core's capture hook may not have captured yet (graphs by core).
-            self._require_execution_ready(capture_pending_ok=True)
+            self._require_execution_ready(
+                capture_pending_ok=self._segment_graphs_pending()
+            )
             return
+        if not self._working_memory_prepared:
+            # Core calls prepare_execution_memory before this step; prepare
+            # here only if it did not.
+            self.prepare_execution_memory_hook(
+                device, graphs_by_core=self._graphs_by_core
+            )
         try:
-            self._prepare_execution_memory(device)
+            if self._graphs_by_core:
+                self._profile_uncaptured(device)
+            else:
+                self._capture_on_profiling_step(device)
         except Exception:
-            self._execution_memory_failed = True
-            try:
-                self._encoder_execution._discard()
-            finally:
-                if self._decode_graph_binding is not None:
-                    self._decode_graph_binding.discard()
+            self._fail_preparation(device)
             raise
         self._execution_memory_prepared = True
 
-    # @spec PORT-STATE-003, PORT-PERF-009, PORT-PERF-011
-    @torch.inference_mode()
-    def _prepare_execution_memory(
-        self, device: torch.device, *, capture: bool = True
-    ) -> None:
-        """Retain execution inventory and profile its transient headroom.
+    def _fail_preparation(self, device: torch.device) -> None:
+        """REG-MEM-004: discard the partial execution state, synchronize the
+        device and mark this worker's preparation failed."""
+        self._execution_memory_failed = True
+        try:
+            self._encoder_execution._discard()
+        finally:
+            if self._decode_graph_binding is not None:
+                self._decode_graph_binding.discard()
+            self._segment_graphs = None
+            _synchronize_quietly(device, None)
 
-        Profiling uses model-owned scratch state built from the model's
-        ``PersistentStateSpec``; it reads no state-slot bindings or pool.
-        ``capture=False`` (core's capture hook captures the decoder graphs
-        later) skips the decoder capture; the profile transaction then runs
-        the dense eager decoder, as it does today when no CHUNK graphs exist.
-        """
+    # @spec PORT-STATE-003, PORT-PERF-009
+    @torch.inference_mode()
+    def _prepare_working_memory(self, device: torch.device) -> None:
+        """Allocate long-lived working memory and warm uncaptured execution:
+        the static encoder domain is warmed and sealed (and a compiled arm
+        compiled). Captures nothing and runs no profile transaction."""
         from vllm_nemotron_asr_streaming.nemotron_asr.profile_execution import (
-            run_persistent_state_profile,
             warmup_static_encoder_execution,
         )
 
         warmup_static_encoder_execution(self, device=device)
+
+    # @spec PORT-STATE-003, PORT-PERF-009, PORT-PERF-011, REG-MEM-002
+    @torch.inference_mode()
+    def _capture_on_profiling_step(self, device: torch.device) -> None:
+        """``--enforce-eager``: capture the segment graphs, verify the whole
+        inventory, then profile its transient headroom with every graph
+        retained.
+
+        Profiling uses model-owned scratch state built from the model's
+        ``PersistentStateSpec``; it reads no state-slot bindings or pool.
+        """
+        from vllm_nemotron_asr_streaming.nemotron_asr.profile_execution import (
+            run_persistent_state_profile,
+        )
+
+        self._capture_segment_graphs(
+            device, capture=PROFILING_STEP, stream=None, graph_pool=None
+        )
+        self._segment_graphs = PROFILING_STEP
+        self._require_execution_ready()
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
-        if not capture:
-            if chunk_binding is not None:
-                raise RuntimeError("CHUNK graphs are captured on the profiling step")
-        elif self._decode_graph_binding is not None:
-            self._decode_graph_binding.warmup(
-                device, self.core.policy.dtype_for("activations")
-            )
-        if chunk_binding is not None:
-            chunk_binding.warmup(device)
-        self._require_execution_ready(capture_pending_ok=not capture)
         # All retained graph buffers must coexist with this temporary
         # transaction so the profiler sees their combined high-water mark.
         if chunk_binding is not None:
@@ -978,51 +1056,68 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             geometry_id=_server_geometry(self.config),
             ready_domain=True,
         )
-        self._require_execution_ready(capture_pending_ok=not capture)
+        self._require_execution_ready()
 
-    # Core's model-state graph hooks (a core that defines them; the model
-    # state forwards ``prepare_execution_memory``, ``capture_cudagraphs``,
-    # ``clear_cudagraphs`` and ``shutdown`` here).
+    @torch.inference_mode()
+    def _profile_uncaptured(self, device: torch.device) -> None:
+        """The hook configuration: verify every configured execution entry
+        except the segment graphs and run the profile transaction once, at its
+        maximum shape, over the arms' uncaptured paths (the encoder's sealed
+        uncaptured transition, the dense eager decode). Captures nothing."""
+        from vllm_nemotron_asr_streaming.nemotron_asr.profile_execution import (
+            run_persistent_state_profile,
+        )
+
+        self._require_execution_inventory_ready(capture_pending_ok=True)
+        run_persistent_state_profile(
+            self,
+            num_rows=self._max_num_seqs,
+            device=device,
+            geometry_id=_server_geometry(self.config),
+            ready_domain=True,
+            uncaptured=True,
+        )
+        self._require_execution_inventory_ready(capture_pending_ok=True)
+
+    # Core's model-state graph hooks: the model state forwards
+    # ``prepare_execution_memory``, ``capture_cudagraphs``,
+    # ``clear_cudagraphs``, ``post_warmup`` and ``shutdown`` here. The
+    # segment-graph part below runs first in each capture call, after the
+    # transaction-graph entry checks; the transaction-graph part is called
+    # through ``_transaction_graph_binding``, which is ``None`` while
+    # transaction graphs are off. The calls it receives (wave 4 fills them):
+    # ``check_capture_entry(profile_only=)`` (TXG-LIFE-007, TXG-LIFE-008),
+    # ``check_profiling_requirement(requirement)`` (TXG-MEM-007, TXG-MEM-009),
+    # ``capture(call)`` after the segment graphs (TXG-LIFE-004, TXG-LIFE-006,
+    # with the margin and the comparison through ``graph_memory``),
+    # ``discard_capture()`` on a failed call (TXG-LIFE-012),
+    # ``release_profiling()`` (TXG-LIFE-005), ``verify_post_warmup()`` and
+    # ``shutdown()`` (TXG-LIFE-010), each before the segment-graph part.
+
     def prepare_execution_memory_hook(
         self, device: torch.device, *, graphs_by_core: bool
     ) -> None:
         """Core's ``prepare_execution_memory``: once, before the profiling
-        forward, inside core's memory profile. Captures nothing.
+        forward, inside core's memory profile, in both runner configurations.
+        Allocates long-lived working memory and warms uncaptured execution;
+        captures nothing and runs no profile transaction.
 
-        With ``graphs_by_core`` (core's capture hook captures the decoder
-        graphs), prepare everything but those graphs. Otherwise a
-        configuration that captures nothing prepares in full here, and one
-        that captures leaves preparation to the first profiling step, as on
-        a core without the hooks. The profiling step never prepares again.
+        ``graphs_by_core``: core's capture hook captures the segment graphs
+        (the hook configuration); otherwise (``--enforce-eager``) the first
+        profiling step captures them.
         """
-        if self._execution_memory_prepared or self._execution_memory_failed:
+        if self._working_memory_prepared or self._execution_memory_failed:
             return
-        if not graphs_by_core:
-            if not self._graphed_execution:
-                self._profile_dummy_step(device)
-            return
-        if (
-            self._decode_graph_binding is None
-            or getattr(self, "_chunk_bucket_binding", None) is not None
-            or getattr(self._encoder_execution, "arm", None)
-            in ("dense-graphed", "eager-graphed")
-        ):
-            raise RuntimeError(
-                "core's capture hook captures only the dense-graphed decoder; "
-                "graphed encoder and CHUNK arms are captured on the profiling step"
-            )
-        self._graphs_by_core = True
+        self._graphs_by_core = bool(graphs_by_core)
+        self._working_memory_prepared = True
         try:
-            self._prepare_execution_memory(device, capture=False)
+            self._prepare_working_memory(device)
         except Exception:
-            self._execution_memory_failed = True
-            try:
-                self._encoder_execution._discard()
-            finally:
-                self._decode_graph_binding.discard()
+            self._fail_preparation(device)
             raise
-        self._execution_memory_prepared = True
 
+    # @spec REG-MEM-017, REG-MEM-023, REG-MEM-024
+    @torch.inference_mode()
     def capture_graphs_hook(
         self,
         device: torch.device,
@@ -1031,40 +1126,399 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         stream: Any,
         profile_only: bool,
     ) -> None:
-        """Core's ``capture_cudagraphs``: capture the decoder graphs into
-        ``graph_pool`` on ``stream``. The profile-only capture is the same
-        capture (same keys and buffers), released by ``release_core_graphs``.
+        """Core's ``capture_cudagraphs``: capture the segment graphs for the
+        server's geometry into ``graph_pool`` on ``stream``, then the
+        transaction-graph part; a profiling call (``profile_only``) ends with
+        the charged margin, a serving call with the memory comparison.
+
+        A refused call captures nothing. A failure after the entry checks
+        discards everything the call created and synchronizes ``stream``
+        before propagating.
         """
-        del profile_only  # the measured capture is the serving capture
-        if not self._graphs_by_core:
-            raise RuntimeError("core's capture hook was not selected at preparation")
         if self._execution_memory_failed or not self._execution_memory_prepared:
-            raise RuntimeError("execution memory is not prepared on this worker")
-        binding = self._decode_graph_binding
-        assert binding is not None
-        if binding.captured_keys:
             raise RuntimeError(
-                "the decoder graphs are already captured; core releases the "
-                "profiling capture before it captures again"
+                "execution memory is not prepared on this worker (core's "
+                "profiling step prepares it before the capture hook)"
             )
+        if not self._graphs_by_core:
+            raise RuntimeError(
+                "core's capture hook was called, but this worker prepared for "
+                "--enforce-eager, where the profiling step captures"
+            )
+        binding = self._transaction_graph_binding
+        if binding is not None:
+            binding.check_capture_entry(profile_only=profile_only)
+        self._check_capture_order(profile_only)
+        requirement = None
+        if not profile_only:
+            if self._profiling_figures is None:
+                requirement = graph_memory.profiling_requirement(self._vllm_config)
+                if binding is not None:
+                    binding.check_profiling_requirement(requirement)
+                elif requirement.required:
+                    raise RuntimeError(
+                        "the serving capture found no profiling capture in this "
+                        "worker although one was required: "
+                        f"{requirement.reason}. Core's graph-memory estimate "
+                        "(capture_cudagraphs(profile_only=True)) did not run, so "
+                        "the segment graphs would not be charged to the budget; "
+                        "restart the engine with the estimate enabled, or set a "
+                        "fixed --kv-cache-memory-bytes that leaves room for them"
+                    )
+            # The entry checks passed: from here the serving capture counts as
+            # attempted, whether or not it succeeds (REG-MEM-024). A call
+            # refused at its entry captured nothing and is no attempt.
+            self._serving_capture_attempted = True
+        capture = PROFILING_CAPTURE if profile_only else SERVING_CAPTURE
         try:
-            binding.warmup(
-                device,
-                self.core.policy.dtype_for("activations"),
+            call_free_before, segment_free_after, seconds = (
+                self._capture_segment_graphs(
+                    device, capture=capture, stream=stream, graph_pool=graph_pool
+                )
+            )
+            self._segment_graphs = capture
+            self._require_execution_ready()
+            call = graph_memory.CaptureCall(
+                capture=capture,
+                profile_only=profile_only,
+                device=device,
                 stream=stream,
                 graph_pool=graph_pool,
+                call_free_before=call_free_before,
+                segment_free_after=segment_free_after,
+                segment_seconds=seconds,
+                requirement=requirement,
+                profiling_ran=self._profiling_figures is not None,
             )
-            self._require_execution_ready()
+            if binding is not None:
+                binding.capture(call)
+                if profile_only:
+                    self._profiling_figures = {
+                        "segment_total": call.segment_total
+                    }
+            elif profile_only:
+                self._end_profiling_call(call)
+            else:
+                self._end_serving_call(call)
         except Exception:
-            binding.discard()
+            self._discard_capture_call(stream)
             raise
 
-    def release_core_graphs(self) -> None:
-        """Core's ``clear_cudagraphs`` / ``shutdown``: drop the graphs and
-        buffers core's capture hook created. Tolerates nothing captured."""
+    def _check_capture_order(self, profile_only: bool) -> None:
+        """REG-MEM-024: refuse a capture call that core's lifecycle does not
+        make, at the call's entry, before capturing."""
+        option = (
+            f" ({TRANSACTION_GRAPH_KEY} is set)"
+            if transaction_graphs_on(self.config)
+            else ""
+        )
+        if not profile_only and self._segment_graphs == SERVING_CAPTURE:
+            raise RuntimeError(
+                "a serving capture while the serving segment graphs exist: "
+                "recapture over live state pools is not supported; recover with "
+                f"an engine restart{option}"
+            )
+        if profile_only and self._serving_capture_attempted:
+            raise RuntimeError(
+                "a profiling capture after a serving capture was attempted in "
+                "this worker is a lifecycle defect (core captures for its "
+                "graph-memory estimate before it serves); recover with an engine "
+                f"restart{option}"
+            )
+        if self._segment_graphs == PROFILING_CAPTURE:
+            raise RuntimeError(
+                f"a {'profiling' if profile_only else 'serving'} capture while "
+                "the profiling capture's segment graphs exist is a lifecycle "
+                "defect: core releases them (clear_cudagraphs) before it "
+                f"captures again{option}"
+            )
+
+    def _end_profiling_call(self, call: Any) -> None:
+        """Transaction graphs off: end the profiling call with the charged
+        margin and keep the call's figures as host integers."""
+        margin = graph_memory.allocate_margin(
+            call.device, stream=call.stream, free_before=call.segment_free_after
+        )
+        self._charged_margin = margin
+        self._profiling_figures = {
+            "segment_total": call.segment_total,
+            "call_total": graph_memory.retained(
+                call.call_free_before, margin.free_after
+            ),
+            "margin_bytes": margin.margin_bytes,
+            "margin_charge": margin.charge,
+            "margin_free_before": margin.free_before,
+            "margin_free_after": margin.free_after,
+        }
+
+    def _end_serving_call(self, call: Any) -> None:
+        """Transaction graphs off: compare the serving call with the profiling
+        call, or, when no profiling capture ran and none was required, warn
+        that the segment graphs were not charged to the budget."""
+        serving_total = call.segment_total
+        figures = self._profiling_figures
+        if figures is None:
+            requirement = call.requirement
+            logger.warning(
+                "Nemotron segment graphs were not charged to the budget: no "
+                "profiling capture ran, and none was required (%s). The serving "
+                "capture retains %s; the budget must leave room for it.",
+                requirement.reason if requirement is not None else "unknown",
+                graph_memory.format_bytes(serving_total),
+            )
+            return
+        profiling_total = figures["call_total"]
+        excess = graph_memory.serving_excess(serving_total, profiling_total)
+        if excess:
+            raise RuntimeError(
+                "the serving capture retains more graph memory than the "
+                "profiling capture core charged to the budget: serving total "
+                f"{graph_memory.format_bytes(serving_total)}, profiling total "
+                f"{graph_memory.format_bytes(profiling_total)} (including the "
+                "charged margin's charge "
+                f"{graph_memory.format_bytes(figures['margin_charge'])} of a "
+                f"{graph_memory.format_bytes(figures['margin_bytes'])} margin), "
+                f"excess {graph_memory.format_bytes(excess)}. "
+                + self._capture_remedies(serving=True)
+            )
+
+    def _discard_capture_call(self, stream: Any) -> None:
+        """Discard everything a failed capture call created, the
+        transaction-graph part first, then the segment graphs, their buffers
+        and the margin, and synchronize the capture stream."""
+        binding = self._transaction_graph_binding
+        try:
+            if binding is not None:
+                binding.discard_capture()
+        finally:
+            self._discard_segment_graphs()
+            margin = self._charged_margin
+            if margin is not None:
+                margin.release()
+                self._charged_margin = None
+            _synchronize_quietly(None, stream)
+
+    def _discard_segment_graphs(self) -> None:
+        """Release every segment graph and segment-graph buffer (encoder,
+        decoder and CHUNK-bucket entries), keeping the sealed execution
+        domain."""
+        execution = getattr(self, "_encoder_execution", None)
+        if execution is not None:
+            execution.release_graphs()
         binding = getattr(self, "_decode_graph_binding", None)
-        if binding is not None and getattr(self, "_graphs_by_core", False):
+        if binding is not None:
             binding.discard()
+        self._segment_graphs = None
+
+    # @spec REG-MEM-015, REG-MEM-017
+    def _capture_segment_graphs(
+        self,
+        device: torch.device,
+        *,
+        capture: str,
+        stream: Any,
+        graph_pool: Any,
+    ) -> tuple[int | None, int | None, float]:
+        """Capture every segment graph for the server's geometry: the encoder
+        at each CHUNK count, then the decoder at each tier, then the
+        CHUNK-bucket cells, on ``stream`` into ``graph_pool`` (core's capture
+        hook) or core's own (``None``). Logs the capture line and returns the
+        free-memory readings around the capture and its time.
+
+        A failure raises an error chained from the original that names the
+        arms, the geometry, ``max_num_seqs``, the failing graph, what was
+        retained so far, the time so far, the budget setting and the remedies;
+        the caller discards what was captured.
+        """
+        from vllm_nemotron_asr_streaming.nemotron_asr.profile_execution import (
+            capture_static_encoder_graphs,
+        )
+
+        execution = self._encoder_execution
+        decoder = self._decode_graph_binding
+        chunk_binding = getattr(self, "_chunk_bucket_binding", None)
+        execution.capture_in_progress = None
+        if decoder is not None:
+            decoder.capture_in_progress = None
+        if chunk_binding is not None:
+            chunk_binding.capture_in_progress = None
+        free_before = graph_memory.free_memory(device, stream)
+        started = time.perf_counter()
+        try:
+            capture_static_encoder_graphs(
+                self, device=device, stream=stream, graph_pool=graph_pool
+            )
+            if decoder is not None:
+                decoder.warmup(
+                    device,
+                    self.core.policy.dtype_for("activations"),
+                    stream=stream,
+                    graph_pool=graph_pool,
+                )
+            if chunk_binding is not None:
+                chunk_binding.warmup(device)
+        except Exception as error:
+            seconds = time.perf_counter() - started
+            try:
+                so_far = graph_memory.retained(
+                    free_before, graph_memory.free_memory(device, stream)
+                )
+            except Exception:
+                so_far = None
+            raise RuntimeError(
+                self._capture_failure_message(
+                    capture, graph=self._failing_segment_graph(), retained=so_far,
+                    seconds=seconds,
+                )
+            ) from error
+        seconds = time.perf_counter() - started
+        free_after = graph_memory.free_memory(device, stream)
+        logger.info(
+            "Nemotron segment graphs: %s; retained %s, capture time %.3f s",
+            self._capture_identity(capture),
+            graph_memory.format_bytes(graph_memory.retained(free_before, free_after)),
+            seconds,
+        )
+        return free_before, free_after, seconds
+
+    def _capture_identity(self, capture: str) -> str:
+        """The runner configuration, the capture, the arms, the server's
+        geometry and ``max_num_seqs``, as the capture line and the failure
+        messages name them."""
+        from vllm_nemotron_asr_streaming.lookahead import (
+            cadence_label,
+            served_lookahead,
+        )
+
+        lookahead = served_lookahead(self.config)
+        runner = "hook configuration" if self._graphs_by_core else "--enforce-eager"
+        encoder = getattr(self._encoder_execution, "arm", None) or "eager"
+        decoder = getattr(self.config, "decode_dispatch_arm", None) or "compact-eager"
+        return (
+            f"{runner} runner, {capture}; encoder_execution_arm {encoder}, "
+            f"decode_dispatch_arm {decoder}; geometry {cadence_label(lookahead)} "
+            f"(lookahead {lookahead}); max_num_seqs {self._max_num_seqs}"
+        )
+
+    def _failing_segment_graph(self) -> str:
+        """The segment graph whose staging or capture was in progress."""
+        from vllm_nemotron_asr_streaming.lookahead import cadence_label
+
+        labels = {
+            index: cadence_label(right)
+            for index, (_left, right) in enumerate(CADENCES.values())
+        }
+        chunk_binding = getattr(self, "_chunk_bucket_binding", None)
+        if chunk_binding is not None and chunk_binding.capture_in_progress:
+            geometry, population = chunk_binding.capture_in_progress
+            return (
+                f"the CHUNK-bucket graph at the {labels[geometry]} geometry with "
+                f"{population} rows (chunk_bucket_graph_populations)"
+            )
+        decoder = self._decode_graph_binding
+        if decoder is not None and decoder.capture_in_progress:
+            geometry, tier = decoder.capture_in_progress
+            return f"the decoder graph at tier {tier} ({labels[geometry]})"
+        cell = self._encoder_execution.capture_in_progress
+        if cell is not None:
+            geometry, count = cell
+            return f"the encoder graph at CHUNK count {count} ({labels[geometry]})"
+        return "a segment graph (before its first CHUNK count or tier)"
+
+    def _budget_setting(self) -> tuple[str, bool]:
+        """The budget setting, and whether it is a fixed budget."""
+        cache = getattr(self._vllm_config, "cache_config", None)
+        fixed = getattr(cache, "kv_cache_memory_bytes", None)
+        if fixed:
+            return f"a fixed budget (--kv-cache-memory-bytes {fixed})", True
+        utilization = getattr(cache, "gpu_memory_utilization", None)
+        return (
+            f"a profiled budget (--gpu-memory-utilization {utilization})",
+            False,
+        )
+
+    def _capture_remedies(self, *, serving: bool) -> str:
+        """REG-MEM-017's remedies for this capture and budget."""
+        budget, fixed = self._budget_setting()
+        remedies = [
+            "a smaller --max-num-seqs",
+            "--hf-overrides '{\"encoder_execution_arm\": \"eager\", "
+            '"decode_dispatch_arm": "dense-eager", '
+            '"chunk_bucket_graph_populations": [], '
+            '"transaction_graph_populations": []}\' together with --enforce-eager',
+        ]
+        if fixed:
+            remedies.append("a smaller --kv-cache-memory-bytes")
+        elif serving:
+            remedies.append("a lower --gpu-memory-utilization")
+        return f"Budget: {budget}. Remedies: " + "; or ".join(remedies) + "."
+
+    def _capture_failure_message(
+        self,
+        capture: str,
+        *,
+        graph: str,
+        retained: int | None,
+        seconds: float,
+    ) -> str:
+        """REG-MEM-017: the message of a segment-graph capture failure."""
+        return (
+            f"Nemotron segment-graph capture failed ({self._capture_identity(capture)}): "
+            f"{graph} failed after retaining {graph_memory.format_bytes(retained)} "
+            f"in {seconds:.3f} s. "
+            + self._capture_remedies(serving=capture == SERVING_CAPTURE)
+        )
+
+    def clear_graphs_hook(self) -> None:
+        """Core's ``clear_cudagraphs``: release what the profiling capture
+        created, the transaction-graph part first, then every segment graph,
+        segment-graph buffer and the charged margin, keeping the profiling
+        figures as host integers. Tolerates nothing captured."""
+        binding = getattr(self, "_transaction_graph_binding", None)
+        try:
+            if binding is not None:
+                binding.release_profiling()
+        finally:
+            if getattr(self, "_segment_graphs", None) == PROFILING_CAPTURE:
+                self._discard_segment_graphs()
+            margin = getattr(self, "_charged_margin", None)
+            if margin is not None:
+                margin.release()
+                self._charged_margin = None
+
+    def post_warmup_hook(self) -> None:
+        """Core's ``post_warmup``, before the worker serves, in either runner
+        configuration: every expected segment-graph entry holds its graph,
+        then the transaction-graph verification. Allocates nothing and
+        replays nothing."""
+        if self._execution_memory_failed:
+            raise RuntimeError(
+                "execution memory preparation failed; a fresh worker is required"
+            )
+        if self._graphs_by_core and self._segment_graphs != SERVING_CAPTURE:
+            raise RuntimeError(
+                "post_warmup before core's serving capture: the segment graphs "
+                "are not captured"
+            )
+        self._require_execution_ready()
+        binding = self._transaction_graph_binding
+        if binding is not None:
+            binding.verify_post_warmup()
+
+    def shutdown_graphs_hook(self) -> None:
+        """Core's ``shutdown``: release every graph and binding-owned buffer,
+        the transaction-graph part first. Tolerates a model whose
+        initialization did not complete or that captured nothing."""
+        binding = getattr(self, "_transaction_graph_binding", None)
+        try:
+            if binding is not None:
+                binding.shutdown()
+        finally:
+            self._discard_segment_graphs()
+            margin = getattr(self, "_charged_margin", None)
+            if margin is not None:
+                margin.release()
+                self._charged_margin = None
 
     def execution_profile_receipt(self) -> dict[str, Any]:
         """Report the resolved execution arms and startup coverage."""
@@ -1254,6 +1708,11 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             # The expected inventory and every graph, not only graph presence;
             # the eager default keeps its steps cheap.
             self._require_execution_ready()
+            if self._segment_graphs_pending():
+                raise RuntimeError(
+                    "a real step before core's serving capture: the serving "
+                    "segment graphs are not captured"
+                )
         context = self._stage_v2_projection(persistent_state_projection)
         planning_failed = self._record_planning(persistent_state_projection, context)
         if (

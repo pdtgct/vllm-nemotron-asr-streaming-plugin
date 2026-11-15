@@ -197,8 +197,9 @@ class NemotronASRModelState(ModelState):
         #: Each live request's latest prompt, as core delivered it.
         self._prompts: dict[str, tuple[int, ...]] = {}
 
-    # Core's graph hooks. A core without them never calls these; the model
-    # then prepares and captures on its first profiling step.
+    # Core's graph hooks (vllm#67583), required in every runner configuration
+    # (REG-ENG-009). Under ``--enforce-eager`` core calls none of the three
+    # capture hooks, and the model captures on its first profiling step.
     def _graphs_by_core(self) -> bool:
         """Whether core captures this model's graphs through
         ``capture_cudagraphs`` (core asks only when the runner is not eager)."""
@@ -207,6 +208,7 @@ class NemotronASRModelState(ModelState):
             and self.needs_cudagraph_capture()
         )
 
+    # @spec REG-MEM-018
     def prepare_execution_memory(self) -> None:
         self.model.prepare_execution_memory_hook(
             self.device, graphs_by_core=self._graphs_by_core()
@@ -226,6 +228,7 @@ class NemotronASRModelState(ModelState):
             self._needs_cudagraph_capture = answer
         return answer
 
+    # @spec REG-MEM-020, REG-MEM-022
     def capture_cudagraphs(
         self,
         *,
@@ -240,13 +243,21 @@ class NemotronASRModelState(ModelState):
             profile_only=profile_only,
         )
 
+    # @spec REG-MEM-021
     def clear_cudagraphs(self) -> None:
-        self.model.release_core_graphs()
+        model = getattr(self, "model", None)
+        if model is not None and hasattr(model, "clear_graphs_hook"):
+            model.clear_graphs_hook()
 
+    # @spec REG-MEM-025
+    def post_warmup(self) -> None:
+        self.model.post_warmup_hook()
+
+    # @spec REG-MEM-026
     def shutdown(self) -> None:
         model = getattr(self, "model", None)
-        if model is not None and hasattr(model, "release_core_graphs"):
-            model.release_core_graphs()
+        if model is not None and hasattr(model, "shutdown_graphs_hook"):
+            model.shutdown_graphs_hook()
 
     # @spec REG-TASK-002
     def get_supported_generation_tasks(self) -> tuple[Any, ...]:

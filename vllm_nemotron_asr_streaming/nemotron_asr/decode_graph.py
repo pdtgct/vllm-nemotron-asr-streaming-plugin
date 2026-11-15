@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,6 +46,93 @@ class GraphRuntime:
     eager_mode: Any
     graph_mode: Any
     synchronize: Callable[[torch.device], None]
+    #: Whether the platform captures static graphs (vLLM's
+    #: ``support_static_graph_mode``), and the device type it captures on
+    #: (``None``: any). Elsewhere graph entries execute eagerly
+    #: (:class:`EagerStaticGraphWrapper`) and nothing is captured.
+    static_graphs: bool = True
+    graph_device_type: str | None = None
+
+    def captures_on(self, device: torch.device) -> bool:
+        """Whether graphs on ``device`` are captured static graphs."""
+        return self.static_graphs and (
+            self.graph_device_type is None or device.type == self.graph_device_type
+        )
+
+    # @spec REG-MEM-028
+    def wrap(
+        self,
+        runnable: Callable[..., Any],
+        vllm_config: Any,
+        descriptor: Any,
+        device: torch.device,
+    ) -> Any:
+        """A graph wrapper for ``runnable``'s entry at ``descriptor`` in this
+        runtime's graph mode: the platform's static graph wrapper, or, where
+        the platform captures no static graphs on ``device``,
+        :class:`EagerStaticGraphWrapper`."""
+        if self.captures_on(device):
+            return self.wrapper_factory(
+                runnable, vllm_config, runtime_mode=self.graph_mode
+            )
+        return EagerStaticGraphWrapper(runnable, descriptor)
+
+    def capture_scope(
+        self, device: torch.device, stream: Any = None
+    ) -> AbstractContextManager:
+        """Core's graph-capture context on ``stream`` (core's own stream when
+        ``None``); no context where nothing is captured."""
+        if not self.captures_on(device):
+            return nullcontext()
+        if stream is None:
+            return self.capture_context(device)
+        return self.capture_context(device, stream)
+
+    def sync(self, device: torch.device) -> None:
+        """Synchronize ``device`` after captures and replays; where nothing is
+        captured, everything ran synchronously."""
+        if self.captures_on(device):
+            self.synchronize(device)
+
+
+class EagerGraph:
+    """The graph an :class:`EagerStaticGraphWrapper` entry holds: its replays
+    execute the runnable. It is no device graph and retains no memory."""
+
+
+@dataclass
+class EagerGraphEntry:
+    """One :class:`EagerStaticGraphWrapper` entry, in the fields core's graph
+    entry has that the bindings read (``cudagraph``, ``output``)."""
+
+    batch_descriptor: Any
+    cudagraph: Any = dataclasses.field(default_factory=EagerGraph)
+    output: Any = None
+
+
+class EagerStaticGraphWrapper:
+    """The static graph wrapper's entry contract (``concrete_cudagraph_entries``
+    keyed by batch descriptor, ``graph_pool``) on a platform without static
+    graphs, such as vLLM's CPU platforms.
+
+    Its one entry, at the binding's descriptor, holds an :class:`EagerGraph`
+    from construction, and every call, in any mode, runs the runnable eagerly.
+    Each binding's runnable copies its results into stable buffers and returns
+    them, so a "replay" yields what a captured graph's replay would. This keeps
+    one inventory, readiness and serving path on every platform, so CPU runs
+    exercise the graphed arms' staging and entry checks; nothing is captured.
+    """
+
+    def __init__(self, runnable: Callable[..., Any], descriptor: Any) -> None:
+        self.runnable = runnable
+        #: Core's wrapper binds a graph pool; nothing is pooled here.
+        self.graph_pool: Any = None
+        self.concrete_cudagraph_entries: dict[Any, EagerGraphEntry] = {
+            descriptor: EagerGraphEntry(batch_descriptor=descriptor)
+        }
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.runnable(*args, **kwargs)
 
 
 @dataclass
@@ -113,6 +200,8 @@ def platform_graph_runtime() -> GraphRuntime:
         eager_mode=CUDAGraphMode.NONE,
         graph_mode=CUDAGraphMode.PIECEWISE,
         synchronize=lambda device: torch.accelerator.synchronize(device),
+        static_graphs=bool(current_platform.support_static_graph_mode()),
+        graph_device_type=current_platform.device_type or None,
     )
 
 
@@ -163,6 +252,9 @@ class DenseGraphBinding:
         self._runtime = runtime
         self._entries: dict[tuple[Any, ...], _GraphEntry] = {}
         self._decode_fns: dict[tuple[Any, ...], Callable[..., Any]] = {}
+        #: ``(geometry, tier)`` of the entry :meth:`warmup` is building or
+        #: capturing; still set after a failed warmup, for its diagnosis.
+        self.capture_in_progress: tuple[int, int] | None = None
 
     @property
     def captured_keys(self) -> tuple[tuple[Any, ...], ...]:
@@ -177,9 +269,12 @@ class DenseGraphBinding:
         )
 
     def discard(self) -> None:
-        """Drop every entry (and so every graph) of a failed preparation."""
+        """Drop every entry (and so every graph and its buffers): a failed
+        preparation, or a capture core releases (``clear_cudagraphs``,
+        ``shutdown``). A later :meth:`warmup` captures again."""
         self._entries = {}
         self._decode_fns = {}
+        self.capture_in_progress = None
 
     def execution_tier(self, live_rows: int) -> int:
         for tier in self._tiers:
@@ -197,6 +292,7 @@ class DenseGraphBinding:
         device: torch.device,
         dtype: torch.dtype,
         runtime: GraphRuntime,
+        graph_pool: Any = None,
     ) -> _GraphEntry:
         frames = self._frame_widths[geometry]
         if frames is None:
@@ -270,11 +366,11 @@ class DenseGraphBinding:
             frame_final_labels.copy_(decoded.frame_final_labels)
             return entry.output_tuple()
 
-        wrapper = runtime.wrapper_factory(
-            run,
-            self._vllm_config,
-            runtime_mode=runtime.graph_mode,
-        )
+        descriptor = runtime.descriptor_factory(tier)
+        wrapper = runtime.wrap(run, self._vllm_config, descriptor, device)
+        if graph_pool is not None:
+            # Core's capture hook: capture into the pool core passes.
+            wrapper.graph_pool = graph_pool
         entry = _GraphEntry(
             geometry=geometry,
             tier=tier,
@@ -291,7 +387,7 @@ class DenseGraphBinding:
             out_last_label=out_last_label,
             frame_emission_counts=frame_emission_counts,
             frame_final_labels=frame_final_labels,
-            descriptor=runtime.descriptor_factory(tier),
+            descriptor=descriptor,
             wrapper=wrapper,
         )
         return entry
@@ -336,51 +432,45 @@ class DenseGraphBinding:
     ) -> None:
         """Capture every declared key. ``stream`` and ``graph_pool`` (core's
         capture hook) capture on that stream into that pool; by default core's
-        capture context picks the stream and the wrapper its global pool."""
+        capture context picks the stream and the wrapper its global pool.
+
+        Tiers are captured largest first, as the encoder's populations are, so
+        a smaller tier's capture can reuse blocks a larger one freed in the
+        shared pool."""
         if self._entries:
             return
-        base = runtime = self._runtime or platform_graph_runtime()
-        if graph_pool is not None:
-            factory = base.wrapper_factory
-
-            def pooled_wrapper(*args: Any, **kwargs: Any) -> Any:
-                wrapper = factory(*args, **kwargs)
-                wrapper.graph_pool = graph_pool
-                return wrapper
-
-            runtime = dataclasses.replace(runtime, wrapper_factory=pooled_wrapper)
-        capture = (
-            runtime.capture_context(device)
-            if stream is None
-            else runtime.capture_context(device, stream)
-        )
-        pending = {
-            self._batch_invariant_mode.graph_key(
-                "decode_fn", (geometry, tier)
-            ): self._new_entry(
-                geometry,
-                tier,
-                device=device,
-                dtype=dtype,
-                runtime=runtime,
-            )
-            for geometry, frames in enumerate(self._frame_widths)
-            if frames is not None
-            for tier in self._tiers
-        }
+        runtime = self._runtime or platform_graph_runtime()
+        pending: dict[tuple[Any, ...], _GraphEntry] = {}
+        for geometry, frames in enumerate(self._frame_widths):
+            if frames is None:
+                continue
+            for tier in reversed(self._tiers):
+                self.capture_in_progress = (geometry, tier)
+                pending[
+                    self._batch_invariant_mode.graph_key("decode_fn", (geometry, tier))
+                ] = self._new_entry(
+                    geometry,
+                    tier,
+                    device=device,
+                    dtype=dtype,
+                    runtime=runtime,
+                    graph_pool=graph_pool,
+                )
         # @spec REG-MEM-007: capture through core's graph-capture context.
-        with torch.inference_mode(), capture:
+        with torch.inference_mode(), runtime.capture_scope(device, stream):
             for entry in pending.values():
+                self.capture_in_progress = (entry.geometry, entry.tier)
                 eager = self._snapshot(self._call(entry, runtime, runtime.eager_mode))
                 captured = self._call(entry, runtime, runtime.graph_mode)
                 self._assert_equal(eager, captured)
                 replayed = self._call(entry, runtime, runtime.graph_mode)
                 self._assert_equal(eager, replayed)
-            runtime.synchronize(device)
+            runtime.sync(device)
+        self.capture_in_progress = None
         decode_fns = {
             key: self._bind_decode(entry, runtime) for key, entry in pending.items()
         }
-        self._runtime = base
+        self._runtime = runtime
         self._entries = pending
         self._decode_fns = decode_fns
 
