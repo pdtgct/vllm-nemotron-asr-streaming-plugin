@@ -39,6 +39,19 @@ ACTION_STEMS = [
     "dummy",
     "latch",
     "profil",
+    # A second serving capture after a successful and after a failed one.
+    "secondservingcapture",
+    "retry",
+    # A failing cancel of the held reservation before the first launch.
+    "prelaunchcancel",
+    # A stage that raises before and one that raises after publication.
+    "stageraises",
+    "publish",
+    # A declined step's option-off reservation, scatter and stage failures.
+    "optionofffailures",
+    # A step before post-warmup verification, after which the engine may die.
+    "premature",
+    "enginedies",
 ]
 
 

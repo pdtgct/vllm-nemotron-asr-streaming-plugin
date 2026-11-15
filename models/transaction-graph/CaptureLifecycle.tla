@@ -23,10 +23,19 @@
 \*  failure before that call is reached) and clear_cudagraphs, also after a
 \*  failed or skipped capture; initialize_state_slots with serving bindings;
 \*  capture_cudagraphs(profile_only=False); post_warmup; serving with
-\*  scheduled steps, dummy steps and cleanup-only steps; a repeated
-\*  initialize_state_slots with an equal or a changed layout; a second
-\*  serving capture attempt; shutdown from any state between hook calls;
-\*  and a killed worker. Each capture call runs its entry checks, then the
+\*  scheduled steps, dummy steps and cleanup-only steps; a scheduled step
+\*  before post-warmup verification, after whose propagated error the
+\*  engine dies or survives (the environment's choice, TXG-EXEC-015);
+\*  all-failed bypass steps after the serving capture on an unlatched
+\*  worker, before and after verification, behind the latch check
+\*  (TXG-FAIL-010; here a latch fails the worker at once, so SplitStep.tla
+\*  checks the latched refusal); a repeated initialize_state_slots with an
+\*  equal or a changed layout; a later serving capture call after a
+\*  successful serving capture (an elastic reconfiguration) and after a
+\*  failed or refused one (ServingCaptureRetry), which core never makes but
+\*  the model does, so that TXG-MODEL-009 holds by the entry refusal and not
+\*  by core's order; shutdown from any state between hook calls; and a
+\*  killed worker. Each capture call runs its entry checks, then the
 \*  segment graphs, the binding buffers, the scatter warm-up, the 2N cells
 \*  (chunk N..1 then echo N..1, each with its validation replay on rejected
 \*  capture rows), then the margin (profiling) or the aggregate memory
@@ -39,10 +48,32 @@
 \*  independent nondeterministic choices. Call totals are abstract units in
 \*  0..MaxMem chosen nondeterministically.
 \*
+\* ENTRY CHECKS (TXG-LIFE-006, TXG-LIFE-007, TXG-LIFE-008, REG-MEM-024,
+\* TXG-MEM-009)
+\*  A serving call tests, in TXG-LIFE-006's order: profiling cells exist
+\*  (TXG-LIFE-007); a serving capture was attempted (TXG-LIFE-008);
+\*  profiling segment graphs exist (REG-MEM-024, whose attempted clause
+\*  TXG-LIFE-008 already decided); a required profiling capture did not run
+\*  (TXG-MEM-009). A profiling call tests a serving capture attempted
+\*  (TXG-LIFE-007), then profiling segment graphs exist (REG-MEM-024). A
+\*  serving call is attempted (servAttempted) only once it has passed every
+\*  one of its checks. The defects these checks detect (profiling state not
+\*  released, a serving capture already attempted, a required profiling
+\*  capture missing) are mutually exclusive for one call: at most one holds
+\*  in any state outside a capture call (EntryChecksExclusive). The order
+\*  therefore never decides whether a call is refused; it decides only
+\*  which of the two checks that test the same defect names it (TXG-LIFE-007
+\*  before REG-MEM-024 for profiling state, TXG-LIFE-008 before REG-MEM-024
+\*  for an attempt). No reachable state holds two defects, so the model has
+\*  no multi-defect precedence witness; one would need an action outside
+\*  core's order and this model (a serving capture with the profiling
+\*  capture not cleared).
+\*
 \* WHAT IS NOT MODELLED
 \*  CUDA semantics, bytes, signatures, page contents, bitwise equivalence;
 \*  the option off (TXG-LIFE-011); a profiling capture after a serving
 \*  capture, which core's order never makes (its entry check is modelled);
+\*  references the propagated error holds (TXG-LIFE-012's last clause);
 \*  the step's execute order, reservations and latch interplay, which
 \*  SplitStep.tla models. A capture call and a hook's two release halves are
 \*  atomic with respect to other hook calls; only a kill interrupts them.
@@ -61,7 +92,15 @@
 \*    created (segment graph, cell, binding buffer or margin) is retained.
 \*  AtMostOneServingCapture (TXG-MODEL-009, TXG-LIFE-008, REG-MEM-024): at
 \*    most one serving capture call passes its entry checks and captures
-\*    graphs in the worker; a second attempt is refused at its entry.
+\*    graphs in the worker; every later serving call, after a successful or
+\*    a failed serving capture, is refused at its entry.
+\*  AttemptedOnlyAfterEntryChecks (TXG-LIFE-007, TXG-LIFE-008,
+\*    REG-MEM-024): the worker records a serving capture as attempted
+\*    exactly when a serving call has passed every entry check; a refused
+\*    call is not an attempt.
+\*  EntryChecksExclusive (TXG-LIFE-006, TXG-LIFE-007, TXG-LIFE-008,
+\*    REG-MEM-024, TXG-MEM-009): between hook calls at most one of the
+\*    defects the entry checks detect holds (ENTRY CHECKS above).
 \*  UnprofiledServingCapture (TXG-MODEL-010, TXG-MEM-007 to TXG-MEM-009):
 \*    a serving capture with no completed profiling capture before it either
 \*    succeeded with the uncharged WARNING because none was required, or
@@ -97,12 +136,17 @@
 \* cooperative-teardown assumption (TXG-MODEL-004). A healthy serving worker
 \* is never forced to shut down; no property is claimed for a killed worker
 \* or a failed construction.
-\*  StartupSettles (TXG-MODEL-004): every startup that is not torn down,
-\*    killed or failed in construction reaches serving or fails with a
-\*    reported error; no startup stalls.
+\*  StartupSettles (TXG-MODEL-004): every startup whose construction
+\*    succeeded and that is neither shut down cooperatively nor killed
+\*    before it serves eventually serves or fails with a reported error; no
+\*    startup stalls.
 \*  FailedWorkerShutsDown (TXG-MODEL-004, TXG-LIFE-010): every latched or
 \*    failed worker reaches shutdown, unless it is killed.
 \*  LatchIsStable (TXG-FAIL-003): the failed latch is never cleared.
+\*  RecaptureRefusalChangesNothing (TXG-LIFE-008, TXG-MODEL-009,
+\*    REG-MEM-024; an action property): refusing a later serving call is
+\*    worker-fatal and leaves the failed latch and every captured object
+\*    unchanged, and after the refusal only shutdown changes them.
 ---------------------------- MODULE CaptureLifecycle ----------------------------
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -124,7 +168,8 @@ NoKey == <<"none", 0>>
 CaptureKey(i) == IF i <= N THEN <<"chunk", N + 1 - i>> ELSE <<"echo", 2 * N + 1 - i>>
 
 \* "prof": capture_cudagraphs(profile_only=True); "serv": the serving capture;
-\* "serv2": a second serving capture attempt over the live pools.
+\* "serv2": a later serving capture call, after the serving capture succeeded
+\* (over the live pools) or failed or was refused (a retry).
 CallKinds == {"prof", "serv", "serv2"}
 ServingCalls == {"serv", "serv2"}
 
@@ -177,7 +222,8 @@ Shutdownable == Phases \ (Terminal \cup {"constructing", "clearing-seg", "shutti
 
 Errors == {
     "none", "profiling-pool", "core-capture", "profiling-after-serving",
-    "profiling-cells-exist", "recapture-over-live-pools", "segment-graphs-exist",
+    "profiling-cells-exist", "recapture-over-live-pools",
+    "profiling-segment-graphs-exist",
     "profiling-capture-required", "segment-capture", "buffer-allocation",
     "scatter-warmup", "cell-capture", "margin", "serving-overrun",
     "verification", "layout-changed", "execute-before-verification",
@@ -194,7 +240,7 @@ VARIABLES
     estimateOn,     \* VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS not 0
     profAttempted,  \* capture_cudagraphs(profile_only=True) was called
     profRan,        \* a profiling capture completed in the worker
-    servAttempted,  \* a serving capture was called (TXG-LIFE-007)
+    servAttempted,  \* a serving call passed its entry checks (TXG-LIFE-007)
     servCapturing,  \* serving calls that passed their entry checks
     servOk,         \* the serving capture returned successfully
     requiredAtServ, \* TXG-MEM-007 decision: "undecided", "yes", "no"
@@ -212,13 +258,14 @@ VARIABLES
     outcome,        \* startup outcome: "pending", "served", "failed"
     error,          \* the first reported error
     steps,          \* scheduled steps run while serving
-    dummySeen       \* a dummy or cleanup-only step ran
+    dummySeen,      \* a dummy or cleanup-only step ran
+    bypassUnverified \* an all-failed bypass ran before verification passed
 
 vars == <<phase, call, captured, replays, bindings, budgetFixed, extensible,
           estimateOn, profAttempted, profRan, servAttempted, servCapturing, servOk,
           requiredAtServ, profTotal, servTotal, servMeasured, uncharged,
           failedCalls, refusedCalls, cleared, pendingFailure, verified, latched,
-          devicePending, outcome, error, steps, dummySeen>>
+          devicePending, outcome, error, steps, dummySeen, bypassUnverified>>
 
 cfgVars == <<budgetFixed, extensible, estimateOn>>
 memVars == <<profAttempted, profRan, servAttempted, servCapturing, servOk,
@@ -244,6 +291,7 @@ TypeOK ==
     /\ error \in Errors
     /\ steps \in 0..MaxSteps
     /\ dummySeen \in BOOLEAN
+    /\ bypassUnverified \in BOOLEAN
 
 Init ==
     /\ phase = "constructing"
@@ -260,6 +308,7 @@ Init ==
     /\ failedCalls = {} /\ refusedCalls = {} /\ cleared = FALSE /\ pendingFailure = FALSE
     /\ verified = FALSE /\ latched = FALSE /\ devicePending = FALSE
     /\ outcome = "pending" /\ error = "none" /\ steps = 0 /\ dummySeen = FALSE
+    /\ bypassUnverified = FALSE
 
 \* The required-capture predicate of REG-MEM-027 on the effective values.
 Required == ~budgetFixed /\ estimateOn /\ ~extensible
@@ -277,14 +326,16 @@ Construct ==
     /\ phase = "constructing"
     /\ phase' = "constructed"
     /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, devicePending, outcome, error, steps, dummySeen>>
+                   verified, latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* No model state exists, so core calls no hook; no property is claimed.
 ConstructionFails ==
     /\ phase = "constructing"
     /\ phase' = "construction-failed"
     /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, devicePending, outcome, error, steps, dummySeen>>
+                   verified, latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* REG-MEM-019: configuration only, true with the option on, the same on
 \* every call; nothing is allocated or captured.
@@ -292,7 +343,8 @@ NeedsCudagraphCapture ==
     /\ phase = "constructed"
     /\ phase' = "asked"
     /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, devicePending, outcome, error, steps, dummySeen>>
+                   verified, latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* A persisted startup plan may fix the budget first (a budget fixed after
 \* construction); then prepare_execution_memory, where the transaction-graph
@@ -303,7 +355,8 @@ PrepareExecutionMemory ==
     /\ phase' = "prepared"
     /\ UNCHANGED <<call, captured, replays, bindings, extensible, estimateOn,
                    memVars, histVars, verified, latched, devicePending, outcome,
-                   error, steps, dummySeen>>
+                   error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* The profiling forward pass is a dummy step (prepare_step with
 \* is_profile=True): no execute, no cell captured or replayed (TXG-LIFE-002).
@@ -312,14 +365,16 @@ ProfilingForwardPass ==
     /\ phase' = "forwarded"
     /\ dummySeen' = TRUE
     /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, devicePending, outcome, error, steps>>
+                   verified, latched, devicePending, outcome, error, steps,
+                   bypassUnverified>>
 
 \* Core's estimate does not run: no profiling capture, no clear_cudagraphs.
 EstimateSkipped ==
     /\ phase = "forwarded"
     /\ phase' = "estimated"
     /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, devicePending, outcome, error, steps, dummySeen>>
+                   verified, latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* Core's temporary profiling pool does not fit: neither capture hook runs.
 ProfilingPoolFails ==
@@ -328,7 +383,8 @@ ProfilingPoolFails ==
     /\ error' = FirstError("profiling-pool")
     /\ outcome' = StartupFails
     /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, devicePending, steps, dummySeen>>
+                   verified, latched, devicePending, steps, dummySeen,
+                   bypassUnverified>>
 
 \* initialize_state_slots with the profiling bindings (TXG-LIFE-003).
 InitializeStateSlotsProfiling ==
@@ -336,7 +392,8 @@ InitializeStateSlotsProfiling ==
     /\ bindings' = "prof"
     /\ phase' = "prof-bound"
     /\ UNCHANGED <<call, captured, replays, cfgVars, memVars, histVars,
-                   verified, latched, devicePending, outcome, error, steps, dummySeen>>
+                   verified, latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* Core fails before it reaches the model state's capture: core still calls
 \* clear_cudagraphs, which must tolerate nothing captured (a skipped capture).
@@ -348,7 +405,8 @@ ProfilingCaptureNotReached ==
     /\ outcome' = StartupFails
     /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars,
                    failedCalls, refusedCalls, cleared, verified, latched,
-                   devicePending, steps, dummySeen>>
+                   devicePending, steps, dummySeen,
+                   bypassUnverified>>
 
 \* The engine disables the extensible KV cache after construction.
 DisableExtensibleCache ==
@@ -356,14 +414,19 @@ DisableExtensibleCache ==
     /\ extensible' = FALSE
     /\ UNCHANGED <<phase, call, captured, replays, bindings, budgetFixed, estimateOn,
                    memVars, histVars, verified, latched, devicePending, outcome,
-                   error, steps, dummySeen>>
+                   error, steps, dummySeen,
+                   bypassUnverified>>
 
 -------------------------------------------------------------------------------
 (* capture_cudagraphs: entry checks                                        *)
 
 \* TXG-LIFE-007 and REG-MEM-024: a profiling capture after a serving capture
-\* was attempted, whether or not it succeeded, raises at its entry.
-ProfEntryRefusal == IF servAttempted THEN "profiling-after-serving" ELSE "none"
+\* was attempted, whether or not it succeeded, raises at its entry, as does
+\* one while profiling segment graphs exist (REG-MEM-024).
+ProfEntryRefusal ==
+    IF servAttempted THEN "profiling-after-serving"
+    ELSE IF Seg("prof") \in captured THEN "profiling-segment-graphs-exist"
+    ELSE "none"
 
 CaptureCudagraphsProfiling ==
     /\ phase = "prof-bound" /\ call.kind = "none" /\ bindings = "prof"
@@ -380,27 +443,31 @@ CaptureCudagraphsProfiling ==
     /\ UNCHANGED <<captured, replays, bindings, cfgVars, profRan, servAttempted,
                    servCapturing, servOk, requiredAtServ, profTotal, servTotal,
                    servMeasured, uncharged, failedCalls, cleared, verified, latched,
-                   devicePending, steps, dummySeen>>
+                   devicePending, steps, dummySeen,
+                   bypassUnverified>>
 
 \* The serving capture's entry checks, in order (TXG-LIFE-006): profiling
-\* cells exist (TXG-LIFE-007); serving cells exist (TXG-LIFE-008); segment
-\* graphs exist (REG-MEM-024); then the required-capture decision
-\* (TXG-MEM-007) and the unexpected absence of a profiling capture
-\* (TXG-MEM-009). Each refusal captures nothing.
+\* cells exist (TXG-LIFE-007); a serving capture was attempted, whether or
+\* not it succeeded (TXG-LIFE-008); profiling segment graphs exist
+\* (REG-MEM-024); then the required-capture decision (TXG-MEM-007) and the
+\* unexpected absence of a profiling capture (TXG-MEM-009). Each refusal
+\* raises at the call's entry and captures nothing.
 ServEntryRefusal ==
     IF \E k \in CellKeys : Cell("prof", k) \in captured THEN "profiling-cells-exist"
-    ELSE IF \E o \in captured : o[2] = "cell" THEN "recapture-over-live-pools"
-    ELSE IF \E o \in captured : o[2] = "seg" THEN "segment-graphs-exist"
+    ELSE IF servAttempted THEN "recapture-over-live-pools"
+    ELSE IF Seg("prof") \in captured THEN "profiling-segment-graphs-exist"
     ELSE IF Required /\ ~profRan THEN "profiling-capture-required"
     ELSE "none"
 OrderingRefusal ==
     ServEntryRefusal \in {"profiling-cells-exist", "recapture-over-live-pools",
-                          "segment-graphs-exist"}
+                          "profiling-segment-graphs-exist"}
 
+\* A serving call. It counts as attempted (TXG-LIFE-007) only once it has
+\* passed every entry check. A refusal is worker-fatal and leaves the latch
+\* and every captured object unchanged (TXG-LIFE-008).
 ServingEntry(c) ==
     /\ call.kind = "none" /\ bindings = "serv"
-    /\ IF c = "serv" THEN phase = "serv-bound" ELSE phase = "serving"
-    /\ servAttempted' = TRUE
+    /\ servAttempted' = (servAttempted \/ ServEntryRefusal = "none")
     /\ requiredAtServ' =
            IF OrderingRefusal THEN requiredAtServ
            ELSE IF Required THEN "yes" ELSE "no"
@@ -416,15 +483,32 @@ ServingEntry(c) ==
     /\ UNCHANGED <<captured, replays, bindings, cfgVars, profAttempted, profRan,
                    servOk, profTotal, servTotal, servMeasured, uncharged,
                    failedCalls, cleared, pendingFailure, verified, latched,
-                   devicePending, steps, dummySeen>>
+                   devicePending, steps, dummySeen,
+                   bypassUnverified>>
 
 \* capture_cudagraphs(profile_only=False) at startup.
-CaptureCudagraphsServing == ServingEntry("serv")
+CaptureCudagraphsServing == phase = "serv-bound" /\ ServingEntry("serv")
 
-\* A second serving capture (an elastic expert-parallel reconfiguration
-\* rerunning the warmup): refused at its entry (TXG-LIFE-008); the recovery
-\* is an engine restart, so the worker fails.
-SecondServingCapture == ServingEntry("serv2")
+\* One later serving call is modelled; it is refused at its entry.
+LaterServingCall ==
+    /\ "serv2" \notin failedCalls \cup refusedCalls
+    /\ ServingEntry("serv2")
+
+\* A second serving capture after the serving capture succeeded (an elastic
+\* expert-parallel reconfiguration rerunning the warmup, before or after
+\* post_warmup, or on a worker that failed later): refused at its entry
+\* (TXG-LIFE-008); the recovery is an engine restart, so the worker fails.
+SecondServingCapture ==
+    /\ servOk /\ phase \in {"captured", "serving", "failed"}
+    /\ LaterServingCall
+
+\* A retry after the serving capture failed or was refused, which core never
+\* makes (a failed serving capture fails startup): a retry after an attempted
+\* call is refused by TXG-LIFE-008, and one after a refused call by the check
+\* that refused it, so TXG-MODEL-009 holds by refusal.
+ServingCaptureRetry ==
+    /\ ~servOk /\ "serv" \in failedCalls \cup refusedCalls /\ phase = "failed"
+    /\ LaterServingCall
 
 -------------------------------------------------------------------------------
 (* capture_cudagraphs: the call body (both captures)                       *)
@@ -448,7 +532,8 @@ SegmentGraphsCaptured ==
     /\ devicePending' = TRUE
     /\ GoTo("buf")
     /\ UNCHANGED <<phase, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, outcome, error, steps, dummySeen>>
+                   verified, latched, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* A segment-graph capture fails after creating some of them (REG-MEM-017).
 SegmentGraphCaptureFails ==
@@ -457,7 +542,8 @@ SegmentGraphCaptureFails ==
     /\ devicePending' = TRUE
     /\ FailTo("segment-capture")
     /\ UNCHANGED <<phase, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, outcome, steps, dummySeen>>
+                   verified, latched, outcome, steps, dummySeen,
+                   bypassUnverified>>
 
 BindingBuffersAllocated ==
     /\ InCall("buf")
@@ -465,7 +551,8 @@ BindingBuffersAllocated ==
     /\ devicePending' = TRUE
     /\ GoTo("scatter")
     /\ UNCHANGED <<phase, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, outcome, error, steps, dummySeen>>
+                   verified, latched, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 BindingBufferAllocationFails ==
     /\ InCall("buf")
@@ -473,7 +560,8 @@ BindingBufferAllocationFails ==
     /\ devicePending' = TRUE
     /\ FailTo("buffer-allocation")
     /\ UNCHANGED <<phase, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, outcome, steps, dummySeen>>
+                   verified, latched, outcome, steps, dummySeen,
+                   bypassUnverified>>
 
 \* TXG-CAP-006: one rejected scatter row per resident pool.
 ScatterWarmup ==
@@ -481,14 +569,16 @@ ScatterWarmup ==
     /\ devicePending' = TRUE
     /\ call' = [call EXCEPT !.pc = "cell", !.i = 1]
     /\ UNCHANGED <<phase, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, outcome, error, steps, dummySeen>>
+                   verified, latched, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 ScatterWarmupFails ==
     /\ InCall("scatter")
     /\ devicePending' = TRUE
     /\ FailTo("scatter-warmup")
     /\ UNCHANGED <<phase, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, outcome, steps, dummySeen>>
+                   verified, latched, outcome, steps, dummySeen,
+                   bypassUnverified>>
 
 \* One cell (TXG-CAP-004): eager reference, three warm-ups, the capture and
 \* one validation replay on rejected capture rows; published only if that
@@ -502,7 +592,8 @@ CellCaptured ==
                THEN [call EXCEPT !.i = @ + 1]
                ELSE [call EXCEPT !.pc = IF C = "prof" THEN "margin" ELSE "compare", !.i = 0]
     /\ UNCHANGED <<phase, bindings, cfgVars, memVars, histVars, verified, latched,
-                   outcome, error, steps, dummySeen>>
+                   outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* Any phase of one cell fails; at worst its graph exists and its validation
 \* replay ran and mismatched.
@@ -513,7 +604,8 @@ CellCaptureFails ==
     /\ devicePending' = TRUE
     /\ FailTo("cell-capture")
     /\ UNCHANGED <<phase, bindings, cfgVars, memVars, histVars, verified, latched,
-                   outcome, steps, dummySeen>>
+                   outcome, steps, dummySeen,
+                   bypassUnverified>>
 
 \* TXG-MEM-004: the profiling capture ends with the charged margin; its
 \* call total (margin charge r included) is kept as a host integer.
@@ -526,14 +618,16 @@ MarginAllocated ==
     /\ UNCHANGED <<phase, replays, bindings, cfgVars, profAttempted, profRan,
                    servAttempted, servCapturing, servOk, requiredAtServ, servTotal,
                    servMeasured, uncharged, histVars, verified, latched, outcome,
-                   error, steps, dummySeen>>
+                   error, steps, dummySeen,
+                   bypassUnverified>>
 
 MarginAllocationFails ==
     /\ InCall("margin")
     /\ devicePending' = TRUE
     /\ FailTo("margin")
     /\ UNCHANGED <<phase, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, outcome, steps, dummySeen>>
+                   verified, latched, outcome, steps, dummySeen,
+                   bypassUnverified>>
 
 \* TXG-MEM-005: when a profiling capture ran, the serving call total may not
 \* exceed the profiling call total; an overrun is a failure of the call
@@ -553,7 +647,8 @@ MemoryComparison ==
     /\ UNCHANGED <<phase, captured, replays, bindings, cfgVars, profAttempted,
                    profRan, servAttempted, servCapturing, servOk, requiredAtServ,
                    profTotal, histVars, verified, latched, devicePending, outcome,
-                   steps, dummySeen>>
+                   steps, dummySeen,
+                   bypassUnverified>>
 
 \* TXG-CAP-010: synchronize the capture stream, then return. The serving
 \* capture records the plain-value pool layout for post_warmup.
@@ -569,7 +664,8 @@ CaptureCallReturns ==
     /\ UNCHANGED <<captured, replays, bindings, cfgVars, profAttempted,
                    servAttempted, servCapturing, requiredAtServ, profTotal,
                    servTotal, servMeasured, uncharged, histVars, verified, latched,
-                   outcome, error, steps, dummySeen>>
+                   outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* TXG-LIFE-012, TXG-LIFE-014: discard the transaction-graph part this call
 \* created (cells, buffers, margin) first ...
@@ -578,7 +674,8 @@ FailureCleanupTxg ==
     /\ captured' = captured \ TxgOf(captured, C)
     /\ GoTo("cleanup-seg")
     /\ UNCHANGED <<phase, replays, bindings, cfgVars, memVars, histVars, verified,
-                   latched, devicePending, outcome, error, steps, dummySeen>>
+                   latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* ... then its segment graphs (REG-MEM-017) ...
 FailureCleanupSegment ==
@@ -586,7 +683,8 @@ FailureCleanupSegment ==
     /\ captured' = captured \ {Seg(C)}
     /\ GoTo("cleanup-sync")
     /\ UNCHANGED <<phase, replays, bindings, cfgVars, memVars, histVars, verified,
-                   latched, devicePending, outcome, error, steps, dummySeen>>
+                   latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* ... then synchronize and propagate the original error. A failed profiling
 \* capture still gets core's clear_cudagraphs before startup fails.
@@ -600,7 +698,8 @@ FailureCleanupRaises ==
        ELSE /\ phase' = "failed" /\ UNCHANGED pendingFailure
     /\ outcome' = StartupFails
     /\ UNCHANGED <<captured, replays, bindings, cfgVars, memVars, refusedCalls,
-                   cleared, verified, latched, error, steps, dummySeen>>
+                   cleared, verified, latched, error, steps, dummySeen,
+                   bypassUnverified>>
 
 CallProgress ==
     \/ SegmentGraphsCaptured \/ SegmentGraphCaptureFails
@@ -621,7 +720,8 @@ ClearCudagraphsTxg ==
     /\ captured' = captured \ TxgOf(captured, "prof")
     /\ phase' = "clearing-seg"
     /\ UNCHANGED <<call, replays, bindings, cfgVars, memVars, histVars, verified,
-                   latched, devicePending, outcome, error, steps, dummySeen>>
+                   latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* REG-MEM-021: then the profiling segment graphs. A pending estimate failure
 \* propagates now and startup fails.
@@ -632,7 +732,8 @@ ClearCudagraphsSegment ==
     /\ phase' = IF pendingFailure THEN "failed" ELSE "estimated"
     /\ UNCHANGED <<call, replays, bindings, cfgVars, memVars, failedCalls,
                    refusedCalls, pendingFailure, verified, latched, devicePending,
-                   outcome, error, steps, dummySeen>>
+                   outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* initialize_state_slots with the serving bindings (TXG-LIFE-003).
 InitializeStateSlotsServing ==
@@ -640,7 +741,8 @@ InitializeStateSlotsServing ==
     /\ bindings' = "serv"
     /\ phase' = "serv-bound"
     /\ UNCHANGED <<call, captured, replays, cfgVars, memVars, histVars, verified,
-                   latched, devicePending, outcome, error, steps, dummySeen>>
+                   latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* TXG-VER-001: segment-graph check, then layout, projected roles, all 2N
 \* cells holding their graphs, external buffers and process constants; no
@@ -652,7 +754,8 @@ PostWarmupPasses ==
     /\ phase' = "serving"
     /\ outcome' = IF outcome = "pending" THEN "served" ELSE outcome
     /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
-                   latched, devicePending, error, steps, dummySeen>>
+                   latched, devicePending, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* TXG-VER-002: a mismatch latches the binding and raises; startup fails.
 PostWarmupMismatch ==
@@ -662,7 +765,8 @@ PostWarmupMismatch ==
     /\ error' = FirstError("verification")
     /\ outcome' = StartupFails
     /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, devicePending, steps, dummySeen>>
+                   verified, devicePending, steps, dummySeen,
+                   bypassUnverified>>
 
 \* TXG-LIFE-009: a repeated initialize_state_slots after the serving
 \* capture; an equal layout changes nothing ...
@@ -678,7 +782,8 @@ ReinitializeStateSlotsChanged ==
     /\ error' = FirstError("layout-changed")
     /\ outcome' = StartupFails
     /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, devicePending, steps, dummySeen>>
+                   verified, devicePending, steps, dummySeen,
+                   bypassUnverified>>
 
 -------------------------------------------------------------------------------
 (* Steps (coarse; SplitStep.tla refines execute)                           *)
@@ -708,31 +813,56 @@ ScheduledStep ==
                  ELSE UNCHANGED <<latched, phase, error>>
          ELSE UNCHANGED <<replays, latched, phase, error>>
     /\ UNCHANGED <<call, captured, bindings, cfgVars, memVars, histVars, verified,
-                   devicePending, outcome, dummySeen>>
+                   devicePending, outcome, dummySeen,
+                   bypassUnverified>>
 
 \* TXG-EXEC-015: execute before post-warmup verification raises, replays
-\* nothing, runs no option-off transaction and does not latch.
+\* nothing, runs no option-off transaction and does not latch. Whether the
+\* engine survives the propagated error is the environment's choice: it dies
+\* (startup fails) or survives (nothing changed, so that branch is a
+\* stuttering step).
 PrematureScheduledStep ==
     /\ phase \in {"serv-bound", "captured"} /\ call.kind = "none" /\ ~verified
-    /\ phase' = "failed"
-    /\ error' = FirstError("execute-before-verification")
-    /\ outcome' = StartupFails
+    /\ \E dies \in BOOLEAN :
+         IF dies
+         THEN /\ phase' = "failed"
+              /\ error' = FirstError("execute-before-verification")
+              /\ outcome' = StartupFails
+         ELSE UNCHANGED <<phase, error, outcome>>
     /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, devicePending, steps, dummySeen>>
+                   verified, latched, devicePending, steps, dummySeen,
+                   bypassUnverified>>
+
+\* TXG-FAIL-009, TXG-FAIL-010: a real step whose every row failed at
+\* planning, after the serving capture. The step entry checks the latch
+\* first; a latched worker raises TXG-FAIL-003's error (here a latch has
+\* already failed the worker, so SplitStep.tla checks that branch).
+\* Otherwise the step takes the bypass whether or not post-warmup
+\* verification passed: no transaction, no replay, no reservation.
+AllFailedStep ==
+    /\ phase \in {"captured", "serving"} /\ call.kind = "none"
+    /\ IF latched
+       THEN UNCHANGED vars
+       ELSE /\ bypassUnverified' = (bypassUnverified \/ ~verified)
+            /\ UNCHANGED <<phase, call, captured, replays, bindings, cfgVars,
+                           memVars, histVars, verified, latched, devicePending,
+                           outcome, error, steps, dummySeen>>
 
 \* TXG-EXEC-012: a dummy step (warmup or idle) never calls execute.
 DummyStep ==
     /\ phase \in {"serv-bound", "captured", "serving"} /\ call.kind = "none"
     /\ dummySeen' = TRUE
     /\ UNCHANGED <<phase, call, captured, replays, bindings, cfgVars, memVars,
-                   histVars, verified, latched, devicePending, outcome, error, steps>>
+                   histVars, verified, latched, devicePending, outcome, error, steps,
+                   bypassUnverified>>
 
 \* REG-MEM-014: a cleanup-only step schedules no row and runs no transaction.
 CleanupOnlyStep ==
     /\ phase = "serving" /\ call.kind = "none"
     /\ dummySeen' = TRUE
     /\ UNCHANGED <<phase, call, captured, replays, bindings, cfgVars, memVars,
-                   histVars, verified, latched, devicePending, outcome, error, steps>>
+                   histVars, verified, latched, devicePending, outcome, error, steps,
+                   bypassUnverified>>
 
 -------------------------------------------------------------------------------
 (* shutdown and kill                                                       *)
@@ -744,7 +874,8 @@ ShutdownTxg ==
     /\ captured' = {o \in captured : o[2] \notin TxgParts}
     /\ phase' = "shutting-down"
     /\ UNCHANGED <<call, replays, bindings, cfgVars, memVars, histVars, verified,
-                   latched, devicePending, outcome, error, steps, dummySeen>>
+                   latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* ... then every segment graph (REG-MEM-026).
 ShutdownSegment ==
@@ -752,7 +883,8 @@ ShutdownSegment ==
     /\ captured' = {}
     /\ phase' = "shutdown"
     /\ UNCHANGED <<call, replays, bindings, cfgVars, memVars, histVars, verified,
-                   latched, devicePending, outcome, error, steps, dummySeen>>
+                   latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 \* A killed worker runs no further hook, not even shutdown; no property is
 \* claimed for it.
@@ -760,7 +892,8 @@ Kill ==
     /\ phase \notin Terminal
     /\ phase' = "killed"
     /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
-                   verified, latched, devicePending, outcome, error, steps, dummySeen>>
+                   verified, latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
 
 Done == phase \in Terminal /\ UNCHANGED vars
 
@@ -781,9 +914,10 @@ FailedTeardown == (phase = "failed" \/ latched) /\ ShutdownTxg
 Next ==
     \/ StartupProgress
     \/ DisableExtensibleCache
-    \/ SecondServingCapture
+    \/ SecondServingCapture \/ ServingCaptureRetry
     \/ ReinitializeStateSlotsSame \/ ReinitializeStateSlotsChanged
-    \/ ScheduledStep \/ PrematureScheduledStep \/ DummyStep \/ CleanupOnlyStep
+    \/ ScheduledStep \/ PrematureScheduledStep \/ AllFailedStep
+    \/ DummyStep \/ CleanupOnlyStep
     \/ ShutdownTxg \/ Kill \/ Done
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(StartupProgress) /\ WF_vars(FailedTeardown)
@@ -802,6 +936,18 @@ NoStepReplayOverProfilingPools ==
 NothingProfilingAfterClear == cleared => OfCall(captured, "prof") = {}
 
 AtMostOneServingCapture == servCapturing <= 1
+
+AttemptedOnlyAfterEntryChecks == servAttempted = (servCapturing >= 1)
+
+\* The defects the entry checks detect (ENTRY CHECKS in the header).
+ProfilingStateLeft == \E o \in captured : o[1] = "prof"
+RequiredCaptureMissing == Required /\ ~profRan
+EntryChecksExclusive ==
+    call.kind = "none" =>
+        Cardinality({d \in {"prof-left", "attempted", "required"} :
+                       \/ d = "prof-left" /\ ProfilingStateLeft
+                       \/ d = "attempted" /\ servAttempted
+                       \/ d = "required" /\ RequiredCaptureMissing}) <= 1
 
 UnprofiledServingCapture ==
     /\ (servOk /\ ~profRan) => (requiredAtServ = "no" /\ uncharged)
@@ -841,11 +987,18 @@ VerifiedBeforeServing == phase = "serving" => verified
 (* Temporal properties                                                     *)
 
 StartupSettles ==
-    <>(outcome \in {"served", "failed"}
+    <>(outcome = "served"
+       \/ (outcome = "failed" /\ error /= "none")
        \/ phase \in {"shutting-down", "shutdown", "killed", "construction-failed"})
 
 FailedWorkerShutsDown == (phase = "failed" \/ latched) ~> (phase \in {"shutdown", "killed"})
 
 LatchIsStable == [][latched => latched']_vars
+
+RecaptureRefusalChangesNothing ==
+    [][/\ ("serv2" \notin refusedCalls /\ "serv2" \in refusedCalls')
+            => (phase' = "failed" /\ latched' = latched /\ captured' = captured)
+       /\ ("serv2" \in refusedCalls /\ phase' \notin {"shutting-down", "shutdown"})
+            => (latched' = latched /\ captured' = captured)]_vars
 
 ===============================================================================
