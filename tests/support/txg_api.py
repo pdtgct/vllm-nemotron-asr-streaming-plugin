@@ -72,10 +72,11 @@ Transaction module (``nemotron_asr.advance``)
 * ``RowPlan.planned_rejection``: a per-row ``bool`` vector, empty when no row
   failed at planning (TXG-COV-010, TXG-MASK-006). It has the default of
   ``is_file``.
-* ``RowPlan.is_fresh``: the per-row ``bool`` freshness mask the body selects
-  on, ``where(is_fresh, initial, gathered)`` (the designs' name; TXG-MASK-001,
-  TXG-EXEC-005). It equals ``~has_initial_states_p`` for the plan's prefill
-  rows, which is today's plan authority for freshness.
+* ``RowPlan.is_fresh``: the per-row ``bool`` freshness mask (the designs'
+  name; TXG-MASK-001, TXG-EXEC-005). A fresh row gathers its zero-initial
+  state from the null page and its book row through
+  ``where(is_fresh, initial, gathered)``. It equals ``~has_initial_states_p``
+  for the plan's prefill rows, which is today's plan authority for freshness.
 * The phase functions of ``advance_model_rows`` (TXG-TXN-006, TXG-TXN-007):
   :data:`PHASES`, each a module-level function of ``advance`` looked up by
   name at call time (so a spy installed on the module sees the call).

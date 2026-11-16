@@ -5,8 +5,10 @@
 The transaction validates every descriptor before its first resident write.
 This module then performs one fixed-shape operation per state tensor: clean
 rows write their unique live page and failed rows issue no store at all.  In
-particular, failed rows are never redirected to vLLM's null block; block zero
-is only a metadata sentinel unless a consuming kernel explicitly masks it.
+particular, failed rows are never redirected to vLLM's null block: block zero
+is never a live session page and nothing stores to it, so it keeps the zeros
+of core's pool allocation and fresh rows gather their zero-initial state from
+it (TXG-MASK-001, TXG-MASK-007).
 """
 
 from __future__ import annotations

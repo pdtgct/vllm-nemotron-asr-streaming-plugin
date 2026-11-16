@@ -360,7 +360,12 @@ class RowPlan:
     ``has_initial_states_p``: ``(num_prefills,)`` bool; ``~mask`` is the
     fresh-row mask (first-chunk prefills initialize from metadata).
     ``null_block_id``: the reserved block that is never a live session
-    page.
+    page. In core's resident pools its page holds the zeros of the pool
+    allocation and nothing stores to it, so fresh rows gather their
+    zero-initial state from it (TXG-MASK-001, TXG-MASK-007). Profiling
+    scratch is not a core pool: its slot 0 holds the descriptor
+    initializers, which are zero for every zero-initial component (the
+    book row, which is not, keeps its own-page gather and select).
     ``num_pool_blocks``: the resident block-pool size (in-range bound).
     ``live_block_ids``: ``(L,)`` long, the scheduler's liveness
     authority — the block ids currently allocated to resident sessions
@@ -424,8 +429,9 @@ class RowPlan:
     it decides the path on the device. Transaction graphs read it to decline
     a step that holds a candidate.
 
-    :attr:`is_fresh` is the per-row freshness mask the body selects on
-    (TXG-MASK-001), derived from ``has_initial_states_p``.
+    :attr:`is_fresh` is the per-row freshness mask the body's gather index
+    and book select read (TXG-MASK-001), derived from
+    ``has_initial_states_p``.
 
     All plan tensors are HOST-side (CPU) scheduler/registry authority:
     structural preflight validates them without any device
@@ -2127,22 +2133,22 @@ def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Ten
     return idx
 
 
-def _gather_fresh_selected(
-    pool: torch.Tensor,
+# @spec TXG-MASK-001, TXG-MASK-007
+def _initial_state_index(
     blocks: torch.Tensor,
     is_fresh: torch.Tensor,
+    null_block_id: int,
 ) -> torch.Tensor:
-    """Gather every row's page by block index, then select per row
-    ``where(is_fresh, 0, gathered)`` (TXG-MASK-001): a fresh row starts as
-    exact zero state whatever its recycled page holds.
+    """The page each row reads its zero-initial state tensors from: the null
+    page for a fresh row, the row's own block otherwise (TXG-MASK-001).
 
-    The select is the gather's first consumer, so no fresh row's output ever
-    depends on its page; it is an in-place masked fill of the contiguous
-    gather, the same operations whatever the fresh count (TXG-TXN-004).
+    The null page holds zero bytes and nothing stores to it (TXG-MASK-007), so
+    a gather by this index gives a fresh row exact zero state whatever its
+    recycled page holds. One select on the index replaces a select on every
+    gathered tensor, and it is the same operation whatever the fresh count
+    (TXG-TXN-004). Scatters keep naming each row's own block.
     """
-    gathered = pool.index_select(0, blocks)
-    fresh = is_fresh.reshape(-1, *([1] * (gathered.dim() - 1)))
-    return gathered.masked_fill_(fresh, 0)
+    return torch.where(is_fresh, null_block_id, blocks)
 
 
 def _counter_invariant_rows(
@@ -3276,7 +3282,8 @@ def prepare_model_rows(
 
 # @spec TXG-TXN-002, TXG-TXN-003, TXG-TXN-004, TXG-TXN-005, TXG-TXN-010,
 # @spec TXG-MASK-001, TXG-MASK-002, TXG-MASK-003, TXG-MASK-004, TXG-MASK-006,
-# @spec TXG-QC-001, FILE-ROW-009, FILE-ROW-011, FILE-ROW-012, FILE-ROW-014
+# @spec TXG-MASK-007, TXG-QC-001, FILE-ROW-009, FILE-ROW-011, FILE-ROW-012,
+# @spec FILE-ROW-014
 def model_rows_body(
     core: NemotronASRCore,
     input_ids: torch.Tensor,
@@ -3308,9 +3315,10 @@ def model_rows_body(
 ) -> BodyResult:
     """Phase 2 of :func:`advance_model_rows` (device only).
 
-    Gathers every row's state by its block index and selects
-    ``where(is_fresh, initial, gathered)`` before any other use; composes the
-    planned-rejection, role, echo, protocol, file-row and invariant statuses
+    Gathers every row's state, a fresh row's zero-initial tensors from the
+    null page and its book row through ``where(is_fresh, initial, gathered)``
+    (TXG-MASK-001), while every scatter names the row's own block; composes
+    the planned-rejection, role, echo, protocol, file-row and invariant statuses
     as elementwise selects on device masks; runs the prepared CHUNK buckets
     (frontend, encoder, decode, endpointing), the adapter projection and its
     validation; and returns the row status, progress, remaining queue counts
@@ -3351,26 +3359,28 @@ def model_rows_body(
     hop = int(core.featurizer.hop_length)
     blank = int(core.blank_id)
 
-    # ---- gather every row, then the fresh-row select (TXG-MASK-001) ----
+    # ---- gather every row's state, fresh rows from the initial state ----
+    # TXG-MASK-001: the zero-initial tensors by the initial-state index (the
+    # null page for a fresh row); the book by each row's own block, then the
+    # select of the initial book row. ``didx`` stays every row's scatter
+    # target.
     didx = vectors.composed_indices
     is_fresh_dev = vectors.is_fresh
+    gidx = _initial_state_index(didx, is_fresh_dev, plan.null_block_id)
     book = torch.where(
         is_fresh_dev.unsqueeze(1),
         vectors.initial_book.to(book_pool.dtype),
         book_pool.index_select(0, didx),
     )
-    queue = _gather_fresh_selected(queue_pool, didx, is_fresh_dev)
-    counters_small = _gather_fresh_selected(frontend_counter_pool, didx, is_fresh_dev)
-    endpoint_history = (
-        _gather_fresh_selected(endpoint_history_pool, didx, is_fresh_dev)
-        if endpoint_enabled
-        else None
-    )
-    endpoint_book = (
-        _gather_fresh_selected(endpoint_book_pool, didx, is_fresh_dev)
-        if endpoint_enabled
-        else None
-    )
+    queue = queue_pool.index_select(0, gidx)
+    counters_small = frontend_counter_pool.index_select(0, gidx)
+    endpoint_history: torch.Tensor | None = None
+    endpoint_book: torch.Tensor | None = None
+    if endpoint_enabled:
+        assert endpoint_history_pool is not None
+        assert endpoint_book_pool is not None
+        endpoint_history = endpoint_history_pool.index_select(0, gidx)
+        endpoint_book = endpoint_book_pool.index_select(0, gidx)
 
     # ---- device role/protocol/invariant composition ----
     is_chunk_dev = vectors.is_chunk
@@ -3527,7 +3537,7 @@ def model_rows_body(
     )
     roles = torch.where(is_chunk_dev, torch.full_like(roles, ROLE_CHUNK), roles)
 
-    # ---- deadline-ordered buckets → fresh-selected gather → transition ----
+    # ---- deadline-ordered buckets → initial-state gather → transition ----
     capture_on = capture
     executed: list[dict[str, Any]] = []
     for prepared_bucket, rows_dev in zip(
@@ -3537,7 +3547,7 @@ def model_rows_body(
         pos_t = prepared_bucket.positions
         resolved = prepared_bucket.resolved
         blocks_dev = didx.index_select(0, rows_dev)
-        fresh_bucket = is_fresh_dev.index_select(0, rows_dev)
+        gather_bucket = gidx.index_select(0, rows_dev)
         capture_geometry = encoder_geometry_shape(core, g) if capture_on else None
         cadence = (
             capture_geometry.cadence_frames
@@ -3554,27 +3564,14 @@ def model_rows_body(
         adm_prompt_b = admitted_prompt_dev.index_select(0, rows_dev)
         incoming = status.index_select(0, rows_dev)
         state = SessionStateBatch(
-            raw_tail=_gather_fresh_selected(
-                frontend_raw_pool, blocks_dev, fresh_bucket
-            ),
-            mel_tail=_gather_fresh_selected(
-                frontend_mel_pool, blocks_dev, fresh_bucket
-            ),
+            raw_tail=frontend_raw_pool.index_select(0, gather_bucket),
+            mel_tail=frontend_mel_pool.index_select(0, gather_bucket),
             frontend_counters=counters_small.index_select(0, rows_dev),
-            channel=[
-                _gather_fresh_selected(pool, blocks_dev, fresh_bucket)
-                for pool in channel_pools
-            ],
-            window_valid=[
-                _gather_fresh_selected(pool, blocks_dev, fresh_bucket)
-                for pool in len_pools
-            ],
-            time=[
-                _gather_fresh_selected(pool, blocks_dev, fresh_bucket)
-                for pool in time_pools
-            ],
-            h=_gather_fresh_selected(h_pool, blocks_dev, fresh_bucket),
-            c=_gather_fresh_selected(c_pool, blocks_dev, fresh_bucket),
+            channel=[pool.index_select(0, gather_bucket) for pool in channel_pools],
+            window_valid=[pool.index_select(0, gather_bucket) for pool in len_pools],
+            time=[pool.index_select(0, gather_bucket) for pool in time_pools],
+            h=h_pool.index_select(0, gather_bucket),
+            c=c_pool.index_select(0, gather_bucket),
             last_label=safe_last.index_select(0, rows_dev),
         )
         bucket = prepared_bucket.transition(
@@ -4278,10 +4275,10 @@ def advance_model_rows(
     2. reject unqualified graph coverage, form CHUNK buckets from CPU
        plan authority, order them by earliest deadline, and resolve
        every eager decode before the first resident read;
-    3. gather every row's session state by its block index and select
-       the plan-authority initial state for fresh rows
-       (``where(is_fresh, initial, gathered)``) before any other use,
-       so no fresh row reads its recycled page's content; evaluate
+    3. gather every row's session state, a fresh row's zero-initial
+       tensors from the null page (zero, never stored to) and its book
+       row through ``where(is_fresh, initial, gathered)``, so no fresh
+       row reads its recycled page's content; evaluate
        replay echoes and the host-role cross-check ON DEVICE into the
        transaction's ``ROW_STATUS_*`` bits (echo mismatch is row-local
        after trusted preflight, PORT-DEC-007 as amended); classify each

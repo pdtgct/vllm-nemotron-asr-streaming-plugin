@@ -148,10 +148,11 @@ The transaction has three phases with one launch boundary:
    CHUNK bucket, CHUNK bucket formation, per-step batch statistics and every host-only check. It
    produces every int64 and bool vector the body reads, from CPU plan authority. It reads no
    device memory and touches no resident page.
-2. **Body** (device only). Gathers of every row's state, the fresh-row and file-row selects, the
-   device role and protocol checks, frontend, encoder, decode, projection, row status, progress,
-   remaining queue counts and the complete scatter plan, validated before any scatter. The body
-   reads host inputs only as device tensors given to it; it stages nothing itself.
+2. **Body** (device only). Gathers of every row's state (a fresh row's zero-initial state from the
+   null page), the fresh book-row and file-row selects, the device role and protocol checks,
+   frontend, encoder, decode, projection, row status, progress, remaining queue counts and the
+   complete scatter plan, validated before any scatter. The body reads host inputs only as device
+   tensors given to it; it stages nothing itself.
 3. **Commit.** One composite reservation, the prevalidated predicated scatters, then the no-fail
    stage of status, progress and remaining queue counts. This is the option-off order; a covered
    step reserves before its cell launches, the cells run the body and the scatters, and the stage
@@ -329,8 +330,10 @@ row's slot. `R|S` is the sub-plan of the rows `S` in ascending order, over the s
    `R`.
 2. Every operation of the body's prologue (state gathers, the fresh and file selects, the role,
    echo, protocol and book-invariant checks, role assignment) is row-local: a gather by the row's
-   own block index, an elementwise operation along the row axis, or a reduction along a non-row
-   axis (the queue slots). Restricting the rows therefore commutes with the prologue.
+   own block index or, for a fresh row's zero-initial state, of the null page, which no
+   transaction stores to (Null page); an elementwise operation along the row axis; or a reduction
+   along a non-row axis (the queue slots). Restricting the rows therefore commutes with the
+   prologue.
 3. `T(R)` forms one CHUNK bucket, the rows `C` in ascending order at count `K`, and resolves its
    decoder from `(geometry, K)`, one ready bucket and the tier for `K`. `T(R|C)` forms the same
    bucket with the same resolver inputs. The frontend, encoder and decoder therefore receive
@@ -381,18 +384,31 @@ rows or a host branch on the step's composition), if the decoder tier is keyed b
 ### Fresh rows
 
 A fresh row is a slot's first step in a new generation: a stream's first chunk or a file's first
-step. Its state starts from plan authority: zero encoder, frontend and predictor state, and a book
-row holding the blank last label, the admitted prompt and the geometry. The body gathers every
-row's pages by block index and then selects, per row, `where(is_fresh, initial, gathered)`. The
-select is the first consumer of every gathered tensor, so a fresh row's outputs, status and stores
-never depend on the content of its recycled page. The gather loads that page, which core bound to
-the row's request for this step (`bind_rows`). Fresh and continuing CHUNK rows stay in one bucket,
-as in the option-off transaction, so freshness never changes the encoder's batch dimension.
+step. Its state starts from plan authority: zero encoder, frontend, predictor, replay-queue and
+endpoint state, and a book row holding the blank last label, the admitted prompt and the geometry.
 
-The select runs in the option-off body too, once per gathered state tensor on every CHUNK step,
-where the body before the phase split gathers an all-continuing step directly. The body
-non-regression check (Qualification) measures that cost against that body; Deferred 10 records the narrower
-alternative.
+The body reads the zero state from the null page. Once per step it computes each row's
+initial-state index, `where(is_fresh, null_block_id, block)`, and gathers every zero-initial state
+tensor by that index (the CHUNK bucket by its rows' entries), so a fresh row reads the null page
+and a continuing row its own page. The book row is the one state whose initial value is not zero:
+the body gathers it by the row's own page and selects `where(is_fresh, initial, gathered)` as that
+gather's first consumer. A fresh row's outputs, status and stores therefore never depend on the
+content of its recycled page, and the cost of freshness is one select on the index and one on the
+book row, not a select over every gathered state tensor. Every scatter names the row's own page,
+which core bound to the row's request for this step (`bind_rows`). Fresh and continuing CHUNK rows
+stay in one bucket, as in the option-off transaction, so freshness never changes the encoder's
+batch dimension.
+
+### Null page
+
+The null page is the page of block `null_block_id` (vLLM's `NULL_BLOCK_ID`, block 0) in every
+component pool. Core allocates the state pool zeroed and binds no request to the null page, so it
+starts as zero bytes. The model keeps it that way: structural preflight refuses the null block ID
+for a real row, the row plan's CUDA-graph padding entries never enter the body, a predicated
+scatter stores only rows with a zero status and only to their own pages, capture rows use pages
+`1 … k`, and the scatter warm-up's rows are rejected. No transaction, cell replay or capture
+therefore stores to it (TXG-MASK-007), which makes it the zero initial state fresh rows gather.
+A cell bakes the null block ID into its gather, so the ID is part of the cell's signature.
 
 ### Whole-file rows
 
@@ -435,8 +451,10 @@ stream rule, term by term:
   expected decision of the projection-invariant check;
 - decision legality: `legal | (f & (decision == continuation))` is `legal`.
 
-An all-false fresh mask reduces `where(is_fresh, initial, gathered)` to `gathered`. Each term is
-an integer or boolean elementwise operation, so each identity is exact.
+An all-false fresh mask reduces the initial-state index `where(is_fresh, null_block_id, block)` to
+`block`, so every gather reads the row's own page, and the book select
+`where(is_fresh, initial, gathered)` to `gathered`. Each term is an integer or boolean elementwise
+operation, so each identity is exact.
 
 ### Exactness obligations for masked rows
 
@@ -481,13 +499,13 @@ computes what the nested graph replays compute.
 
 ### Signature
 
-A cell's signature covers every structural input its body bakes in: kind, count, geometry,
-control token IDs, `endpoint_enabled`, the evidence-capture flag (the transaction's `capture`
-argument), the emission adapter's callable identity, the decode, encoder-transition and
-bucket-transition callable identities (chunk cells), resident pool layouts (address, shape,
-strides, dtype), lazily bound encoder buffers (chunk cells), the carrier width, and the layouts of
-the step arena, static inputs and step outputs. It also covers the two row classes the cells
-exclude (Endpoint arguments): whether any of the cell's rows carries an endpoint policy
+A cell's signature covers every structural input its body bakes in: kind, count, geometry, control
+token IDs, `endpoint_enabled`, the evidence-capture flag (the transaction's `capture` argument),
+the emission adapter's callable identity, the decode, encoder-transition and bucket-transition
+callable identities (chunk cells), resident pool layouts (address, shape, strides, dtype), the null
+page's block ID (Null page), lazily bound encoder buffers (chunk cells), the carrier width, and the
+layouts of the step arena, static inputs and step outputs. It also covers the two row classes the
+cells exclude (Endpoint arguments): whether any of the cell's rows carries an endpoint policy
 (`endpoint_policy`) and whether any is a forced-EOU candidate (`forced_eou`), both false at
 capture. The host computes it before the upload.
 
@@ -517,7 +535,9 @@ if the replay's outputs equal the reference's bit for bit and, in every componen
 page and the cell's capture-row pages equal bit for bit the call's snapshot of them: a host copy
 of pages `0 … N` taken once, at the start of the call's transaction-graph part (before the scatter
 warm-up). Because the comparison is with that snapshot, a store by the scatter warm-up, the
-reference or a warm-up fails the check as well as a store by the replay. A cell at count `k` has
+reference or a warm-up fails the check as well as a store by the replay. The pages are compared
+before the outputs: fresh capture rows gather the null page, so a store to it also changes the
+outputs, and the check reports the store. A cell at count `k` has
 `k` capture rows, which use non-null free pages `1 … k`; the populations bound guarantees them in
 both pools. A CHUNK capture row carries a zero envelope header (`ROW_STATUS_ENVELOPE`); an echo capture
 row carries the stream carrier token (`ROW_STATUS_ROLE_MISMATCH`). Capture rows carry the server's
@@ -650,7 +670,7 @@ these warmed domains:
   covered or fallback, was launched before core enables JIT monitoring. The scatter's record of
   warmed arguments includes each argument's alignment, so a view at an alignment not yet launched
   is never taken as warmed. Padding the views to 16-byte alignment is a measured optimization, not
-  an obligation (Deferred 11).
+  an obligation (Deferred 10).
 - **Bodies at every count.** Each cell's eager reference and warm-ups run its kind's body at its
   count, so both kinds are warmed at every count from 1 to `N`.
 - **Segment graphs.** The encoder at every CHUNK count to `max_num_seqs` and the decoder at its
@@ -1112,9 +1132,8 @@ blocks of legs OLD1, NEW, OLD2, each a fresh process with 2 warm-up and 21 count
 `drift_b = |median OLD1_b − median OLD2_b|`, a population passes exactly when
 `median NEW_b − min(median OLD1_b, median OLD2_b) ≤ max(1 ms, drift_b)` in both blocks. The record
 reports the difference at each population and shows equal resolved geometry, lookahead and arms
-in every leg. A failure is reported at the gate and puts Deferred 10's alternative to measurement;
-tier 5 is claimed only after the check passes on the body that ships, including any such
-mitigation.
+in every leg. A failure is reported at the gate, and tier 5 is claimed only after the check passes
+on the body that ships.
 
 ### Feed-to-park rule (`U_api`)
 
@@ -1307,13 +1326,13 @@ by locale only.
 | Cell range | Both kinds at every count 1 to `N` | Cells only at declared populations | Served populations drift step to step, so a sparse list rarely matches a real `K` or `E`; a contiguous range makes coverage a single bound |
 | Option value | A list whose largest entry fixes `N` | A single maximum | The HLD defines the option as declared step populations; the list keeps that surface while the cell range depends only on its maximum |
 | Freshness | A per-row select inside the chunk cell | A cell dimension (`chunk-fresh`, `chunk-continuing`); separate launches for fresh and continuing rows | A dimension triples cells and sends every step with both to fallback; separating fresh from continuing rows changes the encoder's batch dimension and so its numerics |
-| Fresh-row state | Gather every row, then select the initial state as the first consumer, for every gathered tensor | The variable-length continuing index; a masked-load kernel that skips fresh rows' loads; a select of the book row only, relying on core's new-generation slot initialization (Deferred 10) | The variable-length index is data-dependent and cannot be captured; a masked-load kernel adds a JIT specialization for no change in values; the book-row-only select is cheaper but rests on an unverified coincidence of the fresh flag with a core new-generation bind |
+| Fresh-row state | Gather the zero-initial state tensors by an initial-state index that names the null page for a fresh row, and select the initial book row after the book's gather | A select of the initial state after the gather of every state tensor; the variable-length continuing index; a masked-load kernel that skips fresh rows' loads; a select of the book row only, relying on core's new-generation slot initialization | A select after every gather reads and writes every gathered state tensor once more per step (three per encoder layer and eight more), a cost that grows with the population; the null page is zero and never stored to, so the index gives the same values with one small select. The variable-length index is data-dependent and cannot be captured; a masked-load kernel adds a JIT specialization for no change in values; the book-row-only select rests on an unverified coincidence of the fresh flag with a core new-generation bind, which the null page does not need |
 | Launch boundary | Validation, signatures, allocations and the reservation before the first launch; worker-fatal after it | A reservation per launch; option-off fallback of the second half after a failed first launch | The first launch may already have scattered; a second-half fallback would commit a step neither path produced, and two reservations break the sink's one-in-flight rule |
 | Reservation disposition | Exactly one successful stage or one cancel resolves a reservation, a covered step's or the option-off transaction's; a stage that raises before publication leaves it cancellable; a cancel after a successful stage is a no-op | Treating a called stage as the disposition whether or not it returns; limiting the rule and its model check to covered steps | A stage that raised and counted as the disposition would leave the sink's one in-flight reservation held, so every later reserve fails; every declined step uses the option-off reservation, so the rule and its check must cover it too |
 | Host inputs | One step arena with a section per kind, one upload, double-buffered pinned host side | One arena per cell (two uploads); per-call staging; captured host-to-device copies | One upload per step; captured copies replay a frozen source; per-call staging adds launches |
 | Static inputs and outputs | Shared step-level buffers (Step arena, static inputs and step outputs) | Per-cell buffers with a host-side permutation; reordering the plan CHUNK-first | One buffer set; outputs stay in core's row order with no extra kernels |
 | Capture order | Largest first, chunk cells then echo cells, on core's one stream and pool | Smallest first; interleaved kinds; a stream per cell | Freed graph-pool blocks are reusable only on the stream that allocated them, and a larger capture's freed intermediates fit a smaller one |
-| Masked-scatter alignment | Every resident-pool argument a step passes after startup equals, in address, shape, strides and dtype, one launched by the serving capture's scatter warm-up or a cell's eager reference; the warm-up launches the component pools and the projected views, and its record includes alignment | Padding the state layout so that every view is 16-byte aligned; an aligned base pointer plus an element offset in the Triton kernel | The pools' views have fixed addresses, so warm-up, capture and serving share one alignment specialization whatever a view's offset; padding every component would change the model's state layout and break the projection that reads adjacent scalar fields (the replay book, the frontend counters) as one matrix, for no correctness gain; changing the kernel's addressing would change the option-off transaction's kernel without measured need. Padding remains a measured optimization (Deferred 11) |
+| Masked-scatter alignment | Every resident-pool argument a step passes after startup equals, in address, shape, strides and dtype, one launched by the serving capture's scatter warm-up or a cell's eager reference; the warm-up launches the component pools and the projected views, and its record includes alignment | Padding the state layout so that every view is 16-byte aligned; an aligned base pointer plus an element offset in the Triton kernel | The pools' views have fixed addresses, so warm-up, capture and serving share one alignment specialization whatever a view's offset; padding every component would change the model's state layout and break the projection that reads adjacent scalar fields (the replay book, the frontend counters) as one matrix, for no correctness gain; changing the kernel's addressing would change the option-off transaction's kernel without measured need. Padding remains a measured optimization (Deferred 10) |
 | Graph-memory accounting | Core's estimate through the profiling capture; no model pool | A model-owned admission inventory and graph pool | Core's estimate already measures the same graphs before planning; a model admission needs its own fit rule and release check |
 | Profiling capture content | The serving capture's procedure and cells over the profiling pools, plus the charged margin | A synthetic upper bound; extrapolation from one cell | The same procedure gives the same allocation sequence; extrapolation is unsound because cells do not share memory predictably |
 | Serving against profiling | Aggregate call totals; startup fails when the serving total exceeds the profiling total, which includes one flat charged margin | A per-cell margin; a per-cell inequality; a warning only; an uncharged tolerance | Rounding arises per allocator segment over the whole call, so a per-cell margin overcharges at large `N` and undercharges at small `N`; per-cell growth is order-dependent under reuse; a warning serves with uncharged memory where core estimated; an uncharged tolerance hides real overruns. The margin is memory core charges, so the strict comparison still bounds serving memory |
@@ -1362,11 +1381,7 @@ by locale only.
    permanent `signature` fallback; to be probed on long streams at both geometries.
 9. **Second-launch cost.** The echo launch's cost at small `E` against the echo rows' option-off
    work, from the step rule's split group.
-10. **Fresh-row select scope.** Whether core's new-generation slot initialization lets the body
-    select only the book row (prompt, geometry) for fresh rows. It is unverified that the model's
-    fresh flag always coincides with a core new-generation bind; a test of that coincidence and
-    the body non-regression check settle it.
-11. **Scatter alignment padding.** Whether padding the resident-pool views to 16-byte alignment
+10. **Scatter alignment padding.** Whether padding the resident-pool views to 16-byte alignment
     speeds the masked scatter enough to justify changing the state layout; a measured
     optimization, not a correctness requirement (Warm-up domains).
 

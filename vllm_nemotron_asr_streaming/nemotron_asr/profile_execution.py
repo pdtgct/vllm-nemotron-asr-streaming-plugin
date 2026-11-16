@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm.logger import init_logger
 from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
@@ -163,7 +164,7 @@ def build_profile_invocation(
         state_indices_p=block_ids,
         num_prefills=rows,
         has_initial_states_p=torch.zeros(rows, dtype=torch.bool),
-        null_block_id=0,
+        null_block_id=int(NULL_BLOCK_ID),
         num_pool_blocks=rows + 1,
         live_block_ids=block_ids.clone(),
         geometry_id=torch.full(

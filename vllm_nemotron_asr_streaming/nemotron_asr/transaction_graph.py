@@ -37,6 +37,7 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_nemotron_asr_streaming.lookahead import (
     cadence_label,
@@ -966,7 +967,7 @@ class TransactionGraphBinding:
             state_indices_p=blocks,
             num_prefills=count,
             has_initial_states_p=~torch.tensor(fresh, dtype=torch.bool),
-            null_block_id=0,
+            null_block_id=int(NULL_BLOCK_ID),
             num_pool_blocks=capacity,
             live_block_ids=blocks.clone(),
             geometry_id=torch.full((count,), self.geometry, dtype=torch.int64),
@@ -1008,6 +1009,7 @@ class TransactionGraphBinding:
         tokens: tuple[Any, ...],
         carrier: tuple[Any, ...],
         pools: tuple[Any, ...],
+        null_page: int,
         adapter: Any,
         bucket: Any,
         encoder_transition: Any,
@@ -1016,7 +1018,9 @@ class TransactionGraphBinding:
         (geometry, kind, count), and the two row classes the cells exclude:
         whether any of the cell's rows carries an endpoint policy
         (``endpoint_policy``) and whether any is a forced-EOU candidate
-        (``forced_eou``), both false at capture."""
+        (``forced_eou``), both false at capture. ``null_page`` is the row
+        plan's null block ID, the page a fresh row's zero-initial state is
+        gathered from (TXG-MASK-001)."""
         fields: list[tuple[str, Any]] = [
             ("endpoint_enabled", bool(endpoint_enabled)),
             ("endpoint_policy", bool(endpoint_policy)),
@@ -1025,6 +1029,7 @@ class TransactionGraphBinding:
             ("tokens", tokens),
             ("carrier", carrier),
             ("pools", pools),
+            ("null_page", int(null_page)),
             ("adapter", callable_identity(adapter)),
         ]
         if kind == CHUNK:
@@ -1179,6 +1184,7 @@ class TransactionGraphBinding:
             tokens=self._tokens,
             carrier=(self.hidden, CARRIER_DTYPE),
             pools=pools,
+            null_page=plan.null_block_id,
             adapter=model._emission_adapter,
             bucket=bucket,
             encoder_transition=served_transition,
@@ -1280,16 +1286,11 @@ class TransactionGraphBinding:
             run()
         self._phase = PHASE_VALIDATION
         self._graphs[-1].replay()
-        for (name, reference), (_name, actual) in zip(
-            expected, self._outputs(count), strict=True
-        ):
-            if not _same_bits(reference, actual):
-                raise RuntimeError(
-                    f"the validation replay's {name} differ from the eager "
-                    "reference of the same capture rows"
-                )
         # The pages are compared in host memory with the call's snapshot: the
-        # null page and the cell's capture rows' pages.
+        # null page and the cell's capture rows' pages. They are compared
+        # before the outputs: fresh capture rows gather the null page
+        # (TXG-MASK-001), so a store to it also changes the outputs, and the
+        # store is the defect to report.
         for name, pool in work.components.items():
             if not _same_bits(
                 pool[: count + 1].cpu(), work.snapshot[name][: count + 1]
@@ -1298,6 +1299,14 @@ class TransactionGraphBinding:
                     f"the null page or the capture rows' pages of state pool "
                     f"{name!r} changed: the reference and the validation "
                     "replay store no page"
+                )
+        for (name, reference), (_name, actual) in zip(
+            expected, self._outputs(count), strict=True
+        ):
+            if not _same_bits(reference, actual):
+                raise RuntimeError(
+                    f"the validation replay's {name} differ from the eager "
+                    "reference of the same capture rows"
                 )
         self.cells[key] = Cell(key, self._graphs[-1], program.signature, program.tier)
 
@@ -1959,6 +1968,7 @@ class TransactionGraphBinding:
                 tokens=tokens,
                 carrier=carrier,
                 pools=pools,
+                null_page=plan.null_block_id,
                 adapter=transaction.get("adapter"),
                 bucket=bucket,
                 encoder_transition=transaction.get("encoder_transition"),

@@ -433,6 +433,9 @@ class TransactionEnv:
         self._rejections: dict | None = None
         #: The live serving pool views (``env_from_runner`` only).
         self.serving: Pools | None = None
+        #: The null page of every pool (``Pools.page(0)``) before each driven
+        #: step and after the drive's last step.
+        self.drive_null_pages: list[dict[str, torch.Tensor]] = []
 
     # -- tokens -------------------------------------------------------------
 
@@ -928,6 +931,8 @@ def _env_from_calls(
         model=model,
         state=state,
     )
+    env.drive_null_pages = [call["pools"].page(0) for call in calls]
+    env.drive_null_pages.append(live.page(0))
     for config_key in CONFIGS:
         head = fixtures[config_key][0]
         if head.status is None:

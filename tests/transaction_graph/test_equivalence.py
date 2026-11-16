@@ -237,7 +237,10 @@ SENTINELS = ["nan", "inf", "-inf", "random"]
 # @spec TXG-EQ-006, TXG-MASK-001
 @pytest.mark.parametrize("pattern", SENTINELS)
 @pytest.mark.parametrize("lookahead", [0, 1], ids=["80ms", "160ms"])
-def test_recycled_pages_of_fresh_rows_do_not_matter(txn_env, pattern, lookahead):
+@pytest.mark.parametrize("endpoint", [False, True], ids=["endpoint-off", "on"])
+def test_recycled_pages_of_fresh_rows_do_not_matter(
+    txn_env, pattern, lookahead, endpoint
+):
     env = txn_env(lookahead)
     rejected = next(
         f
@@ -254,8 +257,8 @@ def test_recycled_pages_of_fresh_rows_do_not_matter(txn_env, pattern, lookahead)
         rejected,
     ]
     fresh_blocks = [i + 1 for i, f in enumerate(rows) if f.fresh]
-    zeroed = env.compose(rows)
-    sentinel = env.compose(rows)
+    zeroed = env.compose(rows, endpoint=endpoint)
+    sentinel = env.compose(rows, endpoint=endpoint)
     for block in fresh_blocks:
         zeroed.pools.fill_page(block, "zero")
         sentinel.pools.fill_page(block, pattern, seed=block)

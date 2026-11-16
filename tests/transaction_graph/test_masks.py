@@ -1,23 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 """Freshness, file and planned-rejection masks of the transaction body with
-transaction graphs off, on CPU (TXG-MASK-001 to TXG-MASK-004, TXG-MASK-006).
+transaction graphs off, on CPU (TXG-MASK-001 to TXG-MASK-004, TXG-MASK-006,
+TXG-MASK-007), and the null page the cells bake in (TXG-CELL-004).
 
 TXG-MASK-001's sentinel check is ``test_equivalence.py``'s
 ``test_recycled_pages_of_fresh_rows_do_not_matter``; TXG-MASK-003's
 control-flow check is ``test_exec_phases.py``'s
 ``test_body_control_flow_ignores_file_and_fresh_bits``. The cell checks
-(TXG-MASK-002's one launch, TXG-MASK-005) are in ``test_exec_gpu.py``.
+(TXG-MASK-002's one launch, TXG-MASK-005) are in ``test_exec_gpu.py``; the
+capture's null-page checks (TXG-CAP-004, TXG-CAP-008) are in
+``test_capture.py``.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import logging
 
 import pytest
 import torch
+from support import txg_api as api
 from support import txg_transaction as tx
 from support.core_order import CoreOrder
 from support.txg_fakes import with_planned_rejection
+from torch.utils._python_dispatch import TorchDispatchMode
 
 pytestmark = pytest.mark.engine
 
@@ -55,6 +61,200 @@ def test_a_fresh_row_starts_from_the_initial_book(txn_env, lookahead):
         clean = env.run(env.compose([env.accepted(config)]))
         assert tx.same_bits(out.rows, clean.rows)
         assert not out.pools.differences(clean.pools, blocks=[1])
+
+
+class GatherWatch(TorchDispatchMode):
+    """Records each ``index_select`` on a named resident pool (the pool's
+    name and the index's values) and each ``masked_fill`` whose input is such
+    a gather's output or a view of it."""
+
+    def __init__(self, pools: tx.Pools) -> None:
+        super().__init__()
+        self.names = {
+            (t.data_ptr(), tuple(t.shape), tuple(t.stride())): name
+            for name, t in pools.flat()
+        }
+        self.gathers: list[tuple[str, list[int]]] = []
+        self.fills: list[str] = []
+        # Gather outputs, kept alive so that no address is reused.
+        self._outputs: list[tuple[torch.Tensor, str]] = []
+
+    def _gathered(self, t: object) -> str | None:
+        if not isinstance(t, torch.Tensor):
+            return None
+        ptr = t.untyped_storage().data_ptr()
+        for out, name in self._outputs:
+            if out.untyped_storage().data_ptr() == ptr:
+                return name
+        return None
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func.overloadpacket.__name__.startswith("masked_fill"):
+            name = self._gathered(args[0])
+            if name is not None:
+                self.fills.append(name)
+        out = func(*args, **kwargs)
+        if func is torch.ops.aten.index_select.default:
+            source = args[0]
+            name = self.names.get(
+                (source.data_ptr(), tuple(source.shape), tuple(source.stride()))
+            )
+            if name is not None:
+                self.gathers.append((name, args[2].tolist()))
+                self._outputs.append((out, name))
+        return out
+
+
+def watch_body(env, step, pools):
+    """Run the option-off transaction of ``step`` on ``pools`` with its body
+    under a :class:`GatherWatch`."""
+    advance = api.advance_module()
+    real = api.phase_function(api.PHASES[1])
+    watches = []
+
+    def watched(*args, **kwargs):
+        watch = GatherWatch(pools)
+        watches.append(watch)
+        with watch:
+            return real(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(advance, api.PHASES[1], watched)
+        out = env.run(step, pools=pools)
+    assert len(watches) == 1
+    return watches[0], out
+
+
+# @spec TXG-MASK-001, TXG-MASK-007
+@pytest.mark.parametrize("endpoint", [False, True], ids=["endpoint-off", "on"])
+def test_fresh_rows_gather_zero_initial_state_from_the_null_page(txn_env, endpoint):
+    """Every gather of a zero-initial state tensor reads the null page for
+    each fresh row and the row's own page for each continuing row; the book
+    is gathered by the rows' own pages; and no gathered state is overwritten
+    by a fill (one select on the gather index, not one per state tensor)."""
+    env = txn_env(0)
+    configs = [CF, CC, OF, OC, CFF, CCF, OFF, OCF]
+    rows = [env.accepted(c) for c in configs]
+    step = env.compose(rows, endpoint=endpoint)
+    null = int(step.plan.null_block_id)
+    blocks = step.plan.state_indices_p.tolist()
+    fresh = [f.fresh for f in rows]
+    chunk = [f.kind == "chunk" for f in rows]
+    assert null not in blocks
+    initial = [null if fresh[i] else blocks[i] for i in range(len(rows))]
+    expected = {
+        # step-level gathers (queue, counters, endpoint pages): every row
+        len(rows): initial,
+        # the CHUNK bucket's gathers (encoder, frontend, predictor state)
+        sum(chunk): [v for v, c in zip(initial, chunk) if c],
+    }
+    assert len(expected) == 2, "the step must tell the two gather kinds apart"
+    watch, _ = watch_body(env, step, step.pools.clone())
+    zero_initial = {name for name, _ in step.pools.flat()} - {"book_pool"}
+    seen = {name for name, _ in watch.gathers}
+    assert zero_initial <= seen, sorted(zero_initial - seen)
+    for name, index in watch.gathers:
+        if name == "book_pool":
+            assert list(index) == blocks, name
+        else:
+            assert list(index) == expected[len(index)], (name, index)
+    assert watch.fills == [], f"fills of gathered state: {sorted(set(watch.fills))}"
+
+
+def nonzero(pages: dict[str, torch.Tensor]) -> list[str]:
+    """The names of the pages in ``pages`` that hold a nonzero byte."""
+    return [
+        name
+        for name, t in pages.items()
+        if bool(t.contiguous().view(torch.uint8).ne(0).any())
+    ]
+
+
+# @spec TXG-MASK-007, TXG-MASK-006
+@pytest.mark.parametrize("lookahead", [0, 1], ids=["80ms", "160ms"])
+@pytest.mark.parametrize("endpoint", [False, True], ids=["endpoint-off", "on"])
+def test_no_transaction_stores_to_the_null_page(txn_env, lookahead, endpoint):
+    """A step of every row configuration, rejected fresh and continuing rows,
+    a planning-failed row and CUDA-graph padding entries leaves the null page
+    zero, while its accepted fresh rows store their own pages."""
+    env = txn_env(lookahead)
+    rejections = tx.rejection_fixtures(env)
+    rejected = [
+        rejections[config][0][1] for config in (CF, CCF, CFF, OCF) if rejections[config]
+    ]
+    assert any(f.fresh for f in rejected) and any(not f.fresh for f in rejected)
+    accepted = [env.accepted(c) for c in tx.CONFIGS]
+    rows = accepted + rejected
+    step = env.compose(rows, endpoint=endpoint)
+    planned = [False] * len(rows)
+    planned[tx.CONFIGS.index(CF)] = True
+    step.plan = with_planned_rejection(step.plan, planned)
+    null = int(step.plan.null_block_id)
+    # Two padding entries in the decode indices, as a padded CUDA-graph batch
+    # carries them: they name the null block and never enter the body.
+    step.plan = dataclasses.replace(
+        step.plan, state_indices_d=torch.full((2, 1), null, dtype=torch.int64)
+    )
+    assert not nonzero(step.pools.page(null))
+    before = step.pools.clone()
+    out = env.run(step)
+    status = [int(s) for s in out.status.tolist()]
+    assert all(s != 0 for s in status[len(accepted) :]), status
+    assert status[tx.CONFIGS.index(CF)] != 0, status
+    assert not nonzero(out.pools.page(null))
+    assert not out.pools.differences(before, blocks=[null])
+    stored = [
+        i
+        for i, f in enumerate(rows)
+        if f.fresh and status[i] == 0 and out.pools.differences(before, blocks=[i + 1])
+    ]
+    assert stored, "no accepted fresh row stored its own page"
+
+
+# @spec TXG-MASK-007
+def test_no_driven_step_stores_to_the_null_page(txn_env):
+    """The real steps of a stream and a file (fresh, continuing, file, drain
+    and end rows) leave the serving pools' null page zero, before every step
+    and after the last."""
+    for lookahead in (0, 1):
+        env = txn_env(lookahead)
+        assert len(env.drive_null_pages) > 2
+        for i, page in enumerate(env.drive_null_pages):
+            assert not nonzero(page), (lookahead, i, nonzero(page))
+
+
+# @spec TXG-CELL-004, TXG-COV-005, TXG-MASK-001
+def test_cells_bake_in_the_null_page(on_cpu, monkeypatch, caplog):
+    """Each cell's signature holds the null block ID of its capture rows' plan;
+    a covered step whose plan names another null block falls back by
+    ``signature`` with field ``null_page``, so no cell gathers a fresh row's
+    initial state from a page other than the one it was captured with."""
+    from support import txg_eager as eager
+    from support import txgcap_harness as t
+
+    run = on_cpu(n=3, max_num_seqs=3)
+    steps = eager.build_covered(monkeypatch, run)
+    env = steps.env
+    binding = api.binding_of(env.model)
+    for key, cell in binding.cells.items():
+        assert dict(cell.signature)["null_page"] == 0, key
+    caplog.set_level(logging.WARNING)
+    step = env.compose([env.accepted(c) for c in (CF, OC)])
+    assert steps.run(step) is not None, "the unchanged plan is covered"
+    free = env.capacity - 1
+    assert free not in step.plan.state_indices_p.tolist(), env.capacity
+    before = dict(t.counter(run.env, "fallbacks"))
+    moved = dataclasses.replace(step.plan, null_block_id=free)
+    assert steps.run(step, plan=moved) is None
+    after = dict(t.counter(run.env, "fallbacks"))
+    key = ("signature", api.CHUNK, 1)
+    assert after.get(key, 0) - before.get(key, 0) == 1, after
+    assert any(
+        "null_page" in r.getMessage() and "signature" in r.getMessage().lower()
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    ), "no WARNING names null_page"
 
 
 # @spec TXG-MASK-002

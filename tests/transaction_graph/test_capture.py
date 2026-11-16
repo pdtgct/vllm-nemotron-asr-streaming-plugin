@@ -210,8 +210,10 @@ def test_a_validation_replay_that_differs_from_the_reference_fails_the_capture(
     on_cpu, page
 ):
     """After each replay, one page differs from the call's snapshot: page 1,
-    which the capture rows gather, or the null page, which no capture may
-    store to."""
+    the first capture row's page, or the null page, which no capture may
+    store to and from which the fresh capture rows gather their zero-initial
+    state (TXG-MASK-001). The pages are checked before the outputs, so the
+    error names the changed page in both cases."""
     run = on_cpu(n=2)
     env = run.env
     startup_through_profiling(run)
@@ -223,8 +225,7 @@ def test_a_validation_replay_that_differs_from_the_reference_fails_the_capture(
     env.fake.on_replay = corrupt
     error = h.call_with(run.core.profiling_capture)
     assert error is not None, "a mismatching validation replay published its cell"
-    if page == 0:
-        assert PAGE_MISMATCH in t.text(error), t.text(error)
+    assert PAGE_MISMATCH in t.text(error), t.text(error)
     assert t.fake_graph_count(env) == 0
 
 
@@ -599,9 +600,10 @@ def test_corrupted_validation_replay_fails_and_publishes_nothing_cuda(
     """Every replay in the call (the segment graphs' and the cells') writes a
     value no earlier replay wrote into one page of the profiling pool, so the
     page after each cell's validation replay differs from the page at the
-    start of the call's transaction-graph part: page 1, which the capture rows
-    gather, or the null page, which no capture may store to either. The pool
-    is one flat byte tensor (``model_harness.real_bindings``); a page is
+    start of the call's transaction-graph part: page 1, the first capture
+    row's page, or the null page, which no capture may store to either and
+    from which the fresh capture rows gather their zero-initial state. The
+    pool is one flat byte tensor (``model_harness.real_bindings``); a page is
     ``model_harness.slot_bytes``."""
     env = on_cuda(n=2)
     core = env.core
@@ -621,8 +623,8 @@ def test_corrupted_validation_replay_fails_and_publishes_nothing_cuda(
     assert error is not None, "the mismatching validation replay was accepted"
     assert "validation replay" in t.text(error), t.text(error)
     if page == 0:
-        # No capture row gathers the null page, so the outputs match and the
-        # page check reports the change.
+        # The pages are checked before the outputs, so the page check reports
+        # the change although the fresh capture rows gather the null page.
         assert PAGE_MISMATCH in t.text(error), t.text(error)
     from support import txg_api
 
