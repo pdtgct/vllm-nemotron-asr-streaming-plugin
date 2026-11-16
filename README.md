@@ -60,9 +60,12 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --max-model-len 77000
 ```
 
-- `--max-num-seqs 64` is interim and unpublished: it comes from an unpublished A40 measurement at
-  320 ms under `--enforce-eager`, and qualifies neither runner configuration. The tier 2 measurement
-  that verifies a value for the A40 at 320 ms is owed.
+- `--max-num-seqs 64` met tier 2's serving run on one A40 at 320 ms under the hook configuration
+  (stage 1 build `hook-build-20261114b` @ `9c40a6ffd6`, plugin `8166d85`): the server started,
+  both segment-graph captures fit, the KV budget admits 65 requests, and 64 concurrent sessions
+  completed. The largest sampled step held 38 rows; a 64-row step was not observed. Under
+  `--enforce-eager`, which the command above uses, the value is interim: it comes from an
+  unpublished A40 measurement at 320 ms.
 - A server serves one geometry, fixed at startup. The default is the checkpoint's own default
   lookahead, which is 3 (320 ms) on the published card; another checkpoint can declare another
   default. `num_lookahead_tokens` in `--hf-overrides` selects one of the other implemented
@@ -88,9 +91,14 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
   default arms retained about 1.1, 2.3 and 17.4 GiB at `--max-num-seqs` 32, 64 and 128; device
   memory in use during capture, weights included, peaked at 7.0, 18.3 and 44.4 GiB of the card's
   45 GiB, and startup took about 41, 78 and 182 s, against about 25 s for the eager arms. At 64
-  rows the 160 ms and 80 ms geometries retained 1.8 and 1.6 GiB. The tier 2 figures for these arms
-  are owed at every geometry, and under the hook configuration (below) every figure is owed: the
-  retained memory, capture peak and startup time there are unmeasured.
+  rows the 160 ms and 80 ms geometries retained 1.8 and 1.6 GiB. Under `--enforce-eager` the
+  tier 2 figures for these arms are owed at every geometry.
+- Under the hook configuration at 320 ms with `--max-num-seqs 64` (tier 2 serving run, one A40,
+  stage 1 build `9c40a6ffd6`, plugin `8166d85`), the segment graphs retained 1,544 MiB in the
+  profiling capture and 716 MiB in the serving capture, which took 42.6 and 41.4 s; core's graph
+  pool held 0.70 GiB against its 1.57 GiB estimate. Device memory in use (`nvidia-smi`) peaked at
+  16,445 MiB, on the memory-profiling step, 35.74 GiB was available for KV memory, and the server
+  was ready 130.6 s after launch. The tier 2 figures at the other geometries are owed.
 - `--hf-overrides '{"encoder_execution_arm": "eager", "decode_dispatch_arm": "dense-eager"}'`
   selects the eager arms, the reference the graphed arms are tested against. The eager arms capture
   nothing, so they need `--enforce-eager`. The compiled `dense-graphed` encoder and
@@ -107,8 +115,8 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
   `-cc.cudagraph_mode none` and `-cc.mode none`, on CUDA), core captures them through #67583's
   capture hook and charges them in its graph-memory estimate. The hook configuration requires at
   least one graph the hook captures (the `eager-graphed` encoder, the `dense-graphed` decoder or
-  transaction graphs) and no other graph, and has not met tier 2 on any build. A command that gives neither
-  configuration is refused, naming each unmet condition and its remedy.
+  transaction graphs) and no other graph; Evidence gives its tier 2 result on the stage 1 build. A
+  command that gives neither configuration is refused, naming each unmet condition and its remedy.
 - Each capture of the segment graphs logs one INFO line naming the runner configuration, the arms,
   the geometry, `max_num_seqs`, the retained bytes and the capture time. A capture that cannot
   allocate fails startup with those figures and a remedy: a smaller `--max-num-seqs`, or the eager
@@ -155,6 +163,9 @@ counted. Every covered step's outputs and resident state must equal the option-o
 bit for bit. The option is `transaction_graph_populations`, off by default; core captures the cells
 through #67583's capture hook, into its own graph pool.
 
+Release 0.1.0b2 ships the option opt-in without tier 5: on the stage 1 build the step rule fails at
+80 ms and at 160 ms, and several tier 5 checks are pending (Measured figures).
+
 #### Serve command
 
 <!-- @spec TXG-DOC-001 -->
@@ -167,7 +178,7 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     -cc.mode none \
     --max-num-seqs 64 \
     --max-model-len 82513 \
-    --hf-overrides '{"num_lookahead_tokens": 0, "transaction_graph_populations": [64]}'
+    --hf-overrides '{"num_lookahead_tokens": 0, "transaction_graph_populations": [63]}'
 ```
 
 - The command runs the hook configuration (no `--enforce-eager`) at 80 ms (lookahead 0), with the
@@ -178,29 +189,94 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
   chunk cell and an echo cell at every count from 1 to `N`, `2N` cells in all. The other entries
   change no capture, so `[63]` and `[1, 31, 63]` capture the same cells. An absent key or an empty
   list is off; any other malformed value is refused.
-- `N` = 64 and `--max-num-seqs 64` are the values of the design's first A40 measurement plan, not
-  verified values (owed: the `N` and `--max-num-seqs` that the tier 5 run on the A40 verified to
-  fit, on the stage 1 build). For tier 5, `N` is the smallest count of at least 63 that fits and
-  for which steps with `K ≤ N` and `E ≤ N` make up at least 99 % of served steps.
+- `N` = 63 and `--max-num-seqs 64` are the values the tier 5 run on one A40 verified to fit at
+  80 ms and at 160 ms (stage 1 build `9c40a6ffd6`, plugin `8166d85`): the `N = 63` engines captured
+  126 cells per capture, the KV budget admitted 65 requests, and the engines served the tier 5 `Q`
+  and `M` workloads with no fallback. The inventory runs, at `N` = 64, served 512 streams at concurrency 64
+  in steps of up to 64 rows. Tier 5 takes `N` as the smallest count of at least 63 that fits and
+  for which steps with `K ≤ N` and `E ≤ N` make up at least 99 % of served steps; at `N` = 63 they
+  make up 100 % at 80 ms and 99.84 % at 160 ms. The same rule below 63, which carries no tier 5
+  claim, gives a deployment `N` of 44 at 80 ms (99.10 %; serving capture 832 MiB call total, 268
+  MiB transaction total) and of 36 at 160 ms (99.07 %; 794 and 180 MiB).
 
 #### Measured figures
 
-Every figure below is owed until tier 5 is met on the A40 at FP32 on the stage 1 build, separately
-at 80 ms and at 160 ms.
+The tier 5 run used one NVIDIA A40 at FP32, the stage 1 build `hook-build-20261114b`
+(`pdtgct/vllm` @ `9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee`), card revision `ea30d66d`, `N = 63`
+and `--max-num-seqs 64`, at 80 ms and at 160 ms. The transaction-level checks ran at plugin
+`a19621e`, the served runs and the inventory at plugin `8166d85`; the production code of both
+equals the release candidate `872d163`'s. Tier 5 is not met at either geometry.
 
-- Build, device, geometry and `N` of the figures: (owed: tier 5 on A40, stage 1 build; the build's
-  and plugin's revisions, 80 ms and 160 ms, and `N` for each).
-- Graph memory on the A40 for each capture, profiling and serving (call total, transaction total
-  and per-kind totals): (owed: tier 5 on A40, stage 1 build).
-- Transient peak of each capture: (owed: tier 5 on A40, stage 1 build).
-- Capture time of each capture: (owed: tier 5 on A40, stage 1 build).
-- The `(K, E)` histogram of the served qualification workload from which `N` was chosen: (owed:
-  tier 5 on A40, stage 1 build).
+- Passed: the inventory (TXG-QUAL-025); every transaction-level step compared bit for bit at both
+  geometries (TXG-QUAL-003); `Q` and `M` at 80 ms (TXG-QUAL-002 to -006); forced fallbacks
+  (TXG-QUAL-007); the served `Q` runs and the served `M` run at 160 ms; the capture figures
+  (TXG-QUAL-019).
+- Failed: the step rule (TXG-QUAL-010 to -014), both groups at both geometries; the served `M` run
+  at 80 ms against its preregistered file criterion, equality with one `B_hook` run (123 of 124
+  files; see the note after the served-run table).
+- Pending: `U_api` (TXG-QUAL-016, -017) at both geometries, the body non-regression check
+  (TXG-QUAL-015), the `B_hook` transcript replay of the 160 ms transaction-level `Q` and `M` run, and
+  the revised served comparison of TXG-QUAL-008 (two `B_hook` runs, and each file alone).
+- Not run: tier 4 with the option on, on any build.
 
-On an earlier in-tree copy of this model, a whole-transaction prototype on an A40 at 80 ms saved
-5.2 to 6.4 ms per homogeneous continuing CHUNK step at populations 1, 31 and 63 (unpublished
-project measurement). It predicts neither the saving on split steps, at 160 ms nor in this plugin;
-that saving is owed (tier 5 on the A40, stage 1 build).
+Step rule: `Δ` = min(median OFF1, median OFF2) − median ON, in ms, per block of 21 counted steps per
+leg; a composition is material when `Δ ≥ max(5 ms, |median OFF1 − median OFF2|)` in both blocks
+(TXG-QUAL-013). A group passes only when every one of its compositions is material.
+
+| Group | P | (K, E) | 80 ms Δ, block 1 / 2 | Material | 160 ms Δ, block 1 / 2 | Material |
+|---|---|---|---|---|---|---|
+| one kind | 1 | (1, 0) | 6.85 / 6.72 | yes | 6.82 / 6.83 | yes |
+| one kind | 31 | (31, 0) | 5.66 / 6.11 | yes | 6.00 / 5.89 | yes |
+| one kind | 63 | (63, 0) | 4.38 / 4.30 | no | 4.28 / 4.26 | no |
+| split | 31 | (27, 4) | 5.47 / 5.32 | yes | 5.04 / 4.92 | no |
+| split | 31 | (16, 15) | 4.78 / 4.72 | no | 4.64 / 5.03 | no |
+| split | 63 | (55, 8) | 3.75 / 6.42 | no | 4.10 / 3.58 | no |
+| split | 63 | (32, 31) | 5.07 / 5.00 | yes | 5.25 / 5.01 | yes |
+
+Echo-only steps, reported and not gated, gained 4.42 to 4.89 ms. U(1), the (1, 0) composition's
+block 1 median (TXG-CAL-001): 15.06 ms on and 21.97 ms off at 80 ms, 17.46 ms on and 24.29 ms off at
+160 ms.
+
+- Body non-regression check, OLD `4cc1381` against NEW (TXG-QUAL-015), with its bridge block:
+  (pending: TXG-QUAL-015 body check and bridge block, A40).
+- `U_api` (TXG-QUAL-016, -017) at 80 ms: (pending: `U_api` at 80 ms, A40).
+- `U_api` (TXG-QUAL-016, -017) at 160 ms: (pending: `U_api` at 160 ms, A40).
+
+| Exactness and served runs | 80 ms | 160 ms |
+|---|---|---|
+| Transaction-level `Q` (concurrency 1, 32 and 63, 2,000 steps each) and `M`: steps covered and equal to the option-off transaction in outputs, status, progress, queue counts and every page | 8,230 of 8,230 (`M` 2,230); 0 fallbacks | 8,151 of 8,151 (`M` 2,151); 0 fallbacks |
+| `B_hook` replay of that run's schedule: requests with equal label tokens | 2,067 of 2,067 | (pending: 160 ms `B_hook` transcript replay, qm-bhook-1, A40) |
+| Forced fallbacks (`K` > `N`, `E` > `N`, two signature mismatches): each counted once, outputs equal to the option-off transaction's | pass | pass |
+| Served `Q`, 512 streams at concurrency 63: transcripts equal to `B_hook`'s | 512 of 512; 2,251 steps, all replayed | 512 of 512; 1,978 steps, all replayed |
+| Served `M`, 48 stream slots and 15 file slots, 512 streams and 124 files: transcripts equal to `B_hook`'s | streams 512 of 512, files 123 of 124; 2,221 steps, all replayed | streams 512 of 512, files 124 of 124; 2,494 steps, all replayed |
+
+The 80 ms file `1284-1180-0011` differs from the `B_hook` run by one comma ("I am, my dear, and all
+strangers …" against "I am, my dear and all strangers …"). A second, nonqualifying `B_hook` run
+differed from the first on that file and equalled the option-on run on all 124 files, which points
+to `B_hook`'s own run-to-run variation under wall-clock pacing. Revised TXG-QUAL-008 comparison (two
+`B_hook` runs, and each file alone): (pending: revised TXG-QUAL-008 served comparison, A40).
+
+Graph memory on the A40 at `N = 63`, per capture (MiB unless stated; the call total covers the whole
+capture call: segment graphs, cells and, in the profiling capture, a 64 MiB margin):
+
+| | 80 ms | 160 ms |
+|---|---|---|
+| Profiling capture: call / transaction total (chunk / echo) | 3,884 / 2,462 (2,194 / 268) | 4,174 / 2,702 (2,434 / 268) |
+| Serving capture: call / transaction total (chunk / echo) | 986 / 422 (422 / 0) | 1,042 / 428 (428 / 0) |
+| Transient peak, each capture | 2,104 | 2,154 |
+| Capture time, each capture | 63.9 s to 69.2 s; 87.1 s and 91.9 s in the served run | 68.5 s to 71.1 s |
+| Available KV memory, option on (`B_hook`) | 33.63 GiB (36.03 GiB) | 33.31 GiB (35.95 GiB) |
+| `vllm serve` ready after launch (`B_hook`) | 220.8 s (100.6 s) | 179.4 s (110.4 s) |
+
+The `(K, E)` histogram from which `N` was chosen comes from the served `Q` run on an `N` = 64 engine
+(512 streams at concurrency 64). The three 160 ms steps outside `N` = 63 are (64, 0); an `N` = 63
+engine runs them without transaction graphs (`chunk-uncovered`).
+
+| | 80 ms | 160 ms |
+|---|---|---|
+| Served steps (split / one-kind CHUNK / echo only) | 2,654 (2,262 / 270 / 122) | 1,927 (1,554 / 182 / 191) |
+| Largest `K` / `E` | 60 / 33 | 64 / 40 |
+| Fraction covered at `N` = 32 / 40 / 48 / 63 | 0.8873 / 0.9717 / 0.9962 / 1.0000 | 0.9725 / 0.9974 / 0.9979 / 0.9984 |
 
 #### Memory and the startup log
 
@@ -243,9 +319,25 @@ that saving is owed (tier 5 on the A40, stage 1 build).
 
 Every claim names its tier, the build and the source revisions it was met on.
 
-- Owed: tiers 1 to 4 with the default segment arms on the stage 1 build (with #67583), at the current
-  plugin, for each runner configuration claimed; tier 2 also verifies the serve command's
-  `--max-num-seqs`. Tier 5 is owed at 80 ms and at 160 ms (Transaction graphs).
+- Stage 1 build: `pdtgct/vllm` `hook-build-20261114b` @ `9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee`
+  (with #67583), precompiled wheel `191e5d5df2` (cu132), one NVIDIA A40 at FP32, card revision
+  `ea30d66d`, frontend v0.4.0b3. Evidence: `pdtgct/nemotron-omni-port`
+  `experiments/2026-11-15-plugin-tier2-hook-build/`, `experiments/2026-11-15-plugin-h1-txg-tier5-a/`
+  and `experiments/2026-11-15-plugin-h1-txg-tier5-b/`.
+- Partly achieved (stage 1 build `9c40a6ffd6`, plugin `8166d85`, hook configuration, default
+  segment arms, transaction graphs off), tier 2 (installed-engine cycle) at 320 ms: with
+  `--max-num-seqs 64` and `--max-model-len 77000`, 5,559 LibriSpeech `/v1/realtime` sessions at
+  concurrency 32 all ended `stop`, with WER 3.57 % on test-clean and 7.99 % on test-other. One final,
+  for `2414-128291-0020` (test-other, 1.25 s, a known empty final), was empty, and the WER counts it
+  as deletions. 640 test-clean sessions at concurrency 64 all reached a final transcript (WER
+  2.89 %). The server logged no preemption and no error. GPU tier: (pending: GPU tier at 872d163).
+- Not met (stage 1 build `9c40a6ffd6`; transaction level at plugin `a19621e`, served runs and
+  inventory at plugin `8166d85`), tier 5 for transaction graphs at 80 ms and at 160 ms: the step
+  rule fails at both geometries. Measured figures, under Transaction graphs, lists what passed, what
+  failed and what is pending.
+- Owed: tier 1 on the stage 1 build at the current plugin; tier 2 under `--enforce-eager` and at
+  geometries other than 320 ms; tiers 3 and 4 on the stage 1 build, tier 4 also with transaction
+  graphs on.
 
 Every entry below is historical. The stage 1 entries were made on a stage 1 build without #67583,
 at plugin revisions before the default graphed arms and the one-geometry server; the other entries
