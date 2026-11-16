@@ -93,6 +93,16 @@ def test_body_check_requires_both_blocks():
     assert q.body_check([good, bad]) is False
 
 
+# @spec TXG-QUAL-015
+def test_body_check_gates_every_population():
+    good, bad = block(10, 10, 10), block(10, 12, 10)
+    passing = {p: [good, good] for p in q.BODY_POPULATIONS}
+    assert q.body_check_all(passing) is True
+    assert q.body_check_all({**passing, 31: [good, bad]}) is False
+    with pytest.raises(ValueError):
+        q.body_check_all({1: [good, good], 63: [good, good]})
+
+
 # ---------------------------------------------------------------------------
 # U_api
 

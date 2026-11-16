@@ -93,6 +93,17 @@ def body_check(blocks: Sequence[Block]) -> bool:
     return all(body_block_passes(b) for b in blocks)
 
 
+#: The body check's populations (TXG-QUAL-015).
+BODY_POPULATIONS = (1, 31, 63)
+
+
+def body_check_all(blocks: Mapping[int, Sequence[Block]]) -> bool:
+    """TXG-QUAL-015 at one geometry: every population passes in both blocks."""
+    if set(blocks) != set(BODY_POPULATIONS):
+        raise ValueError(f"the body check covers populations {BODY_POPULATIONS}")
+    return all(body_check(blocks[p]) for p in BODY_POPULATIONS)
+
+
 @dataclass(frozen=True)
 class Bracket:
     """One ``U_api`` bracket: each leg's repeats 0..3 (repeat 0 discarded)."""

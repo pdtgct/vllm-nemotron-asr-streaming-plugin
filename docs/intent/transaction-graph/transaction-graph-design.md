@@ -390,8 +390,8 @@ the row's request for this step (`bind_rows`). Fresh and continuing CHUNK rows s
 as in the option-off transaction, so freshness never changes the encoder's batch dimension.
 
 The select runs in the option-off body too, once per gathered state tensor on every CHUNK step,
-where the released body gathers an all-continuing step directly. The body non-regression check
-(Qualification) measures that cost against the released body; Deferred 10 records the narrower
+where the body before the phase split gathers an all-continuing step directly. The body
+non-regression check (Qualification) measures that cost against that body; Deferred 10 records the narrower
 alternative.
 
 ### Whole-file rows
@@ -986,7 +986,7 @@ a stream count belongs to its consumer (Open Questions).
 ## Qualification
 
 The HLD's tier 5 is met separately at 80 ms and at 160 ms, on an A40 at FP32, on the stage 1
-build. Every comparison is against `B_hook`.
+build. Every option-on/off comparison is against `B_hook`.
 
 ### Workloads
 
@@ -1088,17 +1088,26 @@ tier 5, and compares against a `B_hook` process of the same `max_num_seqs` and s
 ### Option-off body
 
 The phase split changes the option-off body (Fresh rows), and tier 5 compares only option-on with
-option-off on the new body. A preregistered non-regression check therefore compares two plugin
-commits on the same branch and core build, both option-off under the same `B_hook` arms: OLD,
-the commit preceding the phase split, after hook capture of the segment arms has landed (the
-released plugin cannot run `B_hook`, because that capture is a `registration` change), and NEW,
-the commit under qualification. It uses the step rule's one-kind plans at populations 1, 31 and
-63: two blocks of legs OLD1, NEW, OLD2, each a fresh process with 2 warm-up and 21 counted steps.
-With `drift_b = |median OLD1_b − median OLD2_b|`, it passes exactly when
-`median NEW_b − min(median OLD1_b, median OLD2_b) ≤ max(1 ms, drift_b)` in both blocks. The
-record reports the difference at each population. A failure is reported at the gate and puts
-Deferred 10's alternative to measurement; tier 5 is claimed only after the check passes on the
-body that ships, including any such mitigation.
+option-off on the new body. A preregistered non-regression check (TXG-QUAL-015) therefore compares
+two plugin commits on the same branch and core build, both with transaction graphs off: OLD, the
+newest commit whose `advance_model_rows` is not composed of prepare, body and commit functions, and
+NEW, the commit under qualification. Both run under `--enforce-eager` with the default segment arms
+(`eager-graphed` encoder, `dense-graphed` decoder, the plugin capturing its own segment graphs),
+because OLD's hook configuration refuses a graphed encoder. The timed call, `advance_model_rows`,
+does not depend on where the segment graphs were captured, so the check measures the body's cost;
+it does not establish non-regression under hook capture (core-owned capture streams and pools).
+An ungated bridge block of NEW legs under `--enforce-eager`, the hook configuration and
+`--enforce-eager` again reports whether the capture site moves the step time, and a difference
+beyond the check's bound goes to the gate.
+
+The check uses the step rule's one-kind plans at populations 1, 31 and 63 at each geometry: two
+blocks of legs OLD1, NEW, OLD2, each a fresh process with 2 warm-up and 21 counted steps. With
+`drift_b = |median OLD1_b − median OLD2_b|`, a population passes exactly when
+`median NEW_b − min(median OLD1_b, median OLD2_b) ≤ max(1 ms, drift_b)` in both blocks. The record
+reports the difference at each population and shows equal resolved geometry, lookahead and arms
+in every leg. A failure is reported at the gate and puts Deferred 10's alternative to measurement;
+tier 5 is claimed only after the check passes on the body that ships, including any such
+mitigation.
 
 ### Feed-to-park rule (`U_api`)
 
