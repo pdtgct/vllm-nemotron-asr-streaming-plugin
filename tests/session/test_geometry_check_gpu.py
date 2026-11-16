@@ -190,16 +190,13 @@ def finish_reason(outputs) -> str | None:
 
 
 def parked_units(served, outputs) -> int:
-    """The units that parked: outputs of the open stream whose last token is
-    the park token. The finished output is not counted: a normal close
-    (``stop``) ends its last delta with EOS, which is the park token, but
-    parks no unit."""
+    """The outputs whose new token IDs end with the park token: one per unit
+    whose outcome arrived (SESS-ENG-003). The realtime hook packs a stream's
+    audio into its units and a final-tail unit, and the tail parks too
+    (SESS-FLUSH-001), so a stream that closes normally parks once per prompt
+    it sent."""
     park = served.llm.model_config.hf_config.eos_token_id
-    return sum(
-        1
-        for o in outputs
-        if not o.finished and list(o.outputs[0].token_ids)[-1:] == [park]
-    )
+    return sum(1 for o in outputs if list(o.outputs[0].token_ids)[-1:] == [park])
 
 
 def run_streams(served, *streams):
@@ -211,9 +208,10 @@ def run_streams(served, *streams):
 
 # @spec SESS-MODEL-001, SESS-GEOM-001
 def test_a_stream_at_the_servers_geometry_runs_to_a_normal_close(served_engine):
-    (outputs,) = run_streams(served_engine, server_prompts(served_engine, 2))
+    prompts = server_prompts(served_engine, 2)
+    (outputs,) = run_streams(served_engine, prompts)
     assert outputs[-1].finished and finish_reason(outputs) == "stop"
-    assert parked_units(served_engine, outputs) == 2
+    assert parked_units(served_engine, outputs) == len(prompts)
 
 
 # @spec SESS-MODEL-001, SESS-MODEL-003
@@ -228,7 +226,7 @@ def test_a_later_unit_at_another_geometry_fails_its_row_alone(served_engine):
     )
     # The other stream, in the same steps, is unaffected.
     assert good[-1].finished and finish_reason(good) == "stop"
-    assert parked_units(served_engine, good) == 3
+    assert parked_units(served_engine, good) == len(clean)
 
 
 # @spec SESS-MODEL-002
@@ -264,4 +262,4 @@ def test_a_row_status_of_another_class_fails_that_request_alone(served_engine):
     assert bad[-1].finished and finish_reason(bad) == "error"
     assert parked_units(served_engine, bad) == 1
     assert good[-1].finished and finish_reason(good) == "stop"
-    assert parked_units(served_engine, good) == 3
+    assert parked_units(served_engine, good) == len(clean)
