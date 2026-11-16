@@ -303,7 +303,16 @@ class AdvanceSpy:
         return self._real(core, input_ids, inputs_embeds, plan, **kwargs)
 
     def install(self, monkeypatch: Any) -> AdvanceSpy:
-        from vllm_nemotron_asr_streaming.nemotron_asr import advance
+        # ``profile_execution`` binds ``advance_model_rows`` by name at import.
+        # Import it before patching, so it binds the real row transaction: a
+        # binding captured while a spy was installed would outlive the test's
+        # monkeypatch, and the spy's records (and through them the model)
+        # would stay alive for the rest of the process. The profile
+        # transaction therefore never reaches a spy.
+        from vllm_nemotron_asr_streaming.nemotron_asr import (  # noqa: F401
+            advance,
+            profile_execution,
+        )
 
         self._real = advance.advance_model_rows
         monkeypatch.setattr(advance, "advance_model_rows", self)
@@ -312,17 +321,21 @@ class AdvanceSpy:
 
 def drop_advance_records() -> None:
     """Drop what every installed :class:`AdvanceSpy` recorded (each spy
-    installed later wraps the one before it). The recorded keyword arguments
-    hold the pools of every transaction the spies saw, the profile
-    transactions' scratch included, so a test that measures the device memory
-    the model retains drops them first."""
-    from vllm_nemotron_asr_streaming.nemotron_asr import advance
+    installed later wraps the one before it), through both bindings of the
+    row transaction. The recorded keyword arguments hold the pools of every
+    transaction the spies saw, the profile transactions' scratch included, so
+    a test that measures the device memory the model retains drops them
+    first."""
+    from vllm_nemotron_asr_streaming.nemotron_asr import (
+        advance,
+        profile_execution,
+    )
 
-    spy = advance.advance_model_rows
-    while isinstance(spy, AdvanceSpy):
-        spy.calls.clear()
-        spy.kwargs.clear()
-        spy = spy._real
+    for spy in (advance.advance_model_rows, profile_execution.advance_model_rows):
+        while isinstance(spy, AdvanceSpy):
+            spy.calls.clear()
+            spy.kwargs.clear()
+            spy = spy._real
 
 
 class Trap:
