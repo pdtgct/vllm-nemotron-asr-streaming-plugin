@@ -293,7 +293,7 @@ whose profiling transaction totals were 2,462 MiB (80 ms) and 2,702 MiB (160 ms)
 | Profiling capture: call / transaction total (chunk / echo) | 3,832 / 2,410 (2,144 / 266) | 4,148 / 2,676 (2,410 / 266) |
 | Serving capture: call / transaction total (chunk / echo) | 986 / 422 (422 / 0) | 1,042 / 428 (428 / 0) |
 | Transient peak, each capture | 2,104 | 2,154 |
-| Capture time, each capture | 69.5 s and 70.6 s; 87.1 s and 91.9 s in the served run | 73.1 s and 74.0 s |
+| Capture time, each capture | 69.5 s and 70.6 s | 73.1 s and 74.0 s |
 | Available KV memory, option on (`B_hook`) | 33.63 GiB (36.03 GiB) | 33.31 GiB (35.95 GiB) |
 | `vllm serve` ready after launch (`B_hook`) | 220.8 s (100.6 s) | 179.4 s (110.4 s) |
 
@@ -362,8 +362,8 @@ Every claim names its tier, the build and the source revisions it was met on.
   2.89 %). The server logged no preemption and no error. GPU tier at plugin `adfb24b`: 173 of 175
   tests passed, 2 skipped, 0 failed.
 - Not met (stage 1 build `9c40a6ffd6`; transaction level, body check and the revised TXG-QUAL-008 at
-  plugin `adfb24b`, step rule at plugin `a19621e`, the first served runs, inventory and `U_api` at
-  plugin `8166d85`), tier 5 for transaction graphs at 80 ms and at 160 ms: the step rule and `U_api`
+  plugin `adfb24b`, forced fallbacks and step rule at plugin `a19621e`, the first served runs,
+  inventory and `U_api` at plugin `8166d85`), tier 5 for transaction graphs at 80 ms and at 160 ms: the step rule and `U_api`
   fail at both geometries, and the body check fails at population 1. Measured figures, under
   Transaction graphs, lists what passed and what failed.
 - Owed: tier 1 on the stage 1 build at the current plugin; tier 2 under `--enforce-eager` and at
