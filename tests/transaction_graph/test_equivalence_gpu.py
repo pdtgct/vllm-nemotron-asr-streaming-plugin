@@ -21,6 +21,11 @@ pytestmark = [pytest.mark.gpu, pytest.mark.engine]
 
 N = 8
 
+#: The scheduled token of the stream FLUSH row: a label of the runnable
+#: synthetic card (a base-vocabulary token, below ``blank``), so neither a
+#: carrier, the park (EOS) nor the continuation token.
+FLUSH_TOKEN = 7
+
 
 def assert_all_equal(records, *, covered=True):
     assert records, "no step reached execute"
@@ -130,9 +135,11 @@ def test_160_ms_rows_are_exact(on_cuda):
     d.lockstep(["a", "b"])  # a's final tail beside b's regular chunk
     d.until_parked(["a"])  # a's drains: the last REPLAY drain emits park
     # a's FLUSH: a non-CHUNK row of the drained, finalized stream with no
-    # pending echo, as a direct engine stream client sends it (the last
-    # REPLAY drain already parked the stream, so plugin scheduling sends none).
-    d.step(only=["a"], extra_new=[d.special("a", 7)])
+    # pending echo, as a direct engine stream client sends it. After REPLAY
+    # drains, plugin scheduling sends no FLUSH row: the last drain already
+    # parked the stream. (Plugin scheduling ends with a FLUSH row only when
+    # the final tail queued nothing; transcription design, role derivation.)
+    d.step(only=["a"], extra_new=[d.special("a", FLUSH_TOKEN)])
     d.add_stream("big", [{}, {"samples": oversize, "final": True, "oversize": True}])
     d.add_stream("c", [{}, {}])
     d.step(only=["big", "c"])

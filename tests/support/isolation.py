@@ -3,12 +3,15 @@
 
 The device-memory checks of the capture lifecycle read what the allocator and
 the driver hold before and after a call. In a long tier the pytest process
-also holds what earlier in-process CUDA tests left behind: objects that a
-closure held outside Python's reachable graph keeps alive (model parameters,
-transaction arguments), which a later call's inputs can join. Those are not
-the call's, and a test cannot release them. The check therefore runs in a
-child pytest process of its own, which holds nothing else; the parent waits,
-so its own device memory is constant while the child reads.
+also carries allocator and library state from earlier in-process CUDA tests:
+the caching allocator's segments and how they are split, library handles and
+workspaces, loaded kernels, and session-scoped fixtures. A call's reading can
+then depend on which tests ran before it. The check therefore runs in a child
+pytest process of its own, which starts without that state; the parent
+waits, so its own device memory is constant while the child reads. (The
+device memory the tier once retained per model built was a test spy that
+outlived its test, not the cause of this isolation; ``tests/conftest.py``
+prevents it.)
 """
 
 from __future__ import annotations

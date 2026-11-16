@@ -226,7 +226,9 @@ that saving is owed (tier 5 on the A40, stage 1 build).
   differ from its cells' (`signature`) also runs without them and is counted; a direct engine
   stream client that sets an endpoint policy causes one; on plugin-packed input a nonzero `signature`
   count is a defect. The
-  counters, including the `(K, E)` histogram, are read with `transaction_graph_counters`.
+  counters, including the `(K, E)` histogram, are read with `transaction_graph_counters`; under a
+  multiprocess engine it runs on the worker through `AsyncLLM.collective_rpc`, which needs
+  `VLLM_ALLOW_INSECURE_SERIALIZATION=1` in the engine's environment to send a function.
 - `--enforce-eager` with `transaction_graph_populations` is refused: core runs no capture hook
   there.
 - Native burst (`experimental_native_burst: true`) with transaction graphs is refused.

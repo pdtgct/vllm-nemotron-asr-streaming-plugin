@@ -11,8 +11,8 @@ process (``support.engine_child``: ``LLMEngine`` with
 out of process in the stage 1 build), so a check reads the worker's log
 records and figures, patches core, and sees the worker's own startup error.
 The engines start, one at a time, before any test of the session runs
-(marker ``installed_engine``), so none shares the device with memory the
-in-process tests left in the pytest process.
+(marker ``installed_engine``), so the device memory each finds free does not
+depend on which in-process CUDA tests ran before it.
 
 Harness checks (the runnable synthetic card, ``support.txgcap_harness``):
 the expected fallbacks of ``K > N`` and ``E > N`` steps with outputs equal to
@@ -25,6 +25,7 @@ qualification-run obligations.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import pytest
@@ -133,6 +134,14 @@ def test_startup_is_refused_for_each_unsupported_condition(case):
     assert error is not None, f"{case} was accepted"
     if case in NAMES_OPTION:
         assert t.OPTION in t.text(error), t.text(error)
+    if case == "native-burst":
+        # The transaction-graph check's own refusal, not another one that
+        # names the option: one aggregated condition names both.
+        conditions = re.split(r"[;\n]", t.text(error))
+        assert any(
+            t.OPTION in part and "experimental_native_burst" in part
+            for part in conditions
+        ), t.text(error)
 
 
 @pytest.mark.card

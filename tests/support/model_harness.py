@@ -323,9 +323,10 @@ def drop_advance_records() -> None:
     """Drop what every installed :class:`AdvanceSpy` recorded (each spy
     installed later wraps the one before it), through both bindings of the
     row transaction. The recorded keyword arguments hold the pools of every
-    transaction the spies saw, the profile transactions' scratch included, so
-    a test that measures the device memory the model retains drops them
-    first."""
+    call the spies saw, so a test that measures the device memory the model
+    retains drops them first. The profile transaction calls
+    the real function (``profile_execution`` binds it before any spy is
+    installed), so no spy records its scratch."""
     from vllm_nemotron_asr_streaming.nemotron_asr import (
         advance,
         profile_execution,

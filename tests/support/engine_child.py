@@ -12,10 +12,11 @@ Two things keep these checks out of the pytest process:
   ``"llm"``). A check of the multiprocess path itself uses ``AsyncLLM``
   (mode ``"async"``).
 * Each engine asks core for a fixed fraction of the device's total memory,
-  which core refuses when less is free. The in-process CUDA tests of the
-  tier leave device memory allocated in the pytest process (about 250 MB per
-  model built), so an engine started late in the tier finds too little. A
-  check therefore names its engine runs with the marker
+  which core refuses when less is free. While the tier runs, the pytest
+  process holds device memory of its own (its CUDA context, the caching
+  allocator's segments, library workspaces, session-scoped fixtures), so the
+  memory an engine finds free would depend on which in-process CUDA tests
+  ran before it. A check therefore names its engine runs with the marker
   ``installed_engine(name, ...)``; the tier's conftest starts every selected
   run, one at a time, when collection finishes and before any test runs
   (:func:`prestart`), and the test reads the cached reply (:func:`reply`),
@@ -37,6 +38,7 @@ The child reads a JSON request and writes a JSON reply:
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -59,12 +61,6 @@ def _record(worker: Any) -> Any:
     return txg_api.counters(worker)["capture_record"]
 
 
-def _counters(worker: Any) -> Any:
-    from support import txg_api
-
-    return txg_api.graph_module().transaction_graph_counters(worker)
-
-
 def _estimate(worker: Any) -> Any:
     return [
         int(getattr(worker, "cudagraph_memory_estimate", 0)),
@@ -72,8 +68,26 @@ def _estimate(worker: Any) -> Any:
     ]
 
 
-#: What the child can read on the worker.
-READS = {"record": _record, "estimate": _estimate, "counters": _counters}
+#: What the child can read on the worker: a function of the worker, or
+#: ``"module:function"``, imported in the child and sent itself. ``counters``
+#: is the plugin's own reader, ``transaction_graph_counters`` (TXG-OBS-008).
+READS: dict[str, Callable[[Any], Any] | str] = {
+    "record": _record,
+    "estimate": _estimate,
+    "counters": (
+        "vllm_nemotron_asr_streaming.nemotron_asr.transaction_graph"
+        ":transaction_graph_counters"
+    ),
+}
+
+
+def _reader(name: str) -> Callable[[Any], Any]:
+    """The function :data:`READS` names for ``name``."""
+    read = READS[name]
+    if isinstance(read, str):
+        module, _, function = read.partition(":")
+        return getattr(importlib.import_module(module), function)
+    return read
 
 
 class _Records(logging.Handler):
@@ -113,7 +127,7 @@ def _start_llm(request: dict[str, Any], reply: dict[str, Any]) -> Any:
     engine = LLMEngine.from_engine_args(AsyncEngineArgs(**request["settings"]))
     reply["ok"] = True
     for name in request.get("reads", ()):
-        reply["reads"][name] = engine.collective_rpc(READS[name])[0]
+        reply["reads"][name] = engine.collective_rpc(_reader(name))[0]
     return engine.engine_core.shutdown
 
 
@@ -128,7 +142,7 @@ def _start_async(request: dict[str, Any], reply: dict[str, Any]) -> Any:
         try:
             reply["ok"] = True
             for name in request.get("reads", ()):
-                reply["reads"][name] = await llm.collective_rpc(READS[name])
+                reply["reads"][name] = await llm.collective_rpc(_reader(name))
         finally:
             llm.shutdown()
 
@@ -224,6 +238,15 @@ def run_engine(
         raise AssertionError(
             f"the engine child wrote no reply (exit {done.returncode}):\n{tail}"
         )
+    if done.returncode != 0:
+        # The child writes its reply before it stops the engine, so a failed
+        # shutdown or a crash shows only in its exit status. An expected
+        # startup refusal is a reply with ``ok`` false and exit status 0.
+        tail = log.read_text()[-4000:]
+        raise AssertionError(
+            f"the engine child exited with status {done.returncode} after "
+            f"writing its reply:\n{tail}"
+        )
     result = json.loads(reply_path.read_text())
     result["returncode"] = done.returncode
     result["log"] = str(log)
@@ -232,25 +255,40 @@ def run_engine(
 
 #: Replies of the runs :func:`prestart` started, by run name.
 _REPLIES: dict[str, dict[str, Any]] = {}
+#: Failures of the runs :func:`prestart` started, by run name.
+_FAILURES: dict[str, Exception] = {}
 
 
 def prestart(runs: Iterable[tuple[str, Callable[[], dict[str, Any]]]]) -> None:
     """Start each ``(name, request factory)`` run once, one at a time, and
-    keep its reply for :func:`reply`. A factory that raises (a skipped
-    check) starts nothing."""
+    keep its reply for :func:`reply`. A factory that fails or skips starts
+    nothing; the test reports that when it calls the factory itself. A run
+    that fails (a timeout, no reply, a nonzero exit status) is kept as that
+    run's failure, which :func:`reply` raises, so only the tests that read
+    the run fail and the session continues."""
+    import pytest
+
     directory = Path(tempfile.mkdtemp(prefix="installed-engines-"))
     for name, make in runs:
-        if name in _REPLIES:
+        if name in _REPLIES or name in _FAILURES:
             continue
         try:
             request = make()
-        except BaseException:  # noqa: BLE001 - the test reports it itself
+        except (Exception, pytest.skip.Exception):
             continue
-        _REPLIES[name] = run_engine(directory, request)
+        try:
+            _REPLIES[name] = run_engine(directory, request)
+        except Exception as error:  # noqa: BLE001 - raised by reply()
+            _FAILURES[name] = error
 
 
 def reply(name: str, make: Callable[[], dict[str, Any]], directory: Path) -> dict:
-    """The reply of run ``name``: started at collection's end, or now."""
+    """The reply of run ``name``: started at collection's end, or now. Raises
+    if the run started at collection's end failed."""
+    if name in _FAILURES:
+        raise AssertionError(
+            f"engine run {name!r}, started before the tests, failed"
+        ) from _FAILURES[name]
     if name not in _REPLIES:
         _REPLIES[name] = run_engine(directory, make())
     return _REPLIES[name]

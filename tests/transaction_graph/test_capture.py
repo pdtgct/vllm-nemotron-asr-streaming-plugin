@@ -28,6 +28,10 @@ from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
 
 pytestmark = pytest.mark.engine
 
+#: The start of the error a validation replay raises when a component pool's
+#: null page or capture-row pages differ from the call's snapshot (TXG-CAP-004).
+PAGE_MISMATCH = "the null page or the capture rows' pages"
+
 
 def cell_windows(env, mark):
     """``[(begin, end)]`` event indices of each cell capture block since
@@ -200,20 +204,27 @@ def test_each_cell_runs_reference_three_warm_ups_capture_and_one_validation_repl
     assert all(g is not None and g.captured for g in published), "a cell is unpublished"
 
 
-# @spec TXG-CAP-004
-def test_a_validation_replay_that_differs_from_the_reference_fails_the_capture(on_cpu):
+@pytest.mark.parametrize("page", [1, 0], ids=["capture-row-page", "null-page"])
+# @spec TXG-CAP-004, TXG-CAP-008
+def test_a_validation_replay_that_differs_from_the_reference_fails_the_capture(
+    on_cpu, page
+):
+    """After each replay, one page differs from the call's snapshot: page 1,
+    which the capture rows gather, or the null page, which no capture may
+    store to."""
     run = on_cpu(n=2)
     env = run.env
     startup_through_profiling(run)
     bindings = run.core.profiling_bindings
 
     def corrupt(graph):
-        # page 1, which the capture rows gather, now differs from the reference
-        h.slot_bytes(bindings, 1).fill_(0x7F)
+        h.slot_bytes(bindings, page).fill_(0x7F)
 
     env.fake.on_replay = corrupt
     error = h.call_with(run.core.profiling_capture)
     assert error is not None, "a mismatching validation replay published its cell"
+    if page == 0:
+        assert PAGE_MISMATCH in t.text(error), t.text(error)
     assert t.fake_graph_count(env) == 0
 
 
@@ -609,6 +620,10 @@ def test_corrupted_validation_replay_fails_and_publishes_nothing_cuda(
     monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", original)
     assert error is not None, "the mismatching validation replay was accepted"
     assert "validation replay" in t.text(error), t.text(error)
+    if page == 0:
+        # No capture row gathers the null page, so the outputs match and the
+        # page check reports the change.
+        assert PAGE_MISMATCH in t.text(error), t.text(error)
     from support import txg_api
 
     assert not txg_api.binding_of(env.model).cells, "a cell was published"

@@ -46,10 +46,27 @@ ENGINE = _engine_available()
 CUDA = _cuda_available()
 
 
+def _bind_the_real_row_transaction() -> None:
+    """Import ``profile_execution`` before any test runs. It binds
+    ``advance.advance_model_rows`` by name when it is first imported, so a
+    first import while a test had patched that function (an ``AdvanceSpy``,
+    ``support.txg_transaction.recording`` or a test's own spy) would keep the
+    patch, and everything it recorded, for the rest of the process. Imported
+    here, it binds the real row transaction. Where the module cannot be
+    imported (no stage 1 build), no test can create that binding either."""
+    try:
+        importlib.import_module(
+            "vllm_nemotron_asr_streaming.nemotron_asr.profile_execution"
+        )
+    except Exception:
+        pass
+
+
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "engine: needs the stage 1 vLLM build")
     config.addinivalue_line("markers", "gpu: needs an installed engine on CUDA")
     config.addinivalue_line("markers", "card: needs NEMOTRON_CARD_DIR")
+    _bind_the_real_row_transaction()
 
 
 def pytest_collection_modifyitems(

@@ -1219,8 +1219,10 @@ class TransactionGraphBinding:
         """Capture one cell: an eager reference of the body on its rejected
         capture rows (launching the nested segment graphs), three warm-ups
         and the capture with the nested bindings running eagerly, and one
-        validation replay whose outputs and pages equal the reference bit for
-        bit. Only then is the cell published."""
+        validation replay. The replay's outputs must equal the reference's
+        bit for bit, and the null page and the capture rows' pages 1 ... k of
+        every component pool (k the cell's count) must equal the snapshot
+        taken before the call. Only then is the cell published."""
         import vllm.compilation.cudagraph_pool as cudagraph_pool
 
         config = self._model.config

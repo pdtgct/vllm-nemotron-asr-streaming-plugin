@@ -13,6 +13,7 @@ read the allocator.
 from __future__ import annotations
 
 import gc
+import inspect
 import logging
 import weakref
 
@@ -702,16 +703,31 @@ def test_transaction_graph_part_is_released_before_the_segment_graphs(on_cpu, re
 # CUDA
 
 
+def _assert_the_profile_transaction_binds_the_real_function() -> None:
+    """``profile_execution``'s binding of ``advance_model_rows`` is the
+    function ``advance`` defines, not a spy or recorder a test installed
+    (``tests/conftest.py`` imports the module before any test runs)."""
+    from vllm_nemotron_asr_streaming.nemotron_asr import advance, profile_execution
+
+    bound = profile_execution.advance_model_rows
+    assert (
+        inspect.isfunction(bound)
+        and bound.__module__ == advance.__name__
+        and bound.__qualname__ == "advance_model_rows"
+    ), ("profile_execution binds a patched row transaction", bound)
+
+
 def _released() -> tuple[int, int]:
     """Device memory after everything unreferenced is returned: the test
-    spies' recorded transaction arguments are dropped (they hold every
-    transaction's pools, the profile transactions' scratch included), then a
-    collection, a synchronize, PyTorch's per-stream cuBLAS workspaces (a
-    library cache: the first matmul on a stream, such as the capture stream
-    core creates for each capture call, allocates one of 8,519,680 bytes on
-    the A40 that PyTorch keeps for the process) and the allocator's cache
-    release. Returns the allocator's reserved bytes and the driver's free
-    bytes."""
+    spies' recorded transaction arguments are dropped (they hold the pools of
+    every call the spies saw), then a collection, a synchronize, PyTorch's
+    per-stream cuBLAS workspaces (a library cache: the first matmul on a
+    stream, such as the capture stream core creates for each capture call,
+    allocates one of 8,519,680 bytes on the A40 that PyTorch keeps for the
+    process) and the allocator's cache release. The profile transaction must
+    call the real row transaction, so that no spy records it. Returns the
+    allocator's reserved bytes and the driver's free bytes."""
+    _assert_the_profile_transaction_binds_the_real_function()
     h.drop_advance_records()
     gc.collect()
     torch.cuda.synchronize()
@@ -725,19 +741,58 @@ def _warm_the_process(on_cuda) -> None:
     capture loads kernels and creates library handles for core's capture
     stream, device memory outside the allocator that no release returns
     (about 70 MiB on the A40, once per process), so a driver-level reading
-    of a later capture measures only that capture."""
-    env = on_cuda(n=2)
-    env.core.prepare()
-    env.core.bind_profiling()
-    env.core.profiling_capture()
-    env.core.clear()
-    env.state.shutdown()
+    of a later capture measures only that capture. The allocator traces the
+    warm-up, and after its clear and shutdown no live block may come from an
+    allocation by the transaction-graph part: the warm-up cannot absorb
+    allocator memory that only the first capture retains (TXG-LIFE-004,
+    TXG-LIFE-012)."""
+    torch.cuda.synchronize()
+    torch.cuda.memory._record_memory_history(stacks="python", max_entries=200_000)
+    try:
+        env = on_cuda(n=2)
+        env.core.prepare()
+        env.core.bind_profiling()
+        env.core.profiling_capture()
+        env.core.clear()
+        env.state.shutdown()
+        _released()
+        snapshot = torch.cuda.memory._snapshot()
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
+    retained = _live_blocks_from(snapshot, TRANSACTION_GRAPH_SOURCE)
+    assert not retained, (
+        "the warm-up's clear and shutdown left blocks the transaction-graph "
+        "part allocated",
+        retained[:3],
+    )
 
 
 #: The transaction-graph part of the model, as an allocation's stack names it.
 TRANSACTION_GRAPH_SOURCE = (
     "vllm_nemotron_asr_streaming/nemotron_asr/transaction_graph.py"
 )
+
+
+def _live_blocks_from(snapshot: dict, source: str) -> list[tuple[int, list[str]]]:
+    """The blocks of the current device in an allocator ``snapshot``
+    (``torch.cuda.memory._snapshot``) that are still in use (allocated or
+    awaiting free) and whose allocation stack names ``source``, as
+    ``(size, frames)``."""
+    device = torch.cuda.current_device()
+    found = []
+    for segment in snapshot["segments"]:
+        if segment.get("device", device) != device:
+            continue
+        for block in segment["blocks"]:
+            if not str(block["state"]).startswith("active"):
+                continue
+            frames = [
+                f"{frame['filename']}:{frame['line']}"
+                for frame in block.get("frames", [])
+            ]
+            if any(source in frame for frame in frames):
+                found.append((int(block["size"]), frames))
+    return found
 
 
 def _allocations_during(fn) -> list[list[str]]:

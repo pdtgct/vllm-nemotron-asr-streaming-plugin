@@ -512,11 +512,14 @@ reads of nested counters are deltas from a baseline taken after startup.
 
 Capturing one cell runs, on core's capture stream, an eager reference of the body on capture rows
 that the transaction rejects (so no page is stored), three warm-ups with the nested bindings
-running eagerly (Flat capture), the capture, and one
-replay whose outputs, and whose null page and capture rows' pages in every component pool, must
-equal the reference bit for bit before the cell is published.
-Capture rows use non-null free pages `1 … k`, which the populations bound guarantees in both
-pools. A CHUNK capture row carries a zero envelope header (`ROW_STATUS_ENVELOPE`); an echo capture
+running eagerly (Flat capture), the capture, and one validation replay. The cell is published only
+if the replay's outputs equal the reference's bit for bit and, in every component pool, the null
+page and the cell's capture-row pages equal bit for bit the call's snapshot of them: a host copy
+of pages `0 … N` taken once, at the start of the call's transaction-graph part (before the scatter
+warm-up). Because the comparison is with that snapshot, a store by the scatter warm-up, the
+reference or a warm-up fails the check as well as a store by the replay. A cell at count `k` has
+`k` capture rows, which use non-null free pages `1 … k`; the populations bound guarantees them in
+both pools. A CHUNK capture row carries a zero envelope header (`ROW_STATUS_ENVELOPE`); an echo capture
 row carries the stream carrier token (`ROW_STATUS_ROLE_MISMATCH`). Capture rows carry the server's
 geometry and alternate their fresh and file bits, so the self-check exercises both arms of every
 select. Each capture row's rejection depends on its header or token alone, never on the content
@@ -886,7 +889,9 @@ intermediate is live across a replay, and each call writes the scratch fully bef
   returns an empty mapping.
 - **Reader.** `transaction_graph_counters(worker_or_model)` returns the counters and the capture
   record. It takes a model, runner, worker or engine core in-process, and runs on the worker
-  through `AsyncLLM.collective_rpc` under a multiprocess engine. It walks runner and worker
+  through `AsyncLLM.collective_rpc` under a multiprocess engine; vLLM serializes a function sent
+  that way only with `VLLM_ALLOW_INSECURE_SERIALIZATION=1` set in the environment the engine
+  starts in (`vllm/v1/serial_utils.py`). It walks runner and worker
   attributes (a harness convenience, not a core contract) and raises if it cannot reach the
   model, so an unreachable model is never mistaken for the option being off.
 - **Capture record** (per worker): the configuration identity, the figures and settings of

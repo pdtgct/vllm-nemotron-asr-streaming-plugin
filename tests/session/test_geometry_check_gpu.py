@@ -190,8 +190,16 @@ def finish_reason(outputs) -> str | None:
 
 
 def parked_units(served, outputs) -> int:
+    """The units that parked: outputs of the open stream whose last token is
+    the park token. The finished output is not counted: a normal close
+    (``stop``) ends its last delta with EOS, which is the park token, but
+    parks no unit."""
     park = served.llm.model_config.hf_config.eos_token_id
-    return sum(1 for o in outputs if list(o.outputs[0].token_ids)[-1:] == [park])
+    return sum(
+        1
+        for o in outputs
+        if not o.finished and list(o.outputs[0].token_ids)[-1:] == [park]
+    )
 
 
 def run_streams(served, *streams):

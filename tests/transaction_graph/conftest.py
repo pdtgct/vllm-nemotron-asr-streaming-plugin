@@ -61,9 +61,10 @@ def pytest_configure(config: pytest.Config) -> None:
 
 def pytest_collection_finish(session: pytest.Session) -> None:
     """Start the installed-engine runs the selected, unskipped tests name,
-    one at a time, before any test runs (``support.engine_child``): the
-    in-process CUDA tests leave device memory allocated in this process, and
-    each engine needs its fraction of the device free."""
+    one at a time, before any test runs (``support.engine_child``): each
+    engine needs its fraction of the device free, and once the in-process
+    CUDA tests run, what this process holds on the device depends on which
+    of them ran."""
     if session.config.option.collectonly:
         return
     runs = []
