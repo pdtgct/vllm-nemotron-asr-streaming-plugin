@@ -552,6 +552,165 @@ class FakeEngine:
         self._log("retired", request_id)
 
 
+# --------------------------------------------- seam conformance arrangements
+
+
+async def perform(block: Any) -> Any:
+    """Park on ``block`` (a ``vllm_riva_frontend_dev.Block``, duck-typed so
+    this module imports no frontend), then do what it says: raise the
+    exception of a ``Raise``, else return the value of a ``Return``."""
+    await block.park()
+    then = getattr(block, "then", None)
+    exc = getattr(then, "exc", None)
+    if exc is not None:
+        raise exc
+    return getattr(then, "value", None)
+
+
+@dataclass
+class Gate:
+    """A parked call for ``SeamEngine``'s arrangements, without the frontend:
+    ``park`` waits for ``release()``; ``exc`` then makes the call raise."""
+
+    exc: BaseException | None = None
+    entered: asyncio.Event = field(default_factory=asyncio.Event)
+    released: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def then(self) -> Any:
+        return SimpleNamespace(exc=self.exc)
+
+    async def park(self) -> None:
+        self.entered.set()
+        await self.released.wait()
+
+    def release(self) -> None:
+        self.released.set()
+
+
+class SeamEngine(FakeEngine):
+    """The fake engine with the arrangements the frontend's seam conformance
+    suite asks for, each an effect at the engine boundary a real engine client
+    can show:
+
+    * ``open_gates``: the next ``generate`` call parks before admission (its
+      task has taken its first step: the call is recorded) until the gate is
+      released.
+    * ``refusals``: the next ``generate`` call is refused with that reason.
+    * ``abort_gates[caller_id]`` / ``next_abort_gates``: once the request's
+      ``generate`` is cancelled (the client aborted the request and the stream
+      ended in the engine), the cancellation handler awaits the gate before it
+      ends, as ``AsyncLLM``'s handler awaits the engine abort; a ``Raise`` makes
+      the handler raise.
+    * ``outcome_gates[caller_id]``: the next unit outcome of that request (or
+      its close) waits for the gate; a ``Raise`` ends the request with it.
+    * ``release_gates[caller_id]``: the next retirement wait for that caller ID
+      from outside the factory's own tasks parks on the gate.
+    * ``cleanup_gates``: the next retirement wait made by a factory task
+      parks on the gate.
+    * ``fail_request(caller_id, exc)``: ``generate`` for that request raises
+      ``exc``.
+
+    ``engine_calls[caller_id]`` lists what that request's ``generate`` did:
+    ``"generate"``, then ``"abort"`` when it was cancelled. ``in_handler``
+    holds the tasks currently inside the cancellation handler.
+    ``is_factory_task`` tells whether the current task is one the factory
+    created (set by the adapter)."""
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.engine_calls: dict[str, list[str]] = {}
+        self.open_gates: list[Any] = []
+        self.refusals: list[str] = []
+        self.abort_gates: dict[str, Any] = {}
+        self.next_abort_gates: list[Any] = []
+        self.outcome_gates: dict[str, Any] = {}
+        self.release_gates: dict[str, Any] = {}
+        self.cleanup_gates: list[Any] = []
+        self.in_handler: set[asyncio.Task] = set()
+        self.is_factory_task: Callable[[], bool] = lambda: False
+
+    async def generate(
+        self,
+        prompt: AsyncGenerator,
+        sampling_params: Any,
+        request_id: str,
+        *,
+        stream_admission: bool = False,
+        **kwargs: Any,
+    ):
+        from vllm.v1.engine import StreamAdmissionError, StreamAdmissionResult
+
+        self.engine_calls.setdefault(request_id, []).append("generate")
+        if self.next_abort_gates:
+            self.abort_gates[request_id] = self.next_abort_gates.pop(0)
+        open_gate = self.open_gates.pop(0) if self.open_gates else None
+        refusal_reason = self.refusals.pop(0) if self.refusals else None
+        try:
+            if open_gate is not None:
+                await perform(open_gate)
+            if refusal_reason is not None:
+                self.generate_calls.append(
+                    GenerateCall(
+                        request_id, prompt, sampling_params, stream_admission, kwargs
+                    )
+                )
+                raise StreamAdmissionError(
+                    _refusal(StreamAdmissionResult, request_id, refusal_reason)
+                )
+            stream = super().generate(
+                prompt,
+                sampling_params,
+                request_id,
+                stream_admission=stream_admission,
+                **kwargs,
+            )
+            try:
+                async for item in stream:
+                    yield item
+            finally:
+                await stream.aclose()
+        except asyncio.CancelledError:
+            # The request was aborted (the inner generate ended it in the
+            # engine); the handler now awaits the abort's completion.
+            self.engine_calls[request_id].append("abort")
+            task = asyncio.current_task()
+            gate = self.abort_gates.pop(request_id, None)
+            if gate is not None and task is not None:
+                self.in_handler.add(task)
+                try:
+                    await perform(gate)
+                finally:
+                    self.in_handler.discard(task)
+            raise
+
+    async def _emit(self, req: FakeRequest, position: int, outcome: Any) -> None:
+        gate = self.outcome_gates.pop(req.request_id, None)
+        if gate is not None:
+            try:
+                await perform(gate)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                self._end(req, error)
+                return
+        await super()._emit(req, position, outcome)
+
+    def fail_request(self, request_id: str, error: BaseException) -> None:
+        req = self.requests[request_id]
+        if not req.ended:
+            self._end(req, error)
+
+    async def wait_stream_retired(self, request_id: str) -> None:
+        if self.is_factory_task():
+            gate = self.cleanup_gates.pop(0) if self.cleanup_gates else None
+        else:
+            gate = self.release_gates.pop(request_id, None)
+        if gate is not None:
+            await perform(gate)
+        return await super().wait_stream_retired(request_id)
+
+
 # ------------------------------------------------------ admission results
 
 
@@ -712,16 +871,25 @@ def make_hf_config(
     *,
     locales: dict[str, int] | None = None,
     lookaheads: list[int] | None = None,
-    default_lookahead: int = 3,
+    lookahead: int | None = 0,
+    card_default: int | None = 3,
     blank: int | None = None,
     architecture: str = "Nemotron3_5AsrStreamingForRNNT",
-    supported: list[int] | None = None,
 ) -> SimpleNamespace:
     """A served (translated) configuration, shaped as the registration design
     describes it: ``num_asr_labels`` is ``blank``, the locale table is
-    ``prompt_dictionary``, the card's set is ``card_num_lookahead_tokens`` and
-    ``supported_num_lookahead_tokens`` overrides it when present."""
+    ``prompt_dictionary``, the card's declared set is
+    ``card_num_lookahead_tokens`` and the card's default lookahead is
+    ``card_default_num_lookahead_tokens``.
+
+    The server's lookahead (REG-LA-001) is ``lookahead`` as
+    ``num_lookahead_tokens`` (what ``--hf-overrides`` sets), or the card
+    default when ``lookahead`` is ``None``. The default, 0 (80 ms, 1,280
+    samples per unit), keeps the session tests' unit arithmetic small; it
+    differs from the card default 3 so that a reader taking the card default
+    instead of the server's lookahead packs the wrong unit size."""
     blank = DEFAULT_BLANK if blank is None else blank
+    served = lookahead if lookahead is not None else card_default
     cfg = SimpleNamespace(
         architectures=[architecture],
         num_asr_labels=blank,
@@ -737,11 +905,12 @@ def make_hf_config(
         card_num_lookahead_tokens=list(
             CARD_LOOKAHEADS if lookaheads is None else lookaheads
         ),
-        num_lookahead_tokens=default_lookahead,
-        att_context_right=default_lookahead,
+        att_context_right=served,
     )
-    if supported is not None:
-        cfg.supported_num_lookahead_tokens = list(supported)
+    if card_default is not None:
+        cfg.card_default_num_lookahead_tokens = card_default
+    if lookahead is not None:
+        cfg.num_lookahead_tokens = lookahead
     return cfg
 
 

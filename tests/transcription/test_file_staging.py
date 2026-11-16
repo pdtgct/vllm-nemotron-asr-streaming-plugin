@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Production staging and queue-read paths of FILE rows on CPU.
+"""Production staging and queue-count paths of FILE rows on CPU.
 
 Regressions: ``advance_model_rows`` staged an ``is_file`` vector through a
-``HostStaging`` that did not know the slot; the label-queue read of the step
-planner had no test.
+``HostStaging`` that did not know the slot; the step planner read the label
+book on the host (FILE-QC-011 forbids it: the count arrives through the
+commit status, FILE-QC-006).
 """
 
 from __future__ import annotations
@@ -55,11 +56,15 @@ def test_file_and_chunk_role_vectors_use_separate_storage():
     assert staging._is_chunk_buf.data_ptr() != staging._is_file_buf.data_ptr()
 
 
-# @spec FILE-ROW-002, FILE-BUF-002
+# @spec FILE-QC-011, FILE-ROW-002
 @pytest.mark.engine
-def test_production_steps_read_the_device_queue_after_an_advance(
+def test_production_planning_uses_the_file_count_and_never_reads_the_book(
     file_model_state, make_step, monkeypatch
 ):
+    """Each step plans from the file's count, which the test sets as an
+    accepted count would be (layout: ``_file_progress[req].queue_count`` and
+    ``.queue_count_unknown``); the label book is never read and planning
+    leaves the count unchanged."""
     from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import FileAction
     from vllm_nemotron_asr_streaming.nemotron_asr.model_state_v2 import RowBinding
     from vllm_nemotron_asr_streaming.nemotron_asr.rnnt import QUEUE_HEAD, QUEUE_LEN
@@ -73,7 +78,7 @@ def test_production_steps_read_the_device_queue_after_an_advance(
     )
     handle = make_step.handle(1, 1)
     book = torch.zeros(4, 7, dtype=torch.int32)
-    book[1, QUEUE_LEN] = 3  # the device reports two labels still queued
+    book[1, QUEUE_LEN] = 9  # what a host read would find: never consulted
     book[1, QUEUE_HEAD] = 1
     reads = []
     real_index_select = torch.Tensor.index_select
@@ -87,28 +92,32 @@ def test_production_steps_read_the_device_queue_after_an_advance(
     batch = SimpleNamespace(pools=SimpleNamespace(replay_book=book))
     input_batch = SimpleNamespace(num_computed_tokens_np=np.zeros(1, np.int64))
 
-    def run(out, fresh):
+    def run(out, fresh, count=None):
         state.prepare_step(out, dummy_run=False, is_profile=False)
+        entry = state._file_progress["f1"]
+        if count is not None:
+            entry.queue_count = count
+            entry.queue_count_unknown = False
+        before = (entry.queue_count, entry.queue_count_unknown)
         binding = RowBinding("f1", handle["nemotron.state"], fresh)
         plan = state._plan_production_step(
             ("f1",), (binding,), batch, [state._scheduled_tokens["f1"]], input_batch
         )
+        assert (entry.queue_count, entry.queue_count_unknown) == before
         (row,) = plan.rows
         return row.file_plan.action
 
+    cached = make_step.step(cached=["f1"], handles={"f1": handle})
     actions = [
         run(make_step.step(new=[request], handles={"f1": handle}), True),
-        run(make_step.step(cached=["f1"], handles={"f1": handle}), False),
-        run(make_step.step(cached=["f1"], handles={"f1": handle}), False),
-        run(make_step.step(cached=["f1"], handles={"f1": handle}), False),
+        run(cached, False, count=2),
+        run(cached, False, count=1),
+        run(cached, False, count=0),
     ]
-    # fresh row: empty queue, a chunk; the next step reads the device (two
-    # queued labels) and drains; the host then knows the count, drains the
-    # second without a read, and the emptied queue lets the next chunk run.
     assert actions == [
         FileAction.CHUNK,
         FileAction.DRAIN,
         FileAction.DRAIN,
         FileAction.CHUNK,
     ]
-    assert len(reads) == 1
+    assert reads == []

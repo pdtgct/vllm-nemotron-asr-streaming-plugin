@@ -724,6 +724,17 @@ class ResolvedEncoderExecution:
         default_factory=list,
         repr=False,
     )
+    #: Set while :meth:`profile_uncaptured_cell` authorizes the uncaptured
+    #: transition of a sealed graphed arm whose graphs are not captured.
+    _uncaptured_active: bool = field(default=False, repr=False)
+    _uncaptured_transitions: dict[tuple[Any, ...], EncoderTransition] = field(
+        default_factory=dict, repr=False
+    )
+    #: The graph pool of the capture in progress (core's capture hook).
+    _capture_graph_pool: Any = field(default=None, repr=False)
+    #: The cell :meth:`capture_graph_domain` is staging or capturing; still
+    #: set after a failed capture, for its diagnosis.
+    capture_in_progress: tuple[int, int] | None = field(default=None, repr=False)
 
     @property
     def ready(self) -> bool:
@@ -957,7 +968,9 @@ class ResolvedEncoderExecution:
         self._graph_entries.clear()
         self._chunk_graph_entries.clear()
         self._pending_graph_entries.clear()
+        self._uncaptured_transitions.clear()
         self._staging_cell = None
+        self._capture_graph_pool = None
 
     def _materialize_preprofile_state(
         self,
@@ -1047,7 +1060,8 @@ class ResolvedEncoderExecution:
         expected_cells: tuple[tuple[int, int], ...],
         invoke: Callable[[int, int], Any],
     ) -> None:
-        """Warm and seal the complete finite exact-shape domain."""
+        """Warm and seal the complete finite exact-shape domain. A graphed arm's
+        graphs are captured later, by :meth:`capture_graph_domain`."""
         if self.arm not in _STATIC_ARMS:
             raise ValueError("encoder warmup domain requires a static encoder arm")
         self._raise_if_failed()
@@ -1091,6 +1105,47 @@ class ResolvedEncoderExecution:
                     invoke=invoke_cell,
                 )
             self._seal()
+        except Exception:
+            self._discard()
+            raise
+
+    @property
+    def warmed(self) -> bool:
+        """Whether the domain is warmed and sealed, with a graphed arm's graphs
+        possibly not captured yet (core's capture hook captures them later)."""
+        if self.arm == "eager":
+            return True
+        return self._sealed and not self._failed
+
+    @property
+    def graphs_captured(self) -> bool:
+        """Whether a graphed arm holds captured graph entries."""
+        return bool(self._graph_entries or self._chunk_graph_entries)
+
+    # @spec REG-MEM-007
+    def capture_graph_domain(
+        self,
+        *,
+        invoke: Callable[[int, int], Any],
+        stream: Any = None,
+        graph_pool: Any = None,
+    ) -> None:
+        """Capture a graphed arm's graph at every declared cell except the
+        CHUNK-bucket cells, over the sealed domain. ``stream`` and
+        ``graph_pool`` (core's capture hook) capture on that stream into that
+        pool; by default core's capture context picks the stream and the
+        wrapper its global pool. A failure discards the graphs this call
+        created and keeps the sealed domain, so a later call can capture again.
+        """
+        if self.arm not in _GRAPHED_ARMS:
+            return
+        self._raise_if_failed()
+        cells = tuple(
+            (geometry, population)
+            for geometry in self.warmup_geometries
+            for population in self.warmup_populations
+        )
+        try:
             if self.arm == "dense-graphed":
                 # Initial warmup intentionally specializes. After sealing,
                 # staging and capture must reuse exactly that compiler domain.
@@ -1100,12 +1155,117 @@ class ResolvedEncoderExecution:
                     else nullcontext(),
                     torch._dynamo.config.patch(error_on_recompile=True),
                 ):
-                    self._capture_graph_domain(cells=cells, invoke=invoke)
-            elif self.arm == "eager-graphed":
-                self._capture_graph_domain(cells=cells, invoke=invoke)
+                    self._capture_graph_domain(
+                        cells=cells, invoke=invoke, stream=stream, graph_pool=graph_pool
+                    )
+            else:
+                self._capture_graph_domain(
+                    cells=cells, invoke=invoke, stream=stream, graph_pool=graph_pool
+                )
+        except Exception:
+            self.release_graphs()
+            raise
+        self.capture_in_progress = None
+
+    def release_graphs(self) -> None:
+        """Drop every graph entry, its buffers and the uncaptured transitions
+        over them, keeping the sealed domain: a capture core releases
+        (``clear_cudagraphs``, ``shutdown``) or a failed capture call."""
+        self._graph_entries.clear()
+        self._chunk_graph_entries.clear()
+        self._pending_graph_entries.clear()
+        self._uncaptured_transitions.clear()
+        self._staging_cell = None
+        self._capture_graph_pool = None
+
+    def profile_uncaptured_cell(
+        self,
+        *,
+        geometry: int,
+        population: int,
+        invoke: Callable[[], _Result],
+    ) -> _Result:
+        """Profile one cell over the uncaptured transition, before core's
+        capture hook captures the graphs: the sealed domain's signature, no
+        graph replay, no staging."""
+        self._raise_if_failed()
+        if not self.warmed:
+            raise ValueError("uncaptured encoder memory profile requires a warmed domain")
+        cell = (int(geometry), int(population))
+        try:
+            self._assert_model_state()
+            before = self._invocations
+            self._uncaptured_active = True
+            try:
+                result = self._invoke_declared_cell(cell=cell, invoke=invoke)
+            finally:
+                self._uncaptured_active = False
+            if (
+                self._invocations != before + 1
+                or self._last_signature != self._warmup_signatures.get(cell)
+            ):
+                raise ValueError(
+                    "uncaptured encoder memory profile differs from its sealed signature"
+                )
+            self._assert_model_state()
+            return result
         except Exception:
             self._discard()
             raise
+
+    # @spec TXG-CAP-003
+    def uncaptured_transition(self, *, geometry: int, count: int) -> EncoderTransition:
+        """The transition at one captured CHUNK count, run eagerly over that
+        entry's own storage (no graph replay), for a capture that encloses it.
+        The same callable is returned for a count until the graphs are
+        released."""
+        key = self.graph_key("cuda", (int(geometry), int(count)))
+        transition = self._uncaptured_transitions.get(key)
+        if transition is not None:
+            return transition
+        entry = self._graph_entries.get(key)
+        if entry is None:
+            raise ValueError(
+                f"no captured encoder entry at geometry={geometry} count={count}"
+            )
+
+        def transition(
+            mel: torch.Tensor,
+            caches: EncoderCaches,
+            out_offsets: torch.Tensor,
+            out_lengths: torch.Tensor,
+            out_width: int,
+            prompt_index: torch.Tensor,
+            mel_lengths: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            signature = _encoder_signature(
+                mel,
+                caches,
+                out_offsets,
+                out_lengths,
+                out_width,
+                prompt_index,
+                mel_lengths,
+            )
+            if signature != entry.signature:
+                raise ValueError(
+                    "uncaptured encoder transition differs from its captured entry"
+                )
+            runtime = self._graph_runtime
+            assert runtime is not None
+            return self._stage_and_call(
+                entry,
+                mel=mel,
+                caches=caches,
+                out_offsets=out_offsets,
+                out_lengths=out_lengths,
+                prompt_index=prompt_index,
+                mel_lengths=mel_lengths,
+                mode=runtime.eager_mode,
+            )
+
+        self._uncaptured_transitions[key] = transition
+        return transition
 
     def _seal(self) -> None:
         """Seal the exact signatures proven by product-owned warmup."""
@@ -1302,11 +1462,10 @@ class ResolvedEncoderExecution:
             entry.conditioned.copy_(next_conditioned)
             return entry.output_tuple()
 
-        entry.wrapper = runtime.wrapper_factory(
-            run,
-            self._vllm_config,
-            runtime_mode=runtime.graph_mode,
-        )
+        entry.wrapper = runtime.wrap(run, self._vllm_config, descriptor, mel.device)
+        if self._capture_graph_pool is not None:
+            # Core's capture hook: capture into the pool core passes.
+            entry.wrapper.graph_pool = self._capture_graph_pool
         return entry
 
     def _graph_bank(self, cell: tuple[int, int]) -> _EncoderGraphEntry | None:
@@ -1413,11 +1572,14 @@ class ResolvedEncoderExecution:
         *,
         cells: tuple[tuple[int, int], ...],
         invoke: Callable[[int, int], Any],
+        stream: Any = None,
+        graph_pool: Any = None,
     ) -> None:
         if self.arm not in _GRAPHED_ARMS or not self._sealed:
             raise ValueError("encoder graph capture requires a sealed static domain")
         if self._graph_entries or self._pending_graph_entries:
             raise ValueError("graphed encoder capture was repeated")
+        self._capture_graph_pool = graph_pool
         # Largest populations first: they own each geometry's storage bank,
         # and capture into the shared graph pool proceeds from the largest.
         cells = tuple(
@@ -1436,6 +1598,7 @@ class ResolvedEncoderExecution:
         try:
             self._record_memory_diagnostic(device, stage="before-staging")
             for cell in cells:
+                self.capture_in_progress = cell
                 self._staging_cell = cell
                 staging_cell = cell
                 try:
@@ -1458,23 +1621,27 @@ class ResolvedEncoderExecution:
 
             stage = "capture"
             cell = None
-            # @spec REG-MEM-007: capture through core's graph-capture context.
-            with torch.inference_mode(), runtime.capture_context(device):
+            # @spec REG-MEM-007: capture through core's graph-capture context,
+            # on the stream core's capture hook passes when it passes one.
+            with torch.inference_mode(), runtime.capture_scope(device, stream):
                 for cell in cells:
+                    self.capture_in_progress = cell
                     entry = self._pending_graph_entries[self.graph_key("cuda", cell)]
                     self._capture_graph_entry(entry)
                     self._record_memory_diagnostic(
                         device, stage="after-capture", key=cell
                     )
                 cell = None
-                runtime.synchronize(device)
+                runtime.sync(device)
             self._assert_model_state()
             self._graph_entries = dict(self._pending_graph_entries)
             self._pending_graph_entries.clear()
+            self._capture_graph_pool = None
             self._record_memory_diagnostic(device, stage="after-all-captures")
         except Exception:
             # Neither the allocator probe nor a logging handler may replace the
-            # causal startup exception. warmup_domain disposes partial authority.
+            # causal startup exception. capture_graph_domain releases the
+            # partial graphs; a failed preparation discards the authority.
             try:
                 self._record_memory_diagnostic(
                     device, stage=f"failure-{stage}", key=cell
@@ -1542,11 +1709,8 @@ class ResolvedEncoderExecution:
         if len(matches) != 1:
             raise ValueError("graphed encoder signature maps to multiple graph keys")
         entry = matches[0]
-        if type(caches) is not type(entry.caches):
-            raise TypeError("graphed encoder cache adapter class changed")
-        caller_storage = _cache_storage(caches)
-        if _cache_storage_signature(caller_storage) != entry.storage_signature:
-            raise ValueError("graphed encoder cache storage signature changed")
+        # The cache adapter class and storage signature are checked by
+        # _stage_and_call, before any staging.
 
         # The finalized model is immutable through this execution domain's
         # lifetime, as in compiled-static. Reconfiguration requires a fresh
@@ -1557,6 +1721,37 @@ class ResolvedEncoderExecution:
         runtime = self._graph_runtime
         if runtime is None:
             raise ValueError("graphed encoder runtime authority is unavailable")
+        return self._stage_and_call(
+            entry,
+            mel=mel,
+            caches=caches,
+            out_offsets=out_offsets,
+            out_lengths=out_lengths,
+            prompt_index=prompt_index,
+            mel_lengths=mel_lengths,
+            mode=runtime.graph_mode,
+        )
+
+    def _stage_and_call(
+        self,
+        entry: _EncoderGraphEntry,
+        *,
+        mel: torch.Tensor,
+        caches: EncoderCaches,
+        out_offsets: torch.Tensor,
+        out_lengths: torch.Tensor,
+        prompt_index: torch.Tensor,
+        mel_lengths: torch.Tensor | None,
+        mode: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stage the caller's inputs into ``entry``'s storage, run its wrapper
+        in ``mode`` (the graph mode replays; the eager mode runs the uncaptured
+        transition over the same storage) and stage the caches back out."""
+        if type(caches) is not type(entry.caches):
+            raise TypeError("graphed encoder cache adapter class changed")
+        caller_storage = _cache_storage(caches)
+        if _cache_storage_signature(caller_storage) != entry.storage_signature:
+            raise ValueError("graphed encoder cache storage signature changed")
         with phase("port.encode.stage_in"):
             entry.mel.copy_(mel)
             _copy_cache_storage_(entry.cache_storage(), caller_storage)
@@ -1566,7 +1761,7 @@ class ResolvedEncoderExecution:
             if entry.mel_lengths is not None and mel_lengths is not None:
                 entry.mel_lengths.copy_(mel_lengths)
         with phase("port.encode.replay"):
-            self._call_graph_entry(entry, mode=runtime.graph_mode)
+            self._call_graph_entry(entry, mode=mode)
         with phase("port.encode.stage_out"):
             _copy_cache_storage_(caller_storage, entry.cache_storage())
             return entry.raw.clone(), entry.conditioned.clone()
@@ -2074,6 +2269,18 @@ def build_encoder_execution(
                         prompt_index=prompt_index,
                         mel_lengths=mel_lengths,
                     )
+                    result = run_transition(
+                        mel,
+                        caches,
+                        out_offsets,
+                        out_lengths,
+                        out_width,
+                        prompt_index,
+                        mel_lengths,
+                    )
+                elif execution._uncaptured_active:
+                    # The profiling step under core's capture hook (REG-MEM-016):
+                    # the sealed uncaptured transition, before any capture.
                     result = run_transition(
                         mel,
                         caches,

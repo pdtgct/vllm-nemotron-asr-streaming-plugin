@@ -30,8 +30,8 @@ OFFLINE_ARCH = "Nemotron3_5AsrForRNNT"
 
 #: Config-key names of the five control tokens, in ``blank + 1 .. blank + 5``
 #: order. Only ``eos_token_id`` is named by the specs; the other four follow
-#: the names the existing configuration class uses for the stream carrier and
-#: EOU tokens, and extend them to the two new tokens (see the report).
+#: the names the configuration class uses for the stream carrier and EOU
+#: tokens, extended to the file carrier and continuation tokens.
 CONTROL_FIELDS = (
     "eos_token_id",
     "audio_chunk_token_id",
@@ -148,8 +148,11 @@ def make_model_config(registered, monkeypatch) -> Callable[..., Any]:
 
     The lazy model class is inspected by core in a child process, which needs
     the plugin importable there; the repository root goes on ``PYTHONPATH``.
-    ``hf_overrides`` always carries ``num_lookahead_tokens`` (the Hub card has
-    no default lookahead) unless ``lookahead=None``.
+    ``lookahead`` adds ``num_lookahead_tokens`` to ``hf_overrides``. Its
+    default, 3, is the synthetic card's own default lookahead, so the override
+    selects the geometry the card default would; ``lookahead=None`` gives no
+    override (the README's serve command), which the server-lookahead tests
+    use.
     """
     monkeypatch.setenv(
         "PYTHONPATH",
@@ -157,7 +160,7 @@ def make_model_config(registered, monkeypatch) -> Callable[..., Any]:
     )
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
 
-    def make(path, *, overrides=None, lookahead: int | None = 3, **kwargs):
+    def make(path, *, overrides=None, lookahead: Any = 3, **kwargs):
         from vllm.config import ModelConfig
 
         require_registered()
@@ -213,11 +216,19 @@ def engine_config() -> Callable[..., SimpleNamespace]:
 
     Attribute paths are the ones core's own persistent-state validation reads
     (``validate_state_config`` in ``vllm/v1/core/state_slot_manager.py``) plus
-    ``model_config.enforce_eager``. Defaults are the accepted configuration.
-    ``drop`` names ``parallel_config`` attributes to leave undefined.
+    ``model_config.enforce_eager``, the compilation settings of the hook
+    configuration (``compilation_config.mode`` / ``.cudagraph_mode``,
+    ``optimization_level``), ``device_config`` and ``model_config.hf_config``.
+    Defaults are the accepted ``--enforce-eager`` configuration with the card's
+    default arms, no lookahead override (the attribute is absent) and no
+    transaction graphs. ``drop`` names
+    ``parallel_config`` attributes to leave undefined; ``hf`` updates the
+    served configuration's fields.
     """
 
-    def make(*, drop: tuple[str, ...] = (), **settings: Any) -> SimpleNamespace:
+    def make(
+        *, drop: tuple[str, ...] = (), hf: dict[str, Any] | None = None, **settings: Any
+    ) -> SimpleNamespace:
         values: dict[str, Any] = {
             "async_scheduling": False,
             "enable_prefix_caching": False,
@@ -228,12 +239,18 @@ def engine_config() -> Callable[..., SimpleNamespace]:
             "enable_cumem_allocator": False,
             "hisparse_config": None,
             "enable_fault_tolerance": False,
+            "enable_elastic_ep": False,
             "enforce_eager": True,
             "tensor_parallel_size": 1,
             "pipeline_parallel_size": 1,
             "data_parallel_size": 1,
             "decode_context_parallel_size": 1,
             "prefill_context_parallel_size": 1,
+            "compilation_config": None,
+            "optimization_level": None,
+            "device": "cuda",
+            "max_num_seqs": 64,
+            "max_num_batched_tokens": 2048,
         }
         unknown = set(settings) - set(values)
         assert not unknown, unknown
@@ -248,28 +265,66 @@ def engine_config() -> Callable[..., SimpleNamespace]:
                 "prefill_context_parallel_size",
                 "enable_dbo",
                 "enable_fault_tolerance",
+                "enable_elastic_ep",
             )
             if name not in drop
         }
-        return SimpleNamespace(
+        hf_config = {
+            "encoder_execution_arm": "eager-graphed",
+            "decode_dispatch_arm": "dense-graphed",
+            "card_default_num_lookahead_tokens": 3,
+            "card_num_lookahead_tokens": [3, 0, 6, 13],
+            "experimental_native_burst": False,
+        }
+        hf_config.update(hf or {})
+        config = SimpleNamespace(
             scheduler_config=SimpleNamespace(
-                async_scheduling=values["async_scheduling"]
+                async_scheduling=values["async_scheduling"],
+                max_num_seqs=values["max_num_seqs"],
+                max_num_batched_tokens=values["max_num_batched_tokens"],
             ),
             cache_config=SimpleNamespace(
-                enable_prefix_caching=values["enable_prefix_caching"]
+                enable_prefix_caching=values["enable_prefix_caching"],
+                num_gpu_blocks_override=None,
+                kv_cache_memory_bytes=None,
+                enable_extensible_kv_cache=False,
             ),
             parallel_config=SimpleNamespace(**parallel),
             model_config=SimpleNamespace(
                 enable_sleep_mode=values["enable_sleep_mode"],
                 enable_cumem_allocator=values["enable_cumem_allocator"],
                 enforce_eager=values["enforce_eager"],
+                hf_config=SimpleNamespace(**hf_config),
+            ),
+            device_config=SimpleNamespace(
+                device=values["device"], device_type=values["device"]
             ),
             speculative_config=values["speculative_config"],
             kv_transfer_config=values["kv_transfer_config"],
             attention_config=SimpleNamespace(hisparse_config=values["hisparse_config"]),
         )
+        if values["compilation_config"] is not None:
+            config.compilation_config = values["compilation_config"]
+        if values["optimization_level"] is not None:
+            config.optimization_level = values["optimization_level"]
+        return config
 
     return make
+
+
+@pytest.fixture
+def platform(monkeypatch) -> Callable[[bool], None]:
+    """``platform(cuda)``: make vLLM's current platform report CUDA or not
+    (``is_cuda`` / ``is_cuda_alike``), for the hook configuration's platform
+    condition (REG-ENG-005, REG-MEM-019). The engine namespace's
+    ``device_config`` follows the same choice when built after the call."""
+
+    from support.fake_cuda import set_cuda_platform
+
+    def set_platform(cuda: bool) -> None:
+        set_cuda_platform(monkeypatch, cuda)
+
+    return set_platform
 
 
 @pytest.fixture
@@ -302,7 +357,10 @@ class _Capture(logging.Handler):
         self.records: list[logging.LogRecord] = []
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.records.append(record)
+        # The handler sits on several loggers, and a record propagating
+        # through two of them reaches it twice: keep each record once.
+        if not any(kept is record for kept in self.records):
+            self.records.append(record)
 
 
 @pytest.fixture
@@ -346,6 +404,8 @@ def build_model_state(registered) -> Callable[..., Any]:
 
         model = model_cls.__new__(model_cls)
         torch.nn.Module.__init__(model)
+        # The served configuration, as the constructed model holds it.
+        model.config = vllm_config.model_config.hf_config
         state_cls = model_cls.get_model_state_cls()
         return state_cls(vllm_config, model, None, torch.device("cpu"))
 

@@ -3,7 +3,8 @@
 
 A frontend reads ``session_error`` and ``reason`` with ``getattr``; it does not
 import this module. Exceptions that carry neither attribute (``ValueError`` for
-bad audio, ``RuntimeError`` for concurrent calls) are caller bugs.
+bad audio, ``RuntimeError`` for concurrent calls, ``TypeError`` for an ``open``
+call with an argument other than ``locale``) are caller bugs.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ REFUSED_REASONS = (
     "active_limit",
     "engine_paused",
     "request_id_in_use",
-    "cadence",
     "locale",
 )
 FAILED_REASONS = (

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-nemotron-asr-streaming"
-version = "0.1.0b1"
+version = "0.1.0b2"
 description = "Out-of-tree plugin for cache-aware streaming Nemotron ASR on vLLM core (RFC 1 + RFC 2 build)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,6 +14,18 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+
+# The two direct references pin the counterpart frontend release (SESS-FAC-007):
+# vllm-riva-frontend and its seam conformance suite, vllm-riva-frontend-dev (the
+# repository's dev/ subdirectory), both at the commit of the frontend release
+# tag v0.4.0b3. The full commit, not the tag name, keeps the pin immutable.
+# A dependency group stays out of the built package metadata.
+[dependency-groups]
+test = [
+    "pytest>=8",
+    "vllm-riva-frontend @ git+https://github.com/pdtgct/vllm-riva-frontend.git@125ac198846d27ca17a1aaa9f1e17c009b40c676",
+    "vllm-riva-frontend-dev @ git+https://github.com/pdtgct/vllm-riva-frontend.git@125ac198846d27ca17a1aaa9f1e17c009b40c676#subdirectory=dev",
+]
 
 [project.entry-points."vllm.general_plugins"]
 # @spec REG-001
@@ -25,7 +37,7 @@ nemotron_asr_streaming = "vllm_nemotron_asr_streaming.session:create_session_fac
 [project.urls]
 Repository = "https://github.com/pdtgct/vllm-nemotron-asr-streaming-plugin"
 SourceModel = "https://github.com/pdtgct/vllm/tree/rfc1-5212-vllm/vllm/models/nemotron_asr"
-Rfc1Tip = "https://github.com/pdtgct/vllm/tree/persistent-state-admission-20261112"
+Rfc1Tip = "https://github.com/pdtgct/vllm/tree/9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee"
 
 [tool.setuptools.packages.find]
 include = ["vllm_nemotron_asr_streaming*"]
@@ -38,6 +50,13 @@ addopts = "--import-mode=importlib"
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+# The vendored model package is excluded: its inherited modules do not pass
+# these rules. Modules written in this repository are linted by naming them,
+# which overrides the exclusion:
+#   ruff check vllm_nemotron_asr_streaming tests \
+#       vllm_nemotron_asr_streaming/nemotron_asr/transaction_graph.py
+#   ruff format --check vllm_nemotron_asr_streaming tests \
+#       vllm_nemotron_asr_streaming/nemotron_asr/transaction_graph.py
 extend-exclude = ["vllm_nemotron_asr_streaming/nemotron_asr"]
 
 [tool.ruff.lint]

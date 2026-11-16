@@ -1,0 +1,4 @@
+# TLC output: state directories, trace files and any jar kept here by mistake.
+states/
+*_TTrace_*
+*.jar

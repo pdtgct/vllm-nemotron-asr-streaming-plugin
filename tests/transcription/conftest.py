@@ -47,11 +47,10 @@ def served_config() -> Callable[..., Any]:
         if locales is not None:
             processor = processor_config(prompt_dictionary=dict(locales))
         translated = dict(translate_card(card_config(), processor))
+        # the server's one geometry (REG-LA-001), as --hf-overrides sets it;
+        # no served lookahead set (REG-LA-008)
         translated["num_lookahead_tokens"] = right_context
         translated["att_context_right"] = right_context
-        # the synthetic card serves [3, 0, 6, 13]; serve all five geometries
-        # (as --hf-overrides would) so a default of 1 passes REG-LA-005
-        translated["supported_num_lookahead_tokens"] = [0, 1, 3, 6, 13]
         translated["experimental_native_burst"] = native_burst
         if language_locales is not None:
             translated["language_locales"] = dict(language_locales)
@@ -141,8 +140,8 @@ STATE_LAYER = "nemotron.state"
 def _set_inert_model_attributes(model: Any, hf_config: Any) -> None:
     """The private model attributes ``prepare_step`` reads in today's code.
 
-    NOTE: these names come from the current source; Phase 6 may rename them,
-    and this helper is the one place to update.
+    NOTE: these names come from the current source; if the code renames
+    them, this helper is the one place to update.
     """
     model.config = hf_config
     model._persistent_state_layer = SimpleNamespace(prefix=STATE_LAYER)
@@ -179,10 +178,7 @@ def file_model_state(tmp_path):
         model_config = ModelConfig(
             model=str(card),
             config_format="nemotron_asr_streaming",
-            hf_overrides={
-                "num_lookahead_tokens": right_context,
-                "supported_num_lookahead_tokens": [0, 1, 3, 6, 13],
-            },
+            hf_overrides={"num_lookahead_tokens": right_context},
             enforce_eager=True,
             dtype="float32",
         )

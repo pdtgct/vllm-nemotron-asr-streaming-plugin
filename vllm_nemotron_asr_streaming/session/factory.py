@@ -30,10 +30,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_nemotron_asr_streaming.identity import ARCHITECTURE
 from vllm_nemotron_asr_streaming.locales import default_locale
-from vllm_nemotron_asr_streaming.lookahead import (
-    GEOMETRIES,
-    served_lookaheads,
-)
+from vllm_nemotron_asr_streaming.lookahead import geometry_index, served_lookahead
 
 from .errors import SessionFailed, SessionRefused
 from .packer import Packer, PackerCapacityError, Unit, wall_clock_ms
@@ -107,6 +104,10 @@ class SessionLease:
         self.started = False
         self.cleanup_task: asyncio.Task | None = None
         self.holder_task: asyncio.Task | None = None
+        #: An ``abort`` call that has not been cancelled awaits the task.
+        self.abort_waiting = False
+        #: The cleanup faults recorded for this session, by identity.
+        self.recorded_faults: list[BaseException] = []
         self.locale = locale
         self._packer = packer
         self._loop = asyncio.get_running_loop()
@@ -163,6 +164,7 @@ class SessionLease:
         if not self._admitted.done():
             self._admitted.set_result(False)
         self._on_stream_end()
+        self._factory._on_generation_end(self, task)
 
     # @spec SESS-TXT-003
     def _on_output(self, output: Any) -> None:
@@ -380,7 +382,14 @@ class SessionLease:
             # waits, so the lease is aborted before the wait and `release` stays
             # allowed; `release` keeps the task owned until it has ended.
             self.state = ABORTED
-            await asyncio.wait({self.task})
+            # An exception the task's cancellation handler raises while this
+            # call awaits it is a cleanup fault, not this call's error
+            # (SESS-OWN-009): the wait retrieves it without raising it.
+            self.abort_waiting = True
+            try:
+                await asyncio.wait({self.task})
+            finally:
+                self.abort_waiting = False
 
     # @spec SESS-REL-001, SESS-REL-002, SESS-REL-003
     async def release(self) -> None:
@@ -404,11 +413,10 @@ class SessionLease:
             except Exception:
                 factory._hold_until_ended(self)
                 raise
-            if self.task is not None and not self.task.done():
-                # Keep the generate task owned until it has ended.
-                factory._start_cleanup(self)
-            else:
-                factory._drop(self)
+            # The retirement wait has its terminal result; the record goes
+            # once the generate task has ended too (SESS-OWN-002), and one
+            # tracked task keeps it until then.
+            factory._hold_until_ended(self)
             self.state = RELEASED
 
     # @spec SESS-TEAR-001
@@ -421,6 +429,7 @@ class StreamingSessionFactory:
     """Opens sessions on an engine client and owns them until retirement."""
 
     # @spec SESS-FAC-004, SESS-OWN-001, SESS-OWN-005
+    # @spec SESS-GEOM-001, SESS-GEOM-002
     def __init__(
         self,
         engine_client: Any,
@@ -436,12 +445,9 @@ class StreamingSessionFactory:
         self._locale_table: dict[str, int] = dict(hf_config.prompt_dictionary)
         self._park_token_id: int = hf_config.eos_token_id
         self._carrier_token_id: int = hf_config.audio_chunk_token_id
-        self._geometry_by_label = {
-            label: (right, index)
-            for right, label, index in GEOMETRIES
-            if right in set(served_lookaheads(hf_config))
-        }
-        self.served_cadences: frozenset[str] = frozenset(self._geometry_by_label)
+        # The server's geometry, read once: every session packs at it.
+        self._right_context: int = served_lookahead(hf_config)
+        self._geometry_index: int = geometry_index(self._right_context)
         self.locales: frozenset[str] = frozenset(self._locale_table)
         self.default_locale: str | None = default_locale(self._locale_table)
         self.sessions: dict[str, SessionLease] = {}
@@ -449,23 +455,23 @@ class StreamingSessionFactory:
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._faults: list[BaseException] = []
 
-    # @spec SESS-OPEN-001, SESS-OPEN-002, SESS-OPEN-003, SESS-OPEN-004
-    # @spec SESS-OPEN-005, SESS-OPEN-006, SESS-OWN-006
-    async def open(self, *, cadence: str, locale: str) -> SessionLease:
+    # @spec SESS-FAC-006, SESS-OPEN-001, SESS-OPEN-002, SESS-OPEN-003
+    # @spec SESS-OPEN-004, SESS-OPEN-005, SESS-OPEN-006, SESS-OPEN-008
+    # @spec SESS-OWN-006
+    async def open(self, *, locale: str) -> SessionLease:
+        # Python binds the arguments before this body runs: a call with any
+        # other argument, or without ``locale``, raises ``TypeError`` first.
         if self.closed:
             raise SessionFailed("cancelled", "the session factory is closed")
-        if cadence not in self._geometry_by_label:
-            raise SessionRefused("cadence", f"cadence {cadence!r} is not served")
         if locale not in self._locale_table:
             raise SessionRefused("locale", f"locale {locale!r} is not served")
-        right_context, geometry_index = self._geometry_by_label[cadence]
         caller_id = str(uuid.uuid4())
         lease = SessionLease(
             self,
             caller_id,
             Packer(
-                right_context=right_context,
-                geometry_index=geometry_index,
+                right_context=self._right_context,
+                geometry_index=self._geometry_index,
                 locale_row=self._locale_table[locale],
                 carrier_token_id=self._carrier_token_id,
                 clock_ms=wall_clock_ms,
@@ -507,7 +513,7 @@ class StreamingSessionFactory:
         if task is None or task.done() or self.closed:
             self._drop(lease)
             return
-        if lease.holder_task is not None:
+        if self._covered(lease):
             return
 
         async def hold() -> None:
@@ -516,9 +522,7 @@ class StreamingSessionFactory:
 
         holder = asyncio.ensure_future(hold())
         lease.holder_task = holder
-        self._cleanup_tasks.add(holder)
-        holder.add_done_callback(self._cleanup_tasks.discard)
-        holder.add_done_callback(_retrieve)
+        self._track(lease, holder)
 
     def _abandon(self, lease: SessionLease) -> None:
         """The owner is gone: cancel the task and hand the session to cleanup,
@@ -539,9 +543,7 @@ class StreamingSessionFactory:
             return
         task = asyncio.ensure_future(self._cleanup(lease))
         lease.cleanup_task = task
-        self._cleanup_tasks.add(task)
-        task.add_done_callback(self._cleanup_tasks.discard)
-        task.add_done_callback(_retrieve)
+        self._track(lease, task)
 
     # @spec SESS-OWN-002, SESS-OWN-008
     async def _cleanup(self, lease: SessionLease) -> None:
@@ -550,15 +552,68 @@ class StreamingSessionFactory:
         except (StreamAdmissionError, ValueError):
             pass
         except Exception as error:
-            logger.warning(
-                "retirement wait for session %s failed: %r", lease.caller_id, error
-            )
-            self._faults.append(error)
+            self._record_fault(lease, error, "the cleanup retirement wait failed")
         task = lease.task
         if task is not None and not task.done():
             # Ownership lasts until the generate task has ended too.
             await asyncio.wait({task})
         self._drop(lease)
+
+    def _track(self, lease: SessionLease, task: asyncio.Task) -> None:
+        """Own a cleanup or holding task until it ends."""
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+        task.add_done_callback(_retrieve)
+        task.add_done_callback(lambda done: self._on_cover_end(lease, done))
+
+    def _covered(self, lease: SessionLease) -> bool:
+        """A cleanup or holding task owns the session."""
+        return any(
+            task is not None and not task.done()
+            for task in (lease.cleanup_task, lease.holder_task)
+        )
+
+    # @spec SESS-OWN-008, SESS-OWN-009, SESS-OWN-010
+    def _record_fault(
+        self, lease: SessionLease, error: BaseException, what: str
+    ) -> None:
+        """Log ``error`` and keep it for the next ``drain``, once per session
+        even when a task re-raises it."""
+        if any(error is recorded for recorded in lease.recorded_faults):
+            return
+        lease.recorded_faults.append(error)
+        logger.warning(
+            "session %s: %s: %r", lease.caller_id, what, error, exc_info=error
+        )
+        self._faults.append(error)
+
+    # @spec SESS-OWN-009, SESS-OWN-011
+    def _on_generation_end(self, lease: SessionLease, task: asyncio.Task) -> None:
+        """A generate task's exception is a cleanup fault when no caller can
+        receive it: the session was handed to a cleanup or holding task, or
+        an uncancelled ``abort`` awaits the task. A refusal, a failure a lease
+        call reports, and an end after ``teardown_all`` are not faults."""
+        if task.cancelled() or self.closed:
+            return
+        error = task.exception()
+        if error is None or isinstance(error, StreamAdmissionError):
+            return
+        if lease.abort_waiting or self._covered(lease):
+            self._record_fault(lease, error, "the generate task ended with an error")
+
+    # @spec SESS-OWN-010, SESS-OWN-011
+    def _on_cover_end(self, lease: SessionLease, task: asyncio.Task) -> None:
+        """A cleanup or holding task that ends with an exception is a cleanup
+        fault; the session stays owned until its generate task has ended."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        self._record_fault(lease, error, "a cleanup task ended with an error")
+        if lease.holder_task is task:
+            lease.holder_task = None
+        self._hold_until_ended(lease)
 
     # @spec SESS-OWN-004
     async def drain(self, deadline: float) -> list[BaseException]:

@@ -4,9 +4,10 @@
 Registered in ``MODELS_CONFIG_MAP`` under ``Nemotron3_5AsrStreamingForRNNT``
 only. ``verify_and_update_model_config`` runs at the end of model
 configuration, after core has applied every ``--hf-overrides`` key, and
-resolves the launch options (served lookahead set, default lookahead);
+resolves the server's one geometry (``lookahead.served_lookahead``);
 ``verify_and_update_config`` runs once while the engine configuration is
-resolved and refuses the engine settings the model cannot run under.
+resolved and refuses the engine settings the model cannot run under, the
+transaction-graph conditions included.
 """
 
 from __future__ import annotations
@@ -21,67 +22,50 @@ from .engine_flags import check_engine_config
 from .identity import ARCHITECTURE
 from .locales import locale_language, unmapped_languages
 from .lookahead import (
-    IMPLEMENTED_RIGHT_CONTEXTS,
-    default_lookahead,
-    served_lookahead_source,
+    NATIVE_BURST_LOOKAHEAD,
+    cadence_label,
+    served_lookahead,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _lookahead_errors(hf_config: Any) -> list[str]:
-    """Check the served set and the default lookahead; set the nominal context."""
-    errors: list[str] = []
-    source = served_lookahead_source(hf_config)
-    raw = getattr(hf_config, source, None)
-    served: list[Any] = []
-    if raw is None:
-        errors.append(f"{source} is missing")
-    elif isinstance(raw, (list, tuple)):
-        served = list(raw)
-        if not served:
-            errors.append(f"{source} is empty; it needs at least one right context")
-    else:
-        errors.append(f"{source} must be a list of integers, got {raw!r}")
-    for value in served:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value not in IMPLEMENTED_RIGHT_CONTEXTS
-        ):
-            errors.append(
-                f"{source} contains {value!r}, which is not an implemented "
-                f"right context {IMPLEMENTED_RIGHT_CONTEXTS}"
-            )
-    card = getattr(hf_config, "card_num_lookahead_tokens", None)
-    if isinstance(card, (list, tuple)):
-        for value in served:
-            if value in IMPLEMENTED_RIGHT_CONTEXTS and value not in card:
-                logger.warning(
-                    "Serving lookahead %s, a geometry the checkpoint does not "
-                    "declare (it declares %s).",
-                    value,
-                    sorted(card),
-                )
+_ABSENT = object()
 
-    default = default_lookahead(hf_config)
-    if default is None:
+
+def _lookahead_errors(hf_config: Any) -> list[str]:
+    """Check the server's geometry; set the nominal context."""
+    errors: list[str] = []
+    served_set = getattr(hf_config, "supported_num_lookahead_tokens", _ABSENT)
+    if served_set is not _ABSENT:
         errors.append(
-            "num_lookahead_tokens is not set: set the default lookahead with "
-            "--hf-overrides '{\"num_lookahead_tokens\": <N>}' "
-            f"(one of {sorted(v for v in served if isinstance(v, int))})"
+            f"supported_num_lookahead_tokens {served_set!r} is refused: a "
+            "server serves one geometry, selected with num_lookahead_tokens "
+            "in --hf-overrides (or the checkpoint's default lookahead); remove "
+            "supported_num_lookahead_tokens"
         )
-    elif default not in served:
+    try:
+        lookahead: int | None = served_lookahead(hf_config)
+    except ValueError as exc:
+        errors.append(str(exc))
+        lookahead = None
+    if lookahead is not None:
+        hf_config.att_context_right = lookahead
+        card = getattr(hf_config, "card_num_lookahead_tokens", None)
+        if isinstance(card, (list, tuple)) and lookahead not in card:
+            logger.warning(
+                "Serving lookahead %s (%s), a geometry the checkpoint does not "
+                "declare (it declares %s).",
+                lookahead,
+                cadence_label(lookahead),
+                sorted(card),
+            )
+    native_burst = getattr(hf_config, "experimental_native_burst", False)
+    if native_burst and lookahead != NATIVE_BURST_LOOKAHEAD:
+        shown = "not resolved" if lookahead is None else f"{lookahead}"
         errors.append(
-            f"num_lookahead_tokens {default!r} is not in the served lookahead "
-            f"set {served!r} ({source})"
-        )
-    else:
-        hf_config.att_context_right = default
-    if getattr(hf_config, "experimental_native_burst", False) and default != 1:
-        errors.append(
-            "experimental_native_burst requires num_lookahead_tokens 1, "
-            f"got {default!r}"
+            "experimental_native_burst requires the server's lookahead to be "
+            f"{NATIVE_BURST_LOOKAHEAD} (160ms); the server's lookahead is {shown}"
         )
     return errors
 
@@ -139,9 +123,9 @@ class Nemotron3_5AsrStreamingConfig(VerifyAndUpdateConfig):
     """Refuse a served configuration or engine the streaming model cannot run."""
 
     @staticmethod
-    # @spec REG-LA-001, REG-LA-002, REG-LA-003, REG-LA-004, REG-LA-005
-    # @spec REG-LA-006, REG-LA-007, REG-VAL-001, REG-VAL-002, REG-VAL-003
-    # @spec REG-VAL-004, REG-VAL-005, REG-VAL-006
+    # @spec REG-LA-002, REG-LA-003, REG-LA-004, REG-LA-006, REG-LA-007
+    # @spec REG-LA-008, REG-VAL-001, REG-VAL-002, REG-VAL-003, REG-VAL-004
+    # @spec REG-VAL-005, REG-VAL-006, REG-VAL-007
     def verify_and_update_model_config(model_config: Any) -> None:
         from .nemotron_asr.manifests import REALTIME_MAX_TOKENS
 
@@ -186,5 +170,9 @@ class Nemotron3_5AsrStreamingConfig(VerifyAndUpdateConfig):
             )
 
     @staticmethod
+    # @spec REG-VAL-008
     def verify_and_update_config(vllm_config: Any) -> None:
+        # The engine checks include the transaction-graph conditions
+        # (``transaction_graph_config_errors``), evaluated on the geometry
+        # ``verify_and_update_model_config`` resolved.
         check_engine_config(vllm_config, ARCHITECTURE)

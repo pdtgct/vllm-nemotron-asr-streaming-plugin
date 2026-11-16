@@ -2,18 +2,32 @@
 """Execution memory, the model-state interface and state-slot access
 (REG-MEM-*, REG-MS-*, REG-STATE-*).
 
-The model and its model state are the real classes on CPU, driven in core's
-order by ``support.model_harness.Runner`` (see its docstring for what is real,
-what is omitted and which seams the doubles use): a profiling run, later
-dummy steps (kernel warm-up, with attention metadata), and complete real
-steps (``prepare_step`` through ``finish_step``) whose row transaction and
-commit are the plugin's own.
+The model and its model state are the real classes on CPU, driven by
+``support.model_harness.Runner`` (see its docstring for what is real, what is
+omitted and which seams the doubles use): ``prepare_execution_memory`` once
+before the first profiling step (the runner's ``profile_run`` calls it, as
+core's does), a profiling run, later dummy steps (kernel warm-up, with
+attention metadata), and complete real steps (``prepare_step`` through
+``finish_step``) whose row transaction and commit are the plugin's own. The
+capture hooks are called through ``support.core_order.CoreOrder``.
 
-Execution arms (``ARMS``): the card default (``eager``), ``compiled-static``,
-a graphed decoder (``dense-graphed``) and CHUNK populations. CPU cannot
-capture graphs, so graphed arms run with ``FakeGraphRuntime``: core's forward
-context and batch descriptors, and a wrapper with core's entry contract whose
-capture is logged and can be made to fail or to store no graph.
+Execution arms (``ARMS``), each at one server geometry: the eager arms
+(``eager`` encoder, ``dense-eager`` decoder, the reference), ``compiled-static``,
+a graphed decoder alone (``dense-graphed``), the card's default arms
+(``eager-graphed`` encoder and ``dense-graphed`` decoder) and CHUNK
+populations. CPU cannot capture graphs, so graphed arms run with
+``FakeGraphRuntime``: core's forward context and batch descriptors, and a
+wrapper with core's entry contract whose capture is logged and can be made to
+fail or to store no graph.
+
+The hook configuration (REG-MEM-015 to REG-MEM-027) runs on the same CPU
+harness with ``enforce_eager`` off, vLLM's current platform reporting CUDA
+(``is_cuda``), a ``support.fake_cuda.FakeStream`` for the ``stream`` core
+passes, and the memory queries replaced by ``support.fake_cuda.FakeCuda``'s
+(``install_memory``; free memory falls by ``per_segment_graph`` bytes per live
+captured segment graph), so the measurement, comparison and failure rules are
+exercised without a device. The GPU tests repeat the memory rules against
+real free memory.
 
 Expected graph inventories are derived from the configuration alone
 (``expected_entries``), never from an observed run.
@@ -37,6 +51,7 @@ import ast
 import dataclasses
 import gc
 import inspect
+import logging
 import re
 import traceback
 from types import SimpleNamespace
@@ -45,12 +60,17 @@ import numpy as np
 import pytest
 import torch
 from support import model_harness as h
+from support.core_order import PROFILING_POOL, SERVING_POOL, CoreOrder
+from support.fake_cuda import MARGIN_BYTES, FakeCuda
 
 from vllm_nemotron_asr_streaming.nemotron_asr.model_state_v2 import SAMPLED_TOKEN
 
 pytestmark = pytest.mark.engine
 
 LOOKAHEADS = (0, 1, 3, 6, 13)
+CADENCES = ("80ms", "160ms", "320ms", "560ms", "1120ms")
+#: The synthetic card's default lookahead.
+CARD_DEFAULT = 3
 #: Members of core's ``StateSlotBindings`` the model may use during a step:
 #: ``bind_rows`` (REG-STATE-003) and ``fail_requests`` (core's channel for
 #: model-reported row failures, used by ``postprocess_state``).
@@ -58,24 +78,35 @@ PERMITTED_BINDINGS = {"bind_rows", "fail_requests"}
 PERMITTED_ROWS = {"component_pools", "slot_indices_cpu"}
 STALE = "Stale state step access"
 
-#: name → (configuration overrides, right context, max_num_seqs). Served sets
-#: are narrowed where the arm's warm-up cost on CPU grows with them.
+EAGER_ARMS = {"encoder_execution_arm": "eager", "decode_dispatch_arm": "dense-eager"}
+
+#: name → (configuration overrides, server lookahead or ``None`` for the
+#: card default, max_num_seqs).
 ARMS = {
-    "eager": ({}, 6, 2),
+    "eager": (dict(EAGER_ARMS), 6, 2),
     "compiled-static": (
         {
             "encoder_execution_arm": "compiled-static",
-            "supported_num_lookahead_tokens": [0],
+            "decode_dispatch_arm": "dense-eager",
         },
         0,
         1,
     ),
     "dense-graphed": (
-        {
-            "decode_dispatch_arm": "dense-graphed",
-            "supported_num_lookahead_tokens": [0, 6],
-        },
+        {"encoder_execution_arm": "eager", "decode_dispatch_arm": "dense-graphed"},
         6,
+        2,
+    ),
+    # The card's default arms (REG-CARD-008) at the card's default geometry,
+    # given explicitly so these tests do not depend on translation or on the
+    # no-override resolution (tested in test_card_parser and
+    # test_lookahead_validation).
+    "default": (
+        {
+            "encoder_execution_arm": "eager-graphed",
+            "decode_dispatch_arm": "dense-graphed",
+        },
+        CARD_DEFAULT,
         2,
     ),
     # CHUNK buckets accept populations 1, 31 and 63 only; with two
@@ -85,13 +116,15 @@ ARMS = {
             "decode_dispatch_arm": "dense-graphed",
             "encoder_execution_arm": "eager-graphed",
             "chunk_bucket_graph_populations": [1],
-            "supported_num_lookahead_tokens": [1],
         },
         1,
         2,
     ),
 }
-GRAPHED = ("dense-graphed", "chunk")
+GRAPHED = ("dense-graphed", "default", "chunk")
+#: Arms the hook configuration accepts (REG-ENG-005): at least one
+#: hook-captured graph, no compiled encoder and no CHUNK buckets.
+HOOK_ARMS = ("dense-graphed", "default")
 
 
 def geometry_of(right_context: int) -> int:
@@ -109,18 +142,21 @@ def batch_tiers(maximum: int) -> list[int]:
 
 
 def expected_entries(env) -> int:
-    """Graph entries the configuration requires: each served geometry and
-    batch tier of a graphed decoder; each served geometry and population of a
-    graphed encoder, except the cells a CHUNK bucket owns; each CHUNK cell."""
+    """Graph entries the configuration requires, all at the server's one
+    geometry: each batch tier of a graphed decoder; each CHUNK count of a
+    graphed encoder, except the cells a CHUNK bucket owns; each CHUNK cell.
+    An arm the overrides do not set is the card's default arm."""
     overrides = env.overrides
+    encoder = overrides.get("encoder_execution_arm", "eager-graphed")
+    decoder = overrides.get("decode_dispatch_arm", "dense-graphed")
     count = 0
-    if overrides.get("decode_dispatch_arm") == "dense-graphed":
+    if decoder == "dense-graphed":
         count += len(env.served_geometries) * len(batch_tiers(env.max_num_seqs))
-    if overrides.get("encoder_execution_arm") in ("dense-graphed", "eager-graphed"):
-        # Without population bucketing a graphed encoder has one entry per
-        # population 1..max_num_seqs. On the CHUNK arm (max_num_seqs=2) those
-        # populations coincide with the decoder's batch tiers (1, 2) only
-        # because max_num_seqs is 2; the two terms are counted separately.
+    if encoder in ("dense-graphed", "eager-graphed"):
+        # One entry per CHUNK count 1..max_num_seqs. On the CHUNK arm
+        # (max_num_seqs=2) those counts coincide with the decoder's batch
+        # tiers (1, 2) only because max_num_seqs is 2; the two terms are
+        # counted separately.
         cells = {
             (g, n)
             for g in env.served_geometries
@@ -128,6 +164,11 @@ def expected_entries(env) -> int:
         }
         count += len(cells - set(env.chunk_cells))
     return count + len(env.chunk_cells)
+
+
+#: Free memory and the bytes each live captured segment graph holds.
+DEVICE_BYTES = 1 << 40
+PER_GRAPH = 3 << 20
 
 
 @pytest.fixture
@@ -138,7 +179,7 @@ def build(monkeypatch, tmp_path):
     all but ``validate_current``, ``"handle"`` only ``get_handle``, ``None``
     nothing."""
 
-    def make(arm="eager", legacy="all", overrides=None, **config):
+    def make(arm="eager", legacy="all", overrides=None, before_state=None, **config):
         h.spec_without_state_name(monkeypatch)
         if legacy is not None:
             h.legacy_state_api(
@@ -150,6 +191,12 @@ def build(monkeypatch, tmp_path):
         profile = h.ProfileSpy(events).install(monkeypatch)
         advance = h.AdvanceSpy(events).install(monkeypatch)
         graphs = h.FakeGraphRuntime(events).install(monkeypatch)
+        fake = FakeCuda(
+            total=DEVICE_BYTES,
+            free=DEVICE_BYTES,
+            segment_graphs=graphs,
+            per_segment_graph=PER_GRAPH,
+        ).install_memory(monkeypatch)
         arm_overrides, right_context, max_num_seqs = ARMS[arm]
         merged = dict(arm_overrides) | dict(overrides or {})
         settings = {"right_context": right_context, "max_num_seqs": max_num_seqs}
@@ -157,27 +204,36 @@ def build(monkeypatch, tmp_path):
         card = h.write_runnable_card(tmp_path / f"card-{len(list(tmp_path.iterdir()))}")
         vllm_config = h.build_vllm_config(card, overrides=merged, **settings)
         model = h.build_model(vllm_config)
+        if before_state is not None:
+            before_state()
         state = h.build_model_state(vllm_config, model)
-        served = merged.get("supported_num_lookahead_tokens", list(LOOKAHEADS))
+        served = (
+            CARD_DEFAULT
+            if settings["right_context"] is None
+            else settings["right_context"]
+        )
+        geometry = geometry_of(served)
+        runner = h.Runner(vllm_config, model, state)
         return SimpleNamespace(
             arm=arm,
             vllm_config=vllm_config,
             model=model,
             state=state,
             config=model.config,
-            runner=h.Runner(vllm_config, model, state),
+            runner=runner,
+            core=CoreOrder(runner),
             events=events,
             profile=profile,
             advance=advance,
             graphs=graphs,
+            fake=fake,
             max_num_seqs=settings["max_num_seqs"],
-            max_geometry=geometry_of(max(served)),
-            served_geometries=sorted(geometry_of(r) for r in served),
+            right_context=served,
+            max_geometry=geometry,
+            served_geometries=[geometry],
             overrides=merged,
             chunk_cells=[
-                (geometry_of(r), n)
-                for r in served
-                for n in merged.get("chunk_bucket_graph_populations", [])
+                (geometry, n) for n in merged.get("chunk_bucket_graph_populations", [])
             ],
         )
 
@@ -202,14 +258,32 @@ def stream(
     *,
     geometry: int | None = None,
     sequence: int = 0,
-    final: bool = True,
+    final: bool = False,
+    valid_samples: int | None = None,
 ):
+    """One stream unit: a full, non-final chunk by default. A final tail
+    (``final=True``) carries fewer samples than a full chunk (half of one
+    unless ``valid_samples`` says otherwise)."""
+    from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
+        CADENCES as MANIFEST_CADENCES,
+    )
+    from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
+        RAW_SAMPLES_PER_CHUNK,
+    )
+
     geometry = env.max_geometry if geometry is None else geometry
+    if final and valid_samples is None:
+        width = RAW_SAMPLES_PER_CHUNK[tuple(MANIFEST_CADENCES)[geometry]]
+        valid_samples = width // 2
     return h.new_request(
         req_id,
         int(env.config.audio_chunk_token_id),
         audio=h.stream_envelope(
-            env.config, geometry=geometry, sequence=sequence, final=final
+            env.config,
+            geometry=geometry,
+            sequence=sequence,
+            final=final,
+            valid_samples=valid_samples,
         ),
         # each unit is its own multimodal item (its own encoder cache entry)
         identifier=f"uuid-{req_id}-{sequence}",
@@ -655,7 +729,7 @@ def test_failed_preparation_discards_its_state_and_stays_failed(build, arm, wher
 
 
 # @spec REG-MEM-004
-def test_failed_preparation_on_the_card_default_stays_failed(build):
+def test_failed_preparation_on_the_eager_arms_stays_failed(build):
     env = build()
     env.profile.fail = RuntimeError("profile transaction failed")
     assert h.call_with(env.runner.profile_run, core_embeds=False) is not None
@@ -898,7 +972,7 @@ def test_session_turn_arrives_as_a_new_request_between_cached_steps(build):
     handles = {"s1": 1, "f1": 2}
     env.runner.real_step(
         h.scheduler_output(
-            new=(stream(env, "s1", final=False), file(env, "f1", 60000)),
+            new=(stream(env, "s1"), file(env, "f1", 60000)),
             handles=handles,
         )
     )
@@ -994,28 +1068,98 @@ def test_cleanup_only_real_step_completes(build, prepared):
 
 @pytest.fixture
 def served_hf_config(tmp_path):
+    """A served configuration factory: ``served_hf_config(**fields)`` sets
+    ``fields`` on the validated configuration (settings the engine hook would
+    refuse under ``--enforce-eager``, such as the transaction-graph option,
+    are applied after validation)."""
     from vllm.config import ModelConfig
 
     from vllm_nemotron_asr_streaming import register
 
     register()
     card = h.write_runnable_card(tmp_path / "card")
-    return ModelConfig(
+    base = ModelConfig(
         model=str(card),
         config_format="nemotron_asr_streaming",
-        hf_overrides={"num_lookahead_tokens": 6},
+        hf_overrides={"num_lookahead_tokens": 0},
         enforce_eager=True,
         dtype="float32",
     ).hf_config
 
+    def make(**fields):
+        import copy
 
+        config = copy.deepcopy(base)
+        for key, value in fields.items():
+            if value is _ABSENT:
+                if hasattr(config, key):
+                    delattr(config, key)
+            else:
+                setattr(config, key, value)
+        return config
+
+    return make
+
+
+_ABSENT = object()
+_ARMS_CONTRIBUTE = {"max_num_seqs", "encoder_execution_arm", "decode_dispatch_arm"}
+
+#: case → (served-configuration fields, expected memory contributors).
+_CONTRIBUTORS = {
+    "eager arms": (dict(EAGER_ARMS), set()),
+    "compiled-static": (
+        {
+            "encoder_execution_arm": "compiled-static",
+            "decode_dispatch_arm": "dense-eager",
+        },
+        set(),
+    ),
+    "default arms": ({}, _ARMS_CONTRIBUTE),
+    "graphed decoder": (
+        {"encoder_execution_arm": "eager", "decode_dispatch_arm": "dense-graphed"},
+        _ARMS_CONTRIBUTE,
+    ),
+    "compiled graphed encoder": (
+        {
+            "encoder_execution_arm": "dense-graphed",
+            "decode_dispatch_arm": "dense-eager",
+        },
+        _ARMS_CONTRIBUTE,
+    ),
+    "chunk buckets on the eager arms": (
+        {**EAGER_ARMS, "chunk_bucket_graph_populations": [1]},
+        _ARMS_CONTRIBUTE | {"chunk_bucket_graph_populations"},
+    ),
+    "empty chunk buckets": (
+        {**EAGER_ARMS, "chunk_bucket_graph_populations": []},
+        set(),
+    ),
+    "transaction graphs": (
+        {"transaction_graph_populations": [2]},
+        _ARMS_CONTRIBUTE | {"transaction_graph_populations"},
+    ),
+    "malformed transaction graphs (on)": (
+        {**EAGER_ARMS, "transaction_graph_populations": {}},
+        {"transaction_graph_populations"},
+    ),
+    "empty transaction graphs (off)": (
+        {**EAGER_ARMS, "transaction_graph_populations": []},
+        set(),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_CONTRIBUTORS))
 # @spec REG-STATE-001
-def test_state_spec_is_layout_only(monkeypatch, served_hf_config):
+def test_state_spec_is_the_layout_and_the_memory_contributors(
+    monkeypatch, served_hf_config, case
+):
     """No shim here: the builder runs against the target core's class."""
     from vllm.v1.kv_cache_interface import PersistentStateSpec
 
     from vllm_nemotron_asr_streaming.nemotron_asr import state_profile
 
+    fields, expected = _CONTRIBUTORS[case]
     seen: list[tuple[tuple, dict]] = []
 
     def spy(*args, **kwargs):
@@ -1023,13 +1167,24 @@ def test_state_spec_is_layout_only(monkeypatch, served_hf_config):
         return PersistentStateSpec(*args, **kwargs)
 
     monkeypatch.setattr(state_profile, "PersistentStateSpec", spy)
-    spec = state_profile.build_nemotron_persistent_state_spec(served_hf_config)
+    spec = state_profile.build_nemotron_persistent_state_spec(
+        served_hf_config(**fields)
+    )
     assert len(seen) == 1
     args, kwargs = seen[0]
     assert args == ()
-    assert set(kwargs) == {"descriptors", "page_size_bytes", "block_size"}
+    assert set(kwargs) == {
+        "descriptors",
+        "page_size_bytes",
+        "block_size",
+        "memory_contributors",
+    }
     assert kwargs["block_size"] == 1
+    contributors = list(kwargs["memory_contributors"])
+    assert len(contributors) == len(set(contributors)), contributors
+    assert set(contributors) == expected
     assert isinstance(spec, PersistentStateSpec)
+    assert set(spec.memory_contributors) == expected
 
 
 @pytest.mark.parametrize("kind", ["file", "stream", "mixed"])
@@ -1226,15 +1381,18 @@ def _prepare_graphed(env) -> None:
     env.runner.profile_run(core_embeds=False)
 
 
+@pytest.mark.parametrize("arm", ["dense-graphed", "default"])
 # @spec REG-MEM-006
-def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph_cpu(build):
+def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph_cpu(
+    build, arm
+):
     """CPU, ``FakeGraphRuntime``: a good real step replays graphs; one entry
     that step replayed loses its graph; the identical step is refused with no
     capture, no wrapper invocation and no state write; with the graph restored
     the identical step succeeds again (which attributes the refusal to the
     missing graph). No exception type or message is pinned, and the check may
     sit inside the row transaction."""
-    env = build(arm="dense-graphed")
+    env = build(arm=arm)
     _prepare_graphed(env)
     spy = pool(env)
 
@@ -1246,7 +1404,7 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph_cpu(b
 
     replays = len(env.graphs.replays)
     env.runner.real_step(
-        h.scheduler_output(new=(stream(env, "s1", final=False),), handles={"s1": 1})
+        h.scheduler_output(new=(stream(env, "s1"),), handles={"s1": 1})
     )
     new = env.graphs.replays[replays:]
     assert new, "the prepared step replayed no graph"
@@ -1276,8 +1434,9 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph_cpu(b
 def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
     monkeypatch, tmp_path, single_process_dist
 ):
-    """CUDA, core's own graph runtime and static graph wrapper: as the CPU
-    test. Wrapper invocations are counted by instrumenting core's
+    """CUDA, core's own graph runtime and static graph wrapper, the card's
+    default arms under ``--enforce-eager``: as the CPU test. Wrapper
+    invocations are counted by instrumenting core's
     ``CUDAGraphWrapper.__call__`` (no model-internal attribute is read)."""
     from vllm.compilation.cuda_graph import CUDAGraphWrapper
     from vllm.forward_context import get_forward_context
@@ -1298,14 +1457,7 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
 
     monkeypatch.setattr(CUDAGraphWrapper, "__call__", instrumented)
     card = h.write_runnable_card(tmp_path / "card")
-    vllm_config = h.build_vllm_config(
-        card,
-        overrides={
-            "decode_dispatch_arm": "dense-graphed",
-            "supported_num_lookahead_tokens": [6],
-        },
-        device="cuda",
-    )
+    vllm_config = h.build_vllm_config(card, right_context=6, device="cuda")
     model = h.build_model(vllm_config)
     state = h.build_model_state(vllm_config, model)
     runner = h.Runner(vllm_config, model, state)
@@ -1324,9 +1476,7 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
         )
 
     mark = len(calls)
-    runner.real_step(
-        h.scheduler_output(new=(stream(env, "s1", final=False),), handles={"s1": 1})
-    )
+    runner.real_step(h.scheduler_output(new=(stream(env, "s1"),), handles={"s1": 1}))
     replayed = [(w, d) for w, d, kind in calls[mark:] if kind == "replay"]
     assert replayed, "the prepared serving step replayed no graph"
     wrapper, descriptor = replayed[-1]
@@ -1351,3 +1501,840 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
     assert all(v == 0 for st, _ in runner.commit_log for v in st.values()), (
         runner.commit_log
     )
+
+
+# ===========================================================================
+# Runner configurations and core's model-state hooks
+# ===========================================================================
+#
+# Core calls, in every runner configuration: ``prepare_execution_memory`` once
+# before the profiling forward (``Runner.profile_run``), the profiling forward,
+# ``post_warmup`` before the worker serves and ``shutdown`` last. Under the
+# hook configuration only: ``needs_cudagraph_capture``, then
+# ``capture_cudagraphs(profile_only=True)`` for the graph-memory estimate (over
+# core's temporary profiling pools, into a throwaway pool), ``clear_cudagraphs``,
+# the state pool, and ``capture_cudagraphs(profile_only=False)`` with the global
+# pool and the ``graph_capture`` stream. These tests call the hooks in that
+# order on the model's real model state (``support.core_order.CoreOrder``).
+
+
+@pytest.fixture
+def hook(build, monkeypatch, platform):
+    """``hook(arm, ...)``: ``build`` under the hook configuration
+    (``enforce_eager`` off, a CUDA platform from model-state construction on)
+    with a profiled budget: ``kv_cache_memory_bytes`` unset, core's
+    graph-memory estimate on, the extensible KV cache off."""
+
+    def make(arm="default", *, kv_cache_memory_bytes=None, estimate=True, **kwargs):
+        env = build(arm=arm, before_state=lambda: platform(True), **kwargs)
+        env.vllm_config.model_config.enforce_eager = False
+        cache = env.vllm_config.cache_config
+        cache.kv_cache_memory_bytes = kv_cache_memory_bytes
+        cache.enable_extensible_kv_cache = False
+        monkeypatch.setenv(
+            "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1" if estimate else "0"
+        )
+        env.streams = []
+        return env
+
+    return make
+
+
+def _stream(env, name: str):
+    stream = env.fake.new_stream(name=name)
+    env.streams.append(stream)
+    return stream
+
+
+def _capture(env, *, profile_only, stream=None):
+    """One capture call, with core's pool and a named stream of its own."""
+    stream = stream or _stream(env, "profiling" if profile_only else "serving")
+    env.core.capture(profile_only=profile_only, stream=stream)
+    return stream
+
+
+def _wrapper_pools(env) -> set:
+    return {w.graph_pool for w, _ in env.graphs.captured()}
+
+
+def _finals(env) -> list[tuple]:
+    return [shape_of(c) for c in env.profile.calls if is_final(c)]
+
+
+def _startup(env, *, serve=True):
+    """Core's startup under the hook configuration up to (and with ``serve``,
+    including) the serving capture, each capture on a named stream."""
+    core = env.core
+    core.prepare()
+    core.bind_profiling()
+    _capture(env, profile_only=True)
+    core.clear()
+    if serve:
+        pool(env)
+        _capture(env, profile_only=False)
+    return env
+
+
+def _causes(error: BaseException | None) -> list[BaseException]:
+    chain, seen = [], set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    return chain
+
+
+# ---------------------------------------------------------------------------
+# REG-MEM-019: needs_cudagraph_capture
+# ---------------------------------------------------------------------------
+
+
+def _transaction_graph_check_owner(repo_root):
+    """The module that defines ``transaction_graph_config_errors`` (``None``
+    before it exists)."""
+    import importlib
+
+    root = repo_root / "vllm_nemotron_asr_streaming"
+    for path in sorted(root.rglob("*.py")):
+        if "def transaction_graph_config_errors" in path.read_text():
+            name = ".".join(path.relative_to(repo_root).with_suffix("").parts)
+            return importlib.import_module(name)
+    return None
+
+
+#: served-configuration fields → whether a hook-captured graph is selected.
+_PREDICATE = {
+    "default arms": ({}, True),
+    "graphed encoder only": ({"decode_dispatch_arm": "dense-eager"}, True),
+    "graphed decoder only": ({"encoder_execution_arm": "eager"}, True),
+    "eager arms": (dict(EAGER_ARMS), False),
+    "compiled-static": (
+        {
+            "encoder_execution_arm": "compiled-static",
+            "decode_dispatch_arm": "compact-eager",
+        },
+        False,
+    ),
+    "compiled graphed encoder alone": (
+        {
+            "encoder_execution_arm": "dense-graphed",
+            "decode_dispatch_arm": "dense-eager",
+        },
+        False,
+    ),
+    "chunk buckets on the eager arms": (
+        {**EAGER_ARMS, "chunk_bucket_graph_populations": [1]},
+        False,
+    ),
+    "transaction graphs on the eager arms": (
+        {**EAGER_ARMS, "transaction_graph_populations": [2]},
+        True,
+    ),
+    "malformed transaction graphs (on)": (
+        {**EAGER_ARMS, "transaction_graph_populations": {}},
+        True,
+    ),
+    "empty transaction graphs (off)": (
+        {**EAGER_ARMS, "transaction_graph_populations": []},
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize("cuda", [True, False], ids=["cuda", "not-cuda"])
+@pytest.mark.parametrize("case", list(_PREDICATE))
+# @spec REG-MEM-019
+def test_needs_cudagraph_capture_is_the_hook_predicate(
+    make_model_config,
+    make_vllm_config,
+    card_dir,
+    build_model_state,
+    platform,
+    monkeypatch,
+    repo_root,
+    case,
+    cuda,
+):
+    fields, selects = _PREDICATE[case]
+    vllm_config = make_vllm_config(make_model_config(card_dir, lookahead=0))
+    for key, value in fields.items():
+        setattr(vllm_config.model_config.hf_config, key, value)
+    if "transaction_graph_populations" in fields:
+        # The option's own checks (TXG-CFG-008, TXG-CFG-009) refuse these arms
+        # and this runner at construction; they are the transaction-graph
+        # component's specs, isolated here.
+        owner = _transaction_graph_check_owner(repo_root)
+        if owner is not None:
+            monkeypatch.setattr(
+                owner, "transaction_graph_config_errors", lambda *a, **k: []
+            )
+    platform(cuda)
+    state = build_model_state(vllm_config)
+    answer = state.needs_cudagraph_capture()
+    assert answer is (selects and cuda)
+    # The same value for the model state's lifetime: configuration and
+    # platform read once.
+    platform(not cuda)
+    vllm_config.model_config.hf_config.decode_dispatch_arm = (
+        "dense-eager" if answer else "dense-graphed"
+    )
+    assert state.needs_cudagraph_capture() is answer
+    assert state.needs_cudagraph_capture() is answer
+
+
+# ---------------------------------------------------------------------------
+# REG-MEM-018: prepare_execution_memory
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("runner", ["enforce-eager", "hook"])
+@pytest.mark.parametrize("arm", list(ARMS))
+# @spec REG-MEM-018
+def test_prepare_execution_memory_captures_nothing_and_runs_no_profile(
+    build, hook, runner, arm
+):
+    if runner == "hook" and arm not in HOOK_ARMS:
+        pytest.skip("the hook configuration refuses this arm (REG-ENG-005)")
+    env = hook(arm) if runner == "hook" else build(arm=arm)
+    env.runner.prepare_execution_memory()
+    assert env.graphs.captures == [], "prepare_execution_memory captured"
+    assert _finals(env) == [], "prepare_execution_memory ran the profile transaction"
+
+
+# @spec REG-MEM-018, REG-MEM-002
+def test_enforce_eager_captures_on_the_first_profiling_step_after_preparation(build):
+    """``--enforce-eager``: core calls no capture hook; preparation captures
+    nothing and the first profiling step captures every expected graph."""
+    env = build(arm="default")
+    env.runner.prepare_execution_memory()
+    assert env.graphs.captures == []
+    env.runner.profile_run(core_embeds=False)
+    assert len(env.graphs.captures) == expected_entries(env)
+    assert len(env.graphs.captured()) == expected_entries(env)
+
+
+# ---------------------------------------------------------------------------
+# REG-MEM-016: the profiling step under the hook configuration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("arm", HOOK_ARMS)
+# @spec REG-MEM-016, REG-MEM-010
+def test_hook_profiling_step_profiles_once_uncaptured(hook, arm):
+    env = hook(arm)
+    _, output, embeds = env.runner.profile_run(core_embeds=False)
+    assert_dummy_output(output, embeds)
+    assert env.graphs.captures == [], "the profiling step captured"
+    assert _finals(env) == [(env.max_num_seqs, env.max_geometry)], env.profile.calls
+
+
+@pytest.mark.parametrize("arm", HOOK_ARMS)
+# @spec REG-MEM-003, REG-MEM-016
+def test_hook_later_profiling_steps_accept_pending_segment_graphs(hook, arm):
+    """Before the serving capture, later profiling steps verify readiness with
+    the segment graphs pending, and neither capture nor profile again."""
+    env = hook(arm)
+    env.runner.profile_run(core_embeds=False)
+    profiles = len(env.profile.calls)
+    trap = trapped_pool(env)
+    for _ in range(2):
+        _, output, embeds = env.runner.profile_run(
+            randomize_inputs=True, attn=True, core_embeds=False
+        )
+        assert_dummy_output(output, embeds)
+    assert len(env.profile.calls) == profiles
+    assert env.graphs.captures == []
+    assert trap.reads == []
+
+
+# ---------------------------------------------------------------------------
+# REG-MEM-020, REG-MEM-021, REG-MEM-022: the capture hooks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("arm", HOOK_ARMS)
+# @spec REG-MEM-020, REG-MEM-021, REG-MEM-007
+def test_profiling_capture_uses_cores_pool_and_stream_and_clear_releases_it(hook, arm):
+    env = hook(arm)
+    expected = expected_entries(env)
+    assert env.state.needs_cudagraph_capture() is True
+    env.runner.profile_run(core_embeds=False)
+    streams_before = len(env.graphs.capture_streams)
+    stream = _capture(env, profile_only=True)
+    assert len(env.graphs.captures) == expected
+    assert len(env.graphs.captured()) == expected
+    assert _wrapper_pools(env) == {PROFILING_POOL}
+    used = env.graphs.capture_streams[streams_before:]
+    assert used and {id(s) for s in used} == {id(stream)}, (
+        "a capture ran on a stream core did not pass"
+    )
+    env.state.clear_cudagraphs()
+    gc.collect()
+    assert env.graphs.captured() == [] and env.graphs.live_graphs() == 0
+    env.state.clear_cudagraphs()  # nothing left: tolerated
+
+
+@pytest.mark.parametrize("arm", HOOK_ARMS)
+# @spec REG-MEM-022, REG-MEM-011, REG-MEM-007
+def test_serving_capture_rebuilds_into_the_global_pool_and_serves(hook, arm):
+    env = hook(arm)
+    expected = expected_entries(env)
+    _startup(env, serve=False)
+    spy = pool(env)
+    # A real step before the serving capture is refused.
+    assert h.call_with(env.runner.real_step, rows_of(env, "stream")) is not None
+    assert env.advance.calls == []
+    streams_before = len(env.graphs.capture_streams)
+    capture_stream = _capture(env, profile_only=False)
+    assert len(env.graphs.captures) == 2 * expected
+    assert len(env.graphs.captured()) == expected
+    assert _wrapper_pools(env) == {SERVING_POOL}
+    used = env.graphs.capture_streams[streams_before:]
+    assert used and {id(s) for s in used} == {id(capture_stream)}
+    replays = len(env.graphs.replays)
+    output = h.scheduler_output(new=(stream(env, "s1"),), handles={"s1": 1})
+    env.runner.real_step(output)
+    assert env.advance.calls, "the step did not run"
+    assert len(env.graphs.replays) > replays, "the step replayed no graph"
+    assert spy.bind_calls
+
+
+# @spec REG-MEM-022, REG-MEM-027
+def test_serving_capture_within_the_profiling_total_passes(hook):
+    env = hook()
+    _startup(env)
+    assert len(env.graphs.captured()) == expected_entries(env)
+
+
+def _amounts(value: int) -> list[str]:
+    """Renderings of a byte count an error may use."""
+    mib = value / (1 << 20)
+    return [
+        str(value),
+        f"{value:,}",
+        f"{mib:.0f} MiB",
+        f"{mib:.1f} MiB",
+        f"{mib:.2f} MiB",
+        f"{mib:g} MiB",
+    ]
+
+
+def _names_amount(message: str, value: int) -> bool:
+    return any(text in message for text in _amounts(value))
+
+
+REMEDY_WORDS = (
+    "--max-num-seqs",
+    "encoder_execution_arm",
+    "decode_dispatch_arm",
+    "dense-eager",
+    "chunk_bucket_graph_populations",
+    "transaction_graph_populations",
+    "--enforce-eager",
+)
+
+
+# @spec REG-MEM-022, REG-MEM-027, REG-MEM-017
+def test_serving_capture_over_the_profiling_total_fails_startup(hook):
+    """The serving call retains 1 MiB more per graph than the profiling call
+    (whose margin charge is zero here): startup fails naming both totals, the
+    margin's charge, the excess and the remedies, and the call's segment
+    graphs are discarded."""
+    env = hook()
+    expected = expected_entries(env)
+    per_graph = env.fake.per_segment_graph
+    _startup(env, serve=False)
+    pool(env)
+    env.fake.per_segment_graph = per_graph + (1 << 20)
+    stream = _stream(env, "serving")
+    error = h.call_with(_capture, env, profile_only=False, stream=stream)
+    assert error is not None, "a serving capture above the profiling total passed"
+    message = str(error)
+    assert _names_amount(message, expected * per_graph), message
+    assert _names_amount(message, expected * env.fake.per_segment_graph), message
+    assert _names_amount(message, expected << 20), message  # the excess
+    assert "margin" in message.lower(), message
+    for word in (*REMEDY_WORDS, "--gpu-memory-utilization"):
+        assert word in message, (word, message)
+    _release(error)
+    gc.collect()
+    assert env.graphs.captured() == [] and env.graphs.live_graphs() == 0
+    assert ("cuda.stream.synchronize", "serving") in env.fake.events, (
+        "the capture stream was not synchronized"
+    )
+
+
+# ---------------------------------------------------------------------------
+# REG-MEM-023: no profiling capture
+# ---------------------------------------------------------------------------
+
+
+# @spec REG-MEM-023, REG-MEM-027
+def test_a_required_but_absent_profiling_capture_fails_at_entry(hook):
+    env = hook()
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    error = h.call_with(_capture, env, profile_only=False)
+    assert error is not None, "serving capture accepted a missing graph-memory estimate"
+    assert env.graphs.captures == [], "the refused call captured"
+    message = str(error)
+    assert (
+        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" in message
+        or "kv_cache_memory_bytes" in message
+    ), message
+
+
+_NOT_REQUIRED = {
+    "fixed budget": {"kv_cache_memory_bytes": 1 << 30},
+    "estimate off": {"estimate": False},
+}
+
+
+@pytest.mark.parametrize("case", [*_NOT_REQUIRED, "extensible KV cache"])
+# @spec REG-MEM-023, REG-MEM-027
+def test_an_unrequired_profiling_capture_warns_once_after_capture(
+    hook, captured_logs, case
+):
+    env = hook(**_NOT_REQUIRED.get(case, {}))
+    if case == "extensible KV cache":
+        env.vllm_config.cache_config.enable_extensible_kv_cache = True
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    _capture(env, profile_only=False)
+    expected = expected_entries(env)
+    assert len(env.graphs.captured()) == expected
+    warnings = [
+        r
+        for r in captured_logs.records
+        if r.levelno == logging.WARNING
+        and r.name.startswith("vllm_nemotron_asr_streaming")
+        and re.search(r"budget|charg", r.getMessage(), re.I)
+    ]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    message = warnings[0].getMessage()
+    assert _names_amount(message, expected * env.fake.per_segment_graph), message
+    reason = {
+        "fixed budget": "kv_cache_memory_bytes",
+        "estimate off": "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
+        "extensible KV cache": "extensible",
+    }[case]
+    assert reason.lower() in message.lower(), message
+
+
+# ---------------------------------------------------------------------------
+# REG-MEM-024: ordering and a second serving capture
+# ---------------------------------------------------------------------------
+
+
+# @spec REG-MEM-024
+def test_a_second_serving_capture_is_refused_at_entry(hook):
+    env = _startup(hook())
+    captures = len(env.graphs.captures)
+    error = h.call_with(_capture, env, profile_only=False)
+    assert error is not None
+    message = str(error).lower()
+    assert "recapture" in message and "not supported" in message, message
+    assert "restart" in message, message
+    assert len(env.graphs.captures) == captures, "the refused call captured"
+    assert len(env.graphs.captured()) == expected_entries(env), "graphs dropped"
+
+
+@pytest.mark.parametrize("serving", ["succeeded", "failed"])
+# @spec REG-MEM-024
+def test_a_profiling_capture_after_a_serving_capture_is_refused(hook, serving):
+    env = hook()
+    _startup(env, serve=False)
+    pool(env)
+    if serving == "failed":
+        env.graphs.fail_capture_after = 1
+        assert h.call_with(_capture, env, profile_only=False) is not None
+        env.graphs.disarm()
+    else:
+        _capture(env, profile_only=False)
+    captures = len(env.graphs.captures)
+    assert h.call_with(_capture, env, profile_only=True) is not None
+    assert len(env.graphs.captures) == captures
+
+
+# @spec REG-MEM-024
+def test_a_serving_capture_while_profiling_graphs_exist_is_refused(hook):
+    env = hook()
+    env.runner.profile_run(core_embeds=False)
+    _capture(env, profile_only=True)
+    captures = len(env.graphs.captures)
+    pool(env)
+    assert h.call_with(_capture, env, profile_only=False) is not None
+    assert len(env.graphs.captures) == captures
+    assert _wrapper_pools(env) == {PROFILING_POOL}
+
+
+# ---------------------------------------------------------------------------
+# REG-MEM-025, REG-MEM-026: post_warmup and shutdown
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("runner", ["enforce-eager", "hook"])
+# @spec REG-MEM-025
+def test_post_warmup_verifies_every_segment_graph_without_replaying(
+    build, hook, runner
+):
+    env = hook() if runner == "hook" else build(arm="default")
+    if runner == "hook":
+        _startup(env)
+    else:
+        env.runner.profile_run(core_embeds=False)
+    captures, replays = len(env.graphs.captures), len(env.graphs.replays)
+    reads = env.fake.names().count("cuda.mem_get_info")
+    env.state.post_warmup()
+    assert len(env.graphs.captures) == captures and len(env.graphs.replays) == replays
+    assert env.fake.names().count("cuda.mem_get_info") == reads
+    captured = env.graphs.captured()
+    assert len(captured) == expected_entries(env)
+    for wrapper, descriptor in captured:
+        entry = wrapper.concrete_cudagraph_entries[descriptor]
+        graph, entry.cudagraph = entry.cudagraph, None
+        error = h.call_with(env.state.post_warmup)
+        assert error is not None, f"post_warmup accepted {descriptor} without a graph"
+        assert len(env.graphs.captures) == captures, "post_warmup captured"
+        entry.cudagraph = graph
+    env.state.post_warmup()
+
+
+# @spec REG-MEM-025
+def test_post_warmup_before_the_serving_capture_is_refused(hook):
+    env = hook()
+    _startup(env, serve=False)
+    assert h.call_with(env.state.post_warmup) is not None
+
+
+@pytest.mark.parametrize("runner", ["enforce-eager", "hook"])
+# @spec REG-MEM-026
+def test_shutdown_releases_every_segment_graph(build, hook, runner):
+    env = hook() if runner == "hook" else build(arm="default")
+    if runner == "hook":
+        _startup(env)
+    else:
+        env.runner.profile_run(core_embeds=False)
+    assert env.graphs.captured()
+    env.state.shutdown()
+    gc.collect()
+    assert env.graphs.captured() == [] and env.graphs.live_graphs() == 0
+
+
+@pytest.mark.parametrize("arm", list(ARMS))
+# @spec REG-MEM-021, REG-MEM-026
+def test_clear_and_shutdown_tolerate_nothing_captured(build, arm):
+    env = build(arm=arm)
+    env.state.clear_cudagraphs()
+    env.state.shutdown()
+
+
+# @spec REG-MEM-026
+def test_shutdown_tolerates_a_model_state_whose_initialization_did_not_complete():
+    from vllm_nemotron_asr_streaming.nemotron_asr.model_state_v2 import (
+        NemotronASRModelState,
+    )
+
+    NemotronASRModelState.__new__(NemotronASRModelState).shutdown()
+
+
+# ---------------------------------------------------------------------------
+# REG-MEM-005 under the hook configuration
+# ---------------------------------------------------------------------------
+
+
+# @spec REG-MEM-005
+def test_hook_preparation_profile_and_capture_read_no_state_slots(hook):
+    env = hook()
+    trap = trapped_pool(env)
+    pool_bytes = trap._target.views[h.STATE_LAYER]._tensor.clone()
+    env.runner.profile_run(core_embeds=False)  # preparation, then the profile
+    _capture(env, profile_only=True)
+    env.state.clear_cudagraphs()
+    _capture(env, profile_only=False)
+    assert trap.reads == []
+    assert torch.equal(pool_bytes, trap._target.views[h.STATE_LAYER]._tensor)
+
+
+# ---------------------------------------------------------------------------
+# REG-MEM-015: the capture line
+# ---------------------------------------------------------------------------
+
+
+def _capture_lines(captured_logs, env) -> list[str]:
+    decoder = env.overrides.get("decode_dispatch_arm", "dense-graphed")
+    return [
+        r.getMessage()
+        for r in captured_logs.records
+        if r.levelno == logging.INFO
+        and r.name.startswith("vllm_nemotron_asr_streaming")
+        and decoder in r.getMessage()
+        and "max_num_seqs" in r.getMessage()
+    ]
+
+
+#: The information each capture line names, as patterns any of whose
+#: renderings will do: the runner configuration and the capture.
+RUNNERS = {"enforce-eager": r"eager", "hook": r"hook"}
+CAPTURES = {
+    "profiling dummy step": (r"profil", r"dummy"),
+    "profiling capture": (r"profil",),
+    "serving capture": (r"serv",),
+}
+
+
+def _assert_capture_line(line: str, env, *, runner: str, capture: str) -> None:
+    encoder = env.overrides.get("encoder_execution_arm", "eager-graphed")
+    assert encoder in line, line
+    assert re.search(RUNNERS[runner], line, re.I), line
+    for pattern in CAPTURES[capture]:
+        assert re.search(pattern, line, re.I), (capture, line)
+    rc = env.right_context
+    assert CADENCES[LOOKAHEADS.index(rc)] in line or re.search(
+        rf"lookahead\D{{0,10}}{rc}\b", line
+    ), line
+    assert re.search(rf"max_num_seqs\D{{0,10}}{env.max_num_seqs}\b", line), line
+    assert re.search(r"\d(\.\d+)?\s*(ms|s|sec|seconds?)\b", line), (
+        f"no capture time: {line}"
+    )
+
+
+@pytest.mark.parametrize("arm", GRAPHED)
+# @spec REG-MEM-015
+def test_the_profiling_dummy_step_capture_logs_one_line(build, captured_logs, arm):
+    env = build(arm=arm)
+    env.runner.profile_run(core_embeds=False)
+    lines = _capture_lines(captured_logs, env)
+    assert len(lines) == 1, lines
+    _assert_capture_line(
+        lines[0], env, runner="enforce-eager", capture="profiling dummy step"
+    )
+    assert _names_amount(
+        lines[0], expected_entries(env) * env.fake.per_segment_graph
+    ) or (re.search(r"\d+(\.\d+)?\s*(B|KiB|MiB|GiB)\b", lines[0])), lines[0]
+
+
+# @spec REG-MEM-015, REG-MEM-027
+def test_each_hook_capture_logs_one_line_with_its_retained_memory(hook, captured_logs):
+    env = hook()
+    expected = expected_entries(env)
+    env.runner.profile_run(core_embeds=False)
+    assert _capture_lines(captured_logs, env) == [], (
+        "the profiling step logged a capture"
+    )
+    _capture(env, profile_only=True)
+    (profiling,) = _capture_lines(captured_logs, env)
+    _assert_capture_line(profiling, env, runner="hook", capture="profiling capture")
+    assert _names_amount(profiling, expected * env.fake.per_segment_graph), profiling
+    env.state.clear_cudagraphs()
+    pool(env)
+    _capture(env, profile_only=False)
+    lines = _capture_lines(captured_logs, env)
+    assert len(lines) == 2, lines
+    _assert_capture_line(lines[1], env, runner="hook", capture="serving capture")
+    assert _names_amount(lines[1], expected * env.fake.per_segment_graph), lines[1]
+
+
+# ---------------------------------------------------------------------------
+# REG-MEM-027: the measurement
+# ---------------------------------------------------------------------------
+
+#: The allocator peak statistics' resets, as ``FakeCuda`` logs them.
+PEAK_RESETS = ("cuda.reset_peak_memory_stats", "cuda.reset_max_memory_allocated")
+
+
+@pytest.mark.parametrize("profile_only", [True, False], ids=["profiling", "serving"])
+# @spec REG-MEM-027
+def test_each_free_memory_reading_follows_a_sync_and_a_cache_release(
+    hook, profile_only
+):
+    """Over a capture call, every reading of free memory is preceded, since
+    the previous reading, by a synchronization of the capture stream (or the
+    device) and a release of the allocator's cached blocks; no allocator peak
+    statistic is reset."""
+    env = hook()
+    env.runner.profile_run(core_embeds=False)
+    if not profile_only:
+        _capture(env, profile_only=True)
+        env.state.clear_cudagraphs()
+        pool(env)
+    start = len(env.fake.events)
+    name = "profiling" if profile_only else "serving"
+    _capture(env, profile_only=profile_only, stream=_stream(env, name))
+    log = env.fake.events[start:]
+    reads = [i for i, (kind, _) in enumerate(log) if kind == "cuda.mem_get_info"]
+    assert len(reads) >= 2, f"the call was not measured across: {log}"
+    previous = -1
+    for index in reads:
+        window = log[previous + 1 : index]
+        assert any(
+            k == "cuda.synchronize" or (k == "cuda.stream.synchronize" and d == name)
+            for k, d in window
+        ), f"a reading without a synchronization before it: {log}"
+        assert any(k == "cuda.empty_cache" for k, _ in window), (
+            f"a reading without a cache release before it: {log}"
+        )
+        previous = index
+    assert not set(PEAK_RESETS) & {k for k, _ in log}, log
+
+
+# @spec REG-MEM-027
+def test_the_enforce_eager_capture_resets_no_peak_statistic(build):
+    """Under ``--enforce-eager`` the capture runs inside core's
+    memory-profiling window, which reads the peak statistics."""
+    env = build(arm="default")
+    env.runner.profile_run(core_embeds=False)
+    assert not set(PEAK_RESETS) & set(env.fake.names()), env.fake.events
+
+
+# ---------------------------------------------------------------------------
+# REG-MEM-017: capture failure
+# ---------------------------------------------------------------------------
+
+
+def _assert_failure_message(error, env, *, extra=()) -> None:
+    message = str(error)
+    chain = _causes(error)
+    assert any("capture" in str(c) and "failed" in str(c) for c in chain[1:]), (
+        "the error is not chained from the original failure"
+    )
+    encoder = env.overrides.get("encoder_execution_arm", "eager-graphed")
+    decoder = env.overrides.get("decode_dispatch_arm", "dense-graphed")
+    assert encoder in message and decoder in message, message
+    rc = env.right_context
+    assert CADENCES[LOOKAHEADS.index(rc)] in message or re.search(
+        rf"lookahead\D{{0,10}}{rc}\b", message
+    ), message
+    assert re.search(rf"max_num_seqs\D{{0,10}}{env.max_num_seqs}\b", message), message
+    assert re.search(r"(chunk|tier|count|bucket)", message, re.I), (
+        f"the failing graph is not named: {message}"
+    )
+    for word in (*REMEDY_WORDS, *extra):
+        assert word in message, (word, message)
+
+
+@pytest.mark.parametrize("arm", GRAPHED)
+# @spec REG-MEM-017, REG-MEM-004
+def test_a_profiling_dummy_step_capture_failure_names_the_capture_and_remedies(
+    build, arm
+):
+    env = build(arm=arm)
+    env.graphs.fail_capture_after = 1
+    error = h.call_with(env.runner.profile_run, core_embeds=False)
+    assert error is not None
+    _assert_failure_message(error, env)
+    env.graphs.disarm()
+    gc.collect()
+    # The propagated error, its cause and context included, is still held
+    # here with its tracebacks: it keeps no graph of the failed capture alive.
+    assert error.__traceback__ is not None
+    assert env.graphs.live_graphs() == 0, (
+        "the retained error keeps a graph of the failed capture alive"
+    )
+    _release(error)
+
+
+@pytest.mark.parametrize(
+    ("profile_only", "budget", "extra"),
+    [
+        (True, None, ()),
+        (False, None, ("--gpu-memory-utilization",)),
+        (False, 1 << 30, ("--kv-cache-memory-bytes",)),
+    ],
+    ids=["profiling", "serving-profiled-budget", "serving-fixed-budget"],
+)
+# @spec REG-MEM-017
+def test_a_hook_capture_failure_discards_the_call_and_names_the_remedies(
+    hook, profile_only, budget, extra
+):
+    env = hook(kv_cache_memory_bytes=budget)
+    env.runner.profile_run(core_embeds=False)
+    if not profile_only:
+        if budget is None:
+            _capture(env, profile_only=True)
+            env.state.clear_cudagraphs()
+        pool(env)
+    env.graphs.fail_capture_after = len(env.graphs.captures) + 1
+    env.graphs.captures_completed = len(env.graphs.captures)
+    name = "profiling" if profile_only else "serving"
+    error = h.call_with(
+        _capture, env, profile_only=profile_only, stream=_stream(env, name)
+    )
+    assert error is not None
+    _assert_failure_message(error, env, extra=extra)
+    env.graphs.disarm()
+    gc.collect()
+    # The propagated error, its cause and context included, is still held
+    # here with its tracebacks: it keeps no graph of the failed call alive.
+    assert error.__traceback__ is not None
+    assert env.graphs.captured() == [] and env.graphs.live_graphs() == 0, (
+        "the retained error keeps a graph of the failed call alive"
+    )
+    assert ("cuda.stream.synchronize", name) in env.fake.events, (
+        "the capture stream was not synchronized"
+    )
+    _release(error)
+
+
+# ===========================================================================
+# GPU: the hook configuration on CUDA
+# ===========================================================================
+
+
+@pytest.mark.gpu
+# @spec REG-MEM-016, REG-MEM-020, REG-MEM-021, REG-MEM-022, REG-MEM-025
+# @spec REG-MEM-026, REG-MEM-027
+def test_hook_lifecycle_on_cuda(monkeypatch, tmp_path, single_process_dist):
+    """CUDA, core's graph runtime, the card's default arms under the hook
+    configuration: the profiling capture retains the segment graphs and the
+    charged margin (``MARGIN_BYTES``), ``clear_cudagraphs`` returns them, the
+    serving capture passes the aggregate comparison, a real step replays,
+    ``post_warmup`` passes, ``shutdown`` releases the serving graphs."""
+    h.spec_without_state_name(monkeypatch)
+    h.legacy_state_api(monkeypatch)
+    card = h.write_runnable_card(tmp_path / "card")
+    # The hook configuration from construction on, so the engine hook and
+    # the model state's re-check see it.
+    vllm_config = h.build_vllm_config(
+        card, right_context=6, device="cuda", enforce_eager=False
+    )
+    vllm_config.cache_config.enable_extensible_kv_cache = False
+    model = h.build_model(vllm_config)
+    state = h.build_model_state(vllm_config, model)
+    runner = h.Runner(vllm_config, model, state)
+    core = CoreOrder(runner, device="cuda", spy=False)
+    assert core.needs_capture()
+    core.prepare()
+
+    def free() -> int:
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        return torch.cuda.mem_get_info()[0]
+
+    core.bind_profiling()
+    free_before = free()
+    core.profiling_capture()
+    retained = free_before - free()
+    assert retained >= MARGIN_BYTES, f"the profiling capture retained {retained} bytes"
+    core.clear()
+    assert free() >= free_before - (8 << 20), "the profiling capture was not released"
+    core.bind_serving()
+    free_before_serving = free()
+    core.serving_capture()
+    serving_retained = free_before_serving - free()
+    # The serving call holds the same segment graphs without the margin
+    # (allocator rounding may differ by less than the margin absorbs).
+    assert retained - serving_retained >= MARGIN_BYTES - (16 << 20), (
+        retained,
+        serving_retained,
+    )
+    core.post_warmup()
+    env = SimpleNamespace(
+        runner=runner, config=model.config, max_geometry=3, model=model
+    )
+    runner.real_step(h.scheduler_output(new=(stream(env, "s1"),), handles={"s1": 1}))
+    assert runner.commit_log and not runner.commit_log[-1][1]
+    serving_free = free()
+    core.shutdown()
+    assert free() > serving_free, "shutdown released no graph memory"

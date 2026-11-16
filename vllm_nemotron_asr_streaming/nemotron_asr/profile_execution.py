@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm.logger import init_logger
 from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
@@ -163,7 +164,7 @@ def build_profile_invocation(
         state_indices_p=block_ids,
         num_prefills=rows,
         has_initial_states_p=torch.zeros(rows, dtype=torch.bool),
-        null_block_id=0,
+        null_block_id=int(NULL_BLOCK_ID),
         num_pool_blocks=rows + 1,
         live_block_ids=block_ids.clone(),
         geometry_id=torch.full(
@@ -221,8 +222,15 @@ def run_persistent_state_profile(
     device: torch.device,
     geometry_id: int | None = None,
     ready_domain: bool = False,
+    uncaptured: bool = False,
 ) -> torch.Tensor:
-    """Execute the canonical transition and discard all profile effects."""
+    """Execute the canonical transition and discard all profile effects.
+
+    ``ready_domain``: the final, readiness-gated profile transaction.
+    ``uncaptured`` (with ``ready_domain``): run it over the sealed domain's
+    uncaptured paths, before core's capture hook captures the segment graphs
+    (REG-MEM-016).
+    """
     logger.info(
         "Starting Nemotron persistent-state profile execution with %d rows",
         num_rows,
@@ -333,9 +341,12 @@ def run_persistent_state_profile(
         ):
             if geometry_id is None:
                 raise ValueError("static encoder profile geometry is missing")
-            profile_cell = (
-                execution.profile_ready_cell if ready_domain else execution.profile_cell
-            )
+            if ready_domain and uncaptured:
+                profile_cell = execution.profile_uncaptured_cell
+            elif ready_domain:
+                profile_cell = execution.profile_ready_cell
+            else:
+                profile_cell = execution.profile_cell
             return profile_cell(
                 geometry=geometry_id,
                 population=num_rows,
@@ -352,11 +363,12 @@ def warmup_static_encoder_execution(
     *,
     device: torch.device,
 ) -> None:
-    """Warm and attest every served geometry/population cell."""
+    """Warm and attest every served geometry/population cell. Captures no
+    graph (``capture_static_encoder_graphs`` does)."""
     execution = model._encoder_execution
     if execution.arm not in {"compiled-static", "dense-graphed", "eager-graphed"}:
         return
-    if getattr(execution, "ready", False):
+    if getattr(execution, "warmed", False):
         return
     cells = tuple(
         (geometry, population)
@@ -374,9 +386,35 @@ def warmup_static_encoder_execution(
     )
 
 
+def capture_static_encoder_graphs(
+    model: NemotronASRForRNNT,
+    *,
+    device: torch.device,
+    stream: Any = None,
+    graph_pool: Any = None,
+) -> None:
+    """Capture a graphed encoder arm's graph at every warmed cell, staging
+    each over model-owned profile scratch, on ``stream`` into ``graph_pool``
+    (core's capture hook) or core's own (``None``)."""
+    execution = model._encoder_execution
+    if execution.arm not in {"dense-graphed", "eager-graphed"}:
+        return
+    execution.capture_graph_domain(
+        invoke=lambda geometry, population: run_persistent_state_profile(
+            model,
+            num_rows=population,
+            device=device,
+            geometry_id=geometry,
+        ),
+        stream=stream,
+        graph_pool=graph_pool,
+    )
+
+
 __all__ = [
     "PersistentStateProfileInvocation",
     "build_profile_invocation",
+    "capture_static_encoder_graphs",
     "run_persistent_state_profile",
     "warmup_static_encoder_execution",
 ]

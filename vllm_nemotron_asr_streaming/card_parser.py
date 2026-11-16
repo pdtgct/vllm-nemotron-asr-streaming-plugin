@@ -45,7 +45,13 @@ SCHEMA_FIELDS: tuple[str, ...] = (
     "num_prompts",
     "prompt_dictionary",
     "card_num_lookahead_tokens",
+    "card_default_num_lookahead_tokens",
 )
+
+#: The default segment arms translation declares (the fastest pair measured
+#: with equal transcripts); ``--hf-overrides`` may select others.
+DEFAULT_ENCODER_ARM = "eager-graphed"
+DEFAULT_DECODER_ARM = "dense-graphed"
 
 #: The model has no positional limit; this lifts only core's derived context
 #: ceiling, so the deployment's ``max_model_len`` is the effective bound.
@@ -180,6 +186,15 @@ def schema_errors(
                     f"card_num_lookahead_tokens contains {value!r}, which is "
                     f"not an implemented right context {IMPLEMENTED_RIGHT_CONTEXTS}"
                 )
+    default = config.get("card_default_num_lookahead_tokens")
+    if default is not None and not (
+        _is_int(default) and isinstance(card, (list, tuple)) and default in card
+    ):
+        errors.append(
+            f"card_default_num_lookahead_tokens {default!r} must be one of "
+            f"card_num_lookahead_tokens {card!r} (implemented right contexts "
+            f"{IMPLEMENTED_RIGHT_CONTEXTS})"
+        )
     return errors
 
 
@@ -205,6 +220,11 @@ def translate_card(
     if supported is None:
         raise ValueError(
             "public card encoder_config requires supported_num_lookahead_tokens"
+        )
+    card_default = encoder.get("default_num_lookahead_tokens")
+    if card_default is None:
+        raise ValueError(
+            "public card encoder_config requires default_num_lookahead_tokens"
         )
     mapped: dict[str, int] = {}
     for source_key, target_key in _ENCODER_INT_FIELDS:
@@ -235,10 +255,12 @@ def translate_card(
             "num_asr_labels": blank,
             "vocab_size": blank + len(CONTROL_TOKEN_FIELDS) + 1,
             "max_position_embeddings": MAX_POSITION_EMBEDDINGS,
-            "decode_dispatch_arm": "dense-eager",
+            "encoder_execution_arm": DEFAULT_ENCODER_ARM,
+            "decode_dispatch_arm": DEFAULT_DECODER_ARM,
             "card_num_lookahead_tokens": list(supported)
             if isinstance(supported, (list, tuple))
             else supported,
+            "card_default_num_lookahead_tokens": card_default,
             "torch_dtype": str(card.get("dtype", card.get("torch_dtype", "float32"))),
         }
     )

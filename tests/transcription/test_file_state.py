@@ -174,17 +174,25 @@ def test_request_aborted_before_first_schedule_creates_no_buffer(
 # ---------------------------------------------------------------------------
 # FILE-ENG-001, FILE-BUF-002, FILE-ROW-002, FILE-ENG-003 on the production path.
 #
-# Layout addition: ``state.plan_step(scheduler_output, *, queue_lens=None,
-# stream_rows=None) -> StepPlan`` with ``.rows`` (list of ``file_rows.StepRow``)
-# and ``.groups`` (``plan_chunk_groups(rows)``). It is the step planning the
-# model runner makes before the forward: it resolves FILE rows from the
-# buffers, stages each advancing row's samples through
-# ``state.file_buffers.stage`` and advances the row's position.
-# ``queue_lens`` maps request IDs to the label queue length the device book
-# reports (default 0); ``stream_rows`` maps stream request IDs to the
+# Layout addition: ``state.plan_step(scheduler_output, *, stream_rows=None)
+# -> StepPlan`` with ``.rows`` (list of ``file_rows.StepRow``). It is the step
+# planning the model runner makes before the forward: it resolves FILE rows
+# from the buffers and each file's queue count (FILE-QC-006), stages each
+# advancing row's samples through ``state.file_buffers.stage`` and advances
+# the row's position. ``stream_rows`` maps stream request IDs to the
 # ``(geometry_index, deadline)`` the existing header resolution produced.
+# The file progress ``state._file_progress[req].queue_count`` is the count
+# planning reads (``set_count`` stands in for an accepted count, which
+# ``postprocess_state`` applies; ``test_file_steps.py`` drives that path).
 
 GEOMETRIES = ((0, 0), (1, 1), (3, 2), (6, 3), (13, 4))  # (right context, index)
+
+
+def set_count(state, req_id: str, count: int) -> None:
+    """Stand in for an accepted count (see the layout note above)."""
+    entry = state._file_progress[req_id]
+    entry.queue_count = count
+    entry.queue_count_unknown = False
 
 
 class StageProbe:
@@ -251,7 +259,8 @@ def test_production_step_plan_gives_a_file_row_at_most_one_chunk(
             handles=handles,
         )
         state.prepare_step(out, dummy_run=False, is_profile=False)
-        plan = state.plan_step(out, queue_lens={"f1": queue_len})
+        set_count(state, "f1", queue_len)
+        plan = state.plan_step(out)
         (row,) = [r for r in plan.rows if r.request_id == "f1"]
         calls = probe.take()
         copies = probe.take_copies()
@@ -304,9 +313,12 @@ def test_production_mixed_step_plans_file_and_stream_rows_together(
     )
     state.prepare_step(out, dummy_run=False, is_profile=False)
     plan = state.plan_step(out, stream_rows={"s1": (geometry, 700)})
-    assert {r.request_id for r in plan.rows} == {"f1", "s1"}
-    (group,) = plan.groups  # one geometry, both rows in it
-    assert group.geometry_index == geometry
-    assert set(group.request_ids) == {"f1", "s1"}
-    assert tuple(group.deadlines) == (700,)  # the file row adds no deadline
+    rows = {r.request_id: r for r in plan.rows}
+    assert set(rows) == {"f1", "s1"}
+    # both rows run a chunk at the server's one geometry; the file row adds
+    # no deadline (the one CHUNK bucket itself is checked through the
+    # transaction in test_file_steps.py)
+    assert rows["f1"].runs_chunk and rows["s1"].runs_chunk
+    assert rows["f1"].geometry_index == rows["s1"].geometry_index == geometry
+    assert rows["f1"].deadline is None
     assert probe.take() == [("f1", 0, chunk)]

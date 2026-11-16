@@ -28,7 +28,6 @@ from support.fake_engine import (
 )
 
 PKG = Path(__file__).resolve().parents[2]
-CADENCE = "80ms"
 LOCALE = "en-US"
 UNIT = 1280
 
@@ -128,25 +127,6 @@ def test_engine_without_generate_is_refused():
 
 # @spec SESS-FAC-004
 @pytest.mark.engine
-@pytest.mark.parametrize(
-    "card_set,supported,expected",
-    [
-        ([3, 0, 6, 13], None, {"320ms", "80ms", "560ms", "1120ms"}),
-        ([0, 1, 3, 6, 13], [1, 13], {"160ms", "1120ms"}),
-        ([3], None, {"320ms"}),
-    ],
-)
-def test_served_cadences_follow_served_lookahead_set(
-    build, card_set, supported, expected
-):
-    hf = make_hf_config(lookaheads=card_set, supported=supported)
-    _, factory = build(hf=hf)
-    assert isinstance(factory.served_cadences, frozenset)
-    assert factory.served_cadences == frozenset(expected)
-
-
-# @spec SESS-FAC-004
-@pytest.mark.engine
 def test_locales_are_the_table_keys(build):
     _, factory = build()
     assert isinstance(factory.locales, frozenset)
@@ -201,14 +181,10 @@ def _params(fn):
 def test_factory_satisfies_the_protocol_structurally(build):
     _, factory = build()
     K = inspect.Parameter
-    assert isinstance(factory.served_cadences, frozenset)
     assert isinstance(factory.locales, frozenset)
     assert factory.default_locale is None or isinstance(factory.default_locale, str)
     assert inspect.iscoroutinefunction(factory.open)
-    assert _params(factory.open) == [
-        ("cadence", K.KEYWORD_ONLY, True),
-        ("locale", K.KEYWORD_ONLY, True),
-    ]
+    assert _params(factory.open) == [("locale", K.KEYWORD_ONLY, True)]
     assert inspect.iscoroutinefunction(factory.drain)
     assert [p[0] for p in _params(factory.drain)] == ["deadline"]
     assert not inspect.iscoroutinefunction(factory.teardown_all)
@@ -220,7 +196,7 @@ def test_factory_satisfies_the_protocol_structurally(build):
 def test_lease_satisfies_the_protocol_structurally(build):
     async def scenario():
         _, factory = build()
-        return await factory.open(cadence=CADENCE, locale=LOCALE)
+        return await factory.open(locale=LOCALE)
 
     lease = run(scenario())
     K = inspect.Parameter
@@ -237,41 +213,92 @@ def test_lease_satisfies_the_protocol_structurally(build):
         assert _params(getattr(lease, name)) == [], name
 
 
+# @spec SESS-FAC-006
+@pytest.mark.engine
+def test_open_takes_exactly_a_keyword_only_locale_without_default():
+    from vllm_nemotron_asr_streaming.session import create_session_factory
+
+    factory = create_session_factory(FakeEngine(), make_model_config())
+    assert inspect.iscoroutinefunction(factory.open)
+    assert [
+        (p.name, p.kind, p.default)
+        for p in inspect.signature(factory.open).parameters.values()
+    ] == [("locale", inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.empty)]
+
+
+# @spec SESS-FAC-006
+@pytest.mark.engine
+@pytest.mark.parametrize("name", ["served_cadences", "default_cadence"])
+def test_factory_exposes_no_cadence_attribute(name):
+    from vllm_nemotron_asr_streaming.session import create_session_factory
+
+    factory = create_session_factory(FakeEngine(), make_model_config())
+    assert not hasattr(factory, name)
+    assert not hasattr(type(factory), name)
+
+
 # ---------------------------------------------------------------- open
+
+BAD_OPEN_CALLS = [
+    pytest.param((), {"cadence": "80ms", "locale": LOCALE}, id="cadence-and-locale"),
+    pytest.param((), {"cadence": "80ms"}, id="cadence-only"),
+    pytest.param((), {}, id="no-locale"),
+    pytest.param((LOCALE,), {}, id="positional-locale"),
+    pytest.param((), {"locale": LOCALE, "geometry_id": 0}, id="another-keyword"),
+]
+
+
+# @spec SESS-OPEN-008, SESS-ERR-003
+@pytest.mark.engine
+@pytest.mark.parametrize("closed", [False, True], ids=["unclosed", "closed"])
+@pytest.mark.parametrize("args,kwargs", BAD_OPEN_CALLS)
+def test_open_with_another_argument_raises_type_error_from_binding(
+    build, closed, args, kwargs
+):
+    """The call itself raises (argument binding, before the body runs): no
+    engine call, no session record, no task; and the error is a plain
+    ``TypeError``, carrying no seam attribute."""
+
+    async def scenario():
+        engine, factory = build()
+        if closed:
+            factory.teardown_all()
+        before = set(asyncio.all_tasks())
+        try:
+            pending = factory.open(*args, **kwargs)
+        except TypeError as error:
+            raised = error
+        else:
+            pending.close()
+            raised = None
+        await asyncio.sleep(0.01)
+        return engine, factory, raised, set(asyncio.all_tasks()) - before
+
+    engine, factory, error, new_tasks = run(scenario())
+    assert type(error) is TypeError, "the call did not fail at argument binding"
+    assert not hasattr(error, "session_error") and not hasattr(error, "reason")
+    assert engine.generate_calls == [] and engine.wait_calls == []
+    assert engine.events == [] and engine.unexpected == []
+    assert factory.sessions == {}
+    assert new_tasks == set()
 
 
 # @spec SESS-OPEN-001
 @pytest.mark.engine
-@pytest.mark.parametrize(
-    "cadence,locale,reason",
-    [("90ms", LOCALE, "cadence"), (CADENCE, "xx-XX", "locale")],
-)
-def test_open_refuses_unserved_cadence_or_locale_before_the_engine(
-    build, cadence, locale, reason
-):
+@pytest.mark.parametrize("locale", ["xx-XX", "", "EN-US"])
+def test_open_refuses_a_locale_not_in_locales_before_the_engine(build, locale):
     async def scenario():
         engine, factory = build()
+        assert locale not in factory.locales
         with pytest.raises(Exception) as caught:
-            await factory.open(cadence=cadence, locale=locale)
+            await factory.open(locale=locale)
         assert engine.generate_calls == [] and engine.wait_calls == []
         assert engine.events == [] and engine.unexpected == []
+        assert factory.sessions == {}
         return caught.value
 
     error = run(scenario())
-    assert error.session_error == "refused" and error.reason == reason
-
-
-# @spec SESS-OPEN-001
-@pytest.mark.engine
-def test_open_refuses_a_cadence_the_card_does_not_serve(build):
-    async def scenario():
-        engine, factory = build(hf=make_hf_config(lookaheads=[3]))
-        with pytest.raises(Exception) as caught:
-            await factory.open(cadence="80ms", locale=LOCALE)
-        assert engine.generate_calls == []
-        return caught.value
-
-    assert run(scenario()).reason == "cadence"
+    assert error.session_error == "refused" and error.reason == "locale"
 
 
 # @spec SESS-OPEN-002
@@ -286,8 +313,8 @@ def test_open_mints_a_fresh_uuid4_and_records_before_generate(build):
             seen.append(call.request_id in factory.sessions)
 
         engine.on_generate_started = started
-        first = await factory.open(cadence=CADENCE, locale=LOCALE)
-        second = await factory.open(cadence=CADENCE, locale=LOCALE)
+        first = await factory.open(locale=LOCALE)
+        second = await factory.open(locale=LOCALE)
         return engine, seen, (first, second)
 
     engine, seen, _ = run(scenario())
@@ -308,7 +335,7 @@ def test_open_returns_on_the_input_generators_first_read(build):
     async def scenario():
         engine = FakeEngine(admission_delay=0.05, first_read_delay=0.05)
         _, factory = build(engine)
-        task = asyncio.ensure_future(factory.open(cadence=CADENCE, locale=LOCALE))
+        task = asyncio.ensure_future(factory.open(locale=LOCALE))
         await asyncio.sleep(0.03)
         assert not task.done(), "admission has not happened yet"
         await asyncio.sleep(0.05)
@@ -334,7 +361,7 @@ def test_open_maps_admission_refusal_to_session_refused(build, reason):
     async def scenario():
         engine, factory = build(FakeEngine(admission=reason))
         with pytest.raises(Exception) as caught:
-            await factory.open(cadence=CADENCE, locale=LOCALE)
+            await factory.open(locale=LOCALE)
         return caught.value
 
     error = run(scenario())
@@ -386,7 +413,7 @@ def test_refusal_reason_reaches_session_refused_from_the_real_error(build):
 
         engine.generate = spy
         with pytest.raises(Exception) as caught:
-            await factory.open(cadence=CADENCE, locale=LOCALE)
+            await factory.open(locale=LOCALE)
         return caught.value
 
     error = run(scenario())
@@ -404,9 +431,9 @@ def test_second_open_with_a_reserved_id_is_refused_by_the_engine(build, monkeypa
 
     async def scenario():
         _, factory = build()
-        first = await factory.open(cadence=CADENCE, locale=LOCALE)
+        first = await factory.open(locale=LOCALE)
         with pytest.raises(Exception) as caught:
-            await factory.open(cadence=CADENCE, locale=LOCALE)
+            await factory.open(locale=LOCALE)
         return first, caught.value
 
     _, error = run(scenario())
@@ -421,7 +448,7 @@ def test_open_maps_engine_death_before_first_read(build):
     async def scenario():
         _, factory = build(FakeEngine(admission=EngineDeadError()))
         with pytest.raises(Exception) as caught:
-            await factory.open(cadence=CADENCE, locale=LOCALE)
+            await factory.open(locale=LOCALE)
         return caught.value
 
     error = run(scenario())
@@ -435,7 +462,7 @@ def test_open_maps_other_ends_before_first_read(build, admission):
     async def scenario():
         _, factory = build(FakeEngine(admission=admission))
         with pytest.raises(Exception) as caught:
-            await factory.open(cadence=CADENCE, locale=LOCALE)
+            await factory.open(locale=LOCALE)
         return caught.value
 
     error = run(scenario())
@@ -447,7 +474,7 @@ def test_open_maps_other_ends_before_first_read(build, admission):
 def test_cancelled_open_hands_a_started_task_to_one_cleanup(build):
     async def scenario():
         engine, factory = build(FakeEngine(admission="hang"))
-        task = asyncio.ensure_future(factory.open(cadence=CADENCE, locale=LOCALE))
+        task = asyncio.ensure_future(factory.open(locale=LOCALE))
         await wait_until(lambda: engine.generate_calls)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -471,7 +498,7 @@ def test_cancelled_open_never_leaves_an_unowned_record(build):
 
     async def scenario():
         engine, factory = build(FakeEngine(admission="hang"))
-        task = asyncio.ensure_future(factory.open(cadence=CADENCE, locale=LOCALE))
+        task = asyncio.ensure_future(factory.open(locale=LOCALE))
         await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -493,7 +520,7 @@ def test_cancelled_open_never_leaves_an_unowned_record(build):
 def test_record_is_accepted_after_the_first_read(build):
     async def scenario():
         engine, factory = build()
-        lease = await factory.open(cadence=CADENCE, locale=LOCALE)
+        lease = await factory.open(locale=LOCALE)
         caller_id = engine.generate_calls[0].request_id
         return factory.sessions[caller_id].admission, lease
 
@@ -508,7 +535,7 @@ def test_record_stays_pending_when_cancelled_before_either_signal(build):
         engine, factory = build(
             FakeEngine(admission="hang", retire=["hang"]),
         )
-        task = asyncio.ensure_future(factory.open(cadence=CADENCE, locale=LOCALE))
+        task = asyncio.ensure_future(factory.open(locale=LOCALE))
         await wait_until(lambda: engine.generate_calls)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -530,7 +557,7 @@ def test_record_stays_pending_when_the_task_fails_before_either_signal(build):
             FakeEngine(admission=RuntimeError("boom"), retire=["hang"])
         )
         with pytest.raises(Exception):
-            await factory.open(cadence=CADENCE, locale=LOCALE)
+            await factory.open(locale=LOCALE)
         await wait_until(lambda: engine.wait_calls)
         caller_id = engine.generate_calls[0].request_id
         state = factory.sessions[caller_id].admission
@@ -546,7 +573,7 @@ def test_refused_record_is_removed_at_once_without_a_wait(build):
     async def scenario():
         engine, factory = build(FakeEngine(admission="capacity"))
         with pytest.raises(Exception):
-            await factory.open(cadence=CADENCE, locale=LOCALE)
+            await factory.open(locale=LOCALE)
         await asyncio.sleep(0.02)
         return engine, factory
 
@@ -577,7 +604,7 @@ def _result(value):
 async def _orphan(build, retire):
     """An orphaned session: ``open`` cancelled after the task started."""
     engine, factory = build(FakeEngine(admission="hang", retire=[retire]))
-    task = asyncio.ensure_future(factory.open(cadence=CADENCE, locale=LOCALE))
+    task = asyncio.ensure_future(factory.open(locale=LOCALE))
     await wait_until(lambda: engine.generate_calls)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -631,7 +658,7 @@ def test_cleanup_has_no_deadline_of_its_own(build):
         engine, factory = build(
             FakeEngine(admission="hang", retire=[Delay(0.2)]),
         )
-        task = asyncio.ensure_future(factory.open(cadence=CADENCE, locale=LOCALE))
+        task = asyncio.ensure_future(factory.open(locale=LOCALE))
         await wait_until(lambda: engine.generate_calls)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -651,7 +678,7 @@ def test_cleanup_has_no_deadline_of_its_own(build):
 def test_cancelled_release_starts_exactly_one_cleanup(build):
     async def scenario():
         engine, factory = build(FakeEngine(retire=["hang", Delay(0.01)]))
-        lease = await factory.open(cadence=CADENCE, locale=LOCALE)
+        lease = await factory.open(locale=LOCALE)
         await lease.flush()
         release = asyncio.ensure_future(lease.release())
         await wait_until(lambda: len(engine.wait_calls) == 1)
@@ -676,7 +703,7 @@ def test_drain_waits_to_the_deadline_keeps_tasks_and_clears_faults(build):
         engine, factory = build(
             FakeEngine(admission="hang", retire=[Delay(0.3)]),
         )
-        task = asyncio.ensure_future(factory.open(cadence=CADENCE, locale=LOCALE))
+        task = asyncio.ensure_future(factory.open(locale=LOCALE))
         await wait_until(lambda: engine.generate_calls)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -688,7 +715,7 @@ def test_drain_waits_to_the_deadline_keeps_tasks_and_clears_faults(build):
         # A second orphan fails with a cleanup fault.
         engine.retire.append(EngineDeadError())
         engine.admission = "hang"
-        task2 = asyncio.ensure_future(factory.open(cadence=CADENCE, locale=LOCALE))
+        task2 = asyncio.ensure_future(factory.open(locale=LOCALE))
         await wait_until(lambda: len(engine.generate_calls) == 2)
         task2.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -710,11 +737,11 @@ def test_drain_waits_to_the_deadline_keeps_tasks_and_clears_faults(build):
 def test_teardown_all_closes_synchronously_and_returns_cancelled_tasks(build):
     async def scenario():
         engine, factory = build()
-        leases = [await factory.open(cadence=CADENCE, locale=LOCALE) for _ in range(2)]
+        leases = [await factory.open(locale=LOCALE) for _ in range(2)]
         tasks = factory.teardown_all()
         # Closed before returning: no await has happened since the call.
         with pytest.raises(Exception) as caught:
-            await factory.open(cadence=CADENCE, locale=LOCALE)
+            await factory.open(locale=LOCALE)
         assert isinstance(tasks, set) and len(tasks) >= 2
         assert all(isinstance(t, asyncio.Task) for t in tasks)
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -730,7 +757,7 @@ def test_teardown_all_closes_synchronously_and_returns_cancelled_tasks(build):
 def test_teardown_all_returns_cleanup_tasks_too(build):
     async def scenario():
         engine, factory = build(FakeEngine(admission="hang", retire=["hang"]))
-        task = asyncio.ensure_future(factory.open(cadence=CADENCE, locale=LOCALE))
+        task = asyncio.ensure_future(factory.open(locale=LOCALE))
         await wait_until(lambda: engine.generate_calls)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -750,11 +777,11 @@ def test_teardown_all_returns_cleanup_tasks_too(build):
 def test_closed_factory_refuses_open_and_lease_calls(build):
     async def scenario():
         _, factory = build()
-        lease = await factory.open(cadence=CADENCE, locale=LOCALE)
+        lease = await factory.open(locale=LOCALE)
         factory.teardown_all()
         outcomes = {}
         for name, call in {
-            "open": lambda: factory.open(cadence=CADENCE, locale=LOCALE),
+            "open": lambda: factory.open(locale=LOCALE),
             "feed": lambda: lease.feed(audio(10), on_accepted=lambda n: None),
             "update_locale": lambda: lease.update_locale(LOCALE),
             "flush": lambda: lease.flush(),
@@ -775,7 +802,7 @@ def test_closed_factory_refuses_open_and_lease_calls(build):
 def test_cancelled_pending_open_after_close_starts_no_cleanup(build):
     async def scenario():
         engine, factory = build(FakeEngine(admission="hang"))
-        task = asyncio.ensure_future(factory.open(cadence=CADENCE, locale=LOCALE))
+        task = asyncio.ensure_future(factory.open(locale=LOCALE))
         await wait_until(lambda: engine.generate_calls)
         factory.teardown_all()
         task.cancel()
@@ -795,7 +822,7 @@ def test_cancelled_pending_open_after_close_starts_no_cleanup(build):
 def test_cancelled_tasks_have_their_exceptions_retrieved(build):
     async def scenario():
         engine, factory = build(FakeEngine(cancel_raises=RuntimeError("late")))
-        await factory.open(cadence=CADENCE, locale=LOCALE)
+        await factory.open(locale=LOCALE)
         tasks = factory.teardown_all()
         await asyncio.wait(tasks, timeout=1)
         assert all(t.done() for t in tasks)

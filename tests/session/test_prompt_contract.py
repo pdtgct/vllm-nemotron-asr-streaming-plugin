@@ -134,7 +134,7 @@ def test_session_packer_prompts_pass_core_input_processing(card_dir, build):
 
     async def scenario():
         engine, factory = build(FakeEngine(blank=hf.blank_token_id), hf=hf)
-        lease = await factory.open(cadence="320ms", locale=sorted(factory.locales)[0])
+        lease = await factory.open(locale=sorted(factory.locales)[0])
         await lease.feed(
             np.full(5120 + 11, 0.01, np.float32), on_accepted=lambda n: None
         )

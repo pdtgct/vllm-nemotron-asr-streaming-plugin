@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import torch
 from support import model_harness as h
+from support.core_order import CoreOrder
 
 pytestmark = pytest.mark.engine
 
@@ -31,8 +32,7 @@ def file_logits(monkeypatch, tmp_path):
     model = h.build_model(vllm_config)
     state = h.build_model_state(vllm_config, model)
     runner = h.Runner(vllm_config, model, state)
-    runner.profile_run(core_embeds=False)
-    runner.bind_pool(h.real_bindings(h.model_spec(model)))
+    CoreOrder(runner, spy=False).startup(verify=False)
     samples = np.random.default_rng(3).standard_normal(20000).astype(np.float32) * 0.1
     request = h.new_request(
         "f1",

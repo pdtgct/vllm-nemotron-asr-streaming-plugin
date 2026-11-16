@@ -32,7 +32,6 @@ from support.fake_engine import (
 
 pytestmark = pytest.mark.engine
 
-CADENCE = "80ms"
 LOCALE = "en-US"
 UNIT = 1280
 
@@ -43,9 +42,9 @@ def audio(n: int, start: int = 0) -> np.ndarray:
     )
 
 
-async def opened(build, engine=None, *, cadence=CADENCE, locale=LOCALE, **kw):
+async def opened(build, engine=None, *, locale=LOCALE, **kw):
     engine, factory = build(engine, **kw)
-    lease = await factory.open(cadence=cadence, locale=locale)
+    lease = await factory.open(locale=locale)
     return engine, factory, lease
 
 
@@ -822,6 +821,40 @@ def test_repeated_failed_releases_keep_one_holder(build):
     assert run(scenario()) == 1
 
 
+# @spec SESS-REL-001, SESS-OWN-002
+@pytest.mark.parametrize("kind", ["returns", "value-error", "admission-error"])
+def test_release_with_the_task_still_ending_keeps_the_session_owned(build, kind):
+    """``release`` resolves the retirement result as the factory's cleanup
+    does: a terminal result reached while the cancelled generate() task is
+    still ending moves the lease to ``released`` but keeps the record and one
+    tracked task, which ``teardown_all`` would cancel, until the task ends."""
+    from vllm.v1.engine import StreamAdmissionError
+
+    result = {
+        "returns": None,
+        "value-error": ValueError("no longer tracked"),
+        "admission-error": StreamAdmissionError(refusal("x", "capacity")),
+    }[kind]
+
+    async def scenario():
+        engine = FakeEngine(retire=[result])
+        gate = slow_cancel(engine)
+        engine, factory, lease = await opened(build, engine)
+        await cancel_abort(lease)
+        outcome = await raised(lease.release())
+        state = lease.state
+        kept = lease.caller_id in factory.sessions and not lease.task.done()
+        keepers = {t for t in factory._cleanup_tasks if not t.done()}
+        gate.set()
+        await wait_until(lambda: lease.caller_id not in factory.sessions)
+        return outcome, state, kept, keepers
+
+    outcome, state, kept, keepers = run(scenario())
+    assert outcome is None and state == "released"
+    assert kept, "record removed before the generate task ended"
+    assert len(keepers) == 1, "exactly one tracked task keeps the session"
+
+
 # @spec SESS-REL-001
 def test_release_waits_for_retirement_of_its_caller_id(build):
     async def scenario():
@@ -995,26 +1028,27 @@ async def refusals(build):
     got = {}
     for reason in ("capacity", "active_limit", "engine_paused", "request_id_in_use"):
         _, factory = build(FakeEngine(admission=reason))
-        got[reason] = await raised(factory.open(cadence=CADENCE, locale=LOCALE))
+        got[reason] = await raised(factory.open(locale=LOCALE))
     _, factory = build()
-    got["cadence"] = await raised(factory.open(cadence="90ms", locale=LOCALE))
-    got["locale"] = await raised(factory.open(cadence=CADENCE, locale="xx-XX"))
+    got["locale"] = await raised(factory.open(locale="xx-XX"))
     return got
 
 
 # @spec SESS-ERR-001
 def test_session_refused_carries_attribute_and_reason(build):
     from vllm_nemotron_asr_streaming.session import SessionRefused
+    from vllm_nemotron_asr_streaming.session.errors import REFUSED_REASONS
 
-    got = run(refusals(build))
-    assert set(got) == {
+    reasons = {
         "capacity",
         "active_limit",
         "engine_paused",
         "request_id_in_use",
-        "cadence",
         "locale",
     }
+    assert set(REFUSED_REASONS) == reasons, "cadence is no refusal reason"
+    got = run(refusals(build))
+    assert set(got) == reasons
     for reason, error in got.items():
         assert isinstance(error, SessionRefused)
         assert getattr(error, "session_error", None) == "refused"
@@ -1201,7 +1235,7 @@ def test_cancelled_open_with_a_late_acceptance_needs_abort_and_retirement(build)
     async def scenario():
         engine = FakeEngine(admission_delay=0.15)
         engine, factory = build(engine)
-        task = asyncio.ensure_future(factory.open(cadence=CADENCE, locale=LOCALE))
+        task = asyncio.ensure_future(factory.open(locale=LOCALE))
         await wait_until(lambda: engine.generate_calls)
         await asyncio.sleep(0.02)
         task.cancel()

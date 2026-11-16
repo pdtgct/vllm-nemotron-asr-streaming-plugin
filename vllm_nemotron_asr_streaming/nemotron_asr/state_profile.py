@@ -88,7 +88,35 @@ def build_nemotron_persistent_state_spec(config: Any) -> PersistentStateSpec:
         descriptors=descriptors,
         page_size_bytes=offset,
         block_size=1,
+        memory_contributors=memory_contributors(config),
     )
+
+
+def memory_contributors(config: Any) -> tuple[str, ...]:
+    """The configured options that enlarge the model's execution memory or
+    graphs, which core names on a failure of its profiling pool, of a capture
+    and of its capacity planning: ``max_num_seqs`` and the two segment arms
+    when graphed execution is configured, ``chunk_bucket_graph_populations``
+    when it is non-empty, and ``transaction_graph_populations`` while
+    transaction graphs are on."""
+    from vllm_nemotron_asr_streaming.engine_flags import (
+        graphed_execution_configured,
+    )
+    from vllm_nemotron_asr_streaming.transaction_graph_config import (
+        KEY as TRANSACTION_GRAPH_KEY,
+    )
+    from vllm_nemotron_asr_streaming.transaction_graph_config import (
+        transaction_graphs_on,
+    )
+
+    names: list[str] = []
+    if graphed_execution_configured(config):
+        names += ["max_num_seqs", "encoder_execution_arm", "decode_dispatch_arm"]
+    if getattr(config, "chunk_bucket_graph_populations", ()):
+        names.append("chunk_bucket_graph_populations")
+    if transaction_graphs_on(config):
+        names.append(TRANSACTION_GRAPH_KEY)
+    return tuple(names)
 
 
 def _adjacent_matrix(

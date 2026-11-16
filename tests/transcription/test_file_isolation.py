@@ -47,9 +47,11 @@ def _request(make_step, req_id, token, fields, uuid=None):
     return request
 
 
-def _file_fields(n, row=0, count=None):
+def _file_fields(n, row=0, count=None, geometry=3):
     samples = torch.from_numpy(np.zeros(n, np.float32))
-    header = torch.tensor([3, row, n if count is None else count], dtype=torch.int64)
+    header = torch.tensor(
+        [geometry, row, n if count is None else count], dtype=torch.int64
+    )
     return {"samples": samples, "file_header": header}
 
 
@@ -67,13 +69,18 @@ def _bad_fields(kind, num_prompts):
         return {"samples": good["samples"]}
     if kind == "bad_row":
         return _file_fields(2000, row=num_prompts)
+    if kind == "foreign_geometry":
+        # an implemented geometry (index 2, 320 ms) that is not the server's
+        # (index 3, lookahead 6): only a direct engine client can send it
+        return _file_fields(2000, geometry=2)
     return _file_fields(2000, count=1999)
 
 
 @pytest.mark.parametrize(
-    "kind", ["missing_samples", "missing_header", "bad_row", "bad_count"]
+    "kind",
+    ["missing_samples", "missing_header", "bad_row", "bad_count", "foreign_geometry"],
 )
-# @spec FILE-BUF-001, FILE-ROW-001, SESS-MODEL-002
+# @spec FILE-BUF-001, FILE-ROW-001, FILE-PROMPT-007
 def test_malformed_file_request_fails_only_its_row(file_model_state, make_step, kind):
     from vllm_nemotron_asr_streaming.nemotron_asr.file_rows import FileAction
     from vllm_nemotron_asr_streaming.nemotron_asr.model_state_v2 import RowBinding
@@ -112,7 +119,9 @@ def test_malformed_file_request_fails_only_its_row(file_model_state, make_step, 
         ids, bindings, SimpleNamespace(pools=None), token_rows, input_batch
     )
     by_id = {r.request_id: r for r in plan.rows}
-    assert by_id["bad"].failed and "bad" not in state.file_buffers
+    assert by_id["bad"].failed
+    if kind != "foreign_geometry":
+        assert "bad" not in state.file_buffers
     assert by_id["good"].file_plan.action == FileAction.CHUNK
     assert "good" in state.file_buffers
 

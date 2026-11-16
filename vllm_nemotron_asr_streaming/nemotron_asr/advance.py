@@ -40,7 +40,9 @@ never a second legacy forward path).
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
@@ -48,7 +50,7 @@ import torch
 
 from vllm_nemotron_asr_streaming.nemotron_asr.profiling import phase
 from vllm_nemotron_asr_streaming.nemotron_asr.state_scatter import (
-    _execute_masked_page_scatter_,
+    execute_masked_page_scatter_,
     validate_masked_page_scatter,
     warmup_masked_page_scatter,
 )
@@ -358,7 +360,12 @@ class RowPlan:
     ``has_initial_states_p``: ``(num_prefills,)`` bool; ``~mask`` is the
     fresh-row mask (first-chunk prefills initialize from metadata).
     ``null_block_id``: the reserved block that is never a live session
-    page.
+    page. In core's resident pools its page holds the zeros of the pool
+    allocation and nothing stores to it, so fresh rows gather their
+    zero-initial state from it (TXG-MASK-001, TXG-MASK-007). Profiling
+    scratch is not a core pool: its slot 0 holds the descriptor
+    initializers, which are zero for every zero-initial component (the
+    book row, which is not, keeps its own-page gather and select).
     ``num_pool_blocks``: the resident block-pool size (in-range bound).
     ``live_block_ids``: ``(L,)`` long, the scheduler's liveness
     authority — the block ids currently allocated to resident sessions
@@ -408,6 +415,24 @@ class RowPlan:
     previously emitted token, not the stream placeholder, so the device
     cross-checks below follow its own rules.
 
+    ``planned_rejection``: empty (no row failed at planning) or
+    ``(num_decodes + num_prefills,)`` bool, the HOST authority for rows that
+    planning failed (TXG-COV-010). Such a row stays at its scheduled position;
+    the body gives it a nonzero status whatever its kind, freshness, file bit
+    or token, so its masked scatter stores nothing (TXG-MASK-006).
+
+    ``forced_eou_candidate``: empty (no candidate) or
+    ``(num_decodes + num_prefills,)`` bool, the HOST marking of rows that may
+    take the forced-EOU path (TXG-COV-012): every non-CHUNK row whose
+    host-recorded scheduled token is the EOU token
+    (:func:`forced_eou_candidates`). The transaction itself never reads it;
+    it decides the path on the device. Transaction graphs read it to decline
+    a step that holds a candidate.
+
+    :attr:`is_fresh` is the per-row freshness mask the body's gather index
+    and book select read (TXG-MASK-001), derived from
+    ``has_initial_states_p``.
+
     All plan tensors are HOST-side (CPU) scheduler/registry authority:
     structural preflight validates them without any device
     synchronization, and the transaction uploads validated indices
@@ -442,6 +467,48 @@ class RowPlan:
     is_file: torch.Tensor = field(
         default_factory=lambda: torch.zeros(0, dtype=torch.bool)
     )
+    planned_rejection: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, dtype=torch.bool)
+    )
+    forced_eou_candidate: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, dtype=torch.bool)
+    )
+
+    @property
+    def is_fresh(self) -> torch.Tensor:
+        """``(num_decodes + num_prefills,)`` CPU bool, True for a slot's first
+        step in a new generation: ``~has_initial_states_p`` for the prefill
+        rows; a decode row always continues."""
+        fresh = torch.zeros(self.num_decodes + self.num_prefills, dtype=torch.bool)
+        fresh[self.num_decodes :] = ~self.has_initial_states_p
+        return fresh
+
+
+# @spec TXG-COV-012
+def forced_eou_candidates(
+    scheduled_token_ids: Sequence[int],
+    is_chunk: Sequence[bool],
+    eou_token_id: int | None,
+) -> list[bool]:
+    """Mark the rows that may take the forced-EOU path, from host values
+    alone: every non-CHUNK row whose host-recorded scheduled token is the EOU
+    token.
+
+    The body forces EOU for such a row only when its book has no pending
+    echo, an empty queue and an unfinished stream, which live on the device,
+    so this is a superset of the rows the body forces. A row whose scheduled
+    token the host does not record (a position past the request's recorded
+    prompt, which holds a sampled token) is no candidate: a row without an
+    endpoint policy samples the EOU token only as the decision of a forced
+    EOU, which arms its echo, so that token comes back on a REPLAY row.
+    """
+    if eou_token_id is None:
+        return [False] * len(scheduled_token_ids)
+    eou = int(eou_token_id)
+    return [
+        (not bool(chunk)) and int(token) == eou
+        for token, chunk in zip(scheduled_token_ids, is_chunk, strict=True)
+    ]
 
 
 @dataclass
@@ -535,6 +602,13 @@ ROW_STATUS_BURST_OVERFLOW = 131072
 #: over-width length, invalid active nonblank id, or status mismatch).
 #: Its length is sanitized to zero before the adapter sees it.
 ROW_STATUS_DECODE_INVARIANT = 262144
+#: Planning failed the row (``RowPlan.planned_rejection``, TXG-COV-010): the
+#: body rejects it by this bit alone, whatever its kind, freshness, file bit or
+#: token (TXG-MASK-006).
+ROW_STATUS_PLANNED_REJECTION = 524288
+#: Every bit of the transaction's status vocabulary; an adapter that sets a
+#: bit outside it is a decode-invariant defect.
+_ROW_STATUS_VOCABULARY = (ROW_STATUS_PLANNED_REJECTION << 1) - 1
 
 #: Model-row roles at a scheduler step (the transaction's own
 #: vocabulary; values match the retiring ``forward_ops`` constants for
@@ -766,12 +840,16 @@ class CommitPlan:
     ``capture`` is ``None`` when capture is disabled, so the measured path
     prepares no capture-only state. Candidate records are frozen into this
     PRE-COMMIT plan; ``stage`` therefore performs no container allocation.
+    ``queue_counts`` is ``None`` or the device ``int32`` ``(rows,)`` view of
+    each binding's remaining queue count after the step, in binding order
+    (FILE-QC-001, TXG-QC-001); the sink validates it at ``reserve``.
     """
 
     bindings: tuple[PreparedRowBinding, ...]
     capture: CapturePlan | None
     records: tuple[CaptureRecord, ...] = ()
     progress: torch.Tensor | None = None
+    queue_counts: torch.Tensor | None = None
 
     @property
     def request_ids(self) -> tuple[str, ...]:
@@ -971,6 +1049,7 @@ def make_mrv1_adapter(
     return adapter
 
 
+# @spec FILE-ROW-013
 def _mrv1_projection_invariant_rows(
     result: AdvanceResult,
     context: EmissionContext,
@@ -1005,8 +1084,10 @@ def _mrv1_projection_invariant_rows(
     legal = (decision == park_id) | ((decision >= 0) & (decision < blank_id))
     if eou_token_id is not None:
         legal |= decision == eou_token_id
-    if continuation_id is not None:
-        legal |= decision == continuation_id
+    if continuation_id is not None and context.file_rows is not None:
+        # The continuation token is a legal decision on a file row only,
+        # whether or not the step holds one (FILE-ROW-013).
+        legal |= (decision == continuation_id) & context.file_rows
     bad = (~integral) | (~legal)
     if rows.shape[1] > 1:
         bad |= (rows[:, 1:] != 0).any(dim=1)
@@ -1621,12 +1702,52 @@ class _GatheredCaches:
         )
 
 
+#: Whether a transaction-graph flat capture is in progress in this context:
+#: a cell's warm-ups and its outer capture (TXG-CAP-001). Every nested encoder
+#: and decoder launch site of a cell reads it and runs eagerly while it is
+#: set, and host-to-device staging raises (TXG-CAP-002).
+_FLAT_CAPTURE: ContextVar[bool] = ContextVar("nemotron_flat_capture", default=False)
+
+
+def flat_capture_active() -> bool:
+    """Whether a transaction-graph flat capture is in progress."""
+    return _FLAT_CAPTURE.get()
+
+
+# @spec TXG-CAP-001
+@contextmanager
+def flat_capture() -> Iterator[None]:
+    """The scope of a cell's warm-ups and outer capture: nested segment
+    bindings run eagerly inside it, and no host-to-device staging copy may
+    be issued."""
+    token = _FLAT_CAPTURE.set(True)
+    try:
+        yield
+    finally:
+        _FLAT_CAPTURE.reset(token)
+
+
+# @spec TXG-CAP-002
+def _refuse_staging_in_capture(device: torch.device) -> None:
+    """Raise when a host-to-device staging copy is issued inside a graph
+    capture: the captured copy would replay a frozen pinned source."""
+    if _FLAT_CAPTURE.get() or (
+        device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+    ):
+        raise RuntimeError(
+            "host-to-device staging inside a CUDA graph capture: a captured "
+            "copy would replay a frozen pinned source. A captured body reads "
+            "its host inputs only as device tensors given to it"
+        )
+
+
 def _h2d(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     """Host-authority tensor to the compute device without a hot-path
     synchronization: pinned staging + non-blocking copy on CUDA (a
     fresh ``pin_memory()`` allocation every call — the un-pooled
     fallback :class:`HostStaging` exists to avoid), plain move
     elsewhere."""
+    _refuse_staging_in_capture(device)
     if device.type == "cuda":
         return t.pin_memory().to(device, non_blocking=True)
     return t.to(device)
@@ -1646,9 +1767,13 @@ class HostStaging:
 
     Every named purpose is staged AT MOST ONCE per
     :func:`advance_model_rows` call: the composed decode-then-prefill
-    indices, fresh row positions, the fresh-init book rows, the
-    ``is_chunk`` role vector, geometry, admitted prompt, prior
-    prompt, and the merged CHUNK row positions (``chunk_all``).
+    indices, every row's initial book row (``fresh_init_book``), the
+    ``is_chunk``, ``is_file``, ``is_fresh`` and ``planned_rejection``
+    vectors, geometry, admitted prompt, prior prompt, per-row cadence
+    frames, the endpoint policy vectors, and the merged CHUNK row
+    positions (``chunk_all``). Every vector has one entry per row, so
+    the staged shapes never depend on how many rows are fresh
+    (TXG-TXN-004).
     Distinct purposes are distinct storage — two purposes must never
     share a slot within one call, since a slot's non-blocking H2D
     copy can still be in flight (unsynchronized on the host) when the
@@ -1668,18 +1793,22 @@ class HostStaging:
     #: live in their own dedicated buffers below, not this arena.
     _INT64_SLOTS: ClassVar[tuple[str, ...]] = (
         "composed_indices",
-        "fresh_positions",
         "chunk_all",
         "geometry",
         "admitted_prompt",
         "prior_prompt",
         "cadence_frames",
+        "endpoint_mode",
+        "endpoint_threshold",
+        "endpoint_residue",
     )
 
     _arena: torch.Tensor = field(init=False, repr=False)
     _book_init: torch.Tensor = field(init=False, repr=False)
     _is_chunk_buf: torch.Tensor = field(init=False, repr=False)
     _is_file_buf: torch.Tensor = field(init=False, repr=False)
+    _is_fresh_buf: torch.Tensor = field(init=False, repr=False)
+    _planned_rejection_buf: torch.Tensor = field(init=False, repr=False)
     _bucket_arena: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -1706,6 +1835,13 @@ class HostStaging:
         self._is_file_buf = torch.empty(
             (self.capacity,), dtype=torch.bool, pin_memory=pin
         )
+        # The freshness and planned-rejection masks: their own buffers too.
+        self._is_fresh_buf = torch.empty(
+            (self.capacity,), dtype=torch.bool, pin_memory=pin
+        )
+        self._planned_rejection_buf = torch.empty(
+            (self.capacity,), dtype=torch.bool, pin_memory=pin
+        )
         # One dedicated bucket-position buffer PER GEOMETRY: each
         # geometry resolves at most once per call, so a per-geometry
         # buffer's in-flight non-blocking copy is never overwritten
@@ -1730,6 +1866,7 @@ class HostStaging:
                 ``capacity``, or ``slot_name`` names no known slot.
 
         """
+        _refuse_staging_in_capture(device)
         n = int(cpu_tensor.shape[0])
         if n > self.capacity:
             raise ValueError(
@@ -1742,6 +1879,10 @@ class HostStaging:
             buf = self._is_chunk_buf[:n]
         elif slot_name == "is_file":
             buf = self._is_file_buf[:n]
+        elif slot_name == "is_fresh":
+            buf = self._is_fresh_buf[:n]
+        elif slot_name == "planned_rejection":
+            buf = self._planned_rejection_buf[:n]
         else:
             try:
                 row = self._INT64_SLOTS.index(slot_name)
@@ -1769,6 +1910,7 @@ class HostStaging:
                 or ``geometry`` is outside the per-geometry arena.
 
         """
+        _refuse_staging_in_capture(device)
         n = int(cpu_tensor.shape[0])
         if n > self.capacity:
             raise ValueError(
@@ -1877,6 +2019,24 @@ def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Ten
         or plan.is_file.shape[0] != n_real
     ):
         raise ValueError(f"plan.is_file must be empty or CPU bool shaped ({n_real},)")
+    if plan.planned_rejection.numel() and (
+        plan.planned_rejection.device.type != "cpu"
+        or plan.planned_rejection.dtype != torch.bool
+        or plan.planned_rejection.dim() != 1
+        or plan.planned_rejection.shape[0] != n_real
+    ):
+        raise ValueError(
+            f"plan.planned_rejection must be empty or CPU bool shaped ({n_real},)"
+        )
+    if plan.forced_eou_candidate.numel() and (
+        plan.forced_eou_candidate.device.type != "cpu"
+        or plan.forced_eou_candidate.dtype != torch.bool
+        or plan.forced_eou_candidate.dim() != 1
+        or plan.forced_eou_candidate.shape[0] != n_real
+    ):
+        raise ValueError(
+            f"plan.forced_eou_candidate must be empty or CPU bool shaped ({n_real},)"
+        )
     live = plan.live_block_ids
     if live.device.type != "cpu" or live.dtype != torch.int64 or live.dim() != 1:
         raise ValueError("plan.live_block_ids must be rank-one CPU int64")
@@ -1973,27 +2133,22 @@ def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Ten
     return idx
 
 
-def _gather_initialized_rows(
-    pool: torch.Tensor,
+# @spec TXG-MASK-001, TXG-MASK-007
+def _initial_state_index(
     blocks: torch.Tensor,
-    fresh_cpu: torch.Tensor,
+    is_fresh: torch.Tensor,
+    null_block_id: int,
 ) -> torch.Tensor:
-    """Gather only continuing rows; fresh rows start as exact zero state."""
-    rows = int(blocks.shape[0])
-    continuing_cpu = (~fresh_cpu).nonzero(as_tuple=True)[0]
-    if rows and int(continuing_cpu.numel()) == rows:
-        # Keep the legacy zero-scratch layout contract explicit.
-        return pool.index_select(0, blocks).contiguous()
-    scratch = torch.zeros((rows, *pool.shape[1:]), dtype=pool.dtype, device=pool.device)
-    if int(continuing_cpu.numel()):
-        continuing = _h2d(continuing_cpu, pool.device)
-        continuing_blocks = blocks.index_select(0, continuing)
-        scratch.index_copy_(
-            0,
-            continuing,
-            pool.index_select(0, continuing_blocks),
-        )
-    return scratch
+    """The page each row reads its zero-initial state tensors from: the null
+    page for a fresh row, the row's own block otherwise (TXG-MASK-001).
+
+    The null page holds zero bytes and nothing stores to it (TXG-MASK-007), so
+    a gather by this index gives a fresh row exact zero state whatever its
+    recycled page holds. One select on the index replaces a select on every
+    gathered tensor, and it is the same operation whatever the fresh count
+    (TXG-TXN-004). Scatters keep naming each row's own block.
+    """
+    return torch.where(is_fresh, null_block_id, blocks)
 
 
 def _counter_invariant_rows(
@@ -2217,7 +2372,7 @@ def _validated_result(
         ((result.token_ids < 0) | (result.token_ids >= blank_id)) & active
     ).any(dim=1)
     lost_incoming = (result.row_status & incoming) != incoming
-    unknown = (result.row_status & ~((1 << 19) - 1)) != 0
+    unknown = (result.row_status & ~_ROW_STATUS_VOCABULARY) != 0
     invalid = (
         (lengths < 0)
         | (lengths > width)
@@ -2296,7 +2451,9 @@ def advance_chunk_bucket(
     invariant and unmasked delta predicates are returned separately so the
     latter still use the clean-row mask AFTER endpoint status is composed.
     """
-    from vllm_nemotron_asr_streaming.nemotron_asr.encoder_execution import encoder_geometry_shape
+    from vllm_nemotron_asr_streaming.nemotron_asr.encoder_execution import (
+        encoder_geometry_shape,
+    )
     from vllm_nemotron_asr_streaming.nemotron_asr.frontend import (
         CTR_COMMITTED_MEL_FRAMES,
         CTR_EXPECTED_CHUNK_SEQUENCE,
@@ -2304,7 +2461,10 @@ def advance_chunk_bucket(
         CTR_TOTAL_VALID_SAMPLES,
         MEL_TAIL_FRAMES,
     )
-    from vllm_nemotron_asr_streaming.nemotron_asr.manifests import ADMISSION_EPOCH_MODULUS_MS, CADENCES
+    from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
+        ADMISSION_EPOCH_MODULUS_MS,
+        CADENCES,
+    )
     from vllm_nemotron_asr_streaming.nemotron_asr.rnnt import MAX_SYMBOLS_PER_STEP
 
     g, capture_on, cap = geometry, capture, queue_capacity
@@ -2452,7 +2612,7 @@ class _ScatterDescriptor:
     row_status: torch.Tensor
 
 
-def _resident_pool_sequence(
+def resident_pool_sequence(
     *,
     channel_pools: Sequence[torch.Tensor],
     time_pools: Sequence[torch.Tensor],
@@ -2511,7 +2671,7 @@ def warmup_advance_model_rows_scatter(
     preserving the destination pool's actual (possibly padded) block stride.
     Runtime validation then fails closed if a later pool/layout was omitted.
     """
-    pools = _resident_pool_sequence(
+    pools = resident_pool_sequence(
         channel_pools=channel_pools,
         time_pools=time_pools,
         len_pools=len_pools,
@@ -2579,17 +2739,71 @@ def consume_batch_stats() -> list[tuple[str, int]] | None:
     return stats
 
 
-# @spec PORT-ADV-003, PORT-ADV-004, PORT-HOOK-001, PORT-LID-003,
-# @spec PORT-PERF-001, PORT-PERF-004, PORT-STATE-007, PORT-STATE-008
-def advance_model_rows(
-    core: NemotronASRCore,
-    input_ids: torch.Tensor,
-    inputs_embeds: torch.Tensor,
-    plan: RowPlan,
+# ---- the transaction's phases (TXG-TXN-006) ----
+
+
+@dataclass(frozen=True)
+class PoolLayout:
+    """Host metadata of one resident pool: what the prepare phase checks
+    without receiving the pool itself (TXG-TXN-001)."""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
+
+    @classmethod
+    def of(cls, pool: torch.Tensor) -> PoolLayout:
+        return cls(tuple(pool.shape), pool.dtype, pool.device)
+
+    @property
+    def dim(self) -> int:
+        return len(self.shape)
+
+
+@dataclass(frozen=True)
+class ResidentLayout:
+    """The resident pools' host metadata, in :func:`resident_pool_sequence`
+    groups. The endpoint entries are ``None`` when that pool is absent."""
+
+    channel: tuple[PoolLayout, ...]
+    time: tuple[PoolLayout, ...]
+    length: tuple[PoolLayout, ...]
+    h: PoolLayout
+    c: PoolLayout
+    queue: PoolLayout
+    book: PoolLayout
+    frontend_raw: PoolLayout
+    frontend_mel: PoolLayout
+    frontend_counter: PoolLayout
+    endpoint_history: PoolLayout | None = None
+    endpoint_book: PoolLayout | None = None
+
+    def sequence(self) -> tuple[PoolLayout, ...]:
+        """Every present pool's layout in commit order."""
+        layouts: tuple[PoolLayout, ...] = (
+            *self.channel,
+            *self.time,
+            *self.length,
+            self.h,
+            self.c,
+            self.queue,
+            self.book,
+            self.frontend_raw,
+            self.frontend_mel,
+            self.frontend_counter,
+        )
+        if self.endpoint_history is not None:
+            layouts += (self.endpoint_history,)
+        if self.endpoint_book is not None:
+            layouts += (self.endpoint_book,)
+        return layouts
+
+
+def resident_layout(
     *,
-    channel_pools: list[torch.Tensor],
-    time_pools: list[torch.Tensor],
-    len_pools: list[torch.Tensor],
+    channel_pools: Sequence[torch.Tensor],
+    time_pools: Sequence[torch.Tensor],
+    len_pools: Sequence[torch.Tensor],
     h_pool: torch.Tensor,
     c_pool: torch.Tensor,
     queue_pool: torch.Tensor,
@@ -2599,126 +2813,179 @@ def advance_model_rows(
     frontend_counter_pool: torch.Tensor,
     endpoint_history_pool: torch.Tensor | None = None,
     endpoint_book_pool: torch.Tensor | None = None,
-    eou_token_id: int | None = None,
-    adapter: EmissionAdapter,
+) -> ResidentLayout:
+    """The host metadata of the resident pools (no tensor is retained)."""
+    return ResidentLayout(
+        channel=tuple(PoolLayout.of(pool) for pool in channel_pools),
+        time=tuple(PoolLayout.of(pool) for pool in time_pools),
+        length=tuple(PoolLayout.of(pool) for pool in len_pools),
+        h=PoolLayout.of(h_pool),
+        c=PoolLayout.of(c_pool),
+        queue=PoolLayout.of(queue_pool),
+        book=PoolLayout.of(book_pool),
+        frontend_raw=PoolLayout.of(frontend_raw_pool),
+        frontend_mel=PoolLayout.of(frontend_mel_pool),
+        frontend_counter=PoolLayout.of(frontend_counter_pool),
+        endpoint_history=(
+            None
+            if endpoint_history_pool is None
+            else PoolLayout.of(endpoint_history_pool)
+        ),
+        endpoint_book=(
+            None if endpoint_book_pool is None else PoolLayout.of(endpoint_book_pool)
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class PreparedBucket:
+    """One CHUNK bucket resolved by the prepare phase from CPU authority:
+    its geometry, its rows' step positions (CPU, ascending), its decode
+    binding and its transition."""
+
+    geometry: int
+    positions: torch.Tensor
+    resolved: ResolvedDecode
+    transition: Callable[..., ChunkBucketResult]
+
+
+@dataclass(frozen=True)
+class PreparedRows:
+    """The prepare phase's output (TXG-TXN-001): host metadata and every
+    ``int64`` and ``bool`` per-row vector the body reads, on the host, one
+    entry per row of the row plan at its scheduled position.
+
+    ``initial_book`` is every row's initial book row (blank last label,
+    admitted prompt, geometry); the body selects it for fresh rows only.
+    ``chunk_all`` is the step positions of the buckets' rows in bucket
+    order.
+    """
+
+    plan: RowPlan
+    rows: int
+    hidden: int
+    device: torch.device
+    queue_capacity: int
+    endpoint_enabled: bool
+    composed_indices: torch.Tensor
+    is_chunk: torch.Tensor
+    is_file: torch.Tensor
+    is_fresh: torch.Tensor
+    planned_rejection: torch.Tensor
+    initial_book: torch.Tensor
+    geometry: torch.Tensor
+    admitted_prompt: torch.Tensor
+    prior_prompt: torch.Tensor
+    cadence_frames: torch.Tensor
+    endpoint_mode: torch.Tensor
+    endpoint_threshold: torch.Tensor
+    endpoint_residue: torch.Tensor
+    buckets: tuple[PreparedBucket, ...]
+    chunk_all: torch.Tensor
+
+
+@dataclass(frozen=True)
+class RowVectors:
+    """The body's per-row ``int64`` and ``bool`` inputs as device tensors,
+    the prepare phase's vectors after upload. The body reads host inputs only
+    through these (TXG-TXN-002). ``bucket_rows`` holds one step-position
+    vector per prepared bucket; the endpoint vectors are ``None`` when
+    endpointing is off."""
+
+    composed_indices: torch.Tensor
+    is_chunk: torch.Tensor
+    is_file: torch.Tensor
+    is_fresh: torch.Tensor
+    planned_rejection: torch.Tensor
+    initial_book: torch.Tensor
+    geometry: torch.Tensor
+    admitted_prompt: torch.Tensor
+    prior_prompt: torch.Tensor
+    cadence_frames: torch.Tensor
+    bucket_rows: tuple[torch.Tensor, ...]
+    chunk_all: torch.Tensor
+    endpoint_mode: torch.Tensor | None = None
+    endpoint_threshold: torch.Tensor | None = None
+    endpoint_residue: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class BodyResult:
+    """The body's outputs for the commit phase: the runner rows, the row
+    status, progress and remaining queue counts (``int32`` ``(P,)``,
+    TXG-QC-001), the validated scatter plan, the capture plan and records,
+    and the native-burst stage."""
+
+    rows: torch.Tensor
+    status: torch.Tensor
+    progress: torch.Tensor
+    queue_counts: torch.Tensor
+    scatters: tuple[_ScatterDescriptor, ...]
+    capture: CapturePlan | None
+    records: tuple[CaptureRecord, ...]
+    native_stage: Callable[[], None] | None = None
+
+
+def rejected_row_output(
+    rows: int,
+    hidden: int,
+    *,
+    park_id: int,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """The runner rows of ``rows`` rejected rows: zero carriers whose decision
+    slot holds ``park_id``, the output the body writes for any row with a
+    nonzero status (TXG-TXN-010). The model state returns it for a step whose
+    every row failed at planning (TXG-FAIL-009)."""
+    out = torch.zeros((rows, hidden), dtype=dtype, device=device)
+    if hidden:
+        out[:, 0] = park_id
+    return out
+
+
+# @spec TXG-TXN-001
+def prepare_model_rows(
+    core: NemotronASRCore,
+    input_ids: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+    plan: RowPlan,
+    *,
+    resident: ResidentLayout,
     decode_resolver: DecodeResolver,
+    eou_token_id: int | None = None,
     encoder_transition: EncoderTransition | None = None,
     bucket_transition: Callable[..., ChunkBucketResult] | None = None,
-    placeholder_id: int,
-    park_id: int,
-    commit_sink: CommitSink | None = None,
+    has_commit_sink: bool = False,
     capture: bool = False,
     graph_covers_decode: bool = False,
     memory_profile: bool = False,
-    staging: HostStaging | None = None,
-    native_burst_handoff: Any | None = None,
     file_carrier_id: int | None = None,
     continuation_id: int | None = None,
     geometry_order: Sequence[int] | None = None,
-) -> torch.Tensor:
-    """The ONE shared outer transaction (PORT-ADV-003).
+) -> PreparedRows:
+    """Phase 1 of :func:`advance_model_rows` (host only).
 
-    Fixed order (design §Phase-6c transaction seams):
-
-    1. compose decode-then-prefill indices from ``plan`` and validate
-       every structural row/page property HOST-SIDE before any page
-       read (PORT-STATE-007): row count vs ``input_ids``/
-       ``inputs_embeds``; non-null (``!= null_block_id``), live,
-       in-range (``< num_pool_blocks``) indices; uniqueness;
-       speculative-column exclusion (extra decode columns);
-       real/padding-row agreement — then upload the validated indices
-       asynchronously for the device gathers;
-    2. reject unqualified graph coverage, form CHUNK buckets from CPU
-       plan authority, order them by earliest deadline, and resolve
-       every eager decode before the first resident read;
-    3. initialize fresh rows from plan authority without reading
-       recycled pages, then gather only continuing rows' required
-       session state; evaluate replay echoes
-       and the host-role cross-check ON DEVICE into the transaction's
-       ``ROW_STATUS_*`` bits (echo mismatch is row-local after
-       trusted preflight, PORT-DEC-007 as amended); classify each
-       real row CHUNK / REPLAY / FLUSH;
-    4. group CHUNK rows by execution profile + immutable geometry
-       (host authority: ``plan.is_chunk`` + ``plan.geometry_id``) and
-       gather their full frontend/encoder/predictor scratch; valid
-       length stays a per-row tensor, not a batch-key component;
-       and run :func:`advance_session` with its pre-resolved callable;
-    5. validate complete decode results, merge and project them,
-       prepare optional candidate records, and validate the complete
-       all-bucket scatter plan before one composite reservation;
-    6. issue fixed-shape predicated page scatters (failed rows issue
-       no store), then perform the reservation's one no-fail combined
-       status/candidate stage.
-
-    Suppression (PORT-STATE-008): any structural defect fails the
-    whole call before a read; an expected per-row defect resolves to
-    a device status bit and a masked park-only no-op. An unexpected
-    Python/CUDA compute failure aborts the whole call before scatter;
-    a catastrophic device failure during the prevalidated commit is
-    worker-fatal, never bucket/row suppression or rollback. No row
-    scatters unless its emission result can be returned. Transition
-    kernels never mutate resident pages directly.
-
-    ``bucket_transition`` is an optional startup-bound experimental executor
-    for already-gathered CHUNK scratch. The default uses the same canonical
-    tensor helper eagerly. It never owns resident gathers, endpoint processing,
-    adapter execution, reservations, or scatter.
-
-    Host staging (PORT-PERF-001): ``staging`` is optional reusable
-    pinned H2D buffering (:class:`HostStaging`) for the once-per-call
-    composed-index, fresh-row, and control vectors; ``None`` keeps
-    the un-pooled per-call :func:`_h2d` path (probes/CPU). The
-    per-bucket CHUNK row-position vector, staged once per resolved
-    bucket inside step 4's loop, also rides ``staging`` when given —
-    through :meth:`HostStaging.stage_bucket`, which keeps one
-    dedicated buffer PER GEOMETRY. Since each geometry resolves at
-    most once per call, no bucket's in-flight copy is overwritten by a
-    later bucket, so this is allocation-free without the overwrite
-    race a single shared bucket slot would carry; it falls back to
-    ``_h2d`` only when ``staging`` is ``None``.
-
-    FILE rows (``plan.is_file``, FILE-ROW-001 to FILE-ROW-005): a FILE row
-    that advances audio is a CHUNK row whose envelope the model wrote into
-    its carrier row; its scheduled token is the previously emitted token, so
-    the host-role cross-check accepts the file-carrier token (first step) or
-    the continuation token when no echo is pending, and an armed echo is
-    validated like a REPLAY row's. A drain step is a REPLAY row and the end
-    step a FLUSH row. ``file_carrier_id`` and ``continuation_id`` are
-    required when any row is a FILE row; ``continuation_id`` is what a clean
-    FILE CHUNK row with an empty burst emits.
-
-    ``geometry_order``: the step planner's order of chunk groups by
-    geometry index (FILE-ENG-004). Buckets run in that order; a geometry it
-    does not list runs after the listed ones, by earliest deadline.
-
-    Returns:
-        The runner's row output as projected by ``adapter`` (e.g. the
-        ``(N, H)`` decision-carrier for MRV1).
+    Structural preflight of the whole row plan, the resident pools' layout
+    checks, decode and transition resolution for every CHUNK bucket, the
+    per-step batch statistics and every other host-only check; then every
+    ``int64`` and ``bool`` vector the body reads, built from CPU plan
+    authority with one entry per row, so no shape depends on the number of
+    fresh, file or planning-failed rows. It reads no device memory and
+    receives no resident pool (only their :class:`ResidentLayout`).
 
     Raises:
-        ValueError: a structural mapping defect, a missing/invalid
-            resolver, or a trusted-identity projection-shape defect —
-            always before any resident mutation.
+        ValueError: a structural mapping defect or a missing/invalid
+            resolver, before any resident read.
 
     """
-    from vllm_nemotron_asr_streaming.nemotron_asr.encoder_execution import (
-        encoder_geometry_shape,
-    )
-    from vllm_nemotron_asr_streaming.nemotron_asr.frontend import (
-        CTR_EXPECTED_CHUNK_SEQUENCE,
-        CTR_FINALIZED,
-    )
     from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
         CADENCES,
     )
     from vllm_nemotron_asr_streaming.nemotron_asr.rnnt import (
-        BOOK_EXPECTED_LABEL,
         BOOK_GEOMETRY,
-        BOOK_PENDING_ECHO,
         MAX_SYMBOLS_PER_STEP,
-        QUEUE_HEAD,
         QUEUE_LAST_LABEL,
-        QUEUE_LEN,
         QUEUE_PROMPT,
     )
 
@@ -2741,15 +3008,12 @@ def advance_model_rows(
     )
     has_chunk = bool(plan.is_chunk.any())
     is_file_cpu = (
-        plan.is_file
-        if plan.is_file.numel()
-        else torch.zeros(n_real, dtype=torch.bool)
+        plan.is_file if plan.is_file.numel() else torch.zeros(n_real, dtype=torch.bool)
     )
     has_file = bool(is_file_cpu.any())
     if has_file and (file_carrier_id is None or continuation_id is None):
         raise ValueError(
-            "FILE rows require file_carrier_id and continuation_id "
-            "(FILE-ROW-003)"
+            "FILE rows require file_carrier_id and continuation_id (FILE-ROW-003)"
         )
     if graph_covers_decode and has_chunk and plan.execution_tier <= 0:
         raise ValueError(
@@ -2761,17 +3025,17 @@ def advance_model_rows(
         raise ValueError("memory profile cannot claim graph coverage")
     if memory_profile and capture:
         raise ValueError("memory profile cannot publish capture records")
-    if capture and commit_sink is None:
+    if capture and not has_commit_sink:
         raise ValueError("capture requires a composite commit sink")
     lookaheads = [right for (_, right) in CADENCES.values()]
     hop = int(core.featurizer.hop_length)
     num_prompts = int(core.lid.num_prompts)
-    if queue_pool.dim() != 2 or book_pool.dim() != 2:
+    if resident.queue.dim != 2 or resident.book.dim != 2:
         raise ValueError("queue and book pools must be rank two")
-    cap = int(queue_pool.shape[1])
+    cap = int(resident.queue.shape[1])
     if cap <= 0:
         raise ValueError("replay queue capacity must be positive")
-    if book_pool.shape[1] != 7:
+    if resident.book.shape[1] != 7:
         raise ValueError("session book must match the seven-slot manifest")
     blank = int(core.blank_id)
     if n_real and (
@@ -2805,81 +3069,73 @@ def advance_model_rows(
             f"({required_hidden})"
         )
 
-    pools = _resident_pool_sequence(
-        channel_pools=channel_pools,
-        time_pools=time_pools,
-        len_pools=len_pools,
-        h_pool=h_pool,
-        c_pool=c_pool,
-        queue_pool=queue_pool,
-        book_pool=book_pool,
-        frontend_raw_pool=frontend_raw_pool,
-        frontend_mel_pool=frontend_mel_pool,
-        frontend_counter_pool=frontend_counter_pool,
-        endpoint_history_pool=endpoint_history_pool,
-        endpoint_book_pool=endpoint_book_pool,
-    )
+    pools = resident.sequence()
     endpoint_enabled = any(
         value is not None
         for value in (
-            endpoint_history_pool,
-            endpoint_book_pool,
+            resident.endpoint_history,
+            resident.endpoint_book,
             eou_token_id,
         )
     )
     if endpoint_enabled:
         if (
-            endpoint_history_pool is None
-            or endpoint_book_pool is None
+            resident.endpoint_history is None
+            or resident.endpoint_book is None
             or eou_token_id is None
         ):
             raise ValueError("endpoint execution requires history, book, and EOU id")
         if (
-            endpoint_history_pool.dtype != torch.int32
-            or endpoint_history_pool.dim() != 2
-            or endpoint_book_pool.dtype != torch.int32
-            or endpoint_book_pool.dim() != 2
-            or endpoint_book_pool.shape[1] != 6
+            resident.endpoint_history.dtype != torch.int32
+            or resident.endpoint_history.dim != 2
+            or resident.endpoint_book.dtype != torch.int32
+            or resident.endpoint_book.dim != 2
+            or resident.endpoint_book.shape[1] != 6
         ):
             raise ValueError("endpoint resident pools disagree with the manifest")
-    if any(pool.dim() < 1 for pool in pools):
+    if any(pool.dim < 1 for pool in pools):
         raise ValueError("every resident pool must have a block dimension")
     if any(int(pool.shape[0]) != plan.num_pool_blocks for pool in pools):
         raise ValueError("resident pool extent disagrees with RowPlan authority")
     if any(pool.device != device for pool in pools):
         raise ValueError("every resident pool must share the compute device")
-    if queue_pool.dtype != torch.int32 or book_pool.dtype != torch.int32:
+    if resident.queue.dtype != torch.int32 or resident.book.dtype != torch.int32:
         raise ValueError("queue and book pools must use int32")
-    if frontend_counter_pool.dtype != torch.int64:
+    if resident.frontend_counter.dtype != torch.int64:
         raise ValueError("frontend counters must use int64")
     if (
-        any(pool.dtype != torch.float32 for pool in channel_pools)
-        or any(pool.dtype != torch.float32 for pool in time_pools)
-        or any(pool.dtype != torch.int32 for pool in len_pools)
-        or h_pool.dtype != torch.float32
-        or c_pool.dtype != torch.float32
-        or frontend_raw_pool.dtype != torch.float32
-        or frontend_mel_pool.dtype != torch.float32
+        any(pool.dtype != torch.float32 for pool in resident.channel)
+        or any(pool.dtype != torch.float32 for pool in resident.time)
+        or any(pool.dtype != torch.int32 for pool in resident.length)
+        or resident.h.dtype != torch.float32
+        or resident.c.dtype != torch.float32
+        or resident.frontend_raw.dtype != torch.float32
+        or resident.frontend_mel.dtype != torch.float32
     ):
         raise ValueError("resident pool dtypes disagree with the state manifest")
     if (
-        frontend_raw_pool.dim() != 2
-        or frontend_mel_pool.dim() != 3
-        or frontend_counter_pool.dim() != 2
-        or frontend_counter_pool.shape[1] != 8
-        or h_pool.dim() != 3
-        or c_pool.dim() != 3
-        or tuple(h_pool.shape) != tuple(c_pool.shape)
-        or h_pool.dtype != c_pool.dtype
+        resident.frontend_raw.dim != 2
+        or resident.frontend_mel.dim != 3
+        or resident.frontend_counter.dim != 2
+        or resident.frontend_counter.shape[1] != 8
+        or resident.h.dim != 3
+        or resident.c.dim != 3
+        or resident.h.shape != resident.c.shape
+        or resident.h.dtype != resident.c.dtype
     ):
         raise ValueError("frontend/predictor resident pool geometry is invalid")
     layer_count = len(core.encoder.layers)
-    if not (len(channel_pools) == len(time_pools) == len(len_pools) == layer_count):
+    if not (
+        len(resident.channel)
+        == len(resident.time)
+        == len(resident.length)
+        == layer_count
+    ):
         raise ValueError("encoder state pool counts disagree with model layers")
     if (
-        any(pool.dim() != 3 for pool in channel_pools)
-        or any(pool.dim() != 3 for pool in time_pools)
-        or any(pool.dim() != 2 or pool.shape[1] != 1 for pool in len_pools)
+        any(pool.dim != 3 for pool in resident.channel)
+        or any(pool.dim != 3 for pool in resident.time)
+        or any(pool.dim != 2 or pool.shape[1] != 1 for pool in resident.length)
     ):
         raise ValueError("encoder resident pool geometry is invalid")
 
@@ -2897,8 +3153,7 @@ def advance_model_rows(
         key=lambda item: (order_rank.get(item[0], len(order_rank)), item[2], item[0])
     )
     ready = len(unresolved)
-    bucket_pos: list[tuple[int, torch.Tensor, ResolvedDecode]] = []
-    bucket_transitions: dict[int, Callable[..., ChunkBucketResult]] = {}
+    buckets: list[PreparedBucket] = []
     resolve_bucket = getattr(bucket_transition, "resolve", None)
     for geometry, positions, _, _ in unresolved:
         live = int(positions.numel())
@@ -2919,6 +3174,9 @@ def advance_model_rows(
         )
         if not isinstance(resolved, ResolvedDecode) or not callable(resolved.decode_fn):
             raise ValueError("decode resolver returned an invalid binding")
+        transition: Callable[..., ChunkBucketResult] = (
+            advance_chunk_bucket if bucket_transition is None else bucket_transition
+        )
         if callable(resolve_bucket):
             selected = resolve_bucket(
                 geometry=geometry,
@@ -2929,54 +3187,25 @@ def advance_model_rows(
             )
             if not callable(selected):
                 raise ValueError("CHUNK resolver returned an invalid transition")
-            bucket_transitions[geometry] = selected
-        bucket_pos.append((geometry, positions, resolved))
+            transition = selected
+        buckets.append(PreparedBucket(geometry, positions, resolved, transition))
 
     # PORT-OBS-008 (amended): one (cadence_ms, rows) entry per executed
     # nonempty CHUNK geometry bucket, unconditionally — CPU-only (``live``
     # above is already a plain int, no device sync; ``cadence_labels`` is
     # a python list index, not a tensor read), independent of ``capture``
-    # or export being enabled. ``bucket_pos`` is exactly the executed set
-    # (the loop below processes every entry; nothing filters it further).
+    # or export being enabled. ``buckets`` is exactly the executed set
+    # (the body processes every entry; nothing filters it further).
     # Cadence is resolved HERE, at the manifest-table authority, so every
     # downstream consumer (metrics, orchestrator) stays model-agnostic.
     cadence_labels = list(CADENCES)
     _stage_batch_stats(
         [
-            (cadence_labels[geometry].removesuffix("ms"), int(positions.numel()))
-            for geometry, positions, _ in bucket_pos
+            (cadence_labels[b.geometry].removesuffix("ms"), int(b.positions.numel()))
+            for b in buckets
         ]
     )
 
-    # ---- small continuing-row gather + metadata-only fresh init ----
-    def _stage(slot_name: str, cpu_tensor: torch.Tensor) -> torch.Tensor:
-        """Route one once-per-call vector through ``staging`` when
-        given, else the un-pooled :func:`_h2d` path."""
-        if staging is not None:
-            return staging.stage(slot_name, cpu_tensor, device)
-        return _h2d(cpu_tensor, device)
-
-    didx = _stage("composed_indices", idx_cpu)
-    fresh_local = (~plan.has_initial_states_p).nonzero(as_tuple=True)[0]
-    fresh_mask_cpu = torch.zeros(n_real, dtype=torch.bool)
-    if int(fresh_local.numel()):
-        fresh_pos_cpu = plan.num_decodes + fresh_local
-        fresh_mask_cpu[fresh_pos_cpu] = True
-    book = _gather_initialized_rows(book_pool, didx, fresh_mask_cpu)
-    queue = _gather_initialized_rows(queue_pool, didx, fresh_mask_cpu)
-    counters_small = _gather_initialized_rows(
-        frontend_counter_pool, didx, fresh_mask_cpu
-    )
-    endpoint_history = (
-        _gather_initialized_rows(endpoint_history_pool, didx, fresh_mask_cpu)
-        if endpoint_enabled
-        else None
-    )
-    endpoint_book = (
-        _gather_initialized_rows(endpoint_book_pool, didx, fresh_mask_cpu)
-        if endpoint_enabled
-        else None
-    )
     endpoint_mode_cpu = (
         plan.endpoint_mode
         if plan.endpoint_mode.numel()
@@ -2998,26 +3227,167 @@ def advance_model_rows(
         or bool((endpoint_residue_cpu < 0).any())
     ):
         raise ValueError("endpoint policy is outside the admitted vocabulary")
-    if int(fresh_local.numel()):
-        finit = torch.zeros(int(fresh_local.numel()), book.shape[1], dtype=torch.int64)
-        finit[:, QUEUE_LAST_LABEL] = blank
-        finit[:, QUEUE_PROMPT] = plan.prompt_index.index_select(0, fresh_pos_cpu)
-        finit[:, BOOK_GEOMETRY] = plan.geometry_id.index_select(0, fresh_pos_cpu)
-        fresh_dev = _stage("fresh_positions", fresh_pos_cpu)
-        book.index_copy_(0, fresh_dev, _stage("fresh_init_book", finit).to(book.dtype))
 
-    # ---- device role/protocol/invariant composition ----
-    is_chunk_dev = _stage("is_chunk", plan.is_chunk)
-    is_file_dev = _stage("is_file", is_file_cpu) if has_file else None
-    plan_geom_dev = _stage("geometry", plan.geometry_id)
-    admitted_prompt_dev = _stage("admitted_prompt", plan.prompt_index)
-    prior_prompt_dev = _stage(
-        "prior_prompt",
-        torch.tensor(
+    # Every row's initial book row from plan authority; the body selects it
+    # for fresh rows only (TXG-MASK-001), so its shape never depends on the
+    # fresh count (TXG-TXN-004).
+    initial_book = torch.zeros(n_real, 7, dtype=torch.int64)
+    initial_book[:, QUEUE_LAST_LABEL] = blank
+    initial_book[:, QUEUE_PROMPT] = plan.prompt_index
+    initial_book[:, BOOK_GEOMETRY] = plan.geometry_id
+    planned_rejection = (
+        plan.planned_rejection
+        if plan.planned_rejection.numel()
+        else torch.zeros(n_real, dtype=torch.bool)
+    )
+    return PreparedRows(
+        plan=plan,
+        rows=n_real,
+        hidden=hidden,
+        device=device,
+        queue_capacity=cap,
+        endpoint_enabled=endpoint_enabled,
+        composed_indices=idx_cpu,
+        is_chunk=plan.is_chunk,
+        is_file=is_file_cpu,
+        is_fresh=plan.is_fresh,
+        planned_rejection=planned_rejection,
+        initial_book=initial_book,
+        geometry=plan.geometry_id,
+        admitted_prompt=plan.prompt_index,
+        prior_prompt=torch.tensor(
             [binding.prior_prompt_index for binding in plan.bindings],
             dtype=torch.int64,
         ),
+        # Build the per-geometry cadence table on the HOST and index it by
+        # the CPU RowPlan geometry authority; the upload then stages the
+        # per-row result — never ``torch.tensor(list, device=cuda)``, which
+        # is a synchronizing host→device construction on the per-turn hot
+        # path (the full-turn probe's sync tripwire named exactly this call).
+        cadence_frames=torch.tensor(
+            [8 * (lookahead + 1) for lookahead in lookaheads],
+            dtype=torch.int64,
+        ).index_select(0, plan.geometry_id),
+        endpoint_mode=endpoint_mode_cpu,
+        endpoint_threshold=endpoint_threshold_cpu,
+        endpoint_residue=endpoint_residue_cpu,
+        buckets=tuple(buckets),
+        chunk_all=(
+            torch.cat([b.positions for b in buckets])
+            if buckets
+            else torch.zeros(0, dtype=torch.long)
+        ),
     )
+
+
+# @spec TXG-TXN-002, TXG-TXN-003, TXG-TXN-004, TXG-TXN-005, TXG-TXN-010,
+# @spec TXG-MASK-001, TXG-MASK-002, TXG-MASK-003, TXG-MASK-004, TXG-MASK-006,
+# @spec TXG-MASK-007, TXG-QC-001, FILE-ROW-009, FILE-ROW-011, FILE-ROW-012,
+# @spec FILE-ROW-014
+def model_rows_body(
+    core: NemotronASRCore,
+    input_ids: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+    prepared: PreparedRows,
+    vectors: RowVectors,
+    *,
+    channel_pools: list[torch.Tensor],
+    time_pools: list[torch.Tensor],
+    len_pools: list[torch.Tensor],
+    h_pool: torch.Tensor,
+    c_pool: torch.Tensor,
+    queue_pool: torch.Tensor,
+    book_pool: torch.Tensor,
+    frontend_raw_pool: torch.Tensor,
+    frontend_mel_pool: torch.Tensor,
+    frontend_counter_pool: torch.Tensor,
+    endpoint_history_pool: torch.Tensor | None = None,
+    endpoint_book_pool: torch.Tensor | None = None,
+    eou_token_id: int | None = None,
+    adapter: EmissionAdapter,
+    encoder_transition: EncoderTransition | None = None,
+    placeholder_id: int,
+    park_id: int,
+    capture: bool = False,
+    native_burst_handoff: Any | None = None,
+    file_carrier_id: int | None = None,
+    continuation_id: int | None = None,
+) -> BodyResult:
+    """Phase 2 of :func:`advance_model_rows` (device only).
+
+    Gathers every row's state, a fresh row's zero-initial tensors from the
+    null page and its book row through ``where(is_fresh, initial, gathered)``
+    (TXG-MASK-001), while every scatter names the row's own block; composes
+    the planned-rejection, role, echo, protocol, file-row and invariant statuses
+    as elementwise selects on device masks; runs the prepared CHUNK buckets
+    (frontend, encoder, decode, endpointing), the adapter projection and its
+    validation; and returns the row status, progress, remaining queue counts
+    and the complete scatter plan, validated before any scatter. It reads
+    host inputs only as the device tensors in ``vectors`` and stages
+    nothing; its host control flow never depends on whether the step holds
+    fresh, file or planning-failed rows (TXG-TXN-003). Row ``i`` reads only
+    ``input_ids[i]``, ``inputs_embeds[i]`` and binding ``i``, and writes only
+    output row ``i`` (TXG-TXN-010).
+    """
+    from vllm_nemotron_asr_streaming.nemotron_asr.encoder_execution import (
+        encoder_geometry_shape,
+    )
+    from vllm_nemotron_asr_streaming.nemotron_asr.frontend import (
+        CTR_EXPECTED_CHUNK_SEQUENCE,
+        CTR_FINALIZED,
+    )
+    from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
+        CADENCES,
+    )
+    from vllm_nemotron_asr_streaming.nemotron_asr.rnnt import (
+        BOOK_EXPECTED_LABEL,
+        BOOK_GEOMETRY,
+        BOOK_PENDING_ECHO,
+        QUEUE_HEAD,
+        QUEUE_LAST_LABEL,
+        QUEUE_LEN,
+        QUEUE_PROMPT,
+    )
+
+    plan = prepared.plan
+    n_real = prepared.rows
+    hidden = prepared.hidden
+    device = prepared.device
+    cap = prepared.queue_capacity
+    endpoint_enabled = prepared.endpoint_enabled
+    lookaheads = [right for (_, right) in CADENCES.values()]
+    hop = int(core.featurizer.hop_length)
+    blank = int(core.blank_id)
+
+    # ---- gather every row's state, fresh rows from the initial state ----
+    # TXG-MASK-001: the zero-initial tensors by the initial-state index (the
+    # null page for a fresh row); the book by each row's own block, then the
+    # select of the initial book row. ``didx`` stays every row's scatter
+    # target.
+    didx = vectors.composed_indices
+    is_fresh_dev = vectors.is_fresh
+    gidx = _initial_state_index(didx, is_fresh_dev, plan.null_block_id)
+    book = torch.where(
+        is_fresh_dev.unsqueeze(1),
+        vectors.initial_book.to(book_pool.dtype),
+        book_pool.index_select(0, didx),
+    )
+    queue = queue_pool.index_select(0, gidx)
+    counters_small = frontend_counter_pool.index_select(0, gidx)
+    endpoint_history: torch.Tensor | None = None
+    endpoint_book: torch.Tensor | None = None
+    if endpoint_enabled:
+        assert endpoint_history_pool is not None
+        assert endpoint_book_pool is not None
+        endpoint_history = endpoint_history_pool.index_select(0, gidx)
+        endpoint_book = endpoint_book_pool.index_select(0, gidx)
+
+    # ---- device role/protocol/invariant composition ----
+    is_chunk_dev = vectors.is_chunk
+    is_file_dev = vectors.is_file
+    plan_geom_dev = vectors.geometry
+    admitted_prompt_dev = vectors.admitted_prompt
+    prior_prompt_dev = vectors.prior_prompt
     ids_dev = input_ids.long()
     head_all = book[:, QUEUE_HEAD].long()
     len_all = book[:, QUEUE_LEN].long()
@@ -3078,48 +3448,34 @@ def advance_model_rows(
         mel_tail_capacity=int(frontend_mel_pool.shape[2]),
         hop_length=hop,
         n_fft=int(core.featurizer.n_fft),
-        # Build the per-geometry cadence table on the HOST and index it
-        # by the CPU RowPlan geometry authority, THEN stage the per-row
-        # result to the device — never ``torch.tensor(list,
-        # device=cuda)``, which is a synchronizing host→device
-        # construction on the per-turn hot path (the full-turn probe's
-        # sync tripwire named exactly this call). Mirrors how
-        # ``prior_prompt`` etc. are staged: CPU build, pooled
-        # non-blocking H2D.
-        cadence_frames=_stage(
-            "cadence_frames",
-            torch.tensor(
-                [8 * (lookahead + 1) for lookahead in lookaheads],
-                dtype=torch.int64,
-            ).index_select(0, plan.geometry_id),
-        ),
+        cadence_frames=vectors.cadence_frames,
     )
     status = torch.zeros(n_real, dtype=torch.int32, device=device)
-    if is_file_dev is None:
-        stream_role_bad = is_chunk_dev != (ids_dev == placeholder_id)
-        echo_checked = ~is_chunk_dev
-        not_drained = is_chunk_dev & (pending | (remaining > 0))
-        file_role_bad = None
-    else:
-        # A FILE row's scheduled token is the token it emitted last (the
-        # file carrier on its first step), never the stream placeholder.
-        # Its CHUNK steps follow a drained queue whose last label's echo may
-        # still be armed, which the echo check validates and the chunk then
-        # replaces.
-        assert file_carrier_id is not None and continuation_id is not None
-        stream_role_bad = (~is_file_dev) & (is_chunk_dev != (ids_dev == placeholder_id))
-        file_role_bad = (
-            is_file_dev
-            & is_chunk_dev
-            & (~pending)
-            & (ids_dev != file_carrier_id)
-            & (ids_dev != continuation_id)
-        ) | (is_file_dev & (ids_dev == placeholder_id))
-        echo_checked = (~is_chunk_dev) | is_file_dev
-        not_drained = is_chunk_dev & (((~is_file_dev) & pending) | (remaining > 0))
+    # A planning-failed row is rejected by its own bit, whatever its kind,
+    # freshness, file bit or token (TXG-MASK-006).
+    status |= vectors.planned_rejection.to(torch.int32) * ROW_STATUS_PLANNED_REJECTION
+    # The file-row selects run on every step as elementwise choices on the
+    # file bit (TXG-MASK-003); an all-false mask reduces each to the stream
+    # rule (TXG-MASK-004). A FILE row's scheduled token is the token it
+    # emitted last (the file carrier on its first step), never the stream
+    # placeholder. Its CHUNK steps follow a drained queue whose last label's
+    # echo may still be armed, which the echo check validates and the chunk
+    # then replaces. Without configured file tokens (probes) no row is a
+    # FILE row, and -1 matches no token.
+    file_carrier = -1 if file_carrier_id is None else int(file_carrier_id)
+    continuation = -1 if continuation_id is None else int(continuation_id)
+    stream_role_bad = (~is_file_dev) & (is_chunk_dev != (ids_dev == placeholder_id))
+    file_role_bad = (
+        is_file_dev
+        & is_chunk_dev
+        & (~pending)
+        & (ids_dev != file_carrier)
+        & (ids_dev != continuation)
+    ) | (is_file_dev & (ids_dev == placeholder_id))
+    echo_checked = (~is_chunk_dev) | is_file_dev
+    not_drained = is_chunk_dev & (((~is_file_dev) & pending) | (remaining > 0))
     status |= stream_role_bad.to(torch.int32) * ROW_STATUS_ROLE_MISMATCH
-    if file_role_bad is not None:
-        status |= file_role_bad.to(torch.int32) * ROW_STATUS_ROLE_MISMATCH
+    status |= file_role_bad.to(torch.int32) * ROW_STATUS_ROLE_MISMATCH
     status |= (echo_checked & pending & (ids_dev != expected)).to(
         torch.int32
     ) * ROW_STATUS_ECHO_MISMATCH
@@ -3181,23 +3537,17 @@ def advance_model_rows(
     )
     roles = torch.where(is_chunk_dev, torch.full_like(roles, ROLE_CHUNK), roles)
 
-    # ---- deadline-ordered buckets → fresh-aware gather → transition ----
+    # ---- deadline-ordered buckets → initial-state gather → transition ----
     capture_on = capture
     executed: list[dict[str, Any]] = []
-    for g, pos_t, resolved in bucket_pos:
-        # Routed through ``staging`` by GEOMETRY: each geometry resolves
-        # at most once per call, so its dedicated per-geometry buffer's
-        # non-blocking copy is never overwritten by a later bucket in
-        # this call — allocation-free without the overwrite race a
-        # single shared bucket slot would carry. Falls back to the
-        # un-pooled _h2d path (probes/CPU) when no staging is given.
-        rows_dev = (
-            staging.stage_bucket(g, pos_t, device)
-            if staging is not None
-            else _h2d(pos_t, device)
-        )
+    for prepared_bucket, rows_dev in zip(
+        prepared.buckets, vectors.bucket_rows, strict=True
+    ):
+        g = prepared_bucket.geometry
+        pos_t = prepared_bucket.positions
+        resolved = prepared_bucket.resolved
         blocks_dev = didx.index_select(0, rows_dev)
-        fresh_bucket = fresh_mask_cpu.index_select(0, pos_t)
+        gather_bucket = gidx.index_select(0, rows_dev)
         capture_geometry = encoder_geometry_shape(core, g) if capture_on else None
         cadence = (
             capture_geometry.cadence_frames
@@ -3214,33 +3564,17 @@ def advance_model_rows(
         adm_prompt_b = admitted_prompt_dev.index_select(0, rows_dev)
         incoming = status.index_select(0, rows_dev)
         state = SessionStateBatch(
-            raw_tail=_gather_initialized_rows(
-                frontend_raw_pool, blocks_dev, fresh_bucket
-            ),
-            mel_tail=_gather_initialized_rows(
-                frontend_mel_pool, blocks_dev, fresh_bucket
-            ),
+            raw_tail=frontend_raw_pool.index_select(0, gather_bucket),
+            mel_tail=frontend_mel_pool.index_select(0, gather_bucket),
             frontend_counters=counters_small.index_select(0, rows_dev),
-            channel=[
-                _gather_initialized_rows(pool, blocks_dev, fresh_bucket)
-                for pool in channel_pools
-            ],
-            window_valid=[
-                _gather_initialized_rows(pool, blocks_dev, fresh_bucket)
-                for pool in len_pools
-            ],
-            time=[
-                _gather_initialized_rows(pool, blocks_dev, fresh_bucket)
-                for pool in time_pools
-            ],
-            h=_gather_initialized_rows(h_pool, blocks_dev, fresh_bucket),
-            c=_gather_initialized_rows(c_pool, blocks_dev, fresh_bucket),
+            channel=[pool.index_select(0, gather_bucket) for pool in channel_pools],
+            window_valid=[pool.index_select(0, gather_bucket) for pool in len_pools],
+            time=[pool.index_select(0, gather_bucket) for pool in time_pools],
+            h=h_pool.index_select(0, gather_bucket),
+            c=c_pool.index_select(0, gather_bucket),
             last_label=safe_last.index_select(0, rows_dev),
         )
-        transition = bucket_transitions.get(
-            g, advance_chunk_bucket if bucket_transition is None else bucket_transition
-        )
-        bucket = transition(
+        bucket = prepared_bucket.transition(
             core,
             env,
             state,
@@ -3304,6 +3638,9 @@ def advance_model_rows(
             assert endpoint_history is not None
             assert endpoint_book is not None
             assert eou_token_id is not None
+            assert vectors.endpoint_mode is not None
+            assert vectors.endpoint_threshold is not None
+            assert vectors.endpoint_residue is not None
             endpoint_transition = observe_chunk_tensors(
                 history=endpoint_history.index_select(0, rows_dev),
                 book=endpoint_book.index_select(0, rows_dev),
@@ -3312,13 +3649,9 @@ def advance_model_rows(
                 token_ids=result.token_ids,
                 token_lengths=result.token_lengths,
                 final_tail=batch.final_tail.to(device),
-                mode=_h2d(endpoint_mode_cpu.index_select(0, pos_t), device),
-                threshold_frames=_h2d(
-                    endpoint_threshold_cpu.index_select(0, pos_t), device
-                ),
-                residue_frames=_h2d(
-                    endpoint_residue_cpu.index_select(0, pos_t), device
-                ),
+                mode=vectors.endpoint_mode.index_select(0, rows_dev),
+                threshold_frames=vectors.endpoint_threshold.index_select(0, rows_dev),
+                residue_frames=vectors.endpoint_residue.index_select(0, rows_dev),
                 eou_token_id=int(eou_token_id),
                 row_clean=result.row_status == 0,
             )
@@ -3390,13 +3723,8 @@ def advance_model_rows(
         )
 
     # ---- merged results + adapter projection (still fallible) ----
-    chunk_all_t = (
-        torch.cat([positions for _, positions, _ in bucket_pos])
-        if bucket_pos
-        else torch.zeros(0, dtype=torch.long)
-    )
-    chunk_all_dev = _stage("chunk_all", chunk_all_t)
-    b_total = int(chunk_all_t.numel())
+    chunk_all_dev = vectors.chunk_all
+    b_total = int(prepared.chunk_all.numel())
     k_max = max(
         (int(ex["result"].token_ids.shape[1]) for ex in executed),
         default=0,
@@ -3616,7 +3944,7 @@ def advance_model_rows(
     ) != incoming_adapter_status
     status = incoming_adapter_status | projection.row_status
     status |= lost_status.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
-    status |= ((projection.row_status & ~((1 << 19) - 1)) != 0).to(
+    status |= ((projection.row_status & ~_ROW_STATUS_VOCABULARY) != 0).to(
         torch.int32
     ) * ROW_STATUS_DECODE_INVARIANT
     status |= proposed_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
@@ -3628,7 +3956,7 @@ def advance_model_rows(
         park_id=park_id,
         blank_id=blank,
         eou_token_id=eou_token_id if endpoint_enabled else None,
-        continuation_id=continuation_id if has_file else None,
+        continuation_id=continuation_id,
     )
     status |= projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
     native_stage: Callable[[], None] | None = None
@@ -3745,7 +4073,7 @@ def advance_model_rows(
                     CaptureRecord(
                         row=pos,
                         request_id=plan.request_ids[pos],
-                        block_id=int(idx_cpu[pos]),
+                        block_id=int(prepared.composed_indices[pos]),
                         admission_generation=int(plan.admission_generation[pos]),
                         geometry=int(ex["geometry"]),
                         chunk_sequence=ex["batch"].chunk_sequence[i],
@@ -3796,7 +4124,38 @@ def advance_model_rows(
         (progress_sequence, projection.book[:, QUEUE_HEAD].long(), progress_phase),
         dim=1,
     )
-    prepared_records = tuple(records)
+    # TXG-QC-001: every row's remaining queue count after the step, from its
+    # proposed book, int32, at the row's step position.
+    remaining_counts = (
+        (projection.book[:, QUEUE_LEN] - projection.book[:, QUEUE_HEAD])
+        .to(torch.int32)
+        .contiguous()
+    )
+    return BodyResult(
+        rows=projection_rows,
+        status=status,
+        progress=progress,
+        queue_counts=remaining_counts,
+        scatters=tuple(scatter_ops),
+        capture=capture_plan,
+        records=tuple(records),
+        native_stage=native_stage,
+    )
+
+
+# @spec TXG-TXN-008, FILE-QC-001
+def commit_model_rows(
+    plan: RowPlan,
+    body: BodyResult,
+    *,
+    commit_sink: CommitSink | None = None,
+) -> torch.Tensor:
+    """Phase 3 of :func:`advance_model_rows`: one composite reservation
+    covering every row (bindings in row order, capture records, progress and
+    remaining queue counts), then the prevalidated predicated scatters, then
+    the reservation's one no-fail stage of the row status. Returns the
+    body's runner rows.
+    """
     reservation: CommitReservation | None = None
     cancel_reservation: Callable[[], None] | None = None
     stage_reservation: Callable[[torch.Tensor], None] | None = None
@@ -3804,9 +4163,10 @@ def advance_model_rows(
         reservation = commit_sink.reserve(
             CommitPlan(
                 bindings=plan.bindings,
-                capture=capture_plan,
-                records=prepared_records,
-                progress=progress,
+                capture=body.capture,
+                records=body.records,
+                progress=body.progress,
+                queue_counts=body.queue_counts,
             )
         )
         cancel_candidate = getattr(reservation, "cancel", None)
@@ -3824,13 +4184,13 @@ def advance_model_rows(
         stage_reservation = stage_candidate
 
     # ---- commit: prevalidated, allocation-free scatters + no-fail stage ----
-    # Every descriptor was already validated above (the complete-plan
-    # pass); the commit window calls the private prevalidated
+    # Every descriptor was already validated by the body (the complete-plan
+    # pass); the commit window calls the prevalidated
     # executor directly so no descriptor is re-validated here.
     with phase("port.scatter"):
         try:
-            for op in scatter_ops:
-                _execute_masked_page_scatter_(
+            for op in body.scatters:
+                execute_masked_page_scatter_(
                     op.pool, op.scratch, op.blocks, op.row_status
                 )
         except BaseException:
@@ -3838,8 +4198,268 @@ def advance_model_rows(
                 cancel_reservation()
             raise
         # ---- ONE no-fail combined stage through the reserved ticket ----
+        # @spec TXG-EXEC-010: the stage validates and allocates nothing, but a
+        # copy or event fault can still raise. A stage that raises before it
+        # publishes the reservation leaves it cancellable, so the reservation
+        # is cancelled before the failure propagates; after a successful stage
+        # a cancel does nothing. If that cancel itself raises, the reservation
+        # is unresolved: the cancel's failure propagates as worker-fatal, with
+        # the stage's failure chained as its context.
         if stage_reservation is not None:
-            stage_reservation(status)
-        if native_stage is not None:
-            native_stage()
-    return projection_rows
+            try:
+                stage_reservation(body.status)
+            except BaseException:
+                if cancel_reservation is not None:
+                    cancel_reservation()
+                raise
+        if body.native_stage is not None:
+            body.native_stage()
+    return body.rows
+
+
+# @spec PORT-ADV-003, PORT-ADV-004, PORT-HOOK-001, PORT-LID-003,
+# @spec PORT-PERF-001, PORT-PERF-004, PORT-STATE-007, PORT-STATE-008
+# @spec TXG-TXN-006, TXG-TXN-007, FILE-ROW-010
+def advance_model_rows(
+    core: NemotronASRCore,
+    input_ids: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+    plan: RowPlan,
+    *,
+    channel_pools: list[torch.Tensor],
+    time_pools: list[torch.Tensor],
+    len_pools: list[torch.Tensor],
+    h_pool: torch.Tensor,
+    c_pool: torch.Tensor,
+    queue_pool: torch.Tensor,
+    book_pool: torch.Tensor,
+    frontend_raw_pool: torch.Tensor,
+    frontend_mel_pool: torch.Tensor,
+    frontend_counter_pool: torch.Tensor,
+    endpoint_history_pool: torch.Tensor | None = None,
+    endpoint_book_pool: torch.Tensor | None = None,
+    eou_token_id: int | None = None,
+    adapter: EmissionAdapter,
+    decode_resolver: DecodeResolver,
+    encoder_transition: EncoderTransition | None = None,
+    bucket_transition: Callable[..., ChunkBucketResult] | None = None,
+    placeholder_id: int,
+    park_id: int,
+    commit_sink: CommitSink | None = None,
+    capture: bool = False,
+    graph_covers_decode: bool = False,
+    memory_profile: bool = False,
+    staging: HostStaging | None = None,
+    native_burst_handoff: Any | None = None,
+    file_carrier_id: int | None = None,
+    continuation_id: int | None = None,
+    geometry_order: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """The ONE shared outer transaction (PORT-ADV-003).
+
+    It runs three phases over the whole row plan, each a module-level
+    function looked up at call time (TXG-TXN-006): :func:`prepare_model_rows`
+    (host only), then the upload of its host vectors through ``staging``,
+    then :func:`model_rows_body` (device only) and :func:`commit_model_rows`.
+
+    Fixed order (design §Phase-6c transaction seams):
+
+    1. compose decode-then-prefill indices from ``plan`` and validate
+       every structural row/page property HOST-SIDE before any page
+       read (PORT-STATE-007): row count vs ``input_ids``/
+       ``inputs_embeds``; non-null (``!= null_block_id``), live,
+       in-range (``< num_pool_blocks``) indices; uniqueness;
+       speculative-column exclusion (extra decode columns);
+       real/padding-row agreement — then upload the validated indices
+       asynchronously for the device gathers;
+    2. reject unqualified graph coverage, form CHUNK buckets from CPU
+       plan authority, order them by earliest deadline, and resolve
+       every eager decode before the first resident read;
+    3. gather every row's session state, a fresh row's zero-initial
+       tensors from the null page (zero, never stored to) and its book
+       row through ``where(is_fresh, initial, gathered)``, so no fresh
+       row reads its recycled page's content; evaluate
+       replay echoes and the host-role cross-check ON DEVICE into the
+       transaction's ``ROW_STATUS_*`` bits (echo mismatch is row-local
+       after trusted preflight, PORT-DEC-007 as amended); classify each
+       real row CHUNK / REPLAY / FLUSH;
+    4. group CHUNK rows by execution profile + immutable geometry
+       (host authority: ``plan.is_chunk`` + ``plan.geometry_id``) and
+       gather their full frontend/encoder/predictor scratch; valid
+       length stays a per-row tensor, not a batch-key component;
+       and run :func:`advance_session` with its pre-resolved callable;
+    5. validate complete decode results, merge and project them,
+       prepare optional candidate records, and validate the complete
+       all-bucket scatter plan before one composite reservation;
+    6. issue fixed-shape predicated page scatters (failed rows issue
+       no store), then perform the reservation's one no-fail combined
+       status/candidate stage.
+
+    Suppression (PORT-STATE-008): any structural defect fails the
+    whole call before a read; an expected per-row defect resolves to
+    a device status bit and a masked park-only no-op. An unexpected
+    Python/CUDA compute failure aborts the whole call before scatter;
+    a catastrophic device failure during the prevalidated commit is
+    worker-fatal, never bucket/row suppression or rollback. No row
+    scatters unless its emission result can be returned. Transition
+    kernels never mutate resident pages directly.
+
+    ``bucket_transition`` is an optional startup-bound experimental executor
+    for already-gathered CHUNK scratch. The default uses the same canonical
+    tensor helper eagerly. It never owns resident gathers, endpoint processing,
+    adapter execution, reservations, or scatter.
+
+    Host staging (PORT-PERF-001): ``staging`` is optional reusable
+    pinned H2D buffering (:class:`HostStaging`) for the once-per-call
+    per-row vectors the prepare phase builds; ``None`` keeps
+    the un-pooled per-call :func:`_h2d` path (probes/CPU). The
+    per-bucket CHUNK row-position vector also rides ``staging`` when
+    given — through :meth:`HostStaging.stage_bucket`, which keeps one
+    dedicated buffer PER GEOMETRY. Since each geometry resolves at
+    most once per call, no bucket's in-flight copy is overwritten by a
+    later bucket, so this is allocation-free without the overwrite
+    race a single shared bucket slot would carry; it falls back to
+    ``_h2d`` only when ``staging`` is ``None``. Every vector has one
+    entry per row, so the uploads never depend on the fresh count.
+
+    FILE rows (``plan.is_file``, FILE-ROW-001 to FILE-ROW-005): a FILE row
+    that advances audio is a CHUNK row whose envelope the model wrote into
+    its carrier row; its scheduled token is the previously emitted token, so
+    the host-role cross-check accepts the file-carrier token (first step) or
+    the continuation token when no echo is pending, and an armed echo is
+    validated like a REPLAY row's. A drain step is a REPLAY row and the end
+    step a FLUSH row. The file mask is uploaded and its selects run on every
+    step (FILE-ROW-009); ``file_carrier_id`` and ``continuation_id`` are
+    passed on every step (FILE-ROW-010) and required when any row is a FILE
+    row; ``continuation_id`` is what a clean FILE CHUNK row with an empty
+    burst emits.
+
+    Planning-failed rows (``plan.planned_rejection``, TXG-COV-010) stay at
+    their scheduled positions; the body rejects each by that bit alone, and
+    its output row is the rejected-row output (TXG-TXN-010).
+
+    ``geometry_order``: the step planner's order of chunk groups by
+    geometry index. Buckets run in that order; a geometry it does not list
+    runs after the listed ones, by earliest deadline.
+
+    Returns:
+        The runner's row output as projected by ``adapter`` (e.g. the
+        ``(N, H)`` decision-carrier for MRV1), one row per scheduled row
+        in the runner's order.
+
+    Raises:
+        ValueError: a structural mapping defect, a missing/invalid
+            resolver, or a trusted-identity projection-shape defect —
+            always before any resident mutation.
+
+    """
+    prepared = prepare_model_rows(
+        core,
+        input_ids,
+        inputs_embeds,
+        plan,
+        resident=resident_layout(
+            channel_pools=channel_pools,
+            time_pools=time_pools,
+            len_pools=len_pools,
+            h_pool=h_pool,
+            c_pool=c_pool,
+            queue_pool=queue_pool,
+            book_pool=book_pool,
+            frontend_raw_pool=frontend_raw_pool,
+            frontend_mel_pool=frontend_mel_pool,
+            frontend_counter_pool=frontend_counter_pool,
+            endpoint_history_pool=endpoint_history_pool,
+            endpoint_book_pool=endpoint_book_pool,
+        ),
+        decode_resolver=decode_resolver,
+        eou_token_id=eou_token_id,
+        encoder_transition=encoder_transition,
+        bucket_transition=bucket_transition,
+        has_commit_sink=commit_sink is not None,
+        capture=capture,
+        graph_covers_decode=graph_covers_decode,
+        memory_profile=memory_profile,
+        file_carrier_id=file_carrier_id,
+        continuation_id=continuation_id,
+        geometry_order=geometry_order,
+    )
+
+    # ---- upload the prepared host vectors (the body stages nothing) ----
+    device = prepared.device
+
+    def _stage(slot_name: str, cpu_tensor: torch.Tensor) -> torch.Tensor:
+        """Route one once-per-call vector through ``staging`` when
+        given, else the un-pooled :func:`_h2d` path."""
+        if staging is not None:
+            return staging.stage(slot_name, cpu_tensor, device)
+        return _h2d(cpu_tensor, device)
+
+    endpoint_on = prepared.endpoint_enabled
+    vectors = RowVectors(
+        composed_indices=_stage("composed_indices", prepared.composed_indices),
+        is_chunk=_stage("is_chunk", prepared.is_chunk),
+        is_file=_stage("is_file", prepared.is_file),
+        is_fresh=_stage("is_fresh", prepared.is_fresh),
+        planned_rejection=_stage("planned_rejection", prepared.planned_rejection),
+        initial_book=_stage("fresh_init_book", prepared.initial_book),
+        geometry=_stage("geometry", prepared.geometry),
+        admitted_prompt=_stage("admitted_prompt", prepared.admitted_prompt),
+        prior_prompt=_stage("prior_prompt", prepared.prior_prompt),
+        cadence_frames=_stage("cadence_frames", prepared.cadence_frames),
+        # Routed through ``staging`` by GEOMETRY: each geometry resolves
+        # at most once per call, so its dedicated per-geometry buffer's
+        # non-blocking copy is never overwritten by a later bucket in
+        # this call — allocation-free without the overwrite race a
+        # single shared bucket slot would carry. Falls back to the
+        # un-pooled _h2d path (probes/CPU) when no staging is given.
+        bucket_rows=tuple(
+            staging.stage_bucket(b.geometry, b.positions, device)
+            if staging is not None
+            else _h2d(b.positions, device)
+            for b in prepared.buckets
+        ),
+        chunk_all=_stage("chunk_all", prepared.chunk_all),
+        endpoint_mode=(
+            _stage("endpoint_mode", prepared.endpoint_mode) if endpoint_on else None
+        ),
+        endpoint_threshold=(
+            _stage("endpoint_threshold", prepared.endpoint_threshold)
+            if endpoint_on
+            else None
+        ),
+        endpoint_residue=(
+            _stage("endpoint_residue", prepared.endpoint_residue)
+            if endpoint_on
+            else None
+        ),
+    )
+    body = model_rows_body(
+        core,
+        input_ids,
+        inputs_embeds,
+        prepared,
+        vectors,
+        channel_pools=channel_pools,
+        time_pools=time_pools,
+        len_pools=len_pools,
+        h_pool=h_pool,
+        c_pool=c_pool,
+        queue_pool=queue_pool,
+        book_pool=book_pool,
+        frontend_raw_pool=frontend_raw_pool,
+        frontend_mel_pool=frontend_mel_pool,
+        frontend_counter_pool=frontend_counter_pool,
+        endpoint_history_pool=endpoint_history_pool,
+        endpoint_book_pool=endpoint_book_pool,
+        eou_token_id=eou_token_id,
+        adapter=adapter,
+        encoder_transition=encoder_transition,
+        placeholder_id=placeholder_id,
+        park_id=park_id,
+        capture=capture,
+        native_burst_handoff=native_burst_handoff,
+        file_carrier_id=file_carrier_id,
+        continuation_id=continuation_id,
+    )
+    return commit_model_rows(plan, body, commit_sink=commit_sink)
