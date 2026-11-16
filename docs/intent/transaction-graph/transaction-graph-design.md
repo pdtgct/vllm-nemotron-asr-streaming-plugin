@@ -1036,9 +1036,16 @@ build. Every option-on/off comparison is against `B_hook`.
   unit packed by the plugin's packer, every file prompt built by `get_generation_prompt`, no
   endpoint policy), each paced by the wall clock: `Q`'s streams (concurrency `N`, the same
   manifest, seed and offsets) on core's `/v1/realtime`; and `N` requests in flight as `M` defines,
-  its streams on `/v1/realtime` and its files on the transcription route. Each gives transcripts
-  equal to a `B_hook` engine's on the same audio and reports its counters, including the `(K, E)`
-  histogram.
+  its streams on `/v1/realtime` and its files on the transcription route. Each completes every
+  request with zero fallbacks and reports its counters, including the `(K, E)` histogram and the
+  replay fraction. Under load, two runs of one engine can differ: wall-clock pacing changes which
+  steps a request's rows share, and the FP32 kernels are not batch-invariant, so two `B_hook` runs
+  can disagree on a near-tie. Transcript agreement with at least two `B_hook` runs, and between
+  them, is therefore reported, not gated; every disagreement is investigated, and an unresolved
+  suspected execution defect blocks qualification. A file transcribed alone on an idle server has a
+  fixed row plan, so that comparison is exact and gated. Bitwise exactness under load rests on the
+  transaction-level comparison of identical inputs, initial state and ordered row plans
+  (TXG-QUAL-003, TXG-QUAL-006).
 
 ### Exactness
 
