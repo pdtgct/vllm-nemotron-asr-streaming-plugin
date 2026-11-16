@@ -163,8 +163,8 @@ counted. Every covered step's outputs and resident state must equal the option-o
 bit for bit. The option is `transaction_graph_populations`, off by default; core captures the cells
 through #67583's capture hook, into its own graph pool.
 
-Release 0.1.0b2 ships the option opt-in without tier 5: on the stage 1 build the step rule fails at
-80 ms and at 160 ms, and several tier 5 checks are pending (Measured figures).
+Release 0.1.0b2 ships the option opt-in without tier 5: on the stage 1 build the step rule and
+`U_api` fail at 80 ms and at 160 ms, and the body check fails at population 1 (Measured figures).
 
 #### Serve command
 
@@ -203,20 +203,22 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
 
 The tier 5 run used one NVIDIA A40 at FP32, the stage 1 build `hook-build-20261114b`
 (`pdtgct/vllm` @ `9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee`), card revision `ea30d66d`, `N = 63`
-and `--max-num-seqs 64`, at 80 ms and at 160 ms. The transaction-level checks ran at plugin
-`a19621e`, the served runs and the inventory at plugin `8166d85`; the production code of both
-equals the release candidate `872d163`'s. Tier 5 is not met at either geometry.
+and `--max-num-seqs 64`, at 80 ms and at 160 ms. The transaction-level checks, the capture figures,
+the body check and the revised served comparison of TXG-QUAL-008 ran at plugin `adfb24b`, whose
+production code equals this release's. The first served runs, the inventory and `U_api` ran at plugin
+`8166d85`, before `adfb24b` changed how fresh rows take their zero initial state; the forced fallbacks
+and the step rule ran at plugin `a19621e`, with `8166d85`'s production code. Tier 5 is not met at
+either geometry.
 
 - Passed: the inventory (TXG-QUAL-025); every transaction-level step compared bit for bit at both
-  geometries (TXG-QUAL-003); `Q` and `M` at 80 ms (TXG-QUAL-002 to -006); forced fallbacks
-  (TXG-QUAL-007); the served `Q` runs and the served `M` run at 160 ms; the capture figures
-  (TXG-QUAL-019).
-- Failed: the step rule (TXG-QUAL-010 to -014), both groups at both geometries; the served `M` run
-  at 80 ms against its preregistered file criterion, equality with one `B_hook` run (123 of 124
-  files; see the note after the served-run table).
-- Pending: `U_api` (TXG-QUAL-016, -017) at both geometries, the body non-regression check
-  (TXG-QUAL-015), the `B_hook` transcript replay of the 160 ms transaction-level `Q` and `M` run, and
-  the revised served comparison of TXG-QUAL-008 (two `B_hook` runs, and each file alone).
+  geometries (TXG-QUAL-003); `Q` and `M` at 80 ms and at 160 ms (TXG-QUAL-002 to -006); forced
+  fallbacks (TXG-QUAL-007); the revised served comparison (TXG-QUAL-008) at both geometries; the
+  capture figures (TXG-QUAL-019).
+- Failed: the step rule (TXG-QUAL-010 to -014), both groups at both geometries; `U_api`
+  (TXG-QUAL-016, -017) at both geometries; the body check (TXG-QUAL-015) at population 1, one block
+  per geometry. The first served `M` run at 80 ms (plugin `8166d85`) failed its original file
+  criterion, equality with one `B_hook` run (123 of 124 files); TXG-QUAL-008 as revised replaced that
+  criterion (see the note after the served-run table).
 - Not run: tier 4 with the option on, on any build.
 
 Step rule: `Δ` = min(median OFF1, median OFF2) − median ON, in ms, per block of 21 counted steps per
@@ -237,34 +239,61 @@ Echo-only steps, reported and not gated, gained 4.42 to 4.89 ms. U(1), the (1, 0
 block 1 median (TXG-CAL-001): 15.06 ms on and 21.97 ms off at 80 ms, 17.46 ms on and 24.29 ms off at
 160 ms.
 
-- Body non-regression check, OLD `4cc1381` against NEW (TXG-QUAL-015), with its bridge block:
-  (pending: TXG-QUAL-015 body check and bridge block, A40).
-- `U_api` (TXG-QUAL-016, -017) at 80 ms: (pending: `U_api` at 80 ms, A40).
-- `U_api` (TXG-QUAL-016, -017) at 160 ms: (pending: `U_api` at 160 ms, A40).
+Body check (TXG-QUAL-015): the option-off step time of this release (`adfb24b`) against plugin
+`4cc1381`, both under `--enforce-eager` with transaction graphs off, in two blocks of legs OLD1, NEW,
+OLD2 per population. Medians of 21 counted steps (ms); a block passes when NEW − min(OLD1, OLD2) ≤
+max(1 ms, |OLD1 − OLD2|). These are engine step times, not served latencies.
+
+| ms | P | Block 1: OLD1 / NEW / OLD2 | Block 2: OLD1 / NEW / OLD2 | NEW − mean(OLD), block 1 / 2 |
+|---|---|---|---|---|
+| 80 | 1 | 29.59 / 26.20 / 30.41 | 25.80 / 26.85 / 25.08 (**fail**) | −3.80 / +1.41 |
+| 80 | 31 | 48.18 / 47.95 / 48.98 | 48.35 / 48.55 / 47.74 | −0.62 / +0.51 |
+| 80 | 63 | 73.37 / 72.79 / 72.43 | 72.78 / 73.28 / 73.19 | −0.12 / +0.29 |
+| 160 | 1 | 26.17 / 28.68 / 27.79 (**fail**) | 26.23 / 25.85 / 27.30 | +1.69 / −0.92 |
+| 160 | 31 | 50.82 / 50.69 / 51.15 | 51.14 / 51.67 / 51.54 | −0.29 / +0.33 |
+| 160 | 63 | 78.72 / 78.66 / 79.12 | 78.50 / 78.34 / 78.76 | −0.25 / −0.29 |
+
+The check is not met: at population 1 one block per geometry fails (80 ms: NEW − min(OLD) 1.77 ms
+against a bound of 1.00 ms; 160 ms: 2.50 ms against 1.62 ms), while in the other block of the same
+geometry NEW is faster than both OLD legs. At populations 31 and 63 every block passes. In an
+ungated bridge block (option off, `--enforce-eager` legs around one leg in the hook configuration),
+the hook configuration was within the eager legs' drift at 160 ms and 0.7 ms (P 1) and 0.9 ms (P 63)
+above it at 80 ms.
+
+- `U_api` (TXG-QUAL-016, -017; plugin `8166d85`), five brackets of OFF1, ON, OFF2 per geometry at
+  `N = 63`: not met at either geometry. The per-bracket rule failed in three brackets at 80 ms and in
+  two at 160 ms; over the brackets, the counted median was 28.49 ms on and 37.45 ms off at 80 ms, and
+  30.59 ms on and 38.68 ms off at 160 ms.
 
 | Exactness and served runs | 80 ms | 160 ms |
 |---|---|---|
-| Transaction-level `Q` (concurrency 1, 32 and 63, 2,000 steps each) and `M`: steps covered and equal to the option-off transaction in outputs, status, progress, queue counts and every page | 8,230 of 8,230 (`M` 2,230); 0 fallbacks | 8,151 of 8,151 (`M` 2,151); 0 fallbacks |
-| `B_hook` replay of that run's schedule: requests with equal label tokens | 2,067 of 2,067 | (pending: 160 ms `B_hook` transcript replay, qm-bhook-1, A40) |
-| Forced fallbacks (`K` > `N`, `E` > `N`, two signature mismatches): each counted once, outputs equal to the option-off transaction's | pass | pass |
-| Served `Q`, 512 streams at concurrency 63: transcripts equal to `B_hook`'s | 512 of 512; 2,251 steps, all replayed | 512 of 512; 1,978 steps, all replayed |
-| Served `M`, 48 stream slots and 15 file slots, 512 streams and 124 files: transcripts equal to `B_hook`'s | streams 512 of 512, files 123 of 124; 2,221 steps, all replayed | streams 512 of 512, files 124 of 124; 2,494 steps, all replayed |
+| Transaction-level `Q` (concurrency 1, 32 and 63, 2,000 steps each) and `M`, plugin `adfb24b`: steps covered and equal to the option-off transaction in outputs, status, progress, queue counts and every page | 8,151 of 8,151 (`M` 2,151); 0 fallbacks | 8,158 of 8,158 (`M` 2,158); 0 fallbacks |
+| `B_hook` replay of that run's schedule: requests with equal label tokens | 2,036 of 2,036 | 1,700 of 1,700 |
+| Forced fallbacks (`K` > `N`, `E` > `N`, two signature mismatches; plugin `a19621e`): each counted once, outputs equal to the option-off transaction's | pass | pass |
+| Served `Q` (plugin `8166d85`), 512 streams at concurrency 63: transcripts equal to `B_hook`'s | 512 of 512; 2,251 steps, all replayed | 512 of 512; 1,978 steps, all replayed |
+| Served `M` (plugin `8166d85`), 48 stream slots and 15 file slots, 512 streams and 124 files: transcripts equal to `B_hook`'s | streams 512 of 512, files 123 of 124; 2,221 steps, all replayed | streams 512 of 512, files 124 of 124; 2,494 steps, all replayed |
 
 The 80 ms file `1284-1180-0011` differs from the `B_hook` run by one comma ("I am, my dear, and all
 strangers …" against "I am, my dear and all strangers …"). A second, nonqualifying `B_hook` run
 differed from the first on that file and equalled the option-on run on all 124 files, which points
 to `B_hook`'s own run-to-run variation under wall-clock pacing. Revised TXG-QUAL-008 comparison (two
-`B_hook` runs, and each file alone): (pending: revised TXG-QUAL-008 served comparison, A40).
+`B_hook` runs, and each file alone; plugin `adfb24b`): pass at both geometries. Every request
+completed, the option-on engine replayed every step with no fallback, and every file sent alone to an
+idle server equalled both `B_hook` runs (124 of 124). Under load the option-on transcripts equalled
+both `B_hook` runs on every stream and file at 160 ms and on all but `1284-1180-0011` at 80 ms, where
+the option-on run kept the comma and both `B_hook` runs dropped it; alone, all three dropped it.
 
 Graph memory on the A40 at `N = 63`, per capture (MiB unless stated; the call total covers the whole
-capture call: segment graphs, cells and, in the profiling capture, a 64 MiB margin):
+capture call: segment graphs, cells and, in the profiling capture, a 64 MiB margin). The captures are
+plugin `adfb24b`'s; available KV memory and ready time are from the served runs at plugin `8166d85`,
+whose profiling transaction totals were 2,462 MiB (80 ms) and 2,702 MiB (160 ms):
 
 | | 80 ms | 160 ms |
 |---|---|---|
-| Profiling capture: call / transaction total (chunk / echo) | 3,884 / 2,462 (2,194 / 268) | 4,174 / 2,702 (2,434 / 268) |
+| Profiling capture: call / transaction total (chunk / echo) | 3,832 / 2,410 (2,144 / 266) | 4,148 / 2,676 (2,410 / 266) |
 | Serving capture: call / transaction total (chunk / echo) | 986 / 422 (422 / 0) | 1,042 / 428 (428 / 0) |
 | Transient peak, each capture | 2,104 | 2,154 |
-| Capture time, each capture | 63.9 s to 69.2 s; 87.1 s and 91.9 s in the served run | 68.5 s to 71.1 s |
+| Capture time, each capture | 69.5 s and 70.6 s; 87.1 s and 91.9 s in the served run | 73.1 s and 74.0 s |
 | Available KV memory, option on (`B_hook`) | 33.63 GiB (36.03 GiB) | 33.31 GiB (35.95 GiB) |
 | `vllm serve` ready after launch (`B_hook`) | 220.8 s (100.6 s) | 179.4 s (110.4 s) |
 
@@ -330,11 +359,13 @@ Every claim names its tier, the build and the source revisions it was met on.
   concurrency 32 all ended `stop`, with WER 3.57 % on test-clean and 7.99 % on test-other. One final,
   for `2414-128291-0020` (test-other, 1.25 s, a known empty final), was empty, and the WER counts it
   as deletions. 640 test-clean sessions at concurrency 64 all reached a final transcript (WER
-  2.89 %). The server logged no preemption and no error. GPU tier: (pending: GPU tier at 872d163).
-- Not met (stage 1 build `9c40a6ffd6`; transaction level at plugin `a19621e`, served runs and
-  inventory at plugin `8166d85`), tier 5 for transaction graphs at 80 ms and at 160 ms: the step
-  rule fails at both geometries. Measured figures, under Transaction graphs, lists what passed, what
-  failed and what is pending.
+  2.89 %). The server logged no preemption and no error. GPU tier at plugin `adfb24b`: 173 of 175
+  tests passed, 2 skipped, 0 failed.
+- Not met (stage 1 build `9c40a6ffd6`; transaction level, body check and the revised TXG-QUAL-008 at
+  plugin `adfb24b`, step rule at plugin `a19621e`, the first served runs, inventory and `U_api` at
+  plugin `8166d85`), tier 5 for transaction graphs at 80 ms and at 160 ms: the step rule and `U_api`
+  fail at both geometries, and the body check fails at population 1. Measured figures, under
+  Transaction graphs, lists what passed and what failed.
 - Owed: tier 1 on the stage 1 build at the current plugin; tier 2 under `--enforce-eager` and at
   geometries other than 320 ms; tiers 3 and 4 on the stage 1 build, tier 4 also with transaction
   graphs on.
