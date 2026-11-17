@@ -76,19 +76,22 @@ pip install "git+https://github.com/pdtgct/vllm-riva-frontend.git@v0.4.0b3"
 ```bash
 vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --dtype float32 \
-    --enforce-eager \
     --config-format nemotron_asr_streaming \
     --tokenizer-mode nemotron_asr_streaming \
+    -cc.cudagraph_mode none \
+    -cc.mode none \
     --max-num-seqs 64 \
     --max-model-len 77000
 ```
 
-This is the README's serve command. It serves the checkpoint's default lookahead, which is 3
-(320 ms) on the published card. Under `--enforce-eager`, `--max-num-seqs 64` is an interim value
-from an unpublished A40 measurement. The measured tier 2 run used the hook configuration instead:
-replace `--enforce-eager` with `-cc.cudagraph_mode none -cc.mode none`
-([manual, Runner configuration](manual.md#runner-configuration)). If `VLLM_PLUGINS` is set, it must
-include `nemotron_asr_streaming`.
+This command runs the hook configuration: no `--enforce-eager`, and `-cc.cudagraph_mode none`
+with `-cc.mode none`, on CUDA. Core captures the model's segment graphs through vllm#67583's capture
+hook and charges them in its graph-memory estimate. It is the configuration of the tier 2 serving
+run, in which `--max-num-seqs 64` fit one A40 at 320 ms. The command serves the checkpoint's default
+lookahead, which is 3 (320 ms) on the published card. The README's serve command uses the other
+runner configuration, `--enforce-eager`, in which `--max-num-seqs 64` is an interim value from an
+unpublished A40 measurement ([manual, Runner configuration](manual.md#runner-configuration)). If
+`VLLM_PLUGINS` is set, it must include `nemotron_asr_streaming`.
 
 Check the server. Stage 1 core has no `/ready` route; use `/health` and `/v1/models`:
 
@@ -115,9 +118,10 @@ export VLLM_PLUGINS=riva_frontend,nemotron_asr_streaming
 
 vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --dtype float32 \
-    --enforce-eager \
     --config-format nemotron_asr_streaming \
     --tokenizer-mode nemotron_asr_streaming \
+    -cc.cudagraph_mode none \
+    -cc.mode none \
     --max-num-seqs 64 \
     --max-model-len 77000 \
     --shutdown-timeout 60 \

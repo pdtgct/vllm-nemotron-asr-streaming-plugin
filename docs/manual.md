@@ -160,18 +160,23 @@ If `VLLM_PLUGINS` is set, it is an allowlist: include `nemotron_asr_streaming`, 
 
 ## Serving configurations
 
-The [README's Serve section](../README.md#serve) gives the default command and the reasons for each
-flag. This section groups the same settings by the decision each one makes.
+The [README's Serve section](../README.md#serve) gives the reasons for each flag. This section
+groups the same settings by the decision each one makes. This manual leads with the hook
+configuration, the runner configuration of the tier 2 serving run:
 
 ```bash
 vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --dtype float32 \
-    --enforce-eager \
     --config-format nemotron_asr_streaming \
     --tokenizer-mode nemotron_asr_streaming \
+    -cc.cudagraph_mode none \
+    -cc.mode none \
     --max-num-seqs 64 \
     --max-model-len 77000
 ```
+
+The README's serve command is the same except that it uses `--enforce-eager` in place of the two
+`-cc` flags ([Runner configuration](#runner-configuration)).
 
 `--config-format nemotron_asr_streaming` and `--tokenizer-mode nemotron_asr_streaming` are
 required: they select the plugin's translation of the Hub card and its tokenizer mode. Core resolves
@@ -183,22 +188,23 @@ synchronous scheduling and no prefix caching for this model, so the command omit
 The outer model runner must capture no graphs and compile nothing. Two runner configurations meet
 that condition:
 
-| | `--enforce-eager` | Hook configuration |
+| | Hook configuration | `--enforce-eager` |
 | --- | --- | --- |
-| Flags | `--enforce-eager` | no `--enforce-eager`; `-cc.cudagraph_mode none -cc.mode none`; a CUDA platform |
-| Who captures the segment graphs | the model, on core's first memory-profiling step | core, through #67583's capture hook |
-| Graph memory charged by | the profiled budget | core's graph-memory estimate |
-| Transaction graphs | refused | accepted (opt-in) |
-| Eager arms | accepted | refused (no graph to capture) |
-| Measured | `--max-num-seqs 64` is interim, from an unpublished A40 measurement | tier 2 partly met at 320 ms on the stage 1 build |
+| Flags | no `--enforce-eager`; `-cc.cudagraph_mode none -cc.mode none`; a CUDA platform | `--enforce-eager` |
+| Who captures the segment graphs | core, through #67583's capture hook | the model, on core's first memory-profiling step |
+| Graph memory charged by | core's graph-memory estimate | the profiled budget |
+| Transaction graphs | accepted (opt-in) | refused |
+| Eager arms | refused (no graph to capture) | accepted |
+| Measured | tier 2 partly met at 320 ms on the stage 1 build | `--max-num-seqs 64` is interim, from an unpublished A40 measurement |
 
 The hook configuration requires at least one graph the hook captures: the `eager-graphed` encoder,
 the `dense-graphed` decoder or transaction graphs. The default segment arms meet that requirement.
 A command that gives neither configuration is refused at startup, naming each unmet condition and
 its remedy ([Troubleshooting](#troubleshooting)).
 
-To run the hook configuration, replace `--enforce-eager` in the command above with
-`-cc.cudagraph_mode none -cc.mode none`.
+To run under `--enforce-eager`, replace `-cc.cudagraph_mode none -cc.mode none` in the command
+above with `--enforce-eager`. Use it for the eager arms, the compiled `dense-graphed` encoder or
+`chunk_bucket_graph_populations`, or on a platform other than CUDA.
 
 ### Lookahead selection
 
@@ -262,10 +268,10 @@ Figures at 320 ms on one A40 ([README, Serve](../README.md#serve)):
 
 | Runner configuration | `--max-num-seqs` | Retained | Capture peak (device memory in use) | Startup | Status |
 | --- | --- | --- | --- | --- | --- |
+| Hook configuration | 64 | 1,544 MiB (profiling capture), 716 MiB (serving capture) | 16,445 MiB (`nvidia-smi`, on the memory-profiling step) | ready 130.6 s after launch | tier 2 serving run, stage 1 build `9c40a6ffd6`, plugin `8166d85` |
 | `--enforce-eager` | 32 | about 1.1 GiB | 7.0 GiB | about 41 s | unpublished measurement |
 | `--enforce-eager` | 64 | about 2.3 GiB | 18.3 GiB | about 78 s | unpublished measurement |
 | `--enforce-eager` | 128 | about 17.4 GiB | 44.4 GiB of 45 GiB | about 182 s | unpublished measurement |
-| Hook configuration | 64 | 1,544 MiB (profiling capture), 716 MiB (serving capture) | 16,445 MiB (`nvidia-smi`, on the memory-profiling step) | ready 130.6 s after launch | tier 2 serving run, stage 1 build `9c40a6ffd6`, plugin `8166d85` |
 
 In the hook configuration run, 35.74 GiB was available for KV memory, and the KV budget admitted 65
 requests. The largest sampled step held 38 rows; a 64-row step was not observed. Under
