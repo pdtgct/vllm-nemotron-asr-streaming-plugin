@@ -973,7 +973,7 @@ fits, otherwise the largest `N` that fits, and read the `(K, E)` histogram from 
 For tier 5, declare as `N` the smallest count of at least 63 that fits and for which steps with
 `K ≤ N` and `E ≤ N` make up at least 99 % of served steps; if none fits, tier 5 is not claimed. A
 deployment may choose a smaller `N` by the same 99 % rule; it is reported separately as a
-deployment choice and carries no tier 5 claim. The README records the histogram, the chosen `N`
+deployment choice and carries no tier 5 claim. `docs/evidence.md` records the histogram, the chosen `N`
 and its memory.
 "Fits" means both captures and their peaks succeed under a profiled budget and the KV budget
 admits `max_num_seqs` slots. A step outside the inventory executes `B_hook` after classification.
@@ -1224,18 +1224,20 @@ change. It models one worker with a small `N` and bounded steps:
   eventually serves or fails with a reported error. Core gives no shutdown-hook guarantee for a
   killed worker or a failed construction, and the model claims none.
 
-## README
+## User documents
 
-This component owns the README's section for the option. Its serve command runs the hook
-configuration (no `--enforce-eager`) with the default segment arms, `num_lookahead_tokens` 0 or 1
-and `transaction_graph_populations` in `--hf-overrides`, a `--max-model-len` that covers the
-geometry (`registration`, REG-ENG-010), at the `--max-num-seqs` and `N` that the tier 5 run verified to fit the A40. The
-section states the measured graph memory, transient peaks and capture time with the build,
-device, geometry and `N`; the `(K, E)` histogram `N` was chosen from; that a fixed budget must
-leave room for the graphs, which the startup log reports; the limits (one geometry per server,
-80 or 160 ms; `N` bounded by `max_num_seqs`; steps beyond `N` CHUNK or other rows run option-off
-and are counted; refused under `--enforce-eager` and with native burst); that the server needs a
-frontend release that opens streams by locale only; and the tier each claim met, with its build.
+This component owns the option's sections of the user manual (`docs/manual.md`) and of
+`docs/evidence.md`. The manual's section gives a serve command that runs the hook configuration
+(no `--enforce-eager`) with the default segment arms, `num_lookahead_tokens` 0 or 1 and
+`transaction_graph_populations` in `--hf-overrides`, a `--max-model-len` that covers the geometry
+(`registration`, REG-ENG-010), at the `--max-num-seqs` and `N` that the tier 5 run verified to fit
+the A40. It states that a fixed budget must leave room for the graphs, which the startup log
+reports; the limits (one geometry per server, 80 or 160 ms; `N` bounded by `max_num_seqs`; steps
+beyond `N` CHUNK or other rows run option-off and are counted; refused under `--enforce-eager` and
+with native burst); that the server needs a frontend release that opens streams by locale only;
+and the tier each claim met, with its build. The evidence document's section states the measured
+graph memory, transient peaks and capture time with the build, device, geometry and `N`, and the
+`(K, E)` histogram `N` was chosen from.
 
 ## Permitted dependencies
 

@@ -295,11 +295,11 @@ transaction graphs off and which the cells must reproduce; they add no requireme
 - [ ] **TXG-MODEL-004**: The models shall check, under fairness, that every latched or failed worker reaches `shutdown` under cooperative teardown (a worker that runs the runner's shutdown), and that every startup whose construction succeeded and that is neither shut down cooperatively nor killed before it serves eventually serves or fails with a reported error; they shall claim no property for a killed worker or a failed construction.
 - [ ] **TXG-MODEL-005**: TLC shall check every model under `models/transaction-graph/` without violations on the revision a tier 5 claim names.
 
-## README
+## User documents
 
-- [ ] **TXG-DOC-001**: The README's transaction-graph section shall give a serve command that runs the hook configuration (no `--enforce-eager`) with the default segment arms, `num_lookahead_tokens` 0 or 1 and `transaction_graph_populations` in `--hf-overrides`, a `--max-model-len` that covers that geometry (REG-ENG-010), and the `--max-num-seqs` and `N` that the tier 5 run verified to fit the A40.
-- [ ] **TXG-DOC-002**: The README's transaction-graph section shall state the measured graph memory, transient peaks and capture time with the build, device, geometry and `N`, and the `(K, E)` histogram from which `N` was chosen.
-- [ ] **TXG-DOC-003**: The README's transaction-graph section shall state that a fixed `--kv-cache-memory-bytes` must leave room for the graphs, which the startup log reports; the limits (one geometry per server, 80 or 160 ms; `N` bounded by `max_num_seqs`; steps beyond `N` CHUNK rows or `N` other rows run without transaction graphs and are counted; refused under `--enforce-eager` and with native burst); that the server needs a frontend release that opens streams by locale only; and the acceptance tier each claim met, with its build.
+- [ ] **TXG-DOC-001**: The user manual's transaction-graph section (`docs/manual.md`) shall give a serve command that runs the hook configuration (no `--enforce-eager`) with the default segment arms, `num_lookahead_tokens` 0 or 1 and `transaction_graph_populations` in `--hf-overrides`, a `--max-model-len` that covers that geometry (REG-ENG-010), and the `--max-num-seqs` and `N` that the tier 5 run verified to fit the A40.
+- [ ] **TXG-DOC-002**: The transaction-graph section of `docs/evidence.md` shall state the measured graph memory, transient peaks and capture time with the build, device, geometry and `N`, and the `(K, E)` histogram from which `N` was chosen.
+- [ ] **TXG-DOC-003**: The user manual's transaction-graph section shall state that a fixed `--kv-cache-memory-bytes` must leave room for the graphs, which the startup log reports; the limits (one geometry per server, 80 or 160 ms; `N` bounded by `max_num_seqs`; steps beyond `N` CHUNK rows or `N` other rows run without transaction graphs and are counted; refused under `--enforce-eager` and with native burst); that the server needs a frontend release that opens streams by locale only; and the acceptance tier each claim met, with its build.
 
 ## Deferred
 

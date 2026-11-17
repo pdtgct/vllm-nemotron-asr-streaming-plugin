@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The README's transaction-graph section (TXG-DOC-001 to TXG-DOC-003).
-Text checks only: the section is the README section whose heading names
-transaction graphs."""
+"""The transaction-graph sections of the user manual and the evidence document
+(TXG-DOC-001 to TXG-DOC-003). Text checks only: each section is the first
+section of ``docs/manual.md`` or ``docs/evidence.md`` whose heading names
+transaction graphs. The manual owns the serve command and the limits; the
+evidence document owns the measured figures."""
 
 from __future__ import annotations
 
@@ -14,26 +16,38 @@ import pytest
 KEY = "transaction_graph_populations"
 
 
-@pytest.fixture
-def readme(repo_root) -> str:
-    return (repo_root / "README.md").read_text()
-
-
-def transaction_graph_section(readme: str) -> str:
+def transaction_graph_section(text: str, name: str) -> str:
     match = re.search(
         r"^(#{2,3}) [^\n]*transaction graph[^\n]*\n(.*?)(?=^#{1,3} |\Z)",
-        readme,
+        text,
         re.S | re.M | re.I,
     )
-    assert match, "README has no transaction-graph section"
+    assert match, f"{name} has no transaction-graph section"
     return match.group(2)
 
 
+def _section(repo_root, relative: str):
+    """The section text, looked up inside each test so that a missing document
+    or section fails the test rather than erroring its setup."""
+
+    def read() -> str:
+        path = repo_root / relative
+        assert path.exists(), f"{relative} does not exist"
+        return transaction_graph_section(path.read_text(), relative)
+
+    return read
+
+
 @pytest.fixture
-def section(readme):
-    """The section text, looked up inside each test so that a missing section
-    fails the test rather than erroring its setup."""
-    return lambda: transaction_graph_section(readme)
+def section(repo_root):
+    """The user manual's transaction-graph section."""
+    return _section(repo_root, "docs/manual.md")
+
+
+@pytest.fixture
+def evidence_section(repo_root):
+    """The evidence document's transaction-graph section."""
+    return _section(repo_root, "docs/evidence.md")
 
 
 def passages(text: str) -> list[str]:
@@ -103,8 +117,8 @@ def test_serve_command_is_the_one_tier_5_verified(section):
 
 
 # @spec TXG-DOC-002
-def test_section_states_measured_memory_and_capture_time(section):
-    section = section()
+def test_section_states_measured_memory_and_capture_time(evidence_section):
+    section = evidence_section()
     assert find(section, "graph memory", "A40"), "no graph-memory figure on the A40"
     assert re.search(r"\d+(\.\d+)?\s*(MiB|GiB|MB|GB)", section), "no memory figure"
     assert find(section, "transient peak"), "no transient peak"
@@ -119,8 +133,8 @@ def test_section_states_measured_memory_and_capture_time(section):
 
 
 # @spec TXG-DOC-002
-def test_section_states_the_histogram_n_was_chosen_from(section):
-    section = section()
+def test_section_states_the_histogram_n_was_chosen_from(evidence_section):
+    section = evidence_section()
     assert find(section, "(K, E)", "histogram"), "no (K, E) histogram"
 
 

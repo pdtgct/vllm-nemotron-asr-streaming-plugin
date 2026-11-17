@@ -11,7 +11,8 @@ live under `docs/intent/<component>/`.
 - Sign commits and add a DCO line: `Signed-off-by: Name <email>`.
 - Session code uses only `AsyncLLM` / `EngineClient` public and RFC-proposed calls; the model
   adapter's permitted internal dependencies are listed in the `registration` design.
-- README claims name the acceptance tier they meet (see the HLD's Success Metrics).
+- Acceptance claims live in `docs/evidence.md` and name the tier they meet; README performance
+  figures name their tier, build and GPU or link that record (see the HLD's Success Metrics).
 
 ## LID
 
