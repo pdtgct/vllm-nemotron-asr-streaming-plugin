@@ -17,6 +17,11 @@ and `register()` fails with a message saying so.
 The design is in `docs/high-level-design.md` and `docs/intent/`; module names are in
 `docs/implementation-layout.md`.
 
+To install and serve, start with the [quick start](docs/quickstart.md), which covers both stages.
+The [user manual](docs/manual.md) explains the builds and their compatibility, every serving
+setting, the clients, operations and troubleshooting. This README remains the source of record for
+the serve commands, the measured figures and the evidence; the manual links back to it.
+
 ## What is registered
 
 Distribution `vllm-nemotron-asr-streaming`, import package `vllm_nemotron_asr_streaming`. Two entry
