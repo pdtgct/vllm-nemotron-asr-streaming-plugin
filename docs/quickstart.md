@@ -16,9 +16,9 @@ The [user manual](manual.md) explains every setting, the clients, operations and
 This release was measured only on the stage 1 build, on one NVIDIA A40 at FP32. Tier 2 is partly
 met at 320 ms, in the hook configuration: the serving run used plugin `8166d85` and the GPU tests
 used plugin `adfb24b`, whose production code equals this release's
-([README, Evidence](../README.md#evidence)). Stage 2 has not been measured with this release, and
-the frontend `v0.4.0b3` passed CI on CPU only. The install and serve commands below have not been
-run as written; the README records the runs that were.
+([evidence](evidence.md#tier-2-on-the-stage-1-build)). Stage 2 has not been measured with this
+release, and the frontend `v0.4.0b3` passed CI on CPU only. The install and serve commands below
+have not been run as written; the [evidence document](evidence.md) records the runs that were.
 
 ## Versions
 

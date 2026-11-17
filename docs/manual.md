@@ -2,16 +2,18 @@
 
 This manual covers release `v0.1.0b2` of `vllm-nemotron-asr-streaming`. The
 [quick start](quickstart.md) gives the shortest path to a running server. The
-[README](../README.md) is the source of record for the serve commands, the measured figures and
-the evidence; where this manual restates a README statement, it links the README section.
+[README](../README.md) defines the two builds and gives the default serve command; this manual
+gives every serving setting, the transaction-graph serve command and the limits; the
+[evidence document](evidence.md) records every acceptance claim and the measured figures behind
+them.
 
 Measurement status, stated once for the whole manual: this release was measured only on the
 stage 1 build, on one NVIDIA A40 at FP32. Tier 2 is partly met at 320 ms in the hook configuration
 (stage 1 build `hook-build-20261114b` @ `9c40a6ffd6`; serving run at plugin `8166d85`, GPU tests at
 plugin `adfb24b`). Tier 5 for transaction graphs is not met (same build; plugins `adfb24b`,
-`a19621e` and `8166d85`, as the README's Evidence section lists). Stage 2 has not been measured
-with this release, and frontend `v0.4.0b3` passed CI on CPU only. No command in this manual is
-claimed to have been run as written unless the README's Evidence section records it.
+`a19621e` and `8166d85`, as the [evidence document](evidence.md) lists). Stage 2 has not been
+measured with this release, and frontend `v0.4.0b3` passed CI on CPU only. No command in this
+manual is claimed to have been run as written unless the evidence document records it.
 
 ## Contents
 
@@ -38,8 +40,8 @@ keeps its encoder caches and decoder state in a persistent state slot, so the sa
 - complete files, on core's `POST /v1/audio/transcriptions` and, on stage 2, on the frontend's file
   route and Riva gRPC `Recognize`.
 
-The distribution has two entry points
-([README, What is registered](../README.md#what-is-registered)):
+The distribution `vllm-nemotron-asr-streaming` (import package `vllm_nemotron_asr_streaming`) has
+two entry points:
 
 | Entry-point group | Name | Target |
 | --- | --- | --- |
@@ -49,13 +51,19 @@ The distribution has two entry points
 `register()` checks that the installed vLLM has `AsyncLLM.generate(stream_admission=...)` and
 `AsyncLLM.wait_stream_retired`, then registers, without importing the model or touching a device:
 
-- the architecture `Nemotron3_5AsrStreamingForRNNT` and its model-configuration hook;
+- the architecture `Nemotron3_5AsrStreamingForRNNT` (a lazy reference) and its
+  model-configuration hook;
 - the config format `nemotron_asr_streaming`, which translates the Hub card;
-- the tokenizer mode `nemotron_asr_streaming` and the renderer of the same name.
+- the tokenizer mode `nemotron_asr_streaming` and the renderer of the same name, which make the
+  control tokens special and the park token the EOS.
 
-The card names the architecture `Nemotron3_5AsrForRNNT`, which belongs to the offline plugin. This
-plugin never writes that key, so both plugins can be installed in one environment. The session
-factory is for frontends: its `open` takes a locale only.
+The card names the architecture `Nemotron3_5AsrForRNNT`, which is the offline plugin's key. This
+plugin never writes that key or its configuration hook, so both plugins can be installed in one
+environment. When `VLLM_PLUGINS` is an allowlist, include `nemotron_asr_streaming`. The
+configuration hook refuses a core whose `ModelState` lacks any of #67583's model-state hooks,
+naming each missing hook. The session factory, found through the second entry point, is for
+frontends: its `open` takes a locale only, so it needs a frontend release that opens streams by
+locale only ([the frontend pairing](#the-frontend-pairing)).
 
 ## Builds and compatibility
 
@@ -63,7 +71,7 @@ factory is for frontends: its `open` takes a locale only.
 
 No released vLLM provides the interfaces the plugin needs. It targets two fork branches of upstream
 vLLM `main` that carry pull requests still under upstream review
-([README](../README.md#vllm-nemotron-asr-streaming)):
+([README, Builds](../README.md#builds)):
 
 | Build | `pdtgct/vllm` branch | Commit | Carries |
 | --- | --- | --- | --- |
@@ -160,8 +168,8 @@ If `VLLM_PLUGINS` is set, it is an allowlist: include `nemotron_asr_streaming`, 
 
 ## Serving configurations
 
-The [README's Serve section](../README.md#serve) gives the reasons for each flag. This section
-groups the same settings by the decision each one makes. This manual leads with the hook
+This section gives the reasons for each flag of the [README's serve command](../README.md#serve)
+and groups the serving settings by the decision each one makes. It leads with the hook
 configuration, the runner configuration of the tier 2 serving run:
 
 ```bash
@@ -176,7 +184,10 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
 ```
 
 The README's serve command is the same except that it uses `--enforce-eager` in place of the two
-`-cc` flags ([Runner configuration](#runner-configuration)).
+`-cc` flags ([Runner configuration](#runner-configuration)). Under `--enforce-eager` its
+`--max-num-seqs 64` is interim: it comes from an unpublished A40 measurement at 320 ms. Under the
+hook configuration, `--max-num-seqs 64` met tier 2's serving run on one A40 at 320 ms (stage 1
+build `9c40a6ffd6`, plugin `8166d85`; [evidence](evidence.md#tier-2-on-the-stage-1-build)).
 
 `--config-format nemotron_asr_streaming` and `--tokenizer-mode nemotron_asr_streaming` are
 required: they select the plugin's translation of the Hub card and its tokenizer mode. Core resolves
@@ -223,7 +234,9 @@ and every whole file runs at the server's geometry.
   | 6 | 560 ms | yes |
   | 13 | 1120 ms | yes |
 
-  For example: `--hf-overrides '{"num_lookahead_tokens": 13}'`.
+  For example: `--hf-overrides '{"num_lookahead_tokens": 13}'`. In short, `num_lookahead_tokens` in
+  `--hf-overrides` selects one of the other implemented geometries: 0 (80 ms), 1 (160 ms), 6
+  (560 ms) or 13 (1120 ms).
 - `supported_num_lookahead_tokens` is refused. Remove it and select the geometry with
   `num_lookahead_tokens`.
 
@@ -232,10 +245,10 @@ different transcripts for the same audio. Tier 2 has been measured only at 320 m
 
 ### Sizing `--max-model-len`
 
-The model imposes no limit on a file's length. Each engine step advances a file by one chunk, and
-core stops a request when it reaches `--max-model-len` tokens. Size `--max-model-len` for the
-longest file you serve at the server's lookahead `r`
-([README, Serve](../README.md#serve)):
+The model imposes no limit on a file's length. Each engine step advances a file by one chunk and
+emits at most `Q` tokens, and core stops a request when it reaches `--max-model-len` tokens. Size
+`--max-model-len` for the longest file you serve at the server's lookahead `r` (typical output is
+far smaller than the bound):
 
 - a file of `N` samples at 16 kHz emits at most `1 + (floor(N / s) + 1) × Q + 1` tokens, with
   `s = 1280 × (r + 1)` samples per chunk and `Q = 10 × (r + 1) + 1`;
@@ -264,7 +277,7 @@ Two figures matter, and they differ:
 - **Capture peak**: device memory in use during capture, weights included. Capture fails when this
   peak does not fit, even when the retained memory would.
 
-Figures at 320 ms on one A40 ([README, Serve](../README.md#serve)):
+Figures at 320 ms on one A40 ([evidence](evidence.md#tier-2-on-the-stage-1-build)):
 
 | Runner configuration | `--max-num-seqs` | Retained | Capture peak (device memory in use) | Startup | Status |
 | --- | --- | --- | --- | --- | --- |
@@ -283,15 +296,18 @@ remedies: a smaller `--max-num-seqs`, or the eager arms with `--enforce-eager`.
 
 ### The eager arms
 
-The default segment arms are the `eager-graphed` encoder and the `dense-graphed` RNN-T decoder. Their
-graphs are captured for the server's one geometry only. The eager arms capture nothing; they are the
-reference against which the graphed arms are tested:
+The default segment arms are the `eager-graphed` encoder, captured at every CHUNK count from 1 to
+`max_num_seqs`, and the `dense-graphed` RNN-T decoder, captured at padded population tiers; card
+translation declares both. Their graphs (the segment graphs) are captured for the server's one
+geometry only. The eager arms capture nothing; they are the reference against which the graphed
+arms are tested:
 
 ```bash
 --hf-overrides '{"encoder_execution_arm": "eager", "decode_dispatch_arm": "dense-eager"}'
 ```
 
-The eager arms need `--enforce-eager`. With the eager arms, startup took about 25 s in the
+The overrides `encoder_execution_arm` `eager` and `decode_dispatch_arm` `dense-eager` select the
+eager arms, which need `--enforce-eager` because they capture nothing. With the eager arms, startup took about 25 s in the
 unpublished A40 measurement at 320 ms. The compiled `dense-graphed` encoder and
 `chunk_bucket_graph_populations` also need `--enforce-eager`. To combine the eager arms with another
 geometry, put both keys in one `--hf-overrides` object.
@@ -326,20 +342,90 @@ Startup fails, naming each refused setting, for:
 
 ### Transaction graphs (opt-in)
 
-Transaction graphs replay a streaming step's device body and its scatters from CUDA graphs. They are
-off by default, and this release ships them opt-in without tier 5: on the stage 1 build the step
-rule and `U_api` fail at 80 ms and at 160 ms, and the body check fails at population 1. The
-[README section Transaction graphs (opt-in)](../README.md#transaction-graphs-opt-in) gives the serve
-command, the measured figures and every limit. In short:
+Transaction graphs replay a streaming step's device body and its scatters from CUDA graphs. A
+step's CHUNK rows replay a chunk cell captured at exactly their count `K`, and its other rows
+(REPLAY, park echo, FLUSH) replay an echo cell captured at exactly their count `E`. A step that the
+cells do not cover runs wholly without transaction graphs, as the option-off transaction, and is
+counted. Every covered step's outputs and resident state must equal the option-off transaction's
+bit for bit. The option is `transaction_graph_populations`, off by default; core captures the cells
+through #67583's capture hook, into its own graph pool.
 
-- Set `transaction_graph_populations` in `--hf-overrides`. Its largest entry, `N`, fixes the cell
-  inventory: `2N` cells. The tier 5 run verified `N = 63` with `--max-num-seqs 64` to fit the A40.
-- They need the hook configuration, lookahead 0 or 1 (80 or 160 ms), the default segment arms and
-  native burst off; each other combination is refused.
-- Steps with more than `N` CHUNK rows or `N` other rows run without transaction graphs and are
-  counted.
-- Startup captures `2N` cells twice; on the A40 each capture took about 70 to 74 s. If startup
-  exceeds `VLLM_ENGINE_READY_TIMEOUT_S`, raise it ([Operations](#engine-ready-timeout)).
+Release 0.1.0b2 ships the option opt-in without tier 5: on the stage 1 build the step rule and
+`U_api` fail at 80 ms and at 160 ms, and the body check fails at population 1. The
+[evidence document](evidence.md#transaction-graphs-tier-5) gives the measured figures, what passed
+and what failed.
+
+#### Serve command
+
+<!-- @spec TXG-DOC-001 -->
+```bash
+vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
+    --dtype float32 \
+    --config-format nemotron_asr_streaming \
+    --tokenizer-mode nemotron_asr_streaming \
+    -cc.cudagraph_mode none \
+    -cc.mode none \
+    --max-num-seqs 64 \
+    --max-model-len 82513 \
+    --hf-overrides '{"num_lookahead_tokens": 0, "transaction_graph_populations": [63]}'
+```
+
+- The command runs the hook configuration (no `--enforce-eager`) at 80 ms (lookahead 0), with the
+  default segment arms and native burst off. `--max-model-len 82513` holds a 600 s file at 80 ms.
+  For 160 ms, set `num_lookahead_tokens` to 1 and `--max-model-len` to at least 78,773.
+- `transaction_graph_populations` lists distinct step populations, each an integer from 1 to
+  `min(max_num_seqs, max_num_batched_tokens)`. The largest entry, `N`, fixes the cell inventory: a
+  chunk cell and an echo cell at every count from 1 to `N`, `2N` cells in all. The other entries
+  change no capture, so `[63]` and `[1, 31, 63]` capture the same cells. An absent key or an empty
+  list is off; any other malformed value is refused.
+- `N` = 63 and `--max-num-seqs 64` are the values the tier 5 run on one A40 verified to fit at
+  80 ms and at 160 ms (stage 1 build `9c40a6ffd6`, plugin `8166d85`): the `N = 63` engines captured
+  126 cells per capture, the KV budget admitted 65 requests, and the engines served the tier 5 `Q`
+  and `M` workloads with no fallback. Tier 5 takes `N` as the smallest count of at least 63 that
+  fits and for which steps with `K ≤ N` and `E ≤ N` make up at least 99 % of served steps; at
+  `N` = 63 they make up 100 % at 80 ms and 99.84 % at 160 ms (the `(K, E)` histogram is in the
+  [evidence document](evidence.md#the-k-e-histogram-and-the-choice-of-n)).
+- The same rule below 63 carries no tier 5 claim. On the same build it gives a deployment `N` of 44
+  at 80 ms (99.10 %; serving capture 832 MiB call total, 268 MiB transaction total) and of 36 at
+  160 ms (99.07 %; 794 and 180 MiB).
+
+#### Memory and the startup log
+
+- A fixed `--kv-cache-memory-bytes` must leave room for the transaction graphs and the segment
+  graphs, which core does not charge under a fixed budget; the startup log reports the uncharged
+  bytes in a WARNING. With a profiled budget, core's graph-memory estimate charges the profiling
+  capture, and startup fails if the serving capture retains more than the profiling capture.
+- Each capture logs one INFO line with the cells, `N`, the call and transaction totals, the
+  transient peak and the capture time. Post-warmup verification logs one INFO line when it passes,
+  and shutdown logs one INFO line with replays, split steps and fallbacks by reason.
+- Startup captures `2N` cells twice, beside the segment graphs' two captures; on the A40 each
+  capture took about 70 to 74 s. If startup exceeds `VLLM_ENGINE_READY_TIMEOUT_S` (default 600 s),
+  raise it ([Operations](#engine-ready-timeout)).
+
+#### Limits
+
+- One geometry per server: transaction graphs need 80 or 160 ms (lookahead 0 or 1). The published
+  card's default, 320 ms, and 560 and 1120 ms are refused, with the remedy `num_lookahead_tokens` 0
+  or 1.
+- `N` is bounded by `max_num_seqs` (and by `max_num_batched_tokens`, and under
+  `num_gpu_blocks_override` by the override minus 1).
+- Steps with more than `N` CHUNK rows (`chunk-uncovered`) or more than `N` other rows
+  (`echo-uncovered`) run without transaction graphs and are counted. A step whose structural inputs
+  differ from its cells' (`signature`) also runs without them and is counted; a direct engine
+  stream client that sets an endpoint policy causes one; on plugin-packed input a nonzero
+  `signature` count is a defect. The counters, including the `(K, E)` histogram, are read with
+  `transaction_graph_counters`; under a multiprocess engine it runs on the worker through
+  `AsyncLLM.collective_rpc`, which needs `VLLM_ALLOW_INSECURE_SERIALIZATION=1` in the engine's
+  environment to send a function.
+- `--enforce-eager` with `transaction_graph_populations` is refused: core runs no capture hook
+  there.
+- Native burst (`experimental_native_burst: true`) with transaction graphs is refused.
+- Segment arms other than the defaults (`eager-graphed` encoder, `dense-graphed` decoder) are
+  refused, and so is `chunk_bucket_graph_populations`.
+- The server needs a frontend release that opens streams by locale only; the pinned release is
+  v0.4.0b3 ([the frontend pairing](#the-frontend-pairing)).
+- Tier 4 (mixed load) is claimed separately with the option on; it has not been run with the option
+  on, on any build.
 
 ## Clients
 
@@ -597,8 +683,7 @@ stops before the engine shuts down
 
 ### Core's audio file caps
 
-Core's upload and decode caps are operator settings, not the model's
-([README, Serve](../README.md#serve)):
+Core's upload and decode caps are operator settings, not the model's:
 
 | Variable | Default |
 | --- | --- |
@@ -660,7 +745,7 @@ check the plugin and frontend versions against [the frontend pairing](#the-front
 
 ## Limits and the support boundary
 
-The [README's Serve section](../README.md#serve) lists the support boundary:
+The support boundary:
 
 - **One geometry per server.** Clients cannot select a lookahead. Serve each geometry from its own
   server.
@@ -672,15 +757,20 @@ The [README's Serve section](../README.md#serve) lists the support boundary:
     `--max-num-seqs` bounds only the files actively scheduled. Put a cap in front of the server if
     clients are not trusted. On stage 2, untrusted clients use the frontend's file route or
     `Recognize`, which are behind the frontend's ingress cap and file gate.
+  - the model refuses `use_beam_search` and `max_completion_tokens` as options that do not apply to
+    audio transcription, from the `SpeechToTextParams` fields that vllm#67151 adds.
   - on a core without vllm#67151 the request guards are inactive: a client's `max_completion_tokens`
     ends the file early with `length`, and beam search can issue up to `n × max_model_len` engine
-    requests per upload, so do not expose the route to untrusted clients on such a core.
+    requests per upload (one per beam per pass), so do not expose the route to untrusted clients on
+    such a core.
   - on a core without vllm#67144, a file ending in `error` or `abort` returns partial text with
     HTTP 200; on a core without vllm#67151, so does a file ending in a server-caused `length`. Both
     stage builds carry these pull requests.
 - **Mixed load.** Whole-file requests slow concurrent streams on the same server. The last mixed-load
-  measurement was made on an earlier build (README, Evidence, historical); tier 4 has not been run
-  on the stage 1 build. Serve file traffic from a separate server, or keep files short.
+  measurement was made on an earlier build ([evidence, historical
+  entries](evidence.md#historical-entries)): with one 293 s file in flight, eight concurrent
+  streams' p95 final latency rose from 0.55 s to 3.64 s. Tier 4 has not been run on the stage 1
+  build. Serve file traffic from a separate server, or keep files short.
 - **Endpointing.** The plugin binds no endpoint policy, so every stream and file runs with
   endpointing disabled and the model emits no end-of-utterance token.
 - **Stage 2 security.** The gRPC listener has no transport security and is outside `--api-key`;
@@ -704,9 +794,9 @@ the test commands and the acceptance rule.
 
 ## Evidence
 
-The [README's Evidence section](../README.md#evidence) lists every acceptance claim with its tier,
-build and revisions, and marks earlier results as historical. The raw evidence for this release is
-in `pdtgct/nemotron-omni-port`:
+The [evidence document](evidence.md) lists every acceptance claim with its tier, build and
+revisions, the measured figures, and earlier results marked historical. The raw evidence for this
+release is in `pdtgct/nemotron-omni-port`:
 
 - `experiments/2026-11-15-plugin-tier2-hook-build/`: tier 2 on the stage 1 build;
 - `experiments/2026-11-15-plugin-h1-txg-tier5-a/` and `experiments/2026-11-15-plugin-h1-txg-tier5-b/`:

@@ -295,7 +295,7 @@ configurations, chosen from those that acceptance tier 2 has met with the defaul
 hook configuration meets it, `--enforce-eager`), an explicit `--max-num-seqs` that tier 2 verified
 to fit the A40 at 320 ms in that runner configuration, and `--max-model-len 77000`, which holds a 600 s
 file at 320 ms (core's default decode limit; at most 76,918 tokens: 1,875 whole chunks of 5,120
-samples, the tail chunk, at most 41 tokens per chunk, and the first and last tokens). Beside it the README states how
+samples, the tail chunk, at most 41 tokens per chunk, and the first and last tokens). Beside it the README links the user manual's Serving configurations section (`docs/manual.md`), which states how
 `num_lookahead_tokens` selects one of the other four geometries and how `--max-model-len` scales
 with it: by the same bound, `1 + (floor(N / s) + 1) × Q + 1` tokens for `N` samples with
 `s = 1280 × (r + 1)` and `Q = 10 × (r + 1) + 1` at lookahead `r`, a 600 s file needs at most
@@ -304,7 +304,8 @@ at 13, so 77,000 covers 3, 6 and 13, and an override to 0 or 1 needs a correspon
 `--max-model-len` (at least 82,513 or 78,773 for 600 s files); that encoder graph memory grows faster than linearly with `--max-num-seqs`; the
 `--hf-overrides` that select the eager arms and the `--enforce-eager` they need; and that a fixed
 `--kv-cache-memory-bytes` must leave room for the segment graphs. The transaction-graph section of
-the README belongs to that component.
+the user manual belongs to that component. The README carries the overview, the build definitions, this serve
+command and a performance summary; acceptance claims and their figures are in `docs/evidence.md` (REG-DOC-002, REG-DOC-004).
 
 Until the tier 2 measurement verifies a value, the serve command may carry an interim
 `--max-num-seqs` taken from an unpublished A40 measurement (64 at 320 ms under `--enforce-eager`),

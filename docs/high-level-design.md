@@ -166,7 +166,7 @@ the first captured counts and fail before capturing the rest. The eager arms (`e
 - The default configuration runs graphed segments (Approach, section 5). Tiers 1 to 4 are
   qualified with the default segment arms, for each runner configuration claimed; tier 5 adds
   transaction graphs to them.
-- Every claim in this repository's README names the acceptance tier it has met (Success Metrics).
+- Every acceptance claim in this repository is recorded in `docs/evidence.md` and names the tier it has met (Success Metrics); every figure the README summarizes names its tier, build and GPU or links that record.
 
 ## Non-Goals
 
@@ -262,7 +262,7 @@ the leaf designs cite them where they depend on them.
     endpoint plugin such as `vllm-riva-frontend`.
 
   The plugin refuses to start on a core without #67583's model-state hooks, naming the missing
-  hooks. The README records the commits each acceptance tier was actually met on, and claims only
+  hooks. `docs/evidence.md` records the commits each acceptance tier was actually met on, and claims only
   the tiers met; a tier met only on a build without #67583 is a historical record until it is met
   again on stage 1. Python `>=3.11,<3.15`.
 - **Engine settings.** The resolved engine settings must be synchronous scheduling, no prefix
@@ -364,7 +364,7 @@ the leaf designs cite them where they depend on them.
   The model refuses beam search and any client completion limit as options that do not apply to
   audio transcription, from `use_beam_search` and `max_completion_tokens` on
   `SpeechToTextParams` (Request guards). #67151 adds those fields and is part of the stage 1
-  build; on a core without them the guards are inactive and the README states the limits. The
+  build; on a core without them the guards are inactive and the user manual states the limits. The
   model drops its worst-case admission check: the only length bound is core's actual-token
   `max_model_len` stop, which the operator sizes; a file that reaches it fails with HTTP 422 on
   the stage 1 build (Completeness). On a core without #67151, beam search
