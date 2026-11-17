@@ -1,13 +1,24 @@
 # Evidence
 
-This document records every acceptance claim for `vllm-nemotron-asr-streaming`. Each claim names
-the tier it met, the build and the source revisions it was met on; claims from earlier builds are
-marked historical. The acceptance tiers are defined in the
-[high-level design](high-level-design.md) (Success Metrics). The raw evidence is in the public
-harness repository `pdtgct/nemotron-omni-port`, under the experiment directories named below.
+This document records every acceptance claim for `vllm-nemotron-asr-streaming`. An acceptance
+claim states that a build met one tier of the acceptance criteria. Each claim names the tier, the
+build and the source revisions. Claims from earlier builds are marked historical.
 
-The [README](../README.md#expected-performance) summarizes the figures a user can expect; the
-[user manual](manual.md) explains the settings they depend on.
+The [high-level design](high-level-design.md) (Success Metrics) defines the five tiers:
+
+1. CPU conformance: unit and contract tests, including the frontend's conformance suite, pass
+   without a GPU.
+2. Installed-engine cycle: on the target build, a stream runs from plugin load to final transcript
+   and slot retirement, for one session and for concurrent sessions.
+3. Equivalence: on public clips from 20 s to over 400 s, whole-file transcripts equal the streaming
+   transcript.
+4. Mixed load: the latency goal holds in unprofiled serving measurements.
+5. Transaction graphs: the opt-in option meets its exactness, speed and memory criteria, separately
+   at 80 ms and at 160 ms, on the A40 at FP32, on stage 1.
+
+The raw evidence is in the public harness repository `pdtgct/nemotron-omni-port`, under the
+experiment directories named below. The [README](../README.md#expected-performance) summarizes the
+figures, and the [user manual](manual.md) explains the settings they depend on.
 
 ## Contents
 
@@ -56,14 +67,14 @@ Figures from the same run (stage 1 build `9c40a6ffd6`, plugin `8166d85`, one A40
 
 Final latency runs from the client's final commit to `transcription.done`. With
 `--max-num-seqs 64`, the server started, both segment-graph captures fit, and 64 concurrent sessions
-completed. The largest sampled step held 38 rows; paced arrivals spread the chunks, so a 64-row step
-was not observed. Tier 2 figures under `--enforce-eager` and at geometries other than 320 ms are
+completed. The largest sampled step held 38 rows. Paced arrivals spread the chunks, so no 64-row
+step was observed. Tier 2 figures under `--enforce-eager` and at lookaheads other than 320 ms are
 owed.
 
 ## Unpublished measurement under `--enforce-eager`
 
 These figures carry no acceptance tier. They come from an unpublished A40 measurement at 320 ms
-under `--enforce-eager`, the runner configuration of the README's serve command, and are the source
+under `--enforce-eager`, the runner configuration of the README's serve command. They are the source
 of that command's interim `--max-num-seqs 64`.
 
 | `--max-num-seqs` | Segment graphs retained | Device memory in use during capture, weights included | Startup |
@@ -72,32 +83,35 @@ of that command's interim `--max-num-seqs 64`.
 | 64 | about 2.3 GiB | 18.3 GiB | about 78 s |
 | 128 | about 17.4 GiB | 44.4 GiB of the card's 45 GiB | about 182 s |
 
-With the eager arms, startup took about 25 s. At 64 rows the 160 ms and 80 ms geometries retained
-1.8 and 1.6 GiB.
+With the eager arms, startup took about 25 s. At 64 rows, 160 ms retained 1.8 GiB and 80 ms
+retained 1.6 GiB.
 
 ## Transaction graphs, tier 5
 
 - Not met (stage 1 build `9c40a6ffd6`; transaction level, body check and the revised TXG-QUAL-008 at
   plugin `adfb24b`, forced fallbacks and step rule at plugin `a19621e`, the first served runs,
   inventory and `U_api` at plugin `8166d85`), tier 5 for transaction graphs at 80 ms and at 160 ms:
-  the step rule and `U_api` fail at both geometries, and the body check fails at population 1.
+  the step rule and `U_api` fail at both lookaheads, and the body check fails at population 1.
 
 The tier 5 run used one NVIDIA A40 at FP32, the stage 1 build `hook-build-20261114b`
 (`pdtgct/vllm` @ `9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee`), card revision `ea30d66d`, `N = 63`
-and `--max-num-seqs 64`, at 80 ms and at 160 ms. The transaction-level checks, the capture figures,
-the body check and the revised served comparison of TXG-QUAL-008 ran at plugin `adfb24b`, whose
-production code equals this release's. The first served runs, the inventory and `U_api` ran at
-plugin `8166d85`, before `adfb24b` changed how fresh rows take their zero initial state; the forced
-fallbacks and the step rule ran at plugin `a19621e`, with `8166d85`'s production code. Tier 5 is not
-met at either geometry.
+and `--max-num-seqs 64`, at 80 ms and at 160 ms. Three plugin revisions ran its parts:
+
+- `adfb24b`, whose production code equals this release's: the transaction-level checks, the capture
+  figures, the body check and the revised served comparison of TXG-QUAL-008.
+- `8166d85`: the first served runs, the inventory and `U_api`. This revision predates the change in
+  `adfb24b` to how fresh rows take their zero initial state.
+- `a19621e`, with `8166d85`'s production code: the forced fallbacks and the step rule.
+
+Tier 5 is not met at either lookahead.
 
 - Passed: the inventory (TXG-QUAL-025); every transaction-level step compared bit for bit at both
-  geometries (TXG-QUAL-003); `Q` and `M` at 80 ms and at 160 ms (TXG-QUAL-002 to -006); forced
-  fallbacks (TXG-QUAL-007); the revised served comparison (TXG-QUAL-008) at both geometries; the
+  lookaheads (TXG-QUAL-003); `Q` and `M` at 80 ms and at 160 ms (TXG-QUAL-002 to -006); forced
+  fallbacks (TXG-QUAL-007); the revised served comparison (TXG-QUAL-008) at both lookaheads; the
   capture figures (TXG-QUAL-019).
-- Failed: the step rule (TXG-QUAL-010 to -014), both groups at both geometries; `U_api`
-  (TXG-QUAL-016, -017) at both geometries; the body check (TXG-QUAL-015) at population 1, one block
-  per geometry. The first served `M` run at 80 ms (plugin `8166d85`) failed its original file
+- Failed: the step rule (TXG-QUAL-010 to -014), both groups at both lookaheads; `U_api`
+  (TXG-QUAL-016, -017) at both lookaheads; the body check (TXG-QUAL-015) at population 1, one block
+  per lookahead. The first served `M` run at 80 ms (plugin `8166d85`) failed its original file
   criterion, equality with one `B_hook` run (123 of 124 files); TXG-QUAL-008 as revised replaced that
   criterion (see the note after the served-run table).
 - Not run: tier 4 with the option on, on any build.
@@ -143,17 +157,17 @@ max(1 ms, |OLD1 − OLD2|). These are engine step times, not served latencies.
 | 160 | 31 | 50.82 / 50.69 / 51.15 | 51.14 / 51.67 / 51.54 | −0.29 / +0.33 |
 | 160 | 63 | 78.72 / 78.66 / 79.12 | 78.50 / 78.34 / 78.76 | −0.25 / −0.29 |
 
-The check is not met: at population 1 one block per geometry fails (80 ms: NEW − min(OLD) 1.77 ms
+The check is not met: at population 1 one block per lookahead fails (80 ms: NEW − min(OLD) 1.77 ms
 against a bound of 1.00 ms; 160 ms: 2.50 ms against 1.62 ms), while in the other block of the same
-geometry NEW is faster than both OLD legs. At populations 31 and 63 every block passes. In an
+lookahead NEW is faster than both OLD legs. At populations 31 and 63 every block passes. In an
 ungated bridge block (option off, `--enforce-eager` legs around one leg in the hook
 configuration), the hook configuration was within the eager legs' drift at 160 ms and 0.7 ms (P 1)
 and 0.9 ms (P 63) above it at 80 ms.
 
 #### `U_api`
 
-`U_api` (TXG-QUAL-016, -017; plugin `8166d85`), five brackets of OFF1, ON, OFF2 per geometry at
-`N = 63`: not met at either geometry. The per-bracket rule failed in three brackets at 80 ms and in
+`U_api` (TXG-QUAL-016, -017; plugin `8166d85`), five brackets of OFF1, ON, OFF2 per lookahead at
+`N = 63`: not met at either lookahead. The per-bracket rule failed in three brackets at 80 ms and in
 two at 160 ms; over the brackets, the counted median was 28.49 ms on and 37.45 ms off at 80 ms, and
 30.59 ms on and 38.68 ms off at 160 ms.
 
@@ -169,9 +183,9 @@ two at 160 ms; over the brackets, the counted median was 28.49 ms on and 37.45 m
 
 The 80 ms file `1284-1180-0011` differs from the `B_hook` run by one comma ("I am, my dear, and all
 strangers …" against "I am, my dear and all strangers …"). A second, nonqualifying `B_hook` run
-differed from the first on that file and equalled the option-on run on all 124 files, which points
+differed from the first on that file and equalled the option-on run on all 124 files. This points
 to `B_hook`'s own run-to-run variation under wall-clock pacing. Revised TXG-QUAL-008 comparison (two
-`B_hook` runs, and each file alone; plugin `adfb24b`): pass at both geometries. Every request
+`B_hook` runs, and each file alone; plugin `adfb24b`): pass at both lookaheads. Every request
 completed, the option-on engine replayed every step with no fallback, and every file sent alone to an
 idle server equalled both `B_hook` runs (124 of 124). Under load the option-on transcripts equalled
 both `B_hook` runs on every stream and file at 160 ms and on all but `1284-1180-0011` at 80 ms, where
@@ -179,11 +193,11 @@ the option-on run kept the comma and both `B_hook` runs dropped it; alone, all t
 
 #### Graph memory and capture time
 
-Graph memory on the A40 at `N = 63`, per capture (MiB unless stated; the call total covers the whole
-capture call: segment graphs, cells and, in the profiling capture, a 64 MiB margin). The captures are
-plugin `adfb24b`'s on the stage 1 build `9c40a6ffd6`; available KV memory and ready time are from the
-served runs at plugin `8166d85`, whose profiling transaction totals were 2,462 MiB (80 ms) and
-2,702 MiB (160 ms):
+The table gives graph memory on the A40 at `N = 63`, per capture, in MiB unless stated. The call
+total covers the whole capture call: segment graphs, cells and, in the profiling capture, a 64 MiB
+margin. The captures ran at plugin `adfb24b` on the stage 1 build `9c40a6ffd6`. Available KV memory
+and ready time come from the served runs at plugin `8166d85`, whose profiling transaction totals
+were 2,462 MiB (80 ms) and 2,702 MiB (160 ms).
 
 | | 80 ms | 160 ms |
 |---|---|---|
@@ -206,24 +220,24 @@ engine runs them without transaction graphs (`chunk-uncovered`).
 | Largest `K` / `E` | 60 / 33 | 64 / 40 |
 | Fraction covered at `N` = 32 / 40 / 48 / 63 | 0.8873 / 0.9717 / 0.9962 / 1.0000 | 0.9725 / 0.9974 / 0.9979 / 0.9984 |
 
-Tier 5 takes `N` as the smallest count of at least 63 that fits and for which steps with `K ≤ N` and
-`E ≤ N` make up at least 99 % of served steps; at `N` = 63 they make up 100 % at 80 ms and 99.84 % at
-160 ms. The same rule below 63, which carries no tier 5 claim, gives a deployment `N` of 44 at 80 ms
+Tier 5 chooses `N` as the smallest count of at least 63 that fits and for which steps with `K ≤ N`
+and `E ≤ N` make up at least 99 % of served steps. At `N` = 63 they make up 100 % at 80 ms and
+99.84 % at 160 ms. The same rule below 63 carries no tier 5 claim. It gives a deployment `N` of 44 at 80 ms
 (99.10 %; serving capture 832 MiB call total, 268 MiB transaction total) and of 36 at 160 ms
 (99.07 %; 794 and 180 MiB).
 
 ## Owed
 
 - Tier 1 on the stage 1 build at the current plugin.
-- Tier 2 under `--enforce-eager`, and at geometries other than 320 ms.
+- Tier 2 under `--enforce-eager`, and at lookaheads other than 320 ms.
 - Tiers 3 and 4 on the stage 1 build; tier 4 also with transaction graphs on.
 
 ## Historical entries
 
-Every entry below is historical. The stage 1 entries were made on a stage 1 build without #67583,
-at plugin revisions before the default graphed arms and the one-geometry server; the other entries
-were made on the earlier integration build of RFC 1 (the superseded #65544 API) and RFC 2. None is
-a claim about the current plugin on stage 1 or stage 2.
+Every entry below is historical. The stage 1 entries ran on a stage 1 build without #67583, at
+plugin revisions before the default graphed arms and the one-lookahead server. The other entries ran
+on the earlier integration build of RFC 1 (the superseded #65544 API) and RFC 2. None is a claim
+about the current plugin on stage 1 or stage 2.
 
 - Historical stage 1 build (without #67583): `pdtgct/vllm` `stage1-build-20261113` @ `b7e7a20c26`
   (upstream `main` `cf8fce503c` + vllm#67375 + vllm#67151), precompiled wheel `191e5d5df2` (cu132),
