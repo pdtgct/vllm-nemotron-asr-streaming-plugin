@@ -138,7 +138,7 @@ STATE_LAYER = "nemotron.state"
 
 
 def _set_inert_model_attributes(model: Any, hf_config: Any) -> None:
-    """The private model attributes ``prepare_step`` reads in today's code.
+    """The private model attributes the model state's request hooks read.
 
     NOTE: these names come from the current source; if the code renames
     them, this helper is the one place to update.
@@ -247,8 +247,18 @@ def make_step() -> Callable[..., Any]:
     def step(
         *, new=(), cached=(), finished=(), handles=None, free_hashes=(), updates=None
     ):
+        import dataclasses
+
         from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
+        # PR 6: a new request's slot is its one block (``block_ids``).
+        slots = {r: h[STATE_LAYER].slot for r, h in (handles or {}).items()}
+        new = [
+            dataclasses.replace(r, block_ids=([slots[r.req_id]],))
+            if r.req_id in slots
+            else r
+            for r in new
+        ]
         scheduled = {r.req_id: 1 for r in new} | {r: 1 for r in cached}
         return SchedulerOutput(
             scheduled_new_reqs=list(new),
@@ -266,15 +276,23 @@ def make_step() -> Callable[..., Any]:
             finished_req_ids=set(finished),
             free_encoder_mm_hashes=list(free_hashes),
             encoder_input_updates=dict(updates or {}),
-            state_slot_handles=handles,
         )
 
     def handle(slot: int, generation: int):
-        from vllm.v1.kv_cache_interface import StateSlotHandle
+        from vllm_nemotron_asr_streaming.nemotron_asr.model_state_v2 import (
+            SlotHandle,
+        )
 
-        return {STATE_LAYER: StateSlotHandle("epoch", slot, generation)}
+        return {STATE_LAYER: SlotHandle(slot, generation)}
 
-    return SimpleNamespace(new_request=new_request, step=step, handle=handle)
+    def run(state: Any, scheduler_output: Any) -> None:
+        """Core's model-state calls of one step
+        (``support.model_harness.drive_step``)."""
+        from support.model_harness import drive_step
+
+        drive_step(state, scheduler_output)
+
+    return SimpleNamespace(new_request=new_request, step=step, handle=handle, run=run)
 
 
 @pytest.fixture

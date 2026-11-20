@@ -28,7 +28,6 @@ from vllm.logger import init_logger
 from vllm_nemotron_asr_streaming import engine_flags
 from vllm_nemotron_asr_streaming.engine_flags import graphed_execution_configured
 from vllm.model_executor.models.interfaces import SupportsTranscription
-from vllm.model_executor.layers.state import PersistentStateLayerBase
 from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
     ENVELOPE_HEADER_SLOTS,
     DecodeRequest,
@@ -103,7 +102,10 @@ from vllm_nemotron_asr_streaming.nemotron_asr.rnnt import (
     greedy_decode_chunk,
 )
 from vllm_nemotron_asr_streaming.nemotron_asr import graph_memory
-from vllm_nemotron_asr_streaming.nemotron_asr.state_profile import build_nemotron_persistent_state_spec
+from vllm_nemotron_asr_streaming.nemotron_asr.state_layer import NemotronStateLayer
+from vllm_nemotron_asr_streaming.nemotron_asr.state_profile import (
+    build_nemotron_state_layout,
+)
 from vllm_nemotron_asr_streaming.transaction_graph_config import (
     KEY as TRANSACTION_GRAPH_KEY,
     transaction_graphs_on,
@@ -452,8 +454,8 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         )
         if policy is not FP32_BRINGUP:
             apply_policy_dtypes(self.core)
-        self._state_spec = build_nemotron_persistent_state_spec(hf_config)
-        self._persistent_state_layer = PersistentStateLayerBase(
+        self._state_spec = build_nemotron_state_layout(hf_config)
+        self._persistent_state_layer = NemotronStateLayer(
             self._state_spec,
             prefix=f"{prefix}.state" if prefix else "state",
             vllm_config=vllm_config,
@@ -1072,7 +1074,7 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         retained.
 
         Profiling uses model-owned scratch state built from the model's
-        ``PersistentStateSpec``; it reads no state-slot bindings or pool.
+        state layout; it reads no state pool.
         """
         from vllm_nemotron_asr_streaming.nemotron_asr.profile_execution import (
             run_persistent_state_profile,
@@ -1821,6 +1823,9 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         state_batch = persistent_state_projection.state_batch
         if state_batch is None:
             raise RuntimeError("MRv2 projection omitted bounded state views")
+        # A fresh row's page may hold a previous owner's bytes (core does not
+        # clear a reused block): initialize it before the transaction.
+        state_batch.initialize_fresh_pages()
         pools = self._state_pools(persistent_state_projection)
         self._write_file_envelopes(inputs_embeds, persistent_state_projection)
         commit_sink = state_batch.commit_sink(

@@ -93,7 +93,7 @@ def test_production_planning_uses_the_file_count_and_never_reads_the_book(
     input_batch = SimpleNamespace(num_computed_tokens_np=np.zeros(1, np.int64))
 
     def run(out, fresh, count=None):
-        state.prepare_step(out, dummy_run=False, is_profile=False)
+        make_step.run(state, out)
         entry = state._file_progress["f1"]
         if count is not None:
             entry.queue_count = count

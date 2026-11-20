@@ -2,9 +2,9 @@
 """Test tiers.
 
 * unmarked: CPU tests needing only this package and its pure-Python modules.
-* ``engine``: CPU tests that import the stage 1 vLLM build (upstream ``main`` with
-  vllm#67374, #67375, #67144 and #67151 on ``PYTHONPATH``). Skipped when it does not
-  import.
+* ``engine``: CPU tests that import the PR 6 proof-of-concept vLLM build
+  (pdtgct/vllm#6 with vllm#67583's model-state hooks on ``PYTHONPATH``). Skipped
+  when it does not import.
 * ``gpu``: installed-engine tests on a CUDA device (``vllm serve`` with the
   plugin installed). Skipped without CUDA.
 * ``card``: tests against a local copy of the published Hub card, named by
@@ -22,16 +22,20 @@ import pytest
 
 
 def _engine_available() -> bool:
+    """The PR 6 proof-of-concept build: ``MambaManager.layer_config`` takes
+    ``recomputable`` (pdtgct/vllm#6)."""
     try:
-        async_llm = importlib.import_module("vllm.v1.engine.async_llm")
+        managers = importlib.import_module("vllm.v1.core.single_type_kv_cache_manager")
     except Exception:
         return False
-    generate = getattr(async_llm.AsyncLLM, "generate", None)
-    return (
-        generate is not None
-        and "stream_admission" in inspect.signature(generate).parameters
-        and hasattr(async_llm.AsyncLLM, "wait_stream_retired")
-    )
+    layer_config = getattr(managers.MambaManager, "layer_config", None)
+    try:
+        return (
+            layer_config is not None
+            and "recomputable" in inspect.signature(layer_config).parameters
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _cuda_available() -> bool:

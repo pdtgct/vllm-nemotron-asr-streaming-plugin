@@ -2,9 +2,10 @@
 """FILE-BUF and FILE-ROW-001 through the model's real ModelState hooks.
 
 The state is built on CPU the way core builds it (``file_model_state``) and
-fed real ``SchedulerOutput`` structures to ``prepare_step``, the hook core
-calls first in every step, including a step with no scheduled tokens
-(``vllm/v1/worker/gpu/model_runner.py`` ``execute_model``). The state's
+fed real ``SchedulerOutput`` structures through core's request hooks
+(``support.model_harness.drive_step``: ``remove_request`` / ``add_request``,
+then ``prepare_attn`` on a step with scheduled tokens), as core's
+``execute_model`` calls them (``vllm/v1/worker/gpu/model_runner.py``). The state's
 ``file_buffers`` attribute (``FileHostBuffers``) is a layout addition.
 """
 
@@ -31,7 +32,9 @@ def file_request(make_step, req_id, samples, geometry=3, row=0):
 
 
 def run_step(state, scheduler_output):
-    state.prepare_step(scheduler_output, dummy_run=False, is_profile=False)
+    from support.model_harness import drive_step
+
+    drive_step(state, scheduler_output)
 
 
 # @spec FILE-BUF-001, FILE-ROW-001
@@ -258,7 +261,7 @@ def test_production_step_plan_gives_a_file_row_at_most_one_chunk(
             cached=[] if step_no == 0 else ["f1"],
             handles=handles,
         )
-        state.prepare_step(out, dummy_run=False, is_profile=False)
+        make_step.run(state, out)
         set_count(state, "f1", queue_len)
         plan = state.plan_step(out)
         (row,) = [r for r in plan.rows if r.request_id == "f1"]
@@ -311,7 +314,7 @@ def test_production_mixed_step_plans_file_and_stream_rows_together(
         new=[file_req, stream_req],
         handles={"f1": make_step.handle(1, 1), "s1": make_step.handle(2, 1)},
     )
-    state.prepare_step(out, dummy_run=False, is_profile=False)
+    make_step.run(state, out)
     plan = state.plan_step(out, stream_rows={"s1": (geometry, 700)})
     rows = {r.request_id: r for r in plan.rows}
     assert set(rows) == {"f1", "s1"}

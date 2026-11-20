@@ -1,21 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Checkpoint-manifest projection onto the generic persistent-state page."""
+"""Checkpoint-manifest projection onto the model's one state page.
+
+The page layout is the plugin's own record (``StateLayout``): core allocates
+the page as a ``MambaSpec`` whose states are the layout's descriptors in
+manifest order (``state_layer.NemotronStateLayer``), and the plugin keeps the
+offsets and initializers that ``MambaSpec`` does not carry.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from math import prod
 from typing import Any
 
 import torch
 
 from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
     author_state_manifest,
-)
-from vllm.v1.kv_cache_interface import (
-    PersistentStateDescriptor,
-    PersistentStateSpec,
 )
 
 _DTYPES: dict[str, torch.dtype] = {
@@ -46,9 +49,52 @@ def _filled(value: int) -> Callable[..., torch.Tensor]:
     return initialize
 
 
+@dataclass(frozen=True)
+class StateDescriptor:
+    """One state of the page: its name, shape, dtype, byte offset in the page
+    and initializer. ``zero_initialized`` is false only for an initializer
+    that writes a non-zero value (the book's blank label)."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    offset_bytes: int
+    initializer: Callable[..., torch.Tensor]
+    zero_initialized: bool = True
+
+    @property
+    def element_size_bytes(self) -> int:
+        return torch.empty((), dtype=self.dtype).element_size()
+
+    @property
+    def size_bytes(self) -> int:
+        return prod(self.shape) * self.element_size_bytes
+
+
+@dataclass(frozen=True)
+class StateLayout:
+    """The page: its descriptors in manifest order, with no implicit padding,
+    and its size in bytes."""
+
+    descriptors: tuple[StateDescriptor, ...]
+    page_size_bytes: int
+
+    @property
+    def shapes(self) -> tuple[tuple[int, ...], ...]:
+        return tuple(d.shape for d in self.descriptors)
+
+    @property
+    def dtypes(self) -> tuple[torch.dtype, ...]:
+        return tuple(d.dtype for d in self.descriptors)
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(d.name for d in self.descriptors)
+
+
 # @spec REG-STATE-001
-def build_nemotron_persistent_state_spec(config: Any) -> PersistentStateSpec:
-    """Build the one aggregate page directly from the published manifest.
+def build_nemotron_state_layout(config: Any) -> StateLayout:
+    """Build the one page directly from the published manifest.
 
     ``admitted_prompt`` and ``admitted_geometry`` start at zero in raw
     storage; the first transaction stamps both fields from the scheduler's
@@ -57,7 +103,7 @@ def build_nemotron_persistent_state_spec(config: Any) -> PersistentStateSpec:
     initializer.
     """
     manifest = author_state_manifest(config)
-    descriptors: list[PersistentStateDescriptor] = []
+    descriptors: list[StateDescriptor] = []
     offset = 0
     blank_label = int(config.num_asr_labels)
     for entry in manifest["entries"]:
@@ -69,33 +115,36 @@ def build_nemotron_persistent_state_spec(config: Any) -> PersistentStateSpec:
                 f"state manifest requires implicit padding before {entry['name']!r}; "
                 "publish the padding explicitly"
             )
-        init_name = entry["init"]
-        initializer = _filled(blank_label) if init_name == "blank_label" else _zeros
-        descriptor = PersistentStateDescriptor(
+        blank = entry["init"] == "blank_label"
+        descriptor = StateDescriptor(
             name=entry["name"],
             shape=tuple(int(value) for value in entry["shape"]),
             dtype=dtype,
             offset_bytes=offset,
-            alignment_bytes=alignment,
-            initializer=initializer,
+            initializer=_filled(blank_label) if blank else _zeros,
+            zero_initialized=not blank or blank_label == 0,
         )
         descriptors.append(descriptor)
         offset += descriptor.size_bytes
 
     if offset != manifest["total_page_bytes"]:
         raise ValueError("state manifest byte total disagrees with its entries")
-    return PersistentStateSpec(
-        descriptors=descriptors,
-        page_size_bytes=offset,
-        block_size=1,
-        memory_contributors=memory_contributors(config),
-    )
+    return StateLayout(descriptors=tuple(descriptors), page_size_bytes=offset)
+
+
+#: Earlier name of :func:`build_nemotron_state_layout`.
+build_nemotron_persistent_state_spec = build_nemotron_state_layout
+
+
+def manifest_page_bytes(config: Any) -> int:
+    """The manifest's ``total_page_bytes``."""
+    return int(author_state_manifest(config)["total_page_bytes"])
 
 
 def memory_contributors(config: Any) -> tuple[str, ...]:
     """The configured options that enlarge the model's execution memory or
-    graphs, which core names on a failure of its profiling pool, of a capture
-    and of its capacity planning: ``max_num_seqs`` and the two segment arms
+    graphs (diagnostic only; no core in the PR 6 proof of concept reads
+    them): ``max_num_seqs`` and the two segment arms
     when graphed execution is configured, ``chunk_bucket_graph_populations``
     when it is non-empty, and ``transaction_graph_populations`` while
     transaction graphs are on."""
@@ -121,7 +170,7 @@ def memory_contributors(config: Any) -> tuple[str, ...]:
 
 def _adjacent_matrix(
     views: Mapping[str, torch.Tensor],
-    spec: PersistentStateSpec,
+    spec: StateLayout,
     names: tuple[str, ...],
 ) -> torch.Tensor:
     """Project adjacent scalar descriptors as one write-through matrix."""
@@ -168,7 +217,7 @@ class NemotronStatePools:
 # @spec REG-STATE-005
 def project_nemotron_state_pools(
     views: Mapping[str, torch.Tensor],
-    spec: PersistentStateSpec,
+    spec: StateLayout,
     *,
     n_layers: int,
 ) -> NemotronStatePools:
@@ -246,7 +295,7 @@ def project_nemotron_state_pools(
 class StateScratch:
     """Ephemeral batch workspace, never resident slot ownership."""
 
-    spec: PersistentStateSpec
+    spec: StateLayout
     raw: torch.Tensor
     views: dict[str, torch.Tensor]
 
@@ -262,7 +311,7 @@ class StateScratch:
 
 
 def allocate_state_scratch(
-    spec: PersistentStateSpec, rows: int, device: torch.device
+    spec: StateLayout, rows: int, device: torch.device
 ) -> StateScratch:
     """Allocate the transaction's bounded scratch, including its null row."""
     raw = torch.zeros(rows * spec.page_size_bytes, dtype=torch.uint8, device=device)

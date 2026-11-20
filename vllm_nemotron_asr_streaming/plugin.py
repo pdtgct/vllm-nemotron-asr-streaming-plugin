@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """``vllm.general_plugins`` entry point.
 
-``register`` checks the client calls the plugin uses, then registers the
+``register`` checks that the vLLM build carries the core changes the plugin
+needs (``_require_client_path``), then registers the
 streaming architecture, its model-configuration hook, the card parser and the
 tokenizer mode. It does not import the model module, initialize a device or
 load weights, so a process that has not initialized CUDA can still load the
@@ -15,27 +16,30 @@ import inspect
 
 
 def _require_client_path() -> None:
-    """Fail plugin load when the RFC 1 stream-admission client calls are absent."""
-    from vllm.v1.engine.async_llm import AsyncLLM
+    """Fail plugin load on a vLLM build the PR 6 proof of concept cannot run
+    on: one without vllm#67583's model-state hooks or without pdtgct/vllm#6's
+    non-recomputable state layer (``MambaManager.layer_config(...,
+    recomputable=...)``). Stream admission is not required: PR 6 has none,
+    and the session factory that uses it is not supported on this build."""
+    from vllm_nemotron_asr_streaming.engine_flags import missing_graph_hooks
 
-    missing: list[str] = []
-    generate = getattr(AsyncLLM, "generate", None)
+    missing = [f"ModelState.{hook}" for hook in missing_graph_hooks()]
     try:
-        has_admission = (
-            generate is not None
-            and "stream_admission" in inspect.signature(generate).parameters
+        from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+        layer_config = getattr(MambaManager, "layer_config", None)
+        has_flag = layer_config is not None and (
+            "recomputable" in inspect.signature(layer_config).parameters
         )
-    except (TypeError, ValueError):
-        has_admission = False
-    if not has_admission:
-        missing.append("AsyncLLM.generate(stream_admission=...)")
-    if not hasattr(AsyncLLM, "wait_stream_retired"):
-        missing.append("AsyncLLM.wait_stream_retired")
+    except (ImportError, TypeError, ValueError):
+        has_flag = False
+    if not has_flag:
+        missing.append("MambaManager.layer_config(recomputable=...)")
     if missing:
         raise RuntimeError(
-            "vllm-nemotron-asr-streaming requires a vLLM build with RFC 1 "
-            "stream admission (vllm#67375 on #67374); "
-            "this build lacks " + ", ".join(missing)
+            "vllm-nemotron-asr-streaming (PR 6 proof of concept) requires a "
+            "vLLM build with pdtgct/vllm#6's state layer and vllm#67583's "
+            "model-state hooks; this build lacks " + ", ".join(missing)
         )
 
 

@@ -414,7 +414,7 @@ def test_engine_stages_copies_and_encodes_at_most_one_chunk_per_file_step(
     encoded: list[tuple[int, int]] = []  # (step, chunk rows run by the encoder)
     plans: dict[int, Any] = {}  # step -> StepPlan
     real_stage = FileHostBuffers.stage
-    real_prepare = NemotronASRModelState.prepare_step
+    real_prepare = NemotronASRModelState.prepare_inputs
     real_plan = NemotronASRModelState.plan_step
     real_copy = file_rows.copy_chunk_to_device
     real_bucket = advance.advance_chunk_bucket
@@ -423,7 +423,7 @@ def test_engine_stages_copies_and_encodes_at_most_one_chunk_per_file_step(
         staged.append((request_id, step[0], int(start), int(length)))
         return real_stage(self, request_id, start, length)
 
-    def prepare_step(self, *args, **kwargs):
+    def prepare_inputs(self, *args, **kwargs):
         step[0] += 1
         return real_prepare(self, *args, **kwargs)
 
@@ -441,7 +441,7 @@ def test_engine_stages_copies_and_encodes_at_most_one_chunk_per_file_step(
         return real_bucket(core, env, state, **kwargs)
 
     monkeypatch.setattr(FileHostBuffers, "stage", stage)
-    monkeypatch.setattr(NemotronASRModelState, "prepare_step", prepare_step)
+    monkeypatch.setattr(NemotronASRModelState, "prepare_inputs", prepare_inputs)
     monkeypatch.setattr(NemotronASRModelState, "plan_step", plan_step)
     monkeypatch.setattr(file_rows, "copy_chunk_to_device", copy_chunk_to_device)
     monkeypatch.setattr(advance, "advance_chunk_bucket", advance_chunk_bucket)

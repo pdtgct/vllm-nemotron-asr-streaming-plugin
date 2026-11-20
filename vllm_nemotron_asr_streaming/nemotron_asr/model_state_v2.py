@@ -1,6 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MRv2 projection of bounded core state views into Nemotron transactions."""
+"""MRv2 projection of the state layer's views into Nemotron transactions.
+
+The state is one ``MambaSpec`` page per request (``state_layer``), allocated
+by core's ``MambaManager``. Core gives the model state no step record: the
+model state rebuilds each step from ``add_request`` / ``remove_request`` and
+the ``InputBatch``. Per request it records, at ``add_request``, the prompt,
+the slot (``block_ids[0][0]``), the ``NewRequestData`` and an admission
+generation; a row is fresh when its ``num_computed_tokens`` is 0 (the Mamba
+builder's ``has_initial_states_p``), and a fresh row's page is initialized
+before the forward. A dummy step is a step with a row ``add_request`` never
+recorded; the profiling dummy step is a dummy step with no ``prepare_attn``
+call before ``prepare_inputs``.
+
+``remove_request`` records one pending removal; the next model-state call
+decides it: an ``add_request`` of the same request that continues it (same
+slot, ``num_computed_tokens > 0``) replaces the turn, every other call retires
+the request first.
+"""
 
 from __future__ import annotations
 
@@ -9,22 +26,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-
 from vllm.config.compilation import CUDAGraphMode
-from vllm_nemotron_asr_streaming.nemotron_asr.state_profile import (
-    project_nemotron_state_pools,
-)
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
-from vllm.v1.kv_cache_interface import (
-    KVCacheConfig,
-    PersistentStateSpec,
-    StateSlotHandle,
-)
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.state_slots import StateSlotBindings, StateSlotRows
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
+
 from vllm_nemotron_asr_streaming.engine_flags import (
     check_engine_config,
     selects_hook_captured_graph,
@@ -46,7 +55,10 @@ from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
     resolve_row_envelope_header,
     stream_order_key,
 )
-
+from vllm_nemotron_asr_streaming.nemotron_asr.state_profile import (
+    StateLayout,
+    project_nemotron_state_pools,
+)
 
 #: Host-side stand-in for a scheduled token the sampler produced on the
 #: device: never a valid token id, so never the CHUNK or file carrier.
@@ -63,9 +75,28 @@ def _cuda_platform() -> bool:
 
 
 @dataclass(frozen=True)
+class SlotHandle:
+    """A request incarnation's slot and admission generation. The slot is
+    the request's ``MambaManager`` block; the generation comes from the model
+    state's own counter and is new for every fresh incarnation."""
+
+    slot: int
+    generation: int
+
+
+@dataclass
+class _Request:
+    """What ``add_request`` recorded for one live request."""
+
+    handle: SlotHandle
+    prompt: tuple[int, ...]
+    metadata: NewRequestData
+
+
+@dataclass(frozen=True)
 class RowBinding:
     request_id: str
-    handle: StateSlotHandle
+    handle: SlotHandle
     fresh: bool
 
     @property
@@ -127,47 +158,58 @@ class _FileProgress:
 
 
 class _ResidentCommitSink:
-    def __init__(
-        self, sink: Any, access: StateSlotRows, request_ids: tuple[str, ...]
-    ):
+    def __init__(self, sink: Any, slots: tuple[int, ...], request_ids: tuple[str, ...]):
         self.sink = sink
-        self.access = access
+        self.slots = slots
         self.request_ids = request_ids
 
     # @spec REG-STATE-004, REG-STATE-006
     def reserve(self, plan: Any) -> Any:
-        # Core refuses this read outside the live step, and the commit then
-        # writes no state.
-        self.access.component_pools
         if tuple(b.request_id for b in plan.bindings) != self.request_ids:
             raise ValueError("commit row order differs from resident bindings")
-        if tuple(b.block_id for b in plan.bindings) != self.access.slot_indices_cpu:
+        if tuple(b.block_id for b in plan.bindings) != self.slots:
             raise ValueError("commit slots differ from resident bindings")
         return self.sink.reserve(plan)
 
 
 class StateBatch:
-    """Zero-copy resident pools with a step-scoped pre-commit guard."""
+    """Zero-copy resident pools of one step's rows.
+
+    The views are read from the state layer when the step is bound, never
+    kept across steps: the extensible KV cache rebinds them."""
 
     # @spec REG-STATE-003, REG-STATE-005
     def __init__(
         self,
-        slots: StateSlotBindings,
-        layer: str,
+        layer: Any,
         bindings: tuple[RowBinding, ...],
-        spec: PersistentStateSpec,
+        layout: StateLayout,
         n_layers: int,
     ):
+        views = layer.component_pools
+        if views is None:
+            raise RuntimeError("the state pool is not bound")
+        num_blocks = layer.num_blocks
+        self.layer = layer
         self.request_ids = tuple(b.request_id for b in bindings)
-        self.access = slots.bind_rows(
-            layer, self.request_ids, tuple(b.handle for b in bindings)
-        )
-        self.pools = project_nemotron_state_pools(
-            self.access.component_pools, spec, n_layers=n_layers
-        )
+        self.slot_indices = tuple(int(b.slot_id) for b in bindings)
+        self.fresh_slots = tuple(int(b.slot_id) for b in bindings if b.fresh)
+        outside = [s for s in self.slot_indices if not 0 < s < num_blocks]
+        if outside:
+            raise ValueError(
+                f"state slots {outside} are outside the bound pool of "
+                f"{num_blocks} blocks"
+            )
+        self.pools = project_nemotron_state_pools(views, layout, n_layers=n_layers)
+
+    def initialize_fresh_pages(self) -> None:
+        """Initialize the pages of the step's fresh rows, as a newly taken
+        page must be (core does not clear a reused block): the model's
+        forward calls this before its transaction, on the current stream."""
+        self.layer.initialize_pages(self.fresh_slots)
 
     def commit_sink(self, sink: Any) -> _ResidentCommitSink:
-        return _ResidentCommitSink(sink, self.access, self.request_ids)
+        return _ResidentCommitSink(sink, self.slot_indices, self.request_ids)
 
 
 class NemotronASRModelState(ModelState):
@@ -184,18 +226,27 @@ class NemotronASRModelState(ModelState):
         self.file_buffers = FileHostBuffers()
         self._file_progress: dict[str, _FileProgress] = {}
         self._failed_files: set[str] = set()
-        self._scheduler_output: SchedulerOutput | None = None
-        self._metadata: dict[str, NewRequestData] = {}
-        self._initialized: dict[str, StateSlotHandle] = {}
+        #: Each live request's record, from its latest ``add_request``.
+        self._requests: dict[str, _Request] = {}
+        #: The request ``remove_request`` named last, until the next call
+        #: decides it (a turn replacement or a retirement).
+        self._pending_removal: str | None = None
+        #: The requests added since the last ``prepare_inputs``, in order: the
+        #: step's new requests, which plan before its cached ones.
+        self._step_added: list[str] = []
+        #: The admission-generation counter (``SlotHandle.generation``).
+        self._generation = 0
+        #: Each row's scheduled host tokens: a new request's at
+        #: ``add_request``, every row's at ``prepare_inputs``.
+        self._scheduled_tokens: dict[str, tuple[int, ...]] = {}
+        #: Whether ``prepare_attn`` ran since the last ``prepare_inputs``.
+        self._attn_prepared = False
         self._epoch = 0
         self._snapshot: ProjectionSnapshot | None = None
         self._dummy_run = False
         self._is_profile = False
         self._scheduled_encoder_inputs: dict[str, list[int]] = {}
         self._features: torch.Tensor | None = None
-        self._scheduled_tokens: dict[str, tuple[int, ...]] = {}
-        #: Each live request's latest prompt, as core delivered it.
-        self._prompts: dict[str, tuple[int, ...]] = {}
 
     # Core's graph hooks (vllm#67583), required in every runner configuration
     # (REG-ENG-009). Under ``--enforce-eager`` core calls none of the three
@@ -265,104 +316,69 @@ class NemotronASRModelState(ModelState):
         # transcript labels, not text generation.
         return ("transcription", "realtime")
 
-    # @spec TXG-LIFE-003, TXG-LIFE-009
-    def initialize_state_slots(self, bindings: StateSlotBindings) -> None:
-        layer = self.model._persistent_state_layer.prefix
-        # While transaction graphs are on: serving bindings that differ from
-        # the layout the serving capture recorded are refused before they
-        # replace the current ones.
-        transaction_graphs = self.model._transaction_graph_binding
-        if transaction_graphs is not None and layer in bindings.views:
-            transaction_graphs.check_bindings(bindings, layer)
-        super().initialize_state_slots(bindings)
-        if set(bindings.views) != {layer}:
-            raise ValueError("Nemotron requires exactly its aggregate state group")
-        # All resident writes run on the runner stream. Inner graphs also replay
-        # there; no auxiliary state-writing stream is created by this consumer.
-        if transaction_graphs is not None:
-            transaction_graphs.record_bindings(bindings, layer)
+    @property
+    def _metadata(self) -> dict[str, NewRequestData]:
+        """Each live request's latest ``NewRequestData``."""
+        return {r: record.metadata for r, record in self._requests.items()}
 
-    # @spec REG-MEM-001, REG-STATE-002, REG-STATE-007, REG-STATE-008
-    def prepare_step(
-        self, scheduler_output: SchedulerOutput, *, dummy_run: bool, is_profile: bool
+    @property
+    def _prompts(self) -> dict[str, tuple[int, ...]]:
+        """Each live request's latest prompt, as core delivered it."""
+        return {r: record.prompt for r, record in self._requests.items()}
+
+    def _state_layer(self) -> Any:
+        return self.model._persistent_state_layer
+
+    def initialize_kv_cache(
+        self, kv_cache_config: KVCacheConfig, block_tables: Any
     ) -> None:
-        # Only a dummy step that is also a profiling step is a profiling
-        # dummy step; the model's forward prepares execution on it. The
-        # record is replaced on every step and prepares nothing here.
-        self._dummy_run = dummy_run
-        self._is_profile = is_profile
-        self._snapshot = None
-        self._scheduled_encoder_inputs = {}
-        self._features = None
-        self._scheduled_tokens = {}
-        self._epoch = getattr(self, "_epoch", 0) + 1
-        if dummy_run:
-            # Core skips its state-slot bookkeeping on dummy steps: nothing of
-            # an earlier step is kept for them to read.
-            self._scheduler_output = None
-            return
-        # Core sends no token slices for cached requests unless pipeline
-        # parallelism is on, which this model refuses. The host token of a
-        # cached row is therefore read from the prompt this state recorded when
-        # core delivered it as a new request (a session turn arrives that way
-        # too, with its prompt starting at position zero). A position past the
-        # recorded prompt holds a token the sampler produced on the device; the
-        # host never reads it, and no sampled token is a CHUNK carrier, so such
-        # a row is marked with ``SAMPLED_TOKEN``.
-        for req_id in scheduler_output.finished_req_ids:
-            self._prompts.pop(req_id, None)
-        cached = scheduler_output.scheduled_cached_reqs
-        for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens):
-            prompt = self._prompts.get(req_id)
-            if prompt is None:
-                raise ValueError(
-                    f"cached request {req_id!r} has no recorded prompt tokens"
-                )
-            start = int(computed)
-            count = scheduler_output.num_scheduled_tokens[req_id]
-            window = prompt[start : start + count]
-            if window and len(window) != count:
-                raise ValueError(
-                    f"cached request {req_id!r} schedules tokens across the end "
-                    "of its prompt"
-                )
-            self._scheduled_tokens[req_id] = window or (SAMPLED_TOKEN,) * count
-        for request in scheduler_output.scheduled_new_reqs:
-            tokens = request.prefill_token_ids
-            if tokens is None:
-                raise ValueError("state step omitted new host token slice")
-            self._prompts[request.req_id] = tuple(tokens)
-            start = request.num_computed_tokens
-            count = scheduler_output.num_scheduled_tokens[request.req_id]
-            self._scheduled_tokens[request.req_id] = tuple(
-                tokens[start : start + count]
+        super().initialize_kv_cache(kv_cache_config, block_tables)
+        layer = self._state_layer()
+        groups = [list(group.layer_names) for group in kv_cache_config.kv_cache_groups]
+        if groups != [[layer.prefix]]:
+            raise ValueError(
+                "Nemotron requires exactly its one state layer in one KV cache "
+                f"group, got {groups}"
             )
-        self._scheduler_output = scheduler_output
-        for req_id in scheduler_output.finished_req_ids:
-            self._metadata.pop(req_id, None)
-            self._initialized.pop(req_id, None)
-        # FILE-BUF-003: any finished request frees its file buffer, also in a
-        # step with no forward work (this hook runs for every step).
-        for req_id in self.file_buffers.free_finished(
-            scheduler_output.finished_req_ids
-        ):
-            self._file_progress.pop(req_id, None)
-        self._failed_files.difference_update(scheduler_output.finished_req_ids)
-        carrier = getattr(getattr(self.model, "config", None), "file_carrier_token_id", None)
-        if carrier is not None:
-            for request in scheduler_output.scheduled_new_reqs:
-                tokens = self._scheduled_tokens.get(request.req_id, ())
-                if len(tokens) == 1 and tokens[0] == int(carrier):
-                    self._take_file(request, scheduler_output)
-        self.model._registry.prune(self._initialized)
-        handoff = self.model._native_burst_handoff
-        if handoff is not None:
-            handoff.clear()
+        if layer.component_pools is None:
+            raise RuntimeError("core did not bind the state pool to the state layer")
+
+    # -- request lifetime (worker side) --------------------------------------
+
+    def _decide_pending(self) -> None:
+        """Retire the pending removal, if any: every model-state call other
+        than a continuing ``add_request`` of the same request decides it."""
+        pending = self._pending_removal
+        if pending is not None:
+            self._pending_removal = None
+            self._retire(pending)
+
+    def _retire(self, req_id: str) -> None:
+        """Drop everything kept for ``req_id``: its record (prompt, metadata,
+        slot), its registry entry, its file buffer and progress, and its
+        failed-file mark."""
+        self._requests.pop(req_id, None)
+        self._scheduled_tokens.pop(req_id, None)
+        self.model._registry.prune(tuple(self._requests))
+        # FILE-BUF-003: a retired request frees its file buffer.
+        for freed in self.file_buffers.free_finished((req_id,)):
+            self._file_progress.pop(freed, None)
+        self._file_progress.pop(req_id, None)
+        self._failed_files.discard(req_id)
+
+    def _continues(self, req_id: str, new_req_data: NewRequestData, slot: int) -> bool:
+        """Whether ``new_req_data`` is a turn of the live request ``req_id``:
+        the same request, prior state (``num_computed_tokens > 0``), the same
+        slot."""
+        record = self._requests.get(req_id)
+        return (
+            record is not None
+            and int(new_req_data.num_computed_tokens) > 0
+            and record.handle.slot == slot
+        )
 
     # @spec FILE-BUF-001, FILE-BUF-004, FILE-BUF-005, FILE-ROW-001
-    def _take_file(
-        self, request: NewRequestData, scheduler_output: SchedulerOutput
-    ) -> None:
+    def _take_file(self, request: NewRequestData) -> None:
         """Take a file request's samples and header into a request-owned
         host buffer at its first schedule and mark it a FILE request.
 
@@ -373,27 +389,24 @@ class NemotronASRModelState(ModelState):
         """
         req_id = request.req_id
         try:
-            self._take_file_checked(request, scheduler_output)
+            self._take_file_checked(request)
         except (ValueError, KeyError, TypeError, AttributeError, IndexError):
             # any missing or unreadable field makes the item malformed
             self.file_buffers.free_finished([req_id])
             self._file_progress.pop(req_id, None)
             self._failed_files.add(req_id)
 
-    def _take_file_checked(
-        self, request: NewRequestData, scheduler_output: SchedulerOutput
-    ) -> None:
+    def _take_file_checked(self, request: NewRequestData) -> None:
         req_id = request.req_id
         if len(request.mm_features) != 1:
             raise ValueError(f"file request {req_id!r} needs exactly one audio item")
         item = request.mm_features[0].data
         if item is None:
             raise ValueError(f"file request {req_id!r} arrived without its samples")
-        layer = self.model._persistent_state_layer.prefix
-        handles = scheduler_output.state_slot_handles or {}
-        handle = handles.get(req_id, {}).get(layer)
-        if handle is None:
-            raise ValueError(f"file request {req_id!r} has no state slot handle")
+        record = self._requests.get(req_id)
+        if record is None:
+            raise ValueError(f"file request {req_id!r} has no state slot")
+        handle = record.handle
         dropped = self.file_buffers.take(
             req_id,
             handle.slot,
@@ -437,7 +450,7 @@ class NemotronASRModelState(ModelState):
     # @spec FILE-QC-010, FILE-QC-011
     def plan_step(
         self,
-        scheduler_output: SchedulerOutput,
+        scheduler_output: SchedulerOutput | tuple[str, ...],
         *,
         stream_rows: dict[str, tuple[int, int]] | None = None,
     ) -> StepPlan:
@@ -449,11 +462,16 @@ class NemotronASRModelState(ModelState):
         A file that has had a step and whose count's validity is unknown is
         failed alone before its file action is planned (FILE-QC-010).
         ``stream_rows`` maps stream request IDs to ``(geometry_index,
-        deadline)``.
+        deadline)``. The rows are the step's request IDs in planning order
+        (new requests, then cached ones), given directly or as a scheduler
+        output.
         """
-        cached = scheduler_output.scheduled_cached_reqs
-        req_ids = [r.req_id for r in scheduler_output.scheduled_new_reqs]
-        req_ids += list(cached.req_ids)
+        if isinstance(scheduler_output, tuple):
+            req_ids = list(scheduler_output)
+        else:
+            cached = scheduler_output.scheduled_cached_reqs
+            req_ids = [r.req_id for r in scheduler_output.scheduled_new_reqs]
+            req_ids += list(cached.req_ids)
         rows: list[StepRow] = []
         for req_id in req_ids:
             progress = self._file_progress.get(req_id)
@@ -526,8 +544,45 @@ class NemotronASRModelState(ModelState):
             )
         return StepPlan(rows=rows, groups=file_rows.plan_chunk_groups(rows))
 
+    # @spec REG-STATE-002
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         del req_index
+        req_id = new_req_data.req_id
+        groups = new_req_data.block_ids
+        if len(groups) != 1 or not groups[0]:
+            raise ValueError(
+                f"request {req_id!r} needs one state block in one KV cache group"
+            )
+        slot = int(groups[0][0])
+        continues = self._pending_removal == req_id and self._continues(
+            req_id, new_req_data, slot
+        )
+        if continues:
+            # A turn replacement: the session keeps its bookkeeping.
+            self._pending_removal = None
+        else:
+            self._decide_pending()
+            if req_id in self._requests:
+                # Core removes every request before it adds it again.
+                raise RuntimeError(
+                    f"request {req_id!r} was added again without a removal"
+                )
+            if int(new_req_data.num_computed_tokens) != 0:
+                raise RuntimeError(
+                    f"request {req_id!r} arrived with prior state "
+                    f"({new_req_data.num_computed_tokens} computed tokens) but "
+                    "continues no live request on its slot"
+                )
+        tokens = new_req_data.prefill_token_ids
+        if tokens is None:
+            raise ValueError("state step omitted new host token slice")
+        if continues:
+            handle = self._requests[req_id].handle
+        else:
+            self._generation += 1
+            handle = SlotHandle(slot, self._generation)
+        self._requests[req_id] = _Request(handle, tuple(tokens), new_req_data)
+        self._step_added.append(req_id)
         handoff = self.model._native_burst_handoff
         if handoff is not None:
             from vllm_nemotron_asr_streaming.nemotron_asr.native_burst import (
@@ -545,19 +600,31 @@ class NemotronASRModelState(ModelState):
                 max_model_len=self.max_model_len,
                 burst_tokens=handoff.max_tokens,
             )
-        self._metadata[new_req_data.req_id] = new_req_data
+        carrier = getattr(
+            getattr(self.model, "config", None), "file_carrier_token_id", None
+        )
+        start = int(new_req_data.num_computed_tokens)
+        # Every row schedules one token (``prepare_inputs`` refuses others).
+        window = tuple(tokens[start : start + 1])
+        self._scheduled_tokens[req_id] = window
+        if carrier is not None and window == (int(carrier),):
+            self._take_file(new_req_data)
 
     def remove_request(self, req_id: str) -> None:
-        # Core also calls this when replacing a parked turn. prepare_step prunes
-        # terminal identities; the same live handle preserves its acoustic state.
-        self._metadata.pop(req_id, None)
+        # Core calls this for a finished request and before it adds a request
+        # again (a session's next turn): the next call decides which.
+        self._decide_pending()
+        if req_id in self._requests:
+            self._pending_removal = req_id
 
     # @spec REG-MEM-013
     def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         handoff = getattr(getattr(self, "model", None), "_native_burst_handoff", None)
         if handoff is None:
             return None
-        from vllm_nemotron_asr_streaming.nemotron_asr.native_burst import NativeBurstSampler
+        from vllm_nemotron_asr_streaming.nemotron_asr.native_burst import (
+            NativeBurstSampler,
+        )
 
         state = self
 
@@ -597,14 +664,52 @@ class NemotronASRModelState(ModelState):
             )[: input_batch.num_tokens_after_padding]
         return self._features
 
-    # @spec REG-MEM-012
+    def _row_tokens(self, input_batch: InputBatch) -> list[tuple[int, ...]]:
+        """Each row's scheduled host tokens. Core sends no token slices for
+        cached requests unless pipeline parallelism is on, which this model
+        refuses. A row's host token is therefore read from the prompt this
+        state recorded when core delivered the request (a session turn
+        arrives that way too, with its cumulative prompt starting at position
+        zero). A position past the recorded prompt holds a token the sampler
+        produced on the device; the host never reads it, and no sampled
+        token is a CHUNK carrier, so such a row is marked with
+        ``SAMPLED_TOKEN``."""
+        rows: list[tuple[int, ...]] = []
+        for index, req_id in enumerate(input_batch.req_ids):
+            prompt = self._requests[req_id].prompt
+            start = int(input_batch.num_computed_tokens_np[index])
+            count = int(input_batch.num_scheduled_tokens[index])
+            window = prompt[start : start + count]
+            if window and len(window) != count:
+                raise ValueError(
+                    f"request {req_id!r} schedules tokens across the end of its prompt"
+                )
+            rows.append(window or (SAMPLED_TOKEN,) * count)
+        return rows
+
+    # @spec REG-MEM-001, REG-MEM-012, REG-STATE-002, REG-STATE-007
     def prepare_inputs(
         self,
         input_batch: InputBatch,
         req_states: RequestState,
     ) -> dict[str, Any]:
+        self._decide_pending()
+        attn_prepared, self._attn_prepared = self._attn_prepared, False
+        added, self._step_added = self._step_added, []
+        self._epoch = getattr(self, "_epoch", 0) + 1
+        self._snapshot = None
+        handoff = self.model._native_burst_handoff
+        if handoff is not None:
+            handoff.clear()
         req_ids = tuple(input_batch.req_ids)
-        if self._dummy_run:
+        # A dummy batch carries fresh random request IDs that no add_request
+        # recorded; only the memory profile's dummy step (core's
+        # ``skip_attn``) builds no attention metadata.
+        dummy_run = any(r not in self._requests for r in req_ids)
+        is_profile = dummy_run and not attn_prepared
+        self._dummy_run = dummy_run
+        self._is_profile = is_profile
+        if dummy_run:
             snapshot = ProjectionSnapshot(
                 self._epoch,
                 req_ids,
@@ -616,36 +721,38 @@ class NemotronASRModelState(ModelState):
                 req_states,
                 {},
                 dummy_run=True,
-                is_profile=self._is_profile,
+                is_profile=is_profile,
                 no_page_io=True,
             )
         else:
-            if self.state_slots is None:
-                raise RuntimeError("persistent-state bindings are not initialized")
             if any(int(n) != 1 for n in input_batch.num_scheduled_tokens):
                 raise ValueError("every streaming row must be single-token")
-            layer = self.model._persistent_state_layer.prefix
-            # @spec REG-STATE-002: handles come from the scheduler output;
-            # rows are bound here, inside the live step.
-            assert self._scheduler_output is not None
-            handles = self._scheduler_output.state_slot_handles or {}
+            layer = self._state_layer()
             bindings = tuple(
-                RowBinding(req_id, handle, self._initialized.get(req_id) != handle)
-                for req_id in req_ids
-                for handle in (handles[req_id][layer],)
+                RowBinding(
+                    req_id,
+                    self._requests[req_id].handle,
+                    int(input_batch.num_computed_tokens_np[index]) == 0,
+                )
+                for index, req_id in enumerate(req_ids)
             )
             batch = StateBatch(
-                self.state_slots,
                 layer,
                 bindings,
                 self.model._state_spec,
                 int(self.model.config.n_layers),
             )
-            token_rows = [self._scheduled_tokens.get(req_id, ()) for req_id in req_ids]
+            token_rows = self._row_tokens(input_batch)
+            self._scheduled_tokens = dict(zip(req_ids, token_rows, strict=True))
             if any(len(tokens) != 1 for tokens in token_rows):
                 raise ValueError("every streaming row needs one scheduled host token")
+            # The step's new requests plan first, as core ordered them.
+            step_added = set(added)
+            plan_order = tuple(r for r in added if r in set(req_ids)) + tuple(
+                r for r in req_ids if r not in step_added
+            )
             step_plan = self._plan_production_step(
-                req_ids, bindings, batch, token_rows, input_batch
+                req_ids, bindings, batch, token_rows, input_batch, plan_order
             )
             # TXG-FAIL-008: the rows the model state failed at planning.
             planning_failed = {row.request_id for row in step_plan.rows if row.failed}
@@ -659,7 +766,7 @@ class NemotronASRModelState(ModelState):
                 input_batch,
                 req_states,
                 {},
-                {r: self._metadata[r] for r in req_ids},
+                {r: self._requests[r].metadata for r in req_ids},
                 token_ids=tuple(tokens[0] for tokens in token_rows),
                 state_batch=batch,
                 file_rows={
@@ -673,6 +780,8 @@ class NemotronASRModelState(ModelState):
                     if row.is_file and not row.failed
                 ),
             )
+        self._scheduled_encoder_inputs = {}
+        self._features = None
         self._snapshot = snapshot
         return {"persistent_state_projection": snapshot}
 
@@ -683,12 +792,15 @@ class NemotronASRModelState(ModelState):
         batch: StateBatch,
         token_rows: list[tuple[int, ...]],
         input_batch: InputBatch,
+        plan_order: tuple[str, ...] | None = None,
     ) -> StepPlan:
         """Make the step's plan once: resolve stream rows' geometry and
-        deadline, then plan. FILE rows plan from their file's queue count;
-        no label book is read (FILE-QC-011)."""
+        deadline, then plan the rows in ``plan_order`` (default: the batch
+        order). FILE rows plan from their file's queue count; no label book is
+        read (FILE-QC-011)."""
         del bindings, batch
-        assert self._scheduler_output is not None
+        if plan_order is None:
+            plan_order = req_ids
         if not any(
             r in self._file_progress or r in self._failed_files for r in req_ids
         ):
@@ -707,14 +819,14 @@ class NemotronASRModelState(ModelState):
                 scheduled_token_id=token,
                 placeholder_id=int(config.audio_chunk_token_id),
                 num_computed_tokens=int(input_batch.num_computed_tokens_np[index]),
-                mm_features=self._metadata[req_id].mm_features,
+                mm_features=self._requests[req_id].metadata.mm_features,
                 scheduled_encoder_input_ids=self._scheduled_encoder_inputs.get(
                     req_id, ()
                 ),
             )
             assert header is not None
             stream_rows[req_id] = stream_order_key(header, now_ns=now_ns)
-        return self.plan_step(self._scheduler_output, stream_rows=stream_rows)
+        return self.plan_step(plan_order, stream_rows=stream_rows)
 
     # @spec SESS-MODEL-003, TXG-FAIL-008, FILE-QC-006, FILE-QC-012
     def postprocess_state(
@@ -729,19 +841,17 @@ class NemotronASRModelState(ModelState):
         collection = self.model.collect_commit_status()
         # Every collected failure (any nonzero status, SESS-MODEL-003), every
         # planning-failed row (TXG-FAIL-008), and every file row with no
-        # accepted count (FILE-QC-012) fails its request alone.
+        # accepted count (FILE-QC-012) fails a request. Core offers no channel
+        # that ends one request with an error, so a failure ends the engine.
         failed = set(collection.failed) | set(snapshot.planning_failed)
         failed |= self._apply_queue_counts(snapshot, collection)
-        if failed:
-            assert self.state_slots is not None
-            self.state_slots.fail_requests(failed)
-        self._initialized.update(
-            (b.request_id, b.handle)
-            for b in snapshot.bindings
-            if b.request_id not in failed
-        )
         self.model.consume_batch_stats()
         self._snapshot = None
+        if failed:
+            raise RuntimeError(
+                "Nemotron streaming rows failed and this core has no "
+                "per-request failure channel: " + ", ".join(sorted(failed))
+            )
 
     # @spec FILE-QC-006, FILE-QC-008, FILE-QC-009, FILE-QC-012, FILE-QC-013
     def _apply_queue_counts(
@@ -809,4 +919,7 @@ class NemotronASRModelState(ModelState):
     ) -> dict[str, Any]:
         if ubatch_idx or cudagraph_mode == CUDAGraphMode.FULL or for_capture:
             raise RuntimeError("Nemotron does not support DBO or outer graph capture")
+        self._decide_pending()
+        # The model builds no Mamba metadata: it plans its rows on the host.
+        self._attn_prepared = True
         return {}

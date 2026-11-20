@@ -789,17 +789,7 @@ def configure(overrides=None, after=None):
 
 def construct(vllm_config):
     from vllm.config.vllm import set_current_vllm_config
-    from vllm.v1.kv_cache_interface import PersistentStateSpec
     from vllm_nemotron_asr_streaming.model import Nemotron3_5AsrStreamingForRNNT
-    from vllm_nemotron_asr_streaming.nemotron_asr import state_profile
-
-    # Isolates the REG-STATE-001 blocker (the removed ``state_name``
-    # argument), so construction reaches the behaviour under test.
-    def layout(**kwargs):
-        kwargs.pop("state_name", None)
-        return PersistentStateSpec(**kwargs)
-
-    state_profile.PersistentStateSpec = layout
 
     try:
         with set_current_vllm_config(vllm_config):

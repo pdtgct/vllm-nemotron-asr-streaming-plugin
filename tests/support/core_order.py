@@ -11,12 +11,11 @@ model and shutting the worker down (``vllm/v1/worker/gpu_worker.py``,
    profiling forward (``profile_run``, which asks for the preparation again;
    the runner's guard makes that a no-op).
 2. ``profile_cudagraph_memory`` (the graph-memory estimate): a temporary
-   profiling state pool bound through ``initialize_state_slots`` (core's
+   profiling state pool bound to the state layer (core's
    ``initialize_kv_cache(..., is_profiling=True)``), then, when
    ``needs_capture()``, ``capture_cudagraphs(profile_only=True)`` into a
    throwaway graph pool and ``clear_cudagraphs``.
-3. ``initialize_from_config``: the serving state pool through
-   ``initialize_state_slots``.
+3. ``initialize_from_config``: the serving state pool, bound the same way.
 4. ``compile_or_warm_up_model``: the kernel warm-up dummy step; when
    ``needs_capture()``, ``capture_cudagraphs(profile_only=False)`` into the
    global graph pool; the post-capture dummy step; ``post_warmup``.
@@ -25,9 +24,8 @@ model and shutting the worker down (``vllm/v1/worker/gpu_worker.py``,
 ``needs_capture()`` is core's ``model_state_needs_cudagraph_capture``: the
 runner is not eager and the model state asks for a capture.
 
-Every capture runs under ``torch.inference_mode`` and inside the bound pool's
-startup-access window (core passes ``nullcontext`` while no pool is bound);
-on CUDA also inside ``graph_capture``, on its stream. On CPU the stream is the
+Every capture runs under ``torch.inference_mode``; on CUDA also inside
+``graph_capture``, on its stream. On CPU the stream is the
 caller's capture stream (a ``support.fake_cuda.FakeStream``) and the graph
 pools are the tokens :data:`PROFILING_POOL` and :data:`SERVING_POOL`; on CUDA
 they are ``current_platform.graph_pool_handle()`` and
@@ -52,18 +50,6 @@ from support import model_harness as h
 #: graph-memory estimate and core's global pool.
 PROFILING_POOL = "profiling-pool"
 SERVING_POOL = "global-pool"
-
-
-def _core_object(bindings: Any) -> Any:
-    """The ``StateSlotBindings`` a test double wraps: core enters the window on
-    its own object, so a spy or trap does not record core's call."""
-    while True:
-        if isinstance(bindings, h.BindingsSpy):
-            bindings = h.core_bindings(bindings)
-        elif isinstance(bindings, h.Trap):
-            bindings = object.__getattribute__(bindings, "_target")
-        else:
-            return bindings
 
 
 class CoreOrder:
@@ -134,13 +120,9 @@ class CoreOrder:
 
     @contextlib.contextmanager
     def _capture_context(self) -> Iterator[Any]:
-        bindings = self.runner.bindings
-        window = (
-            contextlib.nullcontext()
-            if bindings is None
-            else _core_object(bindings)._startup_access_window()
-        )
-        with torch.inference_mode(), window:
+        # PR 6 has no startup-access window: the layer's views are always
+        # readable.
+        with torch.inference_mode():
             if self.cuda:
                 from vllm.distributed.parallel_state import graph_capture
 

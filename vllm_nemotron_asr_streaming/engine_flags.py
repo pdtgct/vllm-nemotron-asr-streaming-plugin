@@ -47,18 +47,22 @@ PARALLEL_SIZES_MUST_BE_ONE: tuple[str, ...] = (
 #: The model adapter's unconditional internal vLLM dependencies, beyond the
 #: public client surface: module name -> names the adapter uses from it. A
 #: dotted name is a member of the name before the dot: a ``ModelState`` hook,
-#: or the ``memory_contributors`` constructor argument of
-#: ``PersistentStateSpec``.
+#: or a constructor argument (``MambaManager.layer_config``'s
+#: ``recomputable``).
 ADAPTER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "vllm.config.compilation": ("CUDAGraphMode",),
     "vllm.v1.core.sched.output": ("NewRequestData", "SchedulerOutput"),
     "vllm.v1.kv_cache_interface": (
         "KVCacheConfig",
-        "StateSlotHandle",
-        "PersistentStateSpec",
-        "PersistentStateSpec.memory_contributors",
-        "PersistentStateDescriptor",
+        "KVCacheLayerConfig",
+        "MambaSpec",
     ),
+    "vllm.model_executor.layers.mamba.abstract": ("MambaBase",),
+    "vllm.v1.core.single_type_kv_cache_manager": (
+        "MambaManager",
+        "MambaManager.layer_config.recomputable",
+    ),
+    "vllm.v1.attention.backends.registry": ("MambaAttentionBackendEnum",),
     "vllm.v1.worker.gpu.input_batch": ("InputBatch",),
     "vllm.v1.worker.gpu.model_states.interface": (
         "ModelState",
@@ -69,10 +73,8 @@ ADAPTER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "ModelState.post_warmup",
         "ModelState.shutdown",
     ),
-    "vllm.v1.worker.gpu.state_slots": ("StateSlotBindings", "StateSlotRows"),
     "vllm.v1.worker.gpu.states": ("RequestState",),
     "vllm.v1.worker.utils": ("AttentionGroup",),
-    "vllm.model_executor.layers.state": ("PersistentStateLayerBase",),
     "vllm.multimodal": ("MULTIMODAL_REGISTRY",),
     "vllm.v1.attention.backends.utils": ("NULL_BLOCK_ID",),
     "vllm.v1.worker.gpu.sample.output": ("SamplerOutput",),
@@ -91,7 +93,9 @@ GRAPH_RUNTIME_DEPENDENCIES: dict[str, tuple[str, ...]] = {
 }
 
 #: The transaction-graph dependencies, needed only while transaction graphs
-#: are on (``transaction_graph_config.transaction_graphs_on``).
+#: are on (``transaction_graph_config.transaction_graphs_on``). The PR 6
+#: proof of concept refuses transaction graphs (``pr6_poc_refusals``); no
+#: build it runs on has these members.
 TRANSACTION_GRAPH_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "vllm.v1.worker.gpu.state_slots": (
         "StateSlotBindings.startup_pool_access",
@@ -167,6 +171,26 @@ def _cuda_platform(vllm_config: Any) -> bool:
     return bool(current_platform.is_cuda())
 
 
+# @spec REG-ENG-001
+def pr6_poc_refusals(hf_config: Any) -> list[str]:
+    """The features the PR 6 proof of concept does not support: transaction
+    graphs (they need a state pool with fixed addresses and its layout) and
+    native burst (its history check refuses every turn after a session's
+    first, since PR 6 sends each turn with its cumulative prompt)."""
+    errors: list[str] = []
+    if _txg.transaction_graphs_on(hf_config):
+        errors.append(
+            f"{TRANSACTION_GRAPH_KEY} (transaction graphs) is not supported on "
+            "the PR 6 state layer in this proof of concept; remove it"
+        )
+    if getattr(hf_config, "experimental_native_burst", False):
+        errors.append(
+            "experimental_native_burst is not supported on the PR 6 state "
+            "layer in this proof of concept; remove it"
+        )
+    return errors
+
+
 def _mode_value(mode: Any) -> Any:
     return getattr(mode, "value", mode)
 
@@ -187,8 +211,10 @@ def hook_capture_refusals(vllm_config: Any, *, resolved: bool = False) -> list[s
 
     ``enforce_eager`` off lets core capture the model's graphs through the
     model-state hooks. It requires core's own CUDA graphs off
-    (``cudagraph_mode`` NONE; unset is accepted before core resolves it,
-    since core sets NONE for persistent state); torch.compile off
+    (``cudagraph_mode`` NONE; unset is accepted before core resolves it.
+    Stale on PR 6: its core no longer sets NONE for persistent state, so an
+    unset mode is refused only once resolved; pass ``-cc.cudagraph_mode
+    none``); torch.compile off
     (compilation mode NONE: ``-cc.mode none``, or ``-O0`` before core
     resolves the mode); a CUDA platform; at least one graph the hook
     captures; and no graph it does not (the compiled ``dense-graphed``
@@ -245,10 +271,14 @@ def persistent_state_config_errors(
 
     ``async_scheduling`` of ``True`` is refused. An unset value (``None``) is
     accepted before core resolves the option (``resolved=False``: it resolves
-    to ``False`` for a model that declares persistent state); once the engine
-    configuration is final (``resolved=True``) only ``False`` is accepted.
-    The result also lists every model-state hook the core lacks and every
-    condition ``transaction_graph_config_errors`` returns.
+    to ``False`` for a model that declares persistent state; stale on PR 6,
+    whose core resolves an unset value to ``True``, so the refusal then
+    fires only at model-state construction: pass ``--no-async-scheduling``);
+    once the engine configuration is final (``resolved=True``) only
+    ``False`` is accepted. The result also lists every model-state hook the
+    core lacks, the features the PR 6 proof of concept refuses
+    (``pr6_poc_refusals``) and every condition
+    ``transaction_graph_config_errors`` returns.
     """
     errors: list[str] = []
     scheduler = vllm_config.scheduler_config
@@ -310,6 +340,7 @@ def persistent_state_config_errors(
             + ", ".join(hooks)
             + "; the plugin requires vllm#67583's model-state hooks"
         )
+    errors.extend(pr6_poc_refusals(getattr(model, "hf_config", None)))
     errors.extend(_txg.transaction_graph_config_errors(vllm_config))
     return errors
 
@@ -336,15 +367,17 @@ def check_engine_config(
 
 def _absent(module: Any, name: str) -> bool:
     """Whether ``module`` lacks ``name``. A dotted name is a member of the
-    name before the dot: a callable attribute (a hook) or a constructor
-    argument."""
-    owner_name, _, member = name.partition(".")
-    try:
-        owner = getattr(module, owner_name)
-    except AttributeError:
-        return True
-    if not member:
-        return False
+    name before the last dot: a callable attribute (a hook) or a constructor
+    or call argument."""
+    *owners, member = name.split(".")
+    if not owners:
+        return not hasattr(module, member)
+    owner = module
+    for part in owners:
+        try:
+            owner = getattr(owner, part)
+        except AttributeError:
+            return True
     try:
         if member in inspect.signature(owner).parameters:
             return False
@@ -384,9 +417,9 @@ def check_adapter_dependencies() -> None:
     if missing:
         raise _dependency_error(
             missing,
-            "adapter dependencies (a vLLM build with RFC 1 stream admission, "
-            "vllm#67375 on #67374, and vllm#67583's model-state hooks is "
-            "required)",
+            "adapter dependencies (a vLLM build with pdtgct/vllm#6's state "
+            "layer, MambaManager.layer_config(recomputable=...), and "
+            "vllm#67583's model-state hooks is required)",
         )
 
 

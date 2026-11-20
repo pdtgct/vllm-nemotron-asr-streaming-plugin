@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """A malformed file request fails its own row and nothing else (CPU).
 
-Drives ``prepare_step``, the production planning and the registry binding of
-``_stage_v2_projection`` with a malformed file request next to a valid file
-request and a valid stream request.
+Drives core's request hooks (``add_request``), the production planning and
+the registry binding of ``_stage_v2_projection`` with a malformed file request
+next to a valid file request and a valid stream request.
 """
 
 from __future__ import annotations
@@ -105,9 +105,7 @@ def test_malformed_file_request_fails_only_its_row(file_model_state, make_step, 
     ids = ("good", "bad", "stream")
     handles = {i: make_step.handle(n + 1, 1) for n, i in enumerate(ids)}
     out = make_step.step(new=[good, bad, stream], handles=handles)
-    state.prepare_step(out, dummy_run=False, is_profile=False)
-    for n, request in enumerate((good, bad, stream)):
-        state.add_request(n, request)
+    make_step.run(state, out)
 
     bindings = tuple(RowBinding(i, handles[i][LAYER], True) for i in ids)
     input_batch = SimpleNamespace(

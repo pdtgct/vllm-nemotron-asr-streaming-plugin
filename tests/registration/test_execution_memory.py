@@ -362,16 +362,18 @@ def skip_evidence(env) -> bool:
 
 
 def assert_bindings_valid(spy, output, since: int = 0):
-    """Every ``bind_rows`` call of the step (from index ``since``) names the
-    model's layer, requests of this step in the step's order, and their
-    scheduler-output handles."""
+    """Every row binding of the step (from index ``since``; recorded by the
+    harness at ``prepare_inputs``) names the model's layer, requests of this
+    step in the step's order, and the slots core gave them: a new request's
+    ``block_ids``."""
     order = [r.req_id for r in output.scheduled_new_reqs]
     order += list(output.scheduled_cached_reqs.req_ids)
+    slots = {r.req_id: r.block_ids[0][0] for r in output.scheduled_new_reqs}
     for layer, ids, handles, _ in spy.bind_calls[since:]:
         assert layer == h.STATE_LAYER
         assert list(ids) == [r for r in order if r in ids], (ids, order)
-        assert handles == tuple(
-            output.state_slot_handles[r][h.STATE_LAYER] for r in ids
+        assert all(
+            handle.slot == slots[r] for r, handle in zip(ids, handles) if r in slots
         )
 
 
@@ -756,12 +758,12 @@ def test_failed_preparation_refuses_real_steps(build):
 def test_preparation_reads_no_state_slot_bindings_or_pool(build, arm):
     env = build(arm=arm)
     trap = trapped_pool(env)
-    pool_bytes = trap._target.views[h.STATE_LAYER]._tensor.clone()
+    pool_bytes = h.pool_tensor(trap._target).clone()
     env.runner.profile_run(core_embeds=False)
     finals = [c for c in env.profile.calls if is_final(c)]
     assert max_shapes(env) <= profiled_shapes(env, finals)
     assert trap.reads == []
-    assert torch.equal(pool_bytes, trap._target.views[h.STATE_LAYER]._tensor)
+    assert torch.equal(pool_bytes, h.pool_tensor(trap._target))
 
 
 # @spec REG-MEM-005
@@ -828,19 +830,16 @@ def test_dummy_output_matches_the_input_embeddings(build, step):
 def test_dummy_prepare_inputs_after_a_real_step_reads_nothing_retained(
     build, pool_exists, is_profile
 ):
-    """E15: core calls ``prepare_inputs`` on dummy steps after ``prepare_step``
-    returned early; the previous real step's scheduler output is stale."""
-    from vllm.v1.core.sched.output import SchedulerOutput
-
+    """E15: core calls ``prepare_inputs`` on dummy steps after real steps;
+    nothing of the previous real step's rows reaches the dummy step."""
     env = build()
     env.runner.profile_run(core_embeds=False)
-    real = h.Trap(rows_of(env, "mixed"), "scheduler_output")
-    env.state.prepare_step(real, dummy_run=False, is_profile=False)
-    real.armed = True
+    h.drive_step(env.state, rows_of(env, "mixed"))
     trap = trapped_pool(env) if pool_exists else None
-    env.state.prepare_step(
-        SchedulerOutput.make_empty(), dummy_run=True, is_profile=is_profile
-    )
+    if not is_profile:
+        # core builds attention metadata for every dummy step but the
+        # memory profile's
+        env.runner._attn(h.dummy_batch(env.state, 2, 2))
     batch = h.dummy_batch(env.state, 2, 2)
     kwargs = env.state.prepare_inputs(batch, env.runner.req_states)
     assert "'s1'" not in repr(kwargs) and "'f1'" not in repr(kwargs)
@@ -997,6 +996,15 @@ def test_session_turn_arrives_as_a_new_request_between_cached_steps(build):
     assert env.state._file_progress["f1"] != file_before, "the file row stalled"
 
 
+def row_batch(req_ids, computed, *, scheduled: int = 1):
+    """The ``InputBatch`` fields the model state reads for host tokens."""
+    return SimpleNamespace(
+        req_ids=list(req_ids),
+        num_computed_tokens_np=np.array(computed, dtype=np.int32),
+        num_scheduled_tokens=np.full(len(req_ids), scheduled, dtype=np.int32),
+    )
+
+
 def prompted(req_id: str, prompt: list[int]):
     return dataclasses.replace(
         h.new_request(req_id, prompt[0]),
@@ -1014,25 +1022,22 @@ def test_cached_row_reads_a_real_prompt_token(build):
     assert {first, second}.isdisjoint(
         {int(env.config.file_carrier_token_id), int(env.config.audio_chunk_token_id)}
     )
-    new = h.scheduler_output(new=(prompted("r1", [first, second]),), encoder_inputs={})
-    env.state.prepare_step(new, dummy_run=False, is_profile=False)
+    new = h.scheduler_output(
+        new=(prompted("r1", [first, second]),), encoder_inputs={}, handles={"r1": 1}
+    )
+    h.drive_step(env.state, new)
     assert env.state._scheduled_tokens == {"r1": (first,)}
-    cached = cached_step(env, ["r1"], {"r1": 1}, handles={"r1": 1})
-    env.state.prepare_step(cached, dummy_run=False, is_profile=False)
-    assert env.state._scheduled_tokens == {"r1": (second,)}
+    assert env.state._row_tokens(row_batch(["r1"], [1])) == [(second,)]
 
 
 # @spec REG-STATE-008
 def test_cached_window_crossing_the_end_of_the_prompt_is_refused(build):
     env = build()
-    new = h.scheduler_output(new=(prompted("r1", [7, 9]),), encoder_inputs={})
-    env.state.prepare_step(new, dummy_run=False, is_profile=False)
-    cached = cached_step(env, ["r1"], {"r1": 1}, handles={"r1": 1})
-    cached.num_scheduled_tokens["r1"] = 2
-    cached.total_num_scheduled_tokens = 2
-    error = h.call_with(
-        env.state.prepare_step, cached, dummy_run=False, is_profile=False
+    new = h.scheduler_output(
+        new=(prompted("r1", [7, 9]),), encoder_inputs={}, handles={"r1": 1}
     )
+    h.drive_step(env.state, new)
+    error = h.call_with(env.state._row_tokens, row_batch(["r1"], [1], scheduled=2))
     assert isinstance(error, ValueError) and "r1" in str(error), error
 
 
@@ -2047,13 +2052,13 @@ def test_shutdown_tolerates_a_model_state_whose_initialization_did_not_complete(
 def test_hook_preparation_profile_and_capture_read_no_state_slots(hook):
     env = hook()
     trap = trapped_pool(env)
-    pool_bytes = trap._target.views[h.STATE_LAYER]._tensor.clone()
+    pool_bytes = h.pool_tensor(trap._target).clone()
     env.runner.profile_run(core_embeds=False)  # preparation, then the profile
     _capture(env, profile_only=True)
     env.state.clear_cudagraphs()
     _capture(env, profile_only=False)
     assert trap.reads == []
-    assert torch.equal(pool_bytes, trap._target.views[h.STATE_LAYER]._tensor)
+    assert torch.equal(pool_bytes, h.pool_tensor(trap._target))
 
 
 # ---------------------------------------------------------------------------
