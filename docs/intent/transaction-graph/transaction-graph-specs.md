@@ -49,8 +49,10 @@ refused configuration are specified and measured, and none forecloses capturing 
 conformance. On a state layer that offers no state-group layout accessor, which is every core
 this build supports, transaction graphs are refused (TXG-CFG-016); there the configuration checks
 TXG-CFG-001 and TXG-CFG-003 to TXG-CFG-016 are current conformance (a refusal lists TXG-CFG-016
-with every other violated condition), and every other spec here is an obligation of the transaction-graph design's Future roadmap item on
-the state layer.
+with every other violated condition), as is every spec that holds while transaction graphs are
+off or whether they are on or off (among them the option-off transaction, row coverage and row
+failure); a spec that holds only where transaction graphs are on is an obligation of the
+transaction-graph design's Future roadmap item on the state layer.
 
 ## Option and configuration checks
 
