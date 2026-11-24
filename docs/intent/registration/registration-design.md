@@ -720,7 +720,7 @@ is imported:
 | `vllm.utils.import_utils` | `resolve_obj_by_qualname` |
 | `vllm.compilation.cudagraph_pool` | `capture_pool` |
 | `vllm.envs` | `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` |
-| `vllm.v1.worker.gpu.state_slots` (transaction graphs) | `StateSlotBindings.startup_pool_access`, `StateSlotBindings.pool_layout` |
+| `vllm.v1.worker.gpu.state_slots` (transaction graphs, on a core that runs them; not checked on the state layer) | `StateSlotBindings.startup_pool_access`, `StateSlotBindings.pool_layout` |
 | `vllm.utils.torch_utils` | `direct_register_custom_op` |
 | `vllm.model_executor.determinism.batch_invariant` | the batch-invariant matmul used by the batch-invariant mode |
 

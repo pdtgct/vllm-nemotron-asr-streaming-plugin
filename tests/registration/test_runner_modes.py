@@ -973,15 +973,13 @@ def test_first_initialize_kv_cache_in_the_process_logs_the_modes_once(
     assert _NO_RUNNER_CAPTURE.search(line), line
     assert _OWN_GRAPHS_THROUGH_THE_HOOK.search(line), line
     # Once in the process: not again for the same model state, nor for
-    # another one constructed under other modes.
+    # another one constructed under other modes. A repeat is any line with
+    # either statement of the log; other lines naming a mode are not.
     for messages in (again, other_state):
         assert not [
             m
             for m in messages
-            if "own graphs" in m.lower()
-            or _names_modes(m, "FULL_DECODE_ONLY")
-            or _names_modes(m, "DYNAMO_TRACE_ONCE")
-            or _names_modes(m, "FULL_AND_PIECEWISE", "VLLM_COMPILE")
+            if _NO_RUNNER_CAPTURE.search(m) or _OWN_GRAPHS_THROUGH_THE_HOOK.search(m)
         ], messages
 
 

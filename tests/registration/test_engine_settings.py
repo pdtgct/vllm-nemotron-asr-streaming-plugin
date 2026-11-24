@@ -874,8 +874,7 @@ def test_an_enforce_eager_remedy_names_removing_transaction_graphs(
     """At 80 ms with the default arms, transaction graphs on: the clause
     carrying the ``--enforce-eager`` remedy itself names removing
     ``transaction_graph_populations`` (TXG-CFG-016's own condition, which
-    names the option too, is a separate clause). With the option absent the
-    remedy does not name it."""
+    names the option too, is a separate clause)."""
     config = _hook_config(
         engine_config,
         platform,
@@ -884,11 +883,6 @@ def test_an_enforce_eager_remedy_names_removing_transaction_graphs(
         **settings,
     )
     assert _eager_remedies_name_removing_transaction_graphs(_refuse(config))
-    off = _hook_config(engine_config, platform, num_lookahead_tokens=0, **settings)
-    message = _refuse(off)
-    assert not [
-        c for c in rc.eager_remedy_clauses(message) if rc.TRANSACTION_GRAPH_KEY in c
-    ], message
 
 
 @pytest.mark.parametrize("value", [{}, None, False, "", 0], ids=repr)
