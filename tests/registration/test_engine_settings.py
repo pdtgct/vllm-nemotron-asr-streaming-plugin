@@ -25,6 +25,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from support import runner_conditions as rc
 
 pytestmark = pytest.mark.engine
 
@@ -262,11 +263,13 @@ def test_real_vllm_config_with_accepted_settings_constructs(
 def test_real_vllm_config_with_any_async_scheduling_value_constructs(
     make_model_config, make_vllm_config, card_dir, value
 ):
-    """The hook refuses no value; core resolves an unset one."""
+    """The hook refuses no value; the configuration constructs. Only
+    acceptance is asserted: core resolves an unset value, and on CPU the
+    platform's own hook forces asynchronous scheduling off
+    (``CpuPlatform.check_and_update_config``), so a requested ``True`` need
+    not survive."""
     vllm_config = make_vllm_config(make_model_config(card_dir), async_scheduling=value)
     assert isinstance(vllm_config.scheduler_config.async_scheduling, bool)
-    if value is not None:
-        assert vllm_config.scheduler_config.async_scheduling is value
 
 
 # @spec REG-ENG-003
@@ -579,13 +582,13 @@ def test_the_hook_configuration_is_accepted(engine_config, platform, case, stage
 
 
 @STAGES
-# @spec REG-ENG-005, REG-ENG-006, TXG-CFG-016
+# @spec REG-ENG-005, REG-ENG-006, TXG-CFG-016, TXG-CFG-011
 def test_transaction_graphs_at_80_ms_are_refused_on_the_state_layer(
     engine_config, platform, stage
 ):
     """Every other condition holds (80 ms, the default arms, NONE/NONE on
-    CUDA); the refusal is the state-layer condition, naming the option's
-    removal."""
+    CUDA); the refusal carries the state-layer condition exactly once
+    (``support.runner_conditions.assert_one_state_layer_condition``)."""
     config = _hook_config(
         engine_config,
         platform,
@@ -594,7 +597,7 @@ def test_transaction_graphs_at_80_ms_are_refused_on_the_state_layer(
         transaction_graph_populations=[2],
     )
     message = _refused_at(config, stage)
-    _has(message, "transaction_graph_populations", "state layer", "remov")
+    rc.assert_one_state_layer_condition(message, config)
 
 
 @pytest.mark.parametrize("cudagraph", ACCEPTED_GRAPHS)
@@ -712,71 +715,57 @@ def test_construction_reads_breakable_graphs_from_the_resolved_setting(
     on = _hook_config(
         engine_config, platform, mode="none", cudagraph="piecewise", breakable=True
     )
-    _has(_refuse_resolved(on), "VLLM_USE_BREAKABLE_CUDAGRAPH=0")
+    rc.assert_named_with_remedy(_refuse_resolved(on), "breakable piecewise")
 
 
-#: case -> (stage, environment, settings, words the refusal must contain: the
-#: condition and its remedy). ``stage`` is ``"hook"``, ``"constructor"`` or
-#: ``"both"``.
+#: case -> (stage, environment, settings, the unmet condition, named with a
+#: remedy its spec allows: ``support.runner_conditions.CONDITIONS``).
+#: ``stage`` is ``"hook"``, ``"constructor"`` or ``"both"``.
 _HOOK_REFUSED = {
-    "full graphs": (
-        "both",
-        {},
-        {"cudagraph": "full"},
-        ("cudagraph_mode", "FULL", "-cc.cudagraph_mode none"),
-    ),
+    "full graphs": ("both", {}, {"cudagraph": "full"}, "graph mode"),
     "full graphs under breakable graphs": (
         "both",
         {"breakable": True},
         {"cudagraph": "full", "breakable": True},
-        ("cudagraph_mode", "FULL", "-cc.cudagraph_mode none"),
+        "graph mode",
     ),
     "breakable piecewise": (
         "both",
         {"breakable": True},
         {"cudagraph": "piecewise", "breakable": True},
-        (
-            "PIECEWISE",
-            "VLLM_USE_BREAKABLE_CUDAGRAPH=0",
-            "-cc.cudagraph_mode none",
-        ),
+        "breakable piecewise",
     ),
-    "stock torch.compile": (
-        "both",
-        {},
-        {"mode": "stock"},
-        ("stock", "-cc.mode none"),
-    ),
+    "stock torch.compile": ("both", {}, {"mode": "stock"}, "compilation mode"),
     "stock torch.compile surviving construction under breakable graphs": (
         "constructor",
         {"breakable": True},
         {"mode": "stock", "breakable": True},
-        ("stock", "-cc.mode none"),
+        "compilation mode",
     ),
     "stock torch.compile surviving construction under TORCH_COMPILE_DISABLE": (
         "constructor",
         {"compile_disabled": True},
         {"mode": "stock"},
-        ("stock", "-cc.mode none"),
+        "compilation mode",
     ),
-    "not CUDA": ("both", {}, {"cuda": False}, ("cuda", "--enforce-eager")),
+    "not CUDA": ("both", {}, {"cuda": False}, "platform"),
     "no hook-captured graph": (
         "both",
         {},
         {"encoder_execution_arm": "eager", "decode_dispatch_arm": "dense-eager"},
-        ("eager-graphed", "dense-graphed", "--enforce-eager"),
+        "hook-captured graph",
     ),
     "compiled encoder": (
         "both",
         {},
         {"encoder_execution_arm": "dense-graphed"},
-        ("encoder_execution_arm", "dense-graphed", "--enforce-eager"),
+        "compiled encoder",
     ),
     "chunk buckets": (
         "both",
         {},
         {"chunk_bucket_graph_populations": [1]},
-        ("chunk_bucket_graph_populations", "--enforce-eager"),
+        "chunk buckets",
     ),
 }
 
@@ -793,7 +782,10 @@ _REFUSED_CASES = [
 def test_each_unmet_hook_condition_is_named_with_its_remedy(
     engine_config, platform, runner_env, case, stage
 ):
-    _stages, env, settings, words = _HOOK_REFUSED[case]
+    """The condition by its own phrase, and one of the remedies its spec
+    allows (REG-ENG-025's graph-selection remedy: either graphed arm or
+    ``--enforce-eager``)."""
+    _stages, env, settings, condition = _HOOK_REFUSED[case]
     runner_env(**env)
     settings = dict(settings)
     if stage == "hook":
@@ -803,25 +795,7 @@ def test_each_unmet_hook_condition_is_named_with_its_remedy(
     else:
         settings.setdefault("breakable", False)
     config = _hook_config(engine_config, platform, **settings)
-    _has(_refused_at(config, stage), *words)
-
-
-@STAGES
-# @spec REG-ENG-025
-def test_the_no_hook_captured_graph_remedy_does_not_suggest_transaction_graphs(
-    engine_config, platform, stage
-):
-    """Transaction graphs are refused on this core (TXG-CFG-016), so the
-    remedy names only the graphed arms and ``--enforce-eager``."""
-    config = _hook_config(
-        engine_config,
-        platform,
-        breakable=None if stage == "hook" else False,
-        encoder_execution_arm="eager",
-        decode_dispatch_arm="dense-eager",
-    )
-    message = _refused_at(config, stage)
-    assert "transaction" not in message.lower(), message
+    rc.assert_named_with_remedy(_refused_at(config, stage), condition)
 
 
 @STAGES
@@ -841,16 +815,15 @@ def test_every_unmet_hook_condition_is_named_in_one_error(
         chunk_bucket_graph_populations=[1],
     )
     message = _refused_at(config, stage)
-    _has(
-        message,
-        "-cc.cudagraph_mode none",
-        "-cc.mode none",
-        "cuda",
-        "dense-graphed",
-        "eager-graphed",
-        "chunk_bucket_graph_populations",
-        "--enforce-eager",
-    )
+    for condition in (
+        "graph mode",
+        "compilation mode",
+        "platform",
+        "hook-captured graph",
+        "compiled encoder",
+        "chunk buckets",
+    ):
+        rc.assert_condition(message, condition)
 
 
 @STAGES
@@ -869,16 +842,20 @@ def test_breakable_piecewise_is_named_with_the_other_unmet_conditions(
         chunk_bucket_graph_populations=[1],
     )
     message = _refused_at(config, stage)
-    _has(
-        message,
-        "VLLM_USE_BREAKABLE_CUDAGRAPH=0",
-        "cuda",
-        "chunk_bucket_graph_populations",
-        "--enforce-eager",
-    )
+    for condition in ("breakable piecewise", "platform", "chunk buckets"):
+        rc.assert_condition(message, condition)
 
 
-@pytest.mark.parametrize(
+def _eager_remedies_name_removing_transaction_graphs(message: str) -> bool:
+    """REG-ENG-005: every clause of ``message`` that names
+    ``--enforce-eager`` also names removing ``transaction_graph_populations``
+    (``support.runner_conditions.clauses``)."""
+    remedies = rc.eager_remedy_clauses(message)
+    assert remedies, message
+    return all(rc.names_removal_of(c, rc.TRANSACTION_GRAPH_KEY) for c in remedies)
+
+
+_EAGER_REMEDY_CONDITIONS = pytest.mark.parametrize(
     "settings",
     [
         {"cuda": False},
@@ -887,14 +864,18 @@ def test_breakable_piecewise_is_named_with_the_other_unmet_conditions(
     ],
     ids=["not CUDA", "compiled encoder", "chunk buckets"],
 )
+
+
+@_EAGER_REMEDY_CONDITIONS
 # @spec REG-ENG-005
 def test_an_enforce_eager_remedy_names_removing_transaction_graphs(
     engine_config, platform, settings
 ):
-    """At 80 ms with the default arms the transaction-graph checks of the
-    hook-runner pass, so ``transaction_graph_populations`` reaches the message
-    only through the ``--enforce-eager`` remedy (the option is refused under
-    ``--enforce-eager``)."""
+    """At 80 ms with the default arms, transaction graphs on: the clause
+    carrying the ``--enforce-eager`` remedy itself names removing
+    ``transaction_graph_populations`` (TXG-CFG-016's own condition, which
+    names the option too, is a separate clause). With the option absent the
+    remedy does not name it."""
     config = _hook_config(
         engine_config,
         platform,
@@ -902,9 +883,12 @@ def test_an_enforce_eager_remedy_names_removing_transaction_graphs(
         transaction_graph_populations=[2],
         **settings,
     )
-    message = _refuse(config)
-    assert "--enforce-eager" in message
-    assert "transaction_graph_populations" in message, message
+    assert _eager_remedies_name_removing_transaction_graphs(_refuse(config))
+    off = _hook_config(engine_config, platform, num_lookahead_tokens=0, **settings)
+    message = _refuse(off)
+    assert not [
+        c for c in rc.eager_remedy_clauses(message) if rc.TRANSACTION_GRAPH_KEY in c
+    ], message
 
 
 @pytest.mark.parametrize("value", [{}, None, False, "", 0], ids=repr)
@@ -913,7 +897,7 @@ def test_a_malformed_transaction_graph_value_counts_as_on(
     engine_config, platform, value
 ):
     """TXG-CFG-014: one on/off predicate; ``{}`` and the like are on, so the
-    ``--enforce-eager`` remedy names the option."""
+    ``--enforce-eager`` remedy's clause names removing the option."""
     config = _hook_config(
         engine_config,
         platform,
@@ -921,8 +905,7 @@ def test_a_malformed_transaction_graph_value_counts_as_on(
         num_lookahead_tokens=0,
         transaction_graph_populations=value,
     )
-    message = _refuse(config)
-    assert "transaction_graph_populations" in message, message
+    assert _eager_remedies_name_removing_transaction_graphs(_refuse(config))
 
 
 # --------------------------------------------------------------------------
@@ -1070,14 +1053,17 @@ def test_model_state_refuses_a_core_without_the_hooks(
     assert "post_warmup" in str(excinfo.value)
 
 
-# @spec REG-ENG-006, REG-VAL-008
+# @spec REG-ENG-006, REG-VAL-008, TXG-CFG-011, TXG-CFG-016
 def test_model_state_reruns_the_transaction_graph_checks(
     good_vllm_config, build_model_state
 ):
     """The option turned on after the hook ran (under ``--enforce-eager``)
-    is refused at construction, naming the option."""
+    is refused at construction, naming the option, with the state-layer
+    condition exactly once."""
     config = good_vllm_config()
     config.model_config.hf_config.transaction_graph_populations = [2]
     with pytest.raises(ValueError) as excinfo:
         build_model_state(config)
-    assert "transaction_graph_populations" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "transaction_graph_populations" in message
+    rc.assert_one_state_layer_condition(message, config)

@@ -4,8 +4,9 @@ TXG-CFG-016).
 
 Every core this build supports has a state layer without a state-group layout
 accessor, so whenever transaction graphs are on the checks also return
-TXG-CFG-016's state-layer condition (``errors_for`` asserts it and returns the
-other conditions).
+TXG-CFG-016's state-layer condition (``errors_for`` asserts that exactly one
+condition mentions the state layer, that it is TXG-CFG-016's in full, and
+returns the other conditions).
 
 CPU tests on configuration doubles (``support.txg_fakes``), except the
 callers of TXG-CFG-011, which use the stage 1 build (``engine``). The checks'
@@ -23,6 +24,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from support import runner_conditions as rc
 from support import txg_api as api
 from support.txg_fakes import engine_config, hf_config
 
@@ -30,19 +32,20 @@ KEY = api.KEY
 VALID = [4]
 
 
-def is_state_layer_condition(error: str) -> bool:
-    """TXG-CFG-016's condition: the option, the state layer, and its removal
-    as the remedy."""
-    lowered = error.lower()
-    return KEY in error and "state layer" in lowered and "remov" in lowered
-
-
-def without_state_layer(errors):
-    """The conditions other than TXG-CFG-016's, after asserting that it is
-    among ``errors`` exactly once (transaction graphs are on)."""
-    found = [e for e in errors if is_state_layer_condition(e)]
+def without_state_layer(errors, value):
+    """The conditions other than TXG-CFG-016's, after asserting that exactly
+    one condition mentions the state layer and that it is TXG-CFG-016's in
+    full: the option, the rejected ``value`` (TXG-CFG-003), the missing
+    state-group layout accessor and the option's removal. A condition that
+    folded another violation into the state-layer one would be the one
+    mentioning it, so it is not silently dropped: the other conditions are
+    still asserted by the callers."""
+    found = [e for e in errors if rc.state_layer_mentions(e)]
     assert len(found) == 1, errors
-    return [e for e in errors if not is_state_layer_condition(e)]
+    (condition,) = found
+    assert rc.is_state_layer_condition(condition), condition
+    assert shows_value(condition, value), (value, condition)
+    return [e for e in errors if e != condition]
 
 
 def errors_for(populations=VALID, **kwargs):
@@ -61,7 +64,8 @@ def errors_for(populations=VALID, **kwargs):
         )
     }
     return without_state_layer(
-        api.config_errors(engine_config(hf_config(populations, **hf_kwargs), **kwargs))
+        api.config_errors(engine_config(hf_config(populations, **hf_kwargs), **kwargs)),
+        populations,
     )
 
 
@@ -152,7 +156,9 @@ def test_option_is_read_only_from_its_key():
 # @spec TXG-CFG-001, TXG-CFG-004
 @pytest.mark.parametrize("value", ON_VALUES[1:])
 def test_malformed_values_are_on_and_refused(value):
-    errors = without_state_layer(api.config_errors(engine_config(hf_config(value))))
+    errors = without_state_layer(
+        api.config_errors(engine_config(hf_config(value))), value
+    )
     # required information: the option's name and the offending value, in
     # whatever quoting the diagnostic uses
     assert [e for e in mentioning(errors, KEY) if shows_value(e, value)], errors
@@ -415,21 +421,27 @@ def test_runner_and_platform_conditions_are_not_repeated(setting):
 def test_every_violated_condition_is_returned():
     from support.txg_fakes import _ABSENT
 
-    errors = errors_for(
-        [0],
-        lookahead=3,
-        native_burst=True,
-        encoder_arm=_ABSENT,
-        enforce_eager=True,
+    # The whole list: the state-layer condition is one entry among six, and
+    # each other violation is its own entry beside it.
+    errors = api.config_errors(
+        engine_config(
+            hf_config([0], lookahead=3, native_burst=True, encoder_arm=_ABSENT),
+            enforce_eager=True,
+        )
     )
-    assert len(errors) == 5, errors
+    assert len(errors) == 6, errors
     for error in errors:
         assert KEY in error, error
-    assert mentioning(errors, "0")
-    assert mentioning(errors, "num_lookahead_tokens")
-    assert mentioning(errors, "experimental_native_burst")
-    assert mentioning(errors, "encoder_execution_arm")
-    assert mentioning(errors, "--enforce-eager")
+    others = without_state_layer(errors, [0])
+    assert len(others) == 5, errors
+    for needle in (
+        "0",
+        "num_lookahead_tokens",
+        "experimental_native_burst",
+        "encoder_execution_arm",
+        "--enforce-eager",
+    ):
+        assert mentioning(others, needle), (needle, errors)
 
 
 # ---------------------------------------------------------------------------

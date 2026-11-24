@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from support import runner_conditions as rc
 
 pytestmark = pytest.mark.engine
 
@@ -489,7 +490,7 @@ def test_plugin_load_refuses_a_build_without_the_model_state_hooks(monkeypatch):
     ],
     ids=["transaction-graphs", "native-burst"],
 )
-# @spec REG-ENG-019, TXG-CFG-016
+# @spec REG-ENG-019, TXG-CFG-016, TXG-CFG-011
 def test_the_state_layer_refuses_transaction_graphs_and_native_burst(
     engine_config, platform, overrides, option
 ):
@@ -517,12 +518,17 @@ def test_the_state_layer_refuses_transaction_graphs_and_native_burst(
             hf=hf,
         )
 
+    refused = config(overrides)
     with pytest.raises(ValueError) as excinfo:
-        Nemotron3_5AsrStreamingConfig.verify_and_update_config(config(overrides))
+        Nemotron3_5AsrStreamingConfig.verify_and_update_config(refused)
     message = str(excinfo.value)
     assert option in message, message
-    assert "state layer" in message.lower(), message
     assert "remov" in message.lower(), message
+    # One state-layer refusal, not a second one beside it (TXG-CFG-011).
+    if option == rc.TRANSACTION_GRAPH_KEY:
+        rc.assert_one_state_layer_condition(message, refused)
+    else:
+        assert rc.state_layer_mentions(message) == 1, message
     Nemotron3_5AsrStreamingConfig.verify_and_update_config(
         config({"num_lookahead_tokens": overrides["num_lookahead_tokens"]})
     )

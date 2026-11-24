@@ -15,8 +15,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+from types import SimpleNamespace
 
 import pytest
+from support import runner_conditions as rc
 from support.card import (
     BLANK,
     CARD_DEFAULT_LOOKAHEAD,
@@ -176,38 +178,81 @@ def test_stale_stored_right_context_is_replaced(
     assert model_config.hf_config.att_context_right == 3
 
 
+# --------------------------------------------------------------------------
+# Native burst's lookahead (REG-LA-007, REG-ENG-019)
+#
+# REG-LA-007 holds where native burst is supported on the running core. This
+# build's cores have the state layer, which refuses native burst outright
+# (REG-ENG-019), so REG-LA-007's lookahead condition is unit-tested on native
+# burst's own check of it (``validate_native_burst_config`` with the 160 ms
+# profile), and startup on this core is tested after it.
+# --------------------------------------------------------------------------
+
+
+def _native_burst_lookahead_check(lookahead: int) -> None:
+    from vllm_nemotron_asr_streaming.nemotron_asr.native_burst import (
+        validate_native_burst_config,
+    )
+
+    single_device = SimpleNamespace(
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        speculative_config=None,
+        parallel_config=SimpleNamespace(),
+        model_config=SimpleNamespace(logits_processors=None),
+    )
+    validate_native_burst_config(
+        single_device,
+        hf_config=SimpleNamespace(num_lookahead_tokens=lookahead),
+        require_160ms_profile=True,
+    )
+
+
+@pytest.mark.parametrize("lookahead", [0, 3, 6, 13])
 # @spec REG-LA-007
-def test_native_burst_on_the_card_default_is_refused_naming_both(
-    make_model_config, card_dir
+def test_native_bursts_lookahead_check_refuses_another_lookahead_naming_both(
+    lookahead,
 ):
     with pytest.raises(ValueError) as excinfo:
-        make_model_config(
-            card_dir, lookahead=None, overrides={"experimental_native_burst": True}
+        _native_burst_lookahead_check(lookahead)
+    message = str(excinfo.value)
+    assert re.search(rf"\b{lookahead}\b", message), message
+    assert re.search(r"\b1\b", message), message
+
+
+# @spec REG-LA-007
+def test_native_bursts_lookahead_check_accepts_lookahead_one():
+    _native_burst_lookahead_check(1)
+
+
+#: Advice to serve lookahead 1 (160 ms), REG-LA-007's remedy.
+_LOOKAHEAD_ONE_ADVICE = re.compile(
+    r"(?i)(?:\blookahead\b|num_lookahead_tokens)[^;]{0,60}?(?<![\d.])1(?![\d])"
+    r"|\b160\s?ms\b"
+)
+
+
+@pytest.mark.parametrize("lookahead", [3, 0])
+# @spec REG-ENG-019, REG-LA-007
+def test_native_burst_at_another_lookahead_is_refused_once_for_the_state_layer(
+    make_model_config, make_vllm_config, card_dir, lookahead
+):
+    """Startup on this core refuses native burst once, for the state layer,
+    naming its removal. It does not ask for lookahead 1 first (REG-LA-007's
+    remedy, whose premise does not hold here): a user who followed that
+    advice would only meet the same refusal."""
+    with pytest.raises(ValueError) as excinfo:
+        make_vllm_config(
+            make_model_config(
+                card_dir,
+                lookahead=lookahead,
+                overrides={"experimental_native_burst": True},
+            )
         )
     message = str(excinfo.value)
-    assert "experimental_native_burst" in message
-    assert re.search(r"\b3\b", message) and re.search(r"\b1\b", message)
-
-
-@pytest.mark.parametrize("lookahead", [0, 6, 13])
-# @spec REG-LA-007
-def test_native_burst_with_another_lookahead_is_refused(
-    make_model_config, card_dir, lookahead
-):
-    with pytest.raises(ValueError, match="experimental_native_burst"):
-        make_model_config(
-            card_dir,
-            lookahead=lookahead,
-            overrides={"experimental_native_burst": True},
-        )
-
-
-# @spec REG-LA-007
-def test_native_burst_at_lookahead_one_is_accepted(make_model_config, card_dir):
-    model_config = make_model_config(
-        card_dir, lookahead=1, overrides={"experimental_native_burst": True}
-    )
-    assert _served(model_config) == 1
+    assert re.search(r"(?i)experimental_native_burst|native burst", message), message
+    assert rc.state_layer_mentions(message) == 1, message
+    assert re.search(r"(?i)\bremov", message), message
+    assert not _LOOKAHEAD_ONE_ADVICE.search(message), message
 
 
 # @spec REG-LA-007
@@ -366,7 +411,6 @@ def test_every_failed_check_is_listed_in_one_error(make_model_config, tmp_path):
             lookahead=12,
             overrides={
                 "supported_num_lookahead_tokens": [11],
-                "experimental_native_burst": True,
                 "language_locales": {"en": "fr-FR"},
                 "vocab_size": BLANK + 5,
             },
@@ -377,7 +421,6 @@ def test_every_failed_check_is_listed_in_one_error(make_model_config, tmp_path):
     for needle in (
         "12",  # REG-LA-002
         "supported_num_lookahead_tokens",  # REG-LA-008
-        "experimental_native_burst",  # REG-LA-007
         "fr-FR",  # REG-VAL-002
         "vocab_size",  # REG-VAL-001
         "max_model_len",  # REG-VAL-001

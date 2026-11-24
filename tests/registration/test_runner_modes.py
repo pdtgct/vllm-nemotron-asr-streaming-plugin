@@ -32,6 +32,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from support import model_harness as h
+from support import runner_conditions as rc
 
 pytestmark = pytest.mark.engine
 
@@ -50,13 +51,18 @@ ACCEPTED_GRAPHS = ("none", "piecewise", "full_decode_only", "full_and_piecewise"
 ACCEPTED_MODES = ("none", "trace", "compile")
 BREAKABLE_GRAPHS = ("none", "full_decode_only", "full_and_piecewise")
 
-#: The name the model state reports with its graph support (REG-ENG-016).
+#: The statement of the model state's runner-graph refusals (REG-ENG-017,
+#: REG-ENG-029).
 NO_RUNNER_GRAPH = "supports no runner graph"
 
 
 def _compilation_mode(name):
+    """A compilation mode by short name (``None``: unset); a mode passes
+    through."""
     from vllm.config.compilation import CompilationMode
 
+    if isinstance(name, CompilationMode):
+        return name
     return {
         None: None,
         "none": CompilationMode.NONE,
@@ -67,9 +73,13 @@ def _compilation_mode(name):
 
 
 def _graph_mode(name):
+    """A ``cudagraph_mode`` by short name (``None``: unset); a mode passes
+    through."""
     from vllm.config import CUDAGraphMode
 
-    return None if name is None else CUDAGraphMode[name.upper()]
+    if name is None or isinstance(name, CUDAGraphMode):
+        return name
+    return CUDAGraphMode[name.upper()]
 
 
 def _has(message: str, *words: str) -> None:
@@ -183,18 +193,21 @@ def test_construction_refuses_no_async_scheduling_value(stages, runner, value):
 # ---------------------------------------------------------------------------
 # REG-ENG-006: model and model-state construction re-check the shared rule
 
-#: case -> (settings, words the refusal must contain).
+#: case -> (settings, the hook condition named with its remedy
+#: (``support.runner_conditions``), or ``None`` and words the refusal must
+#: contain).
 _REFUSED_AT_CONSTRUCTION = {
-    "unset cudagraph_mode": ({"cudagraph": None}, ("cudagraph_mode",)),
-    "unset compilation mode": ({"mode": None}, ()),
-    "surviving STOCK_TORCH_COMPILE": ({"mode": "stock"}, ("stock", "-cc.mode none")),
-    "FULL": ({"cudagraph": "full"}, ("FULL", "-cc.cudagraph_mode none")),
+    "unset cudagraph_mode": ({"cudagraph": None}, None, ("cudagraph_mode",)),
+    "unset compilation mode": ({"mode": None}, None, ()),
+    "surviving STOCK_TORCH_COMPILE": ({"mode": "stock"}, "compilation mode", ()),
+    "FULL": ({"cudagraph": "full"}, "graph mode", ()),
     "PIECEWISE under resolved breakable graphs": (
         {"cudagraph": "piecewise", "breakable": True},
-        ("PIECEWISE", "VLLM_USE_BREAKABLE_CUDAGRAPH=0", "-cc.cudagraph_mode none"),
+        "breakable piecewise",
+        (),
     ),
-    "not CUDA": ({"cuda": False}, ("cuda", "--enforce-eager")),
-    "prefix caching": ({"prefix_caching": True}, ("prefix",)),
+    "not CUDA": ({"cuda": False}, "platform", ()),
+    "prefix caching": ({"prefix_caching": True}, None, ("prefix",)),
 }
 
 
@@ -202,7 +215,7 @@ _REFUSED_AT_CONSTRUCTION = {
 @pytest.mark.parametrize("stage", ["model", "model-state"])
 # @spec REG-ENG-006, REG-ENG-021, REG-ENG-022, REG-ENG-023, REG-ENG-024
 def test_construction_refuses_what_the_shared_rule_refuses(stages, stage, case):
-    settings, words = _REFUSED_AT_CONSTRUCTION[case]
+    settings, condition, words = _REFUSED_AT_CONSTRUCTION[case]
     if stage == "model":
         config = stages.config(**settings)
         message = _refusal(stages.model, config)
@@ -211,6 +224,8 @@ def test_construction_refuses_what_the_shared_rule_refuses(stages, stage, case):
         model = stages.model(config)
         stages.apply(config, **settings)
         message = _refusal(stages.state, config, model)
+    if condition is not None:
+        rc.assert_named_with_remedy(message, condition)
     _has(message, *words)
     if case == "unset compilation mode":
         assert _names_compilation_mode(message), message
@@ -234,20 +249,16 @@ def test_construction_lists_every_failed_condition_in_one_error(stages, stage):
         model = stages.model(config)
         stages.apply(config, **settings)
         message = _refusal(stages.state, config, model)
-    _has(
-        message,
-        "-cc.cudagraph_mode none",
-        "-cc.mode none",
-        "cuda",
-        "chunk_bucket_graph_populations",
-        "--enforce-eager",
-        "prefix",
-    )
+    for condition in ("graph mode", "compilation mode", "platform", "chunk buckets"):
+        rc.assert_condition(message, condition)
+    assert re.search(r"(?i)prefix caching|enable_prefix_caching", message), message
 
 
 @pytest.mark.parametrize("stage", ["model", "model-state"])
-# @spec REG-ENG-006, REG-VAL-008, TXG-CFG-016
+# @spec REG-ENG-006, REG-VAL-008, TXG-CFG-016, TXG-CFG-011
 def test_construction_refuses_transaction_graphs_on_the_state_layer(stages, stage):
+    """Exactly one state-layer condition: the one
+    ``transaction_graph_config_errors`` returns."""
     settings = {"hf": {"transaction_graph_populations": [2]}}
     if stage == "model":
         config = stages.config(right_context=0, **settings)
@@ -257,7 +268,7 @@ def test_construction_refuses_transaction_graphs_on_the_state_layer(stages, stag
         model = stages.model(config)
         stages.apply(config, **settings)
         message = _refusal(stages.state, config, model)
-    _has(message, "transaction_graph_populations", "state layer")
+    rc.assert_one_state_layer_condition(message, config)
 
 
 # ---------------------------------------------------------------------------
@@ -492,17 +503,62 @@ def _accepted_built_configurations():
     return sorted(built, key=lambda c: (c[0].name, int(c[1]), c[2]))
 
 
+def _configuration_id(configuration) -> str:
+    graph, mode, breakable = configuration
+    return f"{graph.name}-{mode.name}-{'breakable' if breakable else 'unbreakable'}"
+
+
+def _accepted_built_params():
+    """``_accepted_built_configurations()`` as test parameters (none where
+    vLLM is not importable; every test here needs it)."""
+    try:
+        configurations = _accepted_built_configurations()
+    except ImportError:
+        return []
+    return [pytest.param(c, id=_configuration_id(c)) for c in configurations]
+
+
+#: Every configuration model-state construction accepts, as core's build
+#: leaves it (REG-ENG-011, REG-ENG-026).
+ACCEPTED_BUILT = _accepted_built_params()
+
+
 # @spec REG-ENG-012
-def test_core_resolves_every_accepted_built_configuration_to_none():
-    from vllm.config import CompilationConfig, CUDAGraphMode
+def test_the_accepted_built_configurations_reach_every_setting():
+    """The enumeration is not vacuous: breakable graphs on and off, and the
+    compilation modes under which ``@support_torch_compile`` compiles."""
     from vllm.config.compilation import CompilationMode
-    from vllm.v1.attention.backend import AttentionCGSupport
 
     configurations = _accepted_built_configurations()
     assert configurations, "no accepted configuration was enumerated"
-    # Breakable graphs on and off, compiled and not, are all reached.
     assert {c[2] for c in configurations} == {False, True}
-    assert any(c[1] == CompilationMode.VLLM_COMPILE for c in configurations)
+    modes = {c[1] for c in configurations}
+    assert {CompilationMode.VLLM_COMPILE, CompilationMode.DYNAMO_TRACE_ONCE} <= modes
+
+
+def _runner_support(state):
+    """``(min_cg_support, backend name)`` as core's runner resolves the mode
+    with them (``GPUModelRunner.initialize_kv_cache``): the attention
+    backends' support narrowed by the model state's own
+    ``get_additional_cg_support()``. The attention side is taken at its most
+    permissive (``ALWAYS``), so the model state's report alone decides."""
+    from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
+
+    info = AttentionCGSupportInfo().narrow(*state.get_additional_cg_support())
+    return info.min_cg_support, info.min_cg_attn_backend
+
+
+# @spec REG-ENG-012, REG-ENG-016
+def test_core_resolves_every_accepted_built_configuration_to_none(
+    eager_config, build_model_state
+):
+    from vllm.config import CompilationConfig, CUDAGraphMode
+    from vllm.config.compilation import CompilationMode
+
+    state = build_model_state(eager_config())
+    support, backend = _runner_support(state)
+    configurations = _accepted_built_configurations()
+    assert configurations, "no accepted configuration was enumerated"
     resolved = {}
     for graph, mode, breakable in configurations:
         # Splitting ops matter only under VLLM_COMPILE; both possibilities.
@@ -519,37 +575,130 @@ def test_core_resolves_every_accepted_built_configuration_to_none():
                     use_breakable_cudagraph=breakable,
                 )
                 compilation.splitting_ops = ops
-                result = compilation.resolve_cudagraph_mode_and_sizes(
-                    AttentionCGSupport.NEVER,
-                    "nemotron_asr_streaming model state (captures its own graphs)",
-                    1,
-                    kv_cache_config=None,
-                    max_num_reqs=64,
-                    is_profiling=profiling,
-                    piecewise_capture_available=breakable,
-                )
+                try:
+                    result = compilation.resolve_cudagraph_mode_and_sizes(
+                        support,
+                        backend,
+                        state.num_new_sampled_tokens_per_step,
+                        kv_cache_config=None,
+                        max_num_reqs=64,
+                        is_profiling=profiling,
+                        piecewise_capture_available=breakable,
+                    )
+                except ValueError as error:
+                    result = error
                 resolved[(graph.name, mode.name, breakable, ops is None, profiling)] = (
                     result
                 )
     wrong = {k: v for k, v in resolved.items() if v != CUDAGraphMode.NONE}
-    assert not wrong, wrong
+    assert not wrong, (support, wrong)
+
+
+def _decorated_submodules(model) -> list[str]:
+    """Every submodule of a ``@support_torch_compile`` class, compiling or
+    not (the decorator adds ``TorchCompileWithNoGuardsWrapper`` to the
+    class's bases)."""
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+    return [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, TorchCompileWithNoGuardsWrapper)
+    ]
+
+
+@pytest.mark.parametrize("configuration", ACCEPTED_BUILT)
+# @spec REG-ENG-012
+def test_the_model_has_no_compiled_submodule(stages, configuration):
+    """Built under each accepted configuration, as core leaves it, where a
+    decorated submodule would compile (``do_not_compile`` is false for every
+    mode but NONE and ``STOCK_TORCH_COMPILE``,
+    ``vllm/compilation/decorators.py``): core's
+    ``piecewise_capture_available`` is then the resolved breakable setting
+    alone."""
+    from vllm.v1.worker.gpu.cudagraph_utils import has_compiled_submodule
+
+    graph, mode, breakable = configuration
+    config = stages.config(cudagraph=graph, mode=mode, breakable=breakable)
+    model = stages.model(config)
+    assert not has_compiled_submodule(model)
+    assert not _decorated_submodules(model)
 
 
 # @spec REG-ENG-012
-def test_the_model_has_no_compiled_submodule(stages):
-    """Core's ``piecewise_capture_available`` is the resolved breakable
-    setting alone for this model."""
+def test_the_compiled_submodule_checks_find_a_decorated_submodule(stages):
+    """Negative control: a ``@support_torch_compile`` stand-in in the model
+    is found by core's check under ``VLLM_COMPILE`` and by the class check
+    under every mode (core's check no longer sees it under NONE, which is
+    why the model is built under the compiling modes above)."""
+    from torch import nn
+    from vllm.compilation.decorators import support_torch_compile
+    from vllm.config.vllm import set_current_vllm_config
     from vllm.v1.worker.gpu.cudagraph_utils import has_compiled_submodule
 
-    config = stages.config(eager=True)
-    assert not has_compiled_submodule(stages.model(config))
+    # Dimensions given: this module's annotations are strings.
+    @support_torch_compile(dynamic_arg_dims={"x": 0})
+    class CompiledStandIn(nn.Module):
+        def __init__(self, *, vllm_config, prefix: str = "") -> None:
+            super().__init__()
+            self.linear = nn.Linear(2, 2)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.linear(x)
+
+    for mode, compiles in (("compile", True), ("none", False)):
+        # vLLM's CPU platform: with the platform reporting CUDA, importing the
+        # compilation backend reaches CUDA custom ops a CPU host lacks.
+        config = stages.config(eager=True, cuda=False)
+        model = stages.model(config)
+        config.compilation_config.mode = _compilation_mode(mode)
+        with set_current_vllm_config(config):
+            model.add_module("stand_in", CompiledStandIn(vllm_config=config))
+        assert has_compiled_submodule(model) is compiles, mode
+        assert _decorated_submodules(model) == ["stand_in"], mode
+
+
+def _core_capture_sizes(config) -> None:
+    """The capture sizes core's configuration build gives the requested mode
+    with ``enforce_eager`` off (``VllmConfig._set_cudagraph_sizes``: none for
+    an explicit NONE)."""
+    compilation = config.compilation_config
+    compilation.cudagraph_num_of_warmups = 1
+    compilation.cudagraph_capture_sizes = None
+    compilation.max_cudagraph_capture_size = None
+    config._set_cudagraph_sizes()
+
+
+def _core_resolution(config, model, state, *, is_profiling: bool):
+    """Core's mode resolution before each KV-cache initialization
+    (``GPUModelRunner.initialize_kv_cache``), with the model state's support
+    and core's own ``piecewise_capture_available``."""
+    from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+    from vllm.v1.worker.gpu.cudagraph_utils import has_compiled_submodule
+
+    compilation = config.compilation_config
+    support, backend = _runner_support(state)
+    return compilation.resolve_cudagraph_mode_and_sizes(
+        support,
+        backend,
+        state.num_new_sampled_tokens_per_step,
+        kv_cache_config=None,
+        max_num_reqs=config.scheduler_config.max_num_seqs,
+        is_profiling=is_profiling,
+        piecewise_capture_available=bool(
+            is_breakable_cudagraph_enabled(compilation) or has_compiled_submodule(model)
+        ),
+    )
 
 
 def _hook_inventory(tmp_path, monkeypatch, platform, *, cudagraph, mode, breakable):
     """The model's captured segment-graph entry keys after core's startup
-    under the hook configuration, with construction seeing ``cudagraph`` /
-    ``mode`` / ``breakable`` and core resolving the mode to NONE before the
-    KV cache is initialized (REG-ENG-012). A key is the entry's runnable
+    under the hook configuration, construction seeing ``cudagraph`` /
+    ``mode`` / ``breakable`` as core's build leaves them, with core's capture
+    sizes for that mode, core's resolution before each KV-cache
+    initialization, and the profiling pool core sizes from the capture sizes
+    (``min(max_num_seqs, largest capture size) or 1`` blocks,
+    ``_init_minimal_kv_cache_for_profiling``). A key is the entry's runnable
     (encoder CHUNK entries or decoder tier entries) and its batch
     descriptor."""
     from support.core_order import CoreOrder
@@ -561,54 +710,75 @@ def _hook_inventory(tmp_path, monkeypatch, platform, *, cudagraph, mode, breakab
         total=1 << 40, free=1 << 40, segment_graphs=graphs, per_segment_graph=3 << 20
     ).install_memory(monkeypatch)
     monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
-    card = h.write_runnable_card(tmp_path / f"card-{cudagraph}-{mode}-{breakable}")
+    name = _configuration_id((cudagraph, mode, breakable))
+    card = h.write_runnable_card(tmp_path / f"card-{name}")
     config = h.build_vllm_config(
         card, right_context=3, max_num_seqs=2, overrides=DEFAULT_ARMS
     )
     config.model_config.enforce_eager = False
     compilation = config.compilation_config
-    compilation.mode = _compilation_mode(mode)
-    compilation.cudagraph_mode = _graph_mode(cudagraph)
+    compilation.mode = mode
+    compilation.cudagraph_mode = cudagraph
     compilation.use_breakable_cudagraph = breakable
     platform(True)
+    _core_capture_sizes(config)
+    profiling_blocks = (
+        min(
+            config.scheduler_config.max_num_seqs, compilation.max_cudagraph_capture_size
+        )
+        or 1
+    )
     model = h.build_model(config)
     state = h.build_model_state(config, model)
-    compilation.cudagraph_mode = CUDAGraphMode.NONE
     config.cache_config.kv_cache_memory_bytes = None
     config.cache_config.enable_extensible_kv_cache = False
     core = CoreOrder(h.Runner(config, model, state), capture_stream=FakeStream())
-    core.startup()
+    core.prepare()
+    captures = core.needs_capture()
+    resolved = [_core_resolution(config, model, state, is_profiling=True)]
+    if captures:
+        spec = h.model_spec(model)
+        core.bind_profiling(
+            h.BindingsSpy(h.real_bindings(spec, capacity=profiling_blocks))
+        )
+        core.profiling_capture()
+        core.clear()
+    resolved.append(_core_resolution(config, model, state, is_profiling=False))
+    core.bind_serving()
+    if captures:
+        core.serving_capture()
+    core.post_warmup()
+    assert resolved == [CUDAGraphMode.NONE, CUDAGraphMode.NONE], resolved
     keys = {
         (getattr(w.runnable, "__qualname__", type(w.runnable).__qualname__), d)
         for w, d in graphs.captured()
     }
     core.shutdown()
-    return keys
+    return keys, profiling_blocks
 
 
-@pytest.mark.parametrize(
-    "cudagraph, mode, breakable",
-    [
-        ("full_and_piecewise", "compile", False),
-        ("full_and_piecewise", "none", True),
-    ],
-    ids=["serve-defaults", "breakable"],
-)
+@pytest.mark.parametrize("configuration", ACCEPTED_BUILT)
 # @spec REG-ENG-012
 def test_the_segment_graph_inventory_does_not_depend_on_the_modes(
-    tmp_path, monkeypatch, platform, cudagraph, mode, breakable
+    tmp_path, monkeypatch, platform, configuration
 ):
-    explicit_none = _hook_inventory(
-        tmp_path, monkeypatch, platform, cudagraph="none", mode="none", breakable=False
-    )
-    other = _hook_inventory(
+    from vllm.config import CUDAGraphMode
+    from vllm.config.compilation import CompilationMode
+
+    explicit_none, none_blocks = _hook_inventory(
         tmp_path,
         monkeypatch,
         platform,
-        cudagraph=cudagraph,
-        mode=mode,
-        breakable=breakable,
+        cudagraph=CUDAGraphMode.NONE,
+        mode=CompilationMode.NONE,
+        breakable=False,
     )
+    graph, mode, breakable = configuration
+    other, _blocks = _hook_inventory(
+        tmp_path, monkeypatch, platform, cudagraph=graph, mode=mode, breakable=breakable
+    )
+    # An explicit NONE has no capture sizes, so a one-block profiling pool.
+    assert none_blocks == 1
     # Encoder CHUNK entries and decoder tier entries, each at 1 and 2 rows.
     assert len(explicit_none) == 4, explicit_none
     assert other == explicit_none
@@ -622,31 +792,43 @@ def _assert_no_runner_graph(message: str) -> None:
     _has(message, "own graphs", NO_RUNNER_GRAPH)
 
 
+@pytest.mark.parametrize("pool", ["profiling", "serving"])
 @pytest.mark.parametrize(
     "resolved", ["PIECEWISE", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE", "FULL"]
 )
 # @spec REG-ENG-017
-def test_initialize_kv_cache_refuses_a_resolved_runner_graph_mode_first(
-    eager_config, build_model_state, monkeypatch, resolved
+def test_initialize_kv_cache_refuses_a_resolved_runner_graph_mode_before_capture(
+    stages, monkeypatch, resolved, pool
 ):
-    """Raises before anything else, including the base hook."""
+    """Core's resolution left a mode other than NONE: the model state's
+    ``initialize_kv_cache``, for the profiling pool or (a fixed budget, no
+    profiling capture) the serving pool, raises before any graph is captured,
+    naming the resolved mode whole."""
+    from support.core_order import CoreOrder
+    from support.fake_cuda import FakeCuda, FakeStream
     from vllm.config import CUDAGraphMode
-    from vllm.v1.worker.gpu.model_states.interface import ModelState
 
-    state = build_model_state(eager_config())
-    calls = []
-    monkeypatch.setattr(
-        ModelState,
-        "initialize_kv_cache",
-        lambda self, *args, **kwargs: calls.append("base"),
+    graphs = h.FakeGraphRuntime().install(monkeypatch)
+    FakeCuda(
+        total=1 << 40, free=1 << 40, segment_graphs=graphs, per_segment_graph=3 << 20
+    ).install_memory(monkeypatch)
+    monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
+    config = stages.config()
+    model = stages.model(config)
+    core = CoreOrder(
+        h.Runner(config, model, stages.state(config, model)),
+        capture_stream=FakeStream(),
     )
-    state.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode[resolved]
+    core.prepare()
+    captured = len(graphs.captures)
+    config.compilation_config.cudagraph_mode = CUDAGraphMode[resolved]
+    bind = core.bind_profiling if pool == "profiling" else core.bind_serving
     with pytest.raises(Exception) as excinfo:
-        state.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]), None)
+        bind()
     message = str(excinfo.value)
-    assert resolved in message, message
+    assert rc.whole(resolved).search(message), message
     _assert_no_runner_graph(message)
-    assert calls == []
+    assert len(graphs.captures) == captured, "a graph was captured"
 
 
 # @spec REG-ENG-029
@@ -694,8 +876,10 @@ def test_prepare_attn_for_an_uncaptured_step_is_accepted(
 # ---------------------------------------------------------------------------
 # REG-ENG-018: one log line on the first initialize_kv_cache in a process
 #
-# Each case runs in a fresh interpreter: the line is logged once per process,
-# so a test in this process could not observe a first call.
+# The cases run in a fresh interpreter: the line is logged once per process,
+# so a test in this process could not observe a first call. Two model states
+# (two models, constructed under different modes) are initialized there:
+# the first one twice, then the second.
 
 _LOG_SNIPPET = """
 import logging, sys, tempfile
@@ -721,67 +905,95 @@ logging.getLogger("vllm_nemotron_asr_streaming").setLevel(logging.DEBUG)
 
 mp = pytest.MonkeyPatch()
 h.FakeGraphRuntime().install(mp)
-card = h.write_runnable_card(Path(tempfile.mkdtemp()) / "card")
-config = h.build_vllm_config(
-    card,
-    right_context=3,
-    max_num_seqs=2,
-    overrides={{"encoder_execution_arm": "eager-graphed",
-                "decode_dispatch_arm": "dense-graphed"}},
-)
-if {hook!r}:
+
+def built(graph, mode):
+    # Built on the CPU platform, then CUDA (as the stages fixture does).
+    set_cuda_platform(mp, False)
+    card = h.write_runnable_card(Path(tempfile.mkdtemp()) / "card")
+    config = h.build_vllm_config(
+        card,
+        right_context=3,
+        max_num_seqs=2,
+        overrides={{"encoder_execution_arm": "eager-graphed",
+                    "decode_dispatch_arm": "dense-graphed"}},
+    )
     set_cuda_platform(mp, True)
     config.model_config.enforce_eager = False
-    config.compilation_config.mode = CompilationMode.VLLM_COMPILE
-    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    config.compilation_config.mode = mode
+    config.compilation_config.cudagraph_mode = graph
     config.compilation_config.use_breakable_cudagraph = False
-model = h.build_model(config)
-state = h.build_model_state(config, model)
-# Core's resolution (REG-ENG-012) before the KV cache is initialized.
-config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-runner = h.Runner(config, model, state)
+    model = h.build_model(config)
+    state = h.build_model_state(config, model)
+    # Core's resolution (REG-ENG-012) before the KV cache is initialized.
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    return h.Runner(config, model, state), model
+
+first = built(CUDAGraphMode.FULL_AND_PIECEWISE, CompilationMode.VLLM_COMPILE)
+second = built(CUDAGraphMode.FULL_DECODE_ONLY, CompilationMode.DYNAMO_TRACE_ONCE)
 calls = []
-for _ in range(2):
+for runner, model in (first, first, second):
     start = len(records)
     runner.bind_pool(h.real_bindings(h.model_spec(model)))
     calls.append([r.getMessage() for r in records[start:]])
 emit(calls=calls)
 """
 
+#: The line's statements (REG-ENG-018): core's runner captures no graph over
+#: the forward; the model captures its own graphs through the capture hook.
+_NO_RUNNER_CAPTURE = re.compile(
+    r"(?i)\brunner\b[^.;\n]{0,80}(?:\bno\b[^.;\n]{0,20}graph|captures? nothing"
+    r"|does not capture|doesn't capture|never captures)"
+    r"|\bno\b[^.;\n]{0,30}graph[^.;\n]{0,60}\brunner\b"
+)
+_OWN_GRAPHS_THROUGH_THE_HOOK = re.compile(
+    r"(?i)own graphs[^.;\n]{0,80}(?:capture hook|capture_cudagraphs)"
+    r"|(?:capture hook|capture_cudagraphs)[^.;\n]{0,80}own graphs"
+)
 
-def _initialize_kv_cache_logs(run_fresh, repo_root, *, hook: bool):
-    code = _LOG_SNIPPET.format(tests=str(repo_root / "tests"), hook=hook)
+
+def _initialize_kv_cache_logs(run_fresh, repo_root):
+    code = _LOG_SNIPPET.format(tests=str(repo_root / "tests"))
     return run_fresh(code)["calls"]
 
 
-def _mode_line(message: str) -> bool:
-    return "FULL_AND_PIECEWISE" in message and "VLLM_COMPILE" in message
+def _names_modes(message: str, *modes: str) -> bool:
+    return all(rc.whole(mode).search(message) for mode in modes)
 
 
 # @spec REG-ENG-018
-def test_first_initialize_kv_cache_logs_the_modes_once(run_fresh, repo_root):
-    first, second = _initialize_kv_cache_logs(run_fresh, repo_root, hook=True)
-    lines = [m for m in first if _mode_line(m)]
+def test_first_initialize_kv_cache_in_the_process_logs_the_modes_once(
+    run_fresh, repo_root
+):
+    first, again, other_state = _initialize_kv_cache_logs(run_fresh, repo_root)
+    lines = [m for m in first if _names_modes(m, "FULL_AND_PIECEWISE", "VLLM_COMPILE")]
     assert len(lines) == 1, first
     (line,) = lines
     # The resolved mode, besides the two construction saw.
-    assert "NONE" in line, line
-    assert re.search(r"(?i)runner", line) and re.search(r"(?i)own graphs", line), line
-    assert not [m for m in second if _mode_line(m) or "own graphs" in m.lower()], second
-
-
-# @spec REG-ENG-018
-def test_initialize_kv_cache_under_enforce_eager_logs_no_runner_mode_line(
-    run_fresh, repo_root
-):
-    calls = _initialize_kv_cache_logs(run_fresh, repo_root, hook=False)
-    for messages in calls:
-        assert not [m for m in messages if "own graphs" in m.lower()], messages
-        assert not [m for m in messages if re.search(r"(?i)runner.*graph", m)], messages
+    assert _names_modes(line, "NONE"), line
+    assert _NO_RUNNER_CAPTURE.search(line), line
+    assert _OWN_GRAPHS_THROUGH_THE_HOOK.search(line), line
+    # Once in the process: not again for the same model state, nor for
+    # another one constructed under other modes.
+    for messages in (again, other_state):
+        assert not [
+            m
+            for m in messages
+            if "own graphs" in m.lower()
+            or _names_modes(m, "FULL_DECODE_ONLY")
+            or _names_modes(m, "DYNAMO_TRACE_ONCE")
+            or _names_modes(m, "FULL_AND_PIECEWISE", "VLLM_COMPILE")
+        ], messages
 
 
 # ---------------------------------------------------------------------------
-# REG-ENG-020: postprocess_state waits for the commit event
+# REG-ENG-020: the commit event follows the step's last read and is waited on
+#
+# A real stream step on CPU through the harness runner. Every op that reads a
+# request's staged inputs or state is logged by a dispatch mode watching
+# their storages: the state pool, the model's host staging buffers (on CPU
+# the staged device tensors are those buffers) and the forward's input IDs
+# and embeddings. The commit sink's event (on CPU it has none) is a recording
+# stand-in, and its host status buffer logs its reads.
 
 
 class _RecordingEvent:
@@ -793,6 +1005,12 @@ class _RecordingEvent:
 
     def synchronize(self) -> None:
         self.order.append("event.synchronize")
+
+    def query(self) -> bool:
+        return True
+
+    def wait(self, stream=None) -> None:
+        self.order.append("event.wait")
 
 
 class _RecordingHost:
@@ -817,46 +1035,95 @@ class _RecordingHost:
         return View()
 
 
+def _storage(tensor: torch.Tensor) -> int | None:
+    try:
+        return tensor.untyped_storage().data_ptr()
+    except (RuntimeError, NotImplementedError):
+        return None
+
+
+def _tensors(obj) -> list[torch.Tensor]:
+    if isinstance(obj, torch.Tensor):
+        return [obj]
+    values = vars(obj).values() if hasattr(obj, "__dict__") else ()
+    return [v for v in values if isinstance(v, torch.Tensor)]
+
+
+def _read_log(order: list[str], watched: dict[int, str]):
+    """A dispatch mode that appends ``read:<label>`` to ``order`` for every
+    op with an argument in a watched storage."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_leaves
+
+    class ReadLog(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            for leaf in tree_leaves((args, kwargs)):
+                if isinstance(leaf, torch.Tensor):
+                    label = watched.get(_storage(leaf))
+                    if label is not None:
+                        order.append(f"read:{label}")
+                        break
+            return func(*args, **kwargs)
+
+    return ReadLog()
+
+
 # @spec REG-ENG-020
-def test_postprocess_state_waits_for_the_commit_event_before_reading_status(
-    eager_config, build_model_state
-):
-    from vllm_nemotron_asr_streaming.nemotron_asr.commit_sink import (
-        BoundedCommitSink,
-    )
-    from vllm_nemotron_asr_streaming.nemotron_asr.plan import SessionRegistry
+def test_the_commit_event_follows_the_steps_last_read_and_is_waited_on(stages):
+    config = stages.config(eager=True)
+    model = stages.model(config)
+    state = stages.state(config, model)
+    runner = h.Runner(config, model, state)
+    runner.profile_run(core_embeds=False)
+    bindings = runner.bind_pool(h.real_bindings(h.model_spec(model)))
 
     order: list[str] = []
-    state = build_model_state(eager_config())
-    model = state.model
-    registry = SessionRegistry()
-    sink = BoundedCommitSink(registry, max_rows=4)
+    watched = {_storage(h.pool_tensor(bindings)): "state"}
+    for tensor in _tensors(model._ensure_host_staging()):
+        watched[_storage(tensor)] = "staged"
+    sink = model._ensure_commit_sink(torch.device("cpu"))
     sink._event = _RecordingEvent(order)
     sink._status_host = _RecordingHost(sink._status_host, order)
-    model._registry = registry
-    model._commit_sink = sink
-    model.consume_batch_stats = lambda: order.append("batch_stats")
-    # The step's staged commit: the event is recorded after the step's device
-    # work (here, none).
-    sink._stage(
-        SimpleNamespace(bindings=(), progress=None, queue_counts=None, records=()),
-        torch.zeros(0, dtype=torch.int32),
+
+    forward = model.forward
+
+    def watching_forward(*args, **kwargs):
+        for name in ("input_ids", "inputs_embeds"):
+            if isinstance(kwargs.get(name), torch.Tensor):
+                watched[_storage(kwargs[name])] = "staged"
+        return forward(*args, **kwargs)
+
+    model.forward = watching_forward
+    postprocess = state.postprocess_state
+
+    def recording_postprocess(*args, **kwargs):
+        order.append("postprocess")
+        postprocess(*args, **kwargs)
+        order.append("postprocess.return")
+
+    state.postprocess_state = recording_postprocess
+    unit = h.new_request(
+        "s1",
+        int(model.config.audio_chunk_token_id),
+        audio=h.stream_envelope(model.config, geometry=2),
+        identifier="uuid-s1-0",
     )
-    state._snapshot = SimpleNamespace(
-        dummy_run=False,
-        planning_failed=set(),
-        planned_files=(),
-        admission_generations={},
-    )
-    state.postprocess_state(torch.zeros(0, dtype=torch.int32), torch.zeros(0))
-    order.append("returned")
-    assert "event.synchronize" in order and "status.read" in order, order
+    with _read_log(order, watched):
+        runner.real_step(h.scheduler_output(new=(unit,), handles={"s1": 1}))
+
+    assert runner.commit_log and not runner.commit_log[-1][1], runner.commit_log
+    reads = [i for i, e in enumerate(order) if e.startswith("read:")]
+    assert {order[i] for i in reads} >= {"read:state", "read:staged"}, order
+    assert order.count("event.record") == 1, order
+    record = order.index("event.record")
+    assert reads[-1] < record, ("a read after the commit event", order[record:])
+    wait = order.index("event.synchronize")
+    status = order.index("status.read")
     assert (
-        order.index("event.record")
-        < order.index("event.synchronize")
-        < order.index("status.read")
-        < order.index("returned")
+        order.index("postprocess") < wait < status < order.index("postprocess.return")
     ), order
+    assert record < wait, order
 
 
 # ---------------------------------------------------------------------------
@@ -864,13 +1131,20 @@ def test_postprocess_state_waits_for_the_commit_event_before_reading_status(
 
 
 def _state_layer_conditions(errors):
-    from support import txg_api as api
+    """Every returned condition that mentions the state layer."""
+    return [e for e in errors if rc.state_layer_mentions(e)]
 
-    return [
-        e
-        for e in errors
-        if api.KEY in e and "state layer" in e.lower() and "remov" in e.lower()
-    ]
+
+def _assert_the_state_layer_condition(errors, value) -> str:
+    """Exactly one condition mentions the state layer, and it is TXG-CFG-016's
+    in full: the option, the rejected value (TXG-CFG-003), the missing
+    state-group layout accessor, and removing the option."""
+    found = _state_layer_conditions(errors)
+    assert len(found) == 1, errors
+    (condition,) = found
+    assert rc.is_state_layer_condition(condition), condition
+    assert rc.shows_value(condition, value), (value, condition)
+    return condition
 
 
 @pytest.mark.parametrize("value", [[4], [1, 31, 63], 63, None, {}], ids=repr)
@@ -880,20 +1154,23 @@ def test_transaction_graphs_on_always_return_the_state_layer_condition(value):
     from support.txg_fakes import engine_config, hf_config
 
     errors = api.config_errors(engine_config(hf_config(value)))
-    assert len(_state_layer_conditions(errors)) == 1, errors
+    _assert_the_state_layer_condition(errors, value)
 
 
 # @spec TXG-CFG-016, TXG-CFG-003
 def test_the_state_layer_condition_is_returned_with_the_other_violations():
+    """Each other violated condition is its own entry, not folded into the
+    state-layer one."""
     from support import txg_api as api
     from support.txg_fakes import engine_config, hf_config
 
     errors = api.config_errors(
         engine_config(hf_config([4], lookahead=3), enforce_eager=True)
     )
-    assert _state_layer_conditions(errors), errors
-    assert [e for e in errors if "lookahead" in e.lower()], errors
-    assert [e for e in errors if "--enforce-eager" in e], errors
+    condition = _assert_the_state_layer_condition(errors, [4])
+    others = [e for e in errors if e != condition]
+    assert [e for e in others if "lookahead" in e.lower()], errors
+    assert [e for e in others if "--enforce-eager" in e], errors
 
 
 # @spec TXG-CFG-016, TXG-CFG-003
