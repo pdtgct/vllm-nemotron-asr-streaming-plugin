@@ -224,13 +224,13 @@ Validation never changes `encoder_execution_arm` or `decode_dispatch_arm`: a val
 
 ## Engine settings
 
-The persistent-state model needs one scheduler step at a time, one copy of each session's state
-and a single device. The plugin refuses:
-- asynchronous scheduling: an explicit `async_scheduling = True`. Unset is accepted:
-  `verify_and_update_config` runs before core resolves the option and sees it unset, and core
-  then resolves it to `False` for a model that declares persistent state (and itself raises on
-  `True`). The model state re-checks the resolved value when it is constructed and refuses
-  anything but `False`;
+The persistent-state model needs one copy of each session's state and a single device. It
+accepts asynchronous scheduling in every setting (`async_scheduling` `True`, `False` or unset):
+core's per-request barrier for state models schedules no state request while the output of its
+previous step is still in flight, so each stream still advances one step at a time, and the model
+reads a step's commit status in `postprocess_state`, which core runs before it executes the next
+step. Native burst, whose sampler reads ahead of the scheduler, is refused on this core for
+other reasons (Future roadmap). The plugin refuses:
 - prefix caching: `enable_prefix_caching = True` in the resolved configuration. An unset command-line
   option arrives already `False`: `EngineArgs` resolves it from the model, which reports prefix
   caching as unsupported when it declares persistent state. A configuration built directly with
@@ -246,34 +246,69 @@ and a single device. The plugin refuses:
   re-preparation;
 - any tensor, pipeline, data, decode-context or prefill-context parallel size other than 1 (a
   setting the build does not have counts as 1);
-- an outer runner that captures graphs or compiles. Two runner configurations are accepted:
-  - `--enforce-eager`. Core normalizes `cudagraph_mode` to `NONE` before its persistent-state
-    check and runs none of the three graph-capture hooks; the model captures its own segment
-    graphs on the first profiling dummy step (Execution memory). Every segment arm is accepted.
-  - **The hook configuration**: `enforce_eager` off, `cudagraph_mode` NONE (`-cc.cudagraph_mode
-    none`; unset is accepted before core resolves it, since core sets NONE for persistent state)
-    and compilation off (`-cc.mode none`; before core resolves the mode, an unset mode with
-    optimization level 0), on CUDA. Core then captures every graph the model runs through the model-state
-    capture hook, and none is captured on the profiling dummy step. It is accepted only when the
-    configuration selects at least one graph the hook captures (the `eager-graphed` encoder, the
-    `dense-graphed` decoder, or transaction graphs) and no graph it does not: the compiled
-    `dense-graphed` encoder arm and CHUNK-bucket graphs (`chunk_bucket_graph_populations`) are
-    refused there with the remedy `--enforce-eager`. The eager arms alone capture nothing, so
-    they need `--enforce-eager`.
-
-  `enforce_eager` is not core's default, so a command that gives neither configuration is refused,
-  naming each unmet condition of the hook configuration with the remedy for that condition: for
-  `cudagraph_mode` or the compilation mode, `-cc.cudagraph_mode none` or `-cc.mode none`; for a
-  `dense-graphed` encoder, CHUNK-bucket graphs or a configuration that selects no hook-captured
-  graph, `--enforce-eager`, with `transaction_graph_populations` removed when it is set (the option
-  is refused under `--enforce-eager`), or, for the last case, a hook-captured arm; for a platform
-  other than CUDA, `--enforce-eager`.
+- a runner configuration other than the two of Runner configurations, below.
 
 The model state's construction re-checks these rules against the final engine configuration, where
 an unset `cudagraph_mode` or compilation mode is not accepted.
 
 Native burst's own configuration check, run at model construction, applies the same rule for a
 setting the build does not define: a parallel size counts as 1 and expert parallelism as off.
+
+### Runner configurations
+
+The model's forward plans each step on the host. It reads device values back, builds each step's
+row plan as CPU tensors and branches on them, stages inputs into device tensors it allocates per
+step, records a commit event, and replays its own graphs. A runner graph of core's records a
+forward once and replays it without running its Python, and a full graph replays without calling
+the forward at all, so none of this host work would run on replay; and CUDA does not allow the
+model to capture its own graphs inside a capture of core's. The model therefore owns every graph
+it runs, and core captures no graph over its forward in any accepted configuration.
+
+The model state states this to core in the standard way: its `get_additional_cg_support` returns
+`AttentionCGSupport.NEVER`, with the name `nemotron_asr_streaming model state (captures its own
+graphs)`. Core's mode resolution takes the least capable of the model's backends, so it reduces
+every graphed `cudagraph_mode` it can reduce to NONE and logs a warning naming the model state;
+FULL, whose mixed-batch full graphs it cannot reduce, it refuses. The model class carries no
+`@support_torch_compile`, so no compilation mode compiles any of it except `STOCK_TORCH_COMPILE`,
+under which the runner compiles the whole model with `fullgraph=True`.
+
+Two runner configurations are accepted:
+- `--enforce-eager`. Core normalizes `cudagraph_mode` to `NONE` before its persistent-state
+  check and runs none of the three graph-capture hooks; the model captures its own segment
+  graphs on the first profiling dummy step (Execution memory). Every segment arm is accepted.
+- **The hook configuration**: `enforce_eager` off, on CUDA. Core captures every graph the model
+  runs through the model-state capture hook, and none is captured on the profiling dummy step.
+  Its conditions, each with the remedy the refusal names:
+  - `cudagraph_mode` NONE, PIECEWISE, FULL_DECODE_ONLY or FULL_AND_PIECEWISE, or unset before
+    core resolves it; each resolves to NONE for this model. FULL is refused, because core
+    cannot reduce it and would refuse it itself only after the weights load (remedy
+    `-cc.cudagraph_mode none`, or leave the option unset).
+  - not PIECEWISE or FULL_AND_PIECEWISE while breakable CUDA graphs are on (core's
+    `is_breakable_cudagraph_enabled`: `use_breakable_cudagraph`, or `VLLM_USE_BREAKABLE_CUDAGRAPH`
+    while that is unresolved). Breakable graphs give core a piecewise capture path without
+    compilation, so those modes would then capture the forward as one breakable segment, which the
+    forward refuses (remedy `VLLM_USE_BREAKABLE_CUDAGRAPH=0`, or `-cc.cudagraph_mode none`).
+  - compilation mode NONE, `DYNAMO_TRACE_ONCE` or `VLLM_COMPILE`, or unset before core resolves
+    it; not `STOCK_TORCH_COMPILE` (remedy `-cc.mode none`, or leave the option unset).
+  - a CUDA platform (remedy `--enforce-eager`).
+  - at least one graph the hook captures: the `eager-graphed` encoder, the `dense-graphed`
+    decoder, or transaction graphs (remedy: select one of them, or `--enforce-eager`).
+  - no graph it does not capture: the compiled `dense-graphed` encoder arm and CHUNK-bucket
+    graphs (`chunk_bucket_graph_populations`) are refused with the remedy `--enforce-eager`.
+  The eager arms alone capture nothing, so they need `--enforce-eager`.
+
+`enforce_eager` is not core's default, so the hook configuration is the configuration a serve
+command without runner options selects. A refusal names each unmet condition with its remedy;
+every remedy that names `--enforce-eager` also names removing `transaction_graph_populations`
+when it is set (the option is refused under `--enforce-eager`).
+
+The configuration hooks see the requested modes; core resolves the runner mode only when it
+initializes the KV cache, after the model state exists. Before every call of
+`capture_cudagraphs`, the model state therefore checks that the resolved `cudagraph_mode` is NONE
+and fails startup naming the resolved mode otherwise, so a core that ignored the reported support
+cannot capture the forward. In its first `capture_cudagraphs` call under a requested mode other
+than NONE, it logs once that core captures no graph over this model's forward, naming the
+requested mode, and that the model captures its own graphs through the hook.
 
 ### Core hooks
 
@@ -578,11 +613,13 @@ is imported:
 
 | Module | Names |
 | --- | --- |
-| `vllm.config.compilation` | `CUDAGraphMode` |
+| `vllm.config.compilation` | `CUDAGraphMode`, `CompilationMode` |
+| `vllm.compilation.breakable_cudagraph` | `is_breakable_cudagraph_enabled` |
+| `vllm.v1.attention.backend` | `AttentionCGSupport` |
 | `vllm.v1.core.sched.output` | `NewRequestData`, `SchedulerOutput` |
 | `vllm.v1.kv_cache_interface` | `KVCacheConfig`, `StateSlotHandle` |
 | `vllm.v1.worker.gpu.input_batch` | `InputBatch` |
-| `vllm.v1.worker.gpu.model_states.interface` | `ModelState`, with its hooks `prepare_execution_memory`, `needs_cudagraph_capture`, `capture_cudagraphs`, `clear_cudagraphs`, `post_warmup` and `shutdown` |
+| `vllm.v1.worker.gpu.model_states.interface` | `ModelState`, with its hooks `prepare_execution_memory`, `needs_cudagraph_capture`, `capture_cudagraphs`, `clear_cudagraphs`, `post_warmup` and `shutdown`, and its `get_additional_cg_support` |
 | `vllm.v1.worker.gpu.state_slots` | `StateSlotBindings`, `StateSlotRows` |
 | `vllm.v1.worker.gpu.states` | `RequestState` |
 | `vllm.v1.worker.utils` | `AttentionGroup` |
@@ -624,7 +661,9 @@ adding it here and to the import-time check.
   the served configuration, and convert with `lookahead.geometry_index` or
   `lookahead.cadence_label`. No component keeps a served set.
 - **Hook routing.** `engine_flags` holds the one predicate of hook-captured graphs, which both the
-  engine check (Engine settings) and the model state's `needs_cudagraph_capture` use.
+  engine check (Engine settings) and the model state's `needs_cudagraph_capture` use, and the one
+  rule of runner configurations (Runner configurations), which the configuration hook, the model
+  state's construction and model construction call; no other module judges a runner mode.
 - **Precision.** The supported deployment runs at float32 (`--dtype float32`); the model's
   precision check at load refuses any other dtype.
 
@@ -639,32 +678,15 @@ adding it here and to the import-time check.
 | Where model execution memory is prepared | Long-lived working memory in `prepare_execution_memory`; the profile transaction on core's first profiling dummy step (flagged by `prepare_step`); segment graphs on that step under `--enforce-eager` and in `capture_cudagraphs` under the hook configuration | `initialize_state_slots` or first serving step: graphs created after core sized the KV cache and state pool, so their memory is unbudgeted. Capturing in `prepare_execution_memory`: the hook's contract forbids capture there. Capturing on the profiling step under the hook configuration too: core's estimate would not see those graphs as graph memory, and the profiling and serving captures would differ | Each stage runs where #67583 budgets it. A failed preparation ends worker startup and the engine is restarted: partial preparation is not safely retryable in the worker, and no serving state outlives the failure |
 | Served geometry | One per server, fixed at startup: `num_lookahead_tokens` when given, else the card's `default_num_lookahead_tokens`; any of the five implemented lookaheads; `supported_num_lookahead_tokens` refused | A served set with a default (every geometry warmed and captured, multiplying graph memory and startup time); requiring the override (ignores what the checkpoint declares); ignoring `supported_num_lookahead_tokens` silently (an old serve command would start at a geometry its operator did not choose); only the card's four lookaheads (drops the tested 160 ms geometry) | One geometry keeps graph memory and capture time to one set of segment graphs, and matches how a Hugging Face Transformers model fixes its lookahead |
 | Default segment arms | `eager-graphed` encoder and `dense-graphed` decoder, declared at translation; overrides kept | The eager arms by default; the compiled `dense-graphed` encoder | The pair measured fastest with equal transcripts (HLD, Key Design Decisions); the eager arms stay selectable as the reference |
-| Arms under the hook configuration | The `eager-graphed` encoder and `dense-graphed` decoder (and transaction graphs); the compiled `dense-graphed` encoder and CHUNK-bucket graphs refused there | Capture every graphed arm in the hook; capture the unsupported ones on the profiling step | Capture of the compiled encoder and of CHUNK-bucket graphs through the hook is not yet specified or qualified, and the HLD forbids profiling-step capture in the hook configuration; both stay available under `--enforce-eager`. The refusal holds until their hook capture is specified and measured (Deferred 4); nothing technical prevents it |
+| Arms under the hook configuration | The `eager-graphed` encoder and `dense-graphed` decoder (and transaction graphs); the compiled `dense-graphed` encoder and CHUNK-bucket graphs refused there | Capture every graphed arm in the hook; capture the unsupported ones on the profiling step | Capture of the compiled encoder and of CHUNK-bucket graphs through the hook is not yet specified or qualified, and the HLD forbids profiling-step capture in the hook configuration; both stay available under `--enforce-eager`. The refusal holds until their hook capture is specified and measured (Future roadmap 4); nothing technical prevents it |
 | Segment-graph memory under the hook | Core's estimate through the profiling capture, a flat charged margin per call and an aggregate serving-over-profiling check, the same procedure as the transaction-graph cells | A per-graph comparison; a warning only | Core's charge is aggregate and allocator rounding arises per segment over the call; a warning would serve with uncharged memory where core estimated |
 | Graphed arms without static graphs | A stand-in wrapper that runs each entry eagerly, keeping the graphed arms' inventory and serving path | Refusing graphed arms off CUDA; resolving the default arms to the eager arms there | The card's default arms are graphed, so a refusal would fail every non-CUDA run of the default configuration, and silently switching arms would leave the graphed staging and checks untested off CUDA; the stand-in keeps one path whose outputs equal the eager arms' |
+| Core's runner graphs over the forward | None: the model state reports `AttentionCGSupport.NEVER`, core reduces every graphed mode it can to NONE, and the plugin refuses FULL and a piecewise mode under breakable graphs | Refuse every graphed mode; register the stateful segment operations as splitting ops; breakable graphs with host planning inside break operations; core full graphs with the model running eagerly during core's capture | Refusing would make every serve command without runner options name `-cc.cudagraph_mode none` while core can already reduce the mode itself, as it does for encoder-only model states. Splitting ops split a compiled graph, and the forward is not traceable; the code between its stateful segments is index uploads and a projection. Inside a breakable graph the whole forward would be one break operation, so core would capture nothing of value until planning and staging move out of the forward (Future roadmap 5). Core's full graphs replay without calling the forward, so its host planning would not run. The model's own graphs, captured through the hook, already key on its step shapes |
+| Compilation modes | Accept NONE, `DYNAMO_TRACE_ONCE` and `VLLM_COMPILE`, which compile nothing in an undecorated model; refuse `STOCK_TORCH_COMPILE` | Require compilation off; accept every mode | The plugin uses no vLLM custom operator, so a compilation mode changes no operator dispatch in the model; `STOCK_TORCH_COMPILE` compiles the whole model with `fullgraph=True`, which a forward with host reads cannot pass |
+| Asynchronous scheduling | Accepted | Refuse it | Core's per-request barrier for state models runs each stream one step at a time, which is the property the model needs; the model reads commit status in `postprocess_state`, before the next step executes |
 | Core hooks | Required in every configuration; a core without them is refused | Detect them and fall back to profiling-step capture | One core API to test (HLD, Key Design Decisions, Core API) |
 | Load-time checks | Client calls in `register()`; adapter symbols at model import | All checks in `register()` | `register()` and the session factory do not import the model class modules, so loading the plugin stays cheap; core's speech-to-text serving imports the model class in the API server when it starts, so importing it initializes no device and loads no weights |
 | `generate` task | Not advertised (model-state override) | Advertise for compatibility | The model emits transcript labels, not text generation |
-
-## Open Questions & Future Decisions
-
-### Deferred
-1. A version gate for clean vLLM releases once RFC 1's stream admission ships; until then the client-path
-   check is the gate.
-2. **Projected capture failure.** Whether the model projects the segment graphs' total from the first
-   captured encoder counts and fails before capturing the rest, to save startup time on a
-   `max_num_seqs` that cannot fit; it needs a projection rule that the first A40 measurements
-   validate.
-3. **Hook-configuration fit.** The retained memory, capture peak and startup time of the default arms
-   under the hook configuration, where they are captured twice, are unmeasured; the README's serve
-   command moves to that configuration only once tier 2 has met it.
-4. **Hook capture of the other graphed arms.** The compiled `dense-graphed` encoder and CHUNK-bucket
-   graphs can follow the default arms' hook lifecycle: compilation and warm-up in
-   `prepare_execution_memory`, profiling capture over core's profiling pools, release in
-   `clear_cudagraphs`, serving capture into core's graph pool, and the same memory accounting and
-   serving-over-profiling check. Supporting them revises the hook-configuration refusal in REG-ENG-005
-   and the arm table and adds their capture specs beside REG-MEM-016 to REG-MEM-022, once their
-   exactness, fit and serving benefit are measured.
 
 ## References
 
@@ -676,3 +698,52 @@ adding it here and to the import-time check.
 - Plugin loading: `vllm/plugins/__init__.py`.
 - Card translation: `nemotron_asr/configuration_nemotron_asr.py`; geometries:
   `nemotron_asr/manifests.py` and `lookahead.py`.
+
+## Future roadmap
+
+Each item names what is deferred, the trigger that reopens it and the shape of the change.
+
+1. **Version gate.** A version check for clean vLLM releases. Trigger: RFC 1's stream admission
+   ships in a release. Shape: `register()` checks the release version; until then the client-path
+   check is the gate.
+2. **Projected capture failure.** Projecting the segment graphs' total from the first captured
+   encoder counts and failing before capturing the rest, to save startup time on a
+   `max_num_seqs` that cannot fit. Trigger: A40 measurements that validate a projection rule.
+   Shape: a check after the first count's capture.
+3. **Hook-configuration fit.** The retained memory, capture peak and startup time of the default
+   arms under the hook configuration, where they are captured twice, are unmeasured. Trigger:
+   acceptance tier 2 met in the hook configuration. Shape: the README's serve command moves to
+   that configuration.
+4. **Hook capture of the other graphed arms.** The compiled `dense-graphed` encoder and
+   CHUNK-bucket graphs. Trigger: their exactness, fit and serving benefit are measured. Shape:
+   compilation and warm-up in `prepare_execution_memory`, profiling capture over core's profiling
+   pools, release in `clear_cudagraphs`, serving capture into core's graph pool, the same memory
+   accounting and serving-over-profiling check; the hook-configuration refusal and the arm table
+   change, and their capture specs join REG-MEM-016 to REG-MEM-022.
+5. **Runner piecewise graphs through breakable CUDA graphs.** Core capturing the dense work
+   between the model's stateful operations, with the model's graphs replayed inside core's eager
+   breaks. Trigger: a bounded prototype shows a step-time gain over the model's own graphs at a
+   configured chunk size, or a maintainer asks for runner-captured graphs. Shape: host planning
+   moves into `prepare_inputs` and writes fixed-address buffers; staging writes into persistent
+   buffers; the stateful segment operations become operations that end core's capture, run
+   eagerly and write their outputs in place; the model reports `UNIFORM_BATCH` support; PIECEWISE
+   and FULL_AND_PIECEWISE under breakable graphs are accepted.
+6. **Runner full graphs (FULL, and FULL_DECODE_ONLY without reduction).** Trigger: core gains a
+   model-state hook that extends the full-graph dispatch key or declines a full graph for a step.
+   Shape: item 5's host-planning move, plus one predicated device body per row count that holds
+   for every chunk/echo split, geometry, file row and endpoint mix, and a capture-capable
+   `prepare_dummy_inputs`.
+7. **`STOCK_TORCH_COMPILE`.** Trigger: item 5 leaves a forward that Dynamo can trace whole.
+   Shape: accept the mode once the traced forward's transcripts equal `--enforce-eager`'s.
+8. **Transaction graphs on the state layer.** The model refuses `transaction_graph_populations`
+   on this core, which has no state-group layout accessor to capture its state pages through.
+   Trigger: core provides that accessor with fixed page addresses. Shape: capture through the
+   accessor in the hook configuration at the 80 and 160 ms geometries, and the graph-ownership and
+   transcript requirements of the hook configuration extend to the cells.
+9. **Native burst with asynchronous scheduling.** Native burst is refused on this core. Trigger:
+   native burst returns on the state layer. Shape: decide whether its read-ahead sampler composes
+   with core's per-request barrier; refuse the pair until a GPU tier shows equal transcripts.
+10. **Overlap under asynchronous scheduling.** The commit sink waits for each step's commit event
+    in `postprocess_state`, so asynchronous scheduling overlaps little for this model. Trigger: a
+    latency A/B that shows the wait on the critical path. Shape: read the commit status one step
+    later, from a ring of pinned buffers.

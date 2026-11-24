@@ -265,14 +265,21 @@ the leaf designs cite them where they depend on them.
   hooks. `docs/evidence.md` records the commits each acceptance tier was actually met on, and claims only
   the tiers met; a tier met only on a build without #67583 is a historical record until it is met
   again on stage 1. Python `>=3.11,<3.15`.
-- **Engine settings.** The resolved engine settings must be synchronous scheduling, no prefix
-  caching and an outer runner that captures no CUDA graphs and compiles nothing, and the plugin
-  refuses to start otherwise. Two configurations give such a runner:
+- **Engine settings.** The resolved engine settings must be no prefix caching and a runner that
+  captures no CUDA graph over the model's forward and compiles none of the model, and the plugin
+  refuses to start otherwise. Asynchronous scheduling is accepted: core's per-request barrier
+  for state models advances each stream one step at a time. The forward plans each step on the
+  host and replays the model's own graphs, which a runner graph of core's cannot record, so the
+  model owns every graph it runs. Two configurations give such a runner:
   - `--enforce-eager`. Core then runs none of the three graph-capture hooks (it still calls
     `prepare_execution_memory`, `post_warmup` and `shutdown`), and the
     model captures its own encoder and decoder graphs on the first profiling dummy step.
     Transaction graphs are refused in this configuration.
-  - The hook configuration: `cudagraph_mode` NONE with compilation off.
+  - The hook configuration: `enforce_eager` off, on CUDA. The model state reports to core that
+    the model supports no runner graphs, so core resolves every `cudagraph_mode` it can reduce to
+    NONE; the plugin accepts each mode that resolves so and each compilation mode that compiles
+    nothing in the model, and refuses the rest with a remedy (the `registration` design, Runner
+    configurations). A serve command without runner options selects this configuration.
     Every graph the model runs, segment graphs and transaction graphs alike, is then captured in
     `capture_cudagraphs`, and none on the profiling dummy step. This configuration is accepted
     only when it selects at least one graph that the hook captures; the `registration` design
@@ -416,7 +423,7 @@ implementations differ:
 | Live streaming (`/v1/realtime`, frontends) | no | designed for it |
 | Whole-file length | encoder frames ≤ min(5000, `max_model_len`): files above about 164 s are refused at the default `max_model_len` of 2048, above about 400 s at 5000 | no model limit by design; one state slot walks the file in bounded steps |
 | Lookahead | accepted by the model per request; its transcription API sets only the language, so the processor default applies | the server's one geometry, fixed at startup, for streams and files alike |
-| Engine settings | Model Runner V2, `--enforce-eager`, TP = PP = 1; no quantization or speculative decoding | synchronous scheduling, no prefix caching, an outer runner that captures no graphs (Constraints) |
+| Engine settings | Model Runner V2, `--enforce-eager`, TP = PP = 1; no quantization or speculative decoding | no prefix caching, a runner that captures no graph over the forward under any accepted `cudagraph_mode`; asynchronous scheduling accepted (Constraints) |
 
 ## Success Metrics
 
@@ -499,3 +506,11 @@ that retained more graph memory than that profiling capture.
 - Offline plugin: [Sohaib-Ahmed21/vllm-nemotron-asr-plugin](https://github.com/Sohaib-Ahmed21/vllm-nemotron-asr-plugin); its vLLM PR [vllm#59827](https://github.com/vllm-project/vllm/pull/59827)
 - Frontend: [pdtgct/vllm-riva-frontend](https://github.com/pdtgct/vllm-riva-frontend)
 - Feature request: [vllm#47455](https://github.com/vllm-project/vllm/issues/47455)
+
+## Future roadmap
+
+- **Runner-captured graphs.** Core capturing graphs over the model's forward, piecewise through
+  breakable CUDA graphs or full. Trigger and shape: the `registration` design, Future roadmap
+  items 5 to 7.
+- **Transaction graphs on the state layer.** Trigger: core provides a state-group layout accessor
+  with fixed page addresses. Shape: the `registration` design, Future roadmap item 8.

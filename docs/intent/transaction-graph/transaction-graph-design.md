@@ -18,7 +18,8 @@ transaction, which is the reference, and is counted.
 
 The option is `transaction_graph_populations`, off by default. The cells are captured through
 vllm#67583's model-state capture hook (`capture_cudagraphs`), into core's graph pool, on core's
-capture stream, while the outer runner captures nothing (`cudagraph_mode` NONE). The model keeps
+capture stream, while core's runner captures no graph over the forward (its resolved
+`cudagraph_mode` is NONE). The model keeps
 no graph pool and no memory admission of its own.
 
 **Evidence.** The quantitative figures in this design are unpublished project measurements; the
@@ -110,7 +111,7 @@ the condition and the rejected value. The shared runner and platform conditions 
 | Geometry | The server's one geometry, as `registration` resolves it at startup (the `num_lookahead_tokens` override, else the checkpoint's default lookahead), is lookahead 0 or 1 (80 or 160 ms). Lookahead 3 (320 ms), the published checkpoint's default, is refused with the remedy `num_lookahead_tokens` 0 or 1. When `served_lookahead` raises, the condition carries its message. |
 | Native burst | `experimental_native_burst` is false or absent. |
 | Segment arms | The arms the model will run are the default arms: `encoder_execution_arm` `eager-graphed` and `decode_dispatch_arm` `dense-graphed`, configured or written by card translation (REG-CARD-008). An unset key resolves to an eager arm (`eager` encoder, `compact-eager` decoder) and is refused. Every other arm is refused as well, the `dense-graphed` encoder included, which `registration` also refuses under the hook configuration (REG-ENG-005); a non-empty `chunk_bucket_graph_populations` is refused there by `registration`, not by this function. |
-| Runner | `enforce_eager` off. `cudagraph_mode` NONE, compilation off and a CUDA platform are the hook configuration, which `registration` validates (REG-ENG-005 in the configuration hook, REG-ENG-006 at model-state construction); this function does not repeat those conditions. |
+| Runner | `enforce_eager` off. The hook configuration's `cudagraph_mode`, compilation-mode and platform conditions are `registration`'s (the `registration` design, Runner configurations), which it validates (REG-ENG-005 in the configuration hook, REG-ENG-006 at model-state construction); this function does not repeat those conditions. |
 
 **`--enforce-eager`.** Core runs no capture hook under `--enforce-eager`, so the option on
 with `--enforce-eager` is refused, naming both. Once the option is the default, the default
@@ -133,7 +134,7 @@ the compilation mode after the configuration hook.
 
 Every comparison in this design ("the option-off transaction", "option-off run") is against
 **baseline `B_hook`**: the same engine configuration with `transaction_graph_populations` absent.
-That is the hook configuration (`cudagraph_mode` NONE, compilation off, no `--enforce-eager`) with
+That is the hook configuration with `-cc.cudagraph_mode none` and `-cc.mode none` (no `--enforce-eager`), with
 the default segment arms captured through the hook (`eager-graphed` encoder at every CHUNK count
 from 1 to `max_num_seqs`, `dense-graphed` decoder at its tiers), no CHUNK-bucket graphs, native
 burst off, and the same geometry, batching limits, dtype, device and budget setting, so the option
