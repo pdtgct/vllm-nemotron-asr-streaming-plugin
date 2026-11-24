@@ -132,3 +132,7 @@ not an admission limit. Core stops a request at its actual token count reaching 
 
 - [D] **FILE-DEF-003**: Where core lets a model-state request run past `max_model_len` or the transcription route feeds a file as a resumable stream, a file of any length shall be transcribed. (Needs core; see the `transcription` design, Input length.)
 - [D] **FILE-DEF-002**: Where measured file latency requires it, a file row shall advance up to `k > 1` chunks per step.
+
+## Future roadmap
+
+The deferred behaviour of this segment, with each item's trigger and shape, is the transcription design's Future roadmap; the `[D]` specs above are its obligations once their triggers fire.

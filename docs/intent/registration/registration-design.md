@@ -327,7 +327,7 @@ has settled by then:
 
 | Stage | Runs | Modes it sees | What it judges |
 | --- | --- | --- | --- |
-| Configuration hook (`verify_and_update_config`) | in the API server, while core builds the engine configuration, before core resolves scheduling, eager mode, breakable graphs and the mode defaults | the requested `cudagraph_mode` and compilation mode, either possibly unset | every condition; an unset mode passes; breakable graphs are predicted from `VLLM_USE_BREAKABLE_CUDAGRAPH` and `TORCH_COMPILE_DISABLE` as core will apply them |
+| Configuration hook (`verify_and_update_config`) | in the API server, while core builds the engine configuration, before core resolves scheduling, eager mode, breakable graphs and the mode defaults | the requested `cudagraph_mode` and compilation mode, either possibly unset | every condition; an unset mode passes; breakable graphs are predicted from `VLLM_USE_BREAKABLE_CUDAGRAPH`, and the compilation mode core will set from breakable graphs and `TORCH_COMPILE_DISABLE`, as core will apply them |
 | Model and model-state construction | in the worker, after core filled every default and normalized the configuration; model construction first | both modes set; breakable graphs resolved | every condition again; an unset mode is refused; a `STOCK_TORCH_COMPILE` still present here is refused, since core would have set it to NONE if it were going to |
 | The model state's `initialize_kv_cache` | after core resolves the runner mode, before any capture, in the profiling and the serving KV-cache initialization alike (also under a budget fixed through `--kv-cache-memory-bytes`) | the resolved `cudagraph_mode` | that it is NONE; otherwise startup fails naming the resolved mode |
 
@@ -345,12 +345,13 @@ construction saw and the resolved `cudagraph_mode`; core's own log names the mod
 `prepare_execution_memory` and the profiling dummy step run before core resolves the mode, so
 neither depends on the resolved mode.
 
-A graphed mode that core reduces only when it initializes the KV cache (FULL_DECODE_ONLY, and
-FULL_AND_PIECEWISE under `VLLM_COMPILE`) is not identical to an explicit NONE at startup: the
+A mode that is not NONE after core's configuration build (FULL_DECODE_ONLY; PIECEWISE and
+FULL_AND_PIECEWISE under `VLLM_COMPILE`; FULL_AND_PIECEWISE with breakable graphs on), and that
+core therefore reduces only when it initializes the KV cache, is not identical to an explicit NONE at startup: the
 engine configuration sizes core's graph capture sizes from the requested mode, and core's
 profiling KV-cache initialization, with it the temporary state pools of the profiling capture,
-holds `min(max_num_seqs, the largest capture size)` pages where an explicit NONE, or a mode
-reduced while the configuration is built, holds one. The model's graphs and its serving pools do
+holds `min(max_num_seqs, the largest capture size) or 1` pages, where an explicit NONE, or a
+mode reduced while the configuration is built, has no capture sizes and so holds one. The model's graphs and its serving pools do
 not change; the profiling capture's transient memory does (Future roadmap 3).
 
 ### Qualification of the runner configurations
@@ -359,7 +360,9 @@ Accepting a configuration and qualifying it are separate. Acceptance is decided 
 rule above. Qualification has two parts.
 
 The CPU tier shows, for every accepted combination of `cudagraph_mode`, compilation mode and
-breakable setting, that core's own resolution with the model's reported support yields NONE, and
+breakable setting, that core's own resolution, run on the normalized configuration with the
+model's reported support and with piecewise capture available exactly when breakable graphs are
+on (the model has no compiled submodule), yields NONE, and
 that the model's graph inventory (its segment-graph entry keys: encoder CHUNK counts and decoder
 tiers) does not depend on either mode: the model decides what it captures from the served
 configuration alone.
@@ -382,7 +385,9 @@ count (zero), the model's graph inventory and the modes its construction saw. Th
   the runner conditions are unchanged under it.
 Outside batch-invariant mode the comparisons presume, as every earlier tier observed at float32,
 that transcripts do not change with batch composition; a mismatch there fails the tier and is
-investigated against the batch-invariant run. A configuration that fails its tier is refused with
+investigated against the batch-invariant run. The plugin's `gpu` test tier, which covers stream
+and whole-file aborts and steps with only finished requests, also runs under asynchronous
+scheduling. A configuration that fails its tier is refused with
 its reason and remedy, and its gap becomes a Future roadmap item, until a fix passes.
 
 ### Core hooks

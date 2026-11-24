@@ -1407,7 +1407,9 @@ by locale only.
 - **Transaction graphs on the state layer.** The model refuses `transaction_graph_populations` on
   a core whose state layer offers no state-group layout accessor. Trigger: core provides that
   accessor with fixed page addresses. Shape: the cells capture through the accessor in the hook
-  configuration at 80 and 160 ms, under the runner rule of the `registration` design.
+  configuration at 80 and 160 ms, first only with the restricted baseline of the `registration`
+  design's Future roadmap item 8 (explicit `cudagraph_mode` NONE, compilation mode NONE,
+  synchronous scheduling).
 - **More geometries, encoder arms, endpoint policies.** Deferred items 4 to 6 above. Trigger: each
   item's exactness and latency evidence at the geometry or arm. Shape: new cells with their own
   warm-up domains and qualification rows.
