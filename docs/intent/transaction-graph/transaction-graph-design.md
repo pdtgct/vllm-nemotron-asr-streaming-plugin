@@ -112,6 +112,7 @@ the condition and the rejected value. The shared runner and platform conditions 
 | Native burst | `experimental_native_burst` is false or absent. |
 | Segment arms | The arms the model will run are the default arms: `encoder_execution_arm` `eager-graphed` and `decode_dispatch_arm` `dense-graphed`, configured or written by card translation (REG-CARD-008). An unset key resolves to an eager arm (`eager` encoder, `compact-eager` decoder) and is refused. Every other arm is refused as well, the `dense-graphed` encoder included, which `registration` also refuses under the hook configuration (REG-ENG-005); a non-empty `chunk_bucket_graph_populations` is refused there by `registration`, not by this function. |
 | Runner | `enforce_eager` off. The hook configuration's `cudagraph_mode`, compilation-mode and platform conditions are `registration`'s (the `registration` design, Runner configurations), which it validates (REG-ENG-005 in the configuration hook, REG-ENG-006 at model-state construction); this function does not repeat those conditions. |
+| State layer | Refused on a state layer that offers no state-group layout accessor, which is every core this build supports: the cells bake in state-page addresses that only such an accessor exposes (remedy: remove `transaction_graph_populations`; the design's Future roadmap). |
 
 **`--enforce-eager`.** Core runs no capture hook under `--enforce-eager`, so the option on
 with `--enforce-eager` is refused, naming both. Once the option is the default, the default

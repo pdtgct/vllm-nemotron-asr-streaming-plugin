@@ -65,6 +65,7 @@ conformance.
 - [ ] **TXG-CFG-013**: `transaction_graph_config_errors` shall modify no configuration object it is given.
 - [ ] **TXG-CFG-014**: The module of TXG-CFG-012 shall define `transaction_graphs_on(hf_config)`, the one implementation of TXG-CFG-001's on predicate, and every component that decides whether transaction graphs are on (the transaction-graph part and `registration`'s checks, hooks, dependency gate and memory contributors) shall call it and shall not test the value of `transaction_graph_populations` itself.
 - [ ] **TXG-CFG-015**: Where transaction graphs are on, when `transaction_graph_config_errors` runs while `max_num_seqs` or `max_num_batched_tokens` is not yet resolved, it shall bound the populations of TXG-CFG-004 by the resolved limits only (by none when neither is resolved), and model-state construction (REG-ENG-006) shall apply the full bound `P_max` against the final engine configuration.
+- [ ] **TXG-CFG-016**: While the model runs on a state layer that offers no state-group layout accessor (every core this plugin build supports), if transaction graphs are on, then `transaction_graph_config_errors` shall return a condition stating that transaction graphs are not supported on this state layer and naming removing `transaction_graph_populations` as the remedy.
 
 ## Transaction structure
 
@@ -305,3 +306,7 @@ transaction graphs off and which the cells must reproduce; they add no requireme
 
 - [D] **TXG-DEF-001**: Where transaction graphs are on by default, under `--enforce-eager` the default shall resolve to off with one INFO line naming the reason, while a `transaction_graph_populations` key present in the final configuration shall still be refused (TXG-CFG-009).
 - [D] **TXG-DEF-002**: Where an admission component consumes the calibration record (TXG-CAL-003), that component (its owner to be named when admission's use of U(1) is designed, the transaction-graph design's Deferred 7) shall apply the option-on figures only to an engine with the same configuration identity and only when the served replay fraction measured at that identity is 1, and shall use the option-off figures otherwise.
+
+## Future roadmap
+
+The deferred behaviour of this segment, with each item's trigger and shape, is the transaction-graph design's Future roadmap; the `[D]` specs above are its obligations once their triggers fire.
