@@ -312,8 +312,9 @@ Two runner configurations are accepted:
     unset). NONE, `DYNAMO_TRACE_ONCE` and `VLLM_COMPILE` compile nothing in the model.
   - **platform**: CUDA (remedy `--enforce-eager`).
   - **hook-captured graphs**: at least one graph the hook captures, the `eager-graphed` encoder,
-    the `dense-graphed` decoder, or transaction graphs (remedy: select one of them, or
-    `--enforce-eager`); and no graph it does not capture: the compiled `dense-graphed` encoder
+    the `dense-graphed` decoder, or transaction graphs (remedy: select the `eager-graphed` encoder
+    or the `dense-graphed` decoder, or `--enforce-eager`; transaction graphs are refused on this
+    core); and no graph it does not capture: the compiled `dense-graphed` encoder
     arm and CHUNK-bucket graphs (`chunk_bucket_graph_populations`) are refused with the remedy
     `--enforce-eager`. The eager arms alone capture nothing, so they need `--enforce-eager`.
 

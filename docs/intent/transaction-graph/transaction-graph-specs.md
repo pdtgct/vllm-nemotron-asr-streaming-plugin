@@ -47,9 +47,9 @@ A refusal in these specs is a refusal of this release: it holds until transactio
 refused configuration are specified and measured, and none forecloses capturing a graph through
 #67583's capture hook. Deferred (`[D]`) specs are future obligations, excluded from current
 conformance. On a state layer that offers no state-group layout accessor, which is every core
-this build supports, transaction graphs are refused (TXG-CFG-016); there only TXG-CFG-001,
-TXG-CFG-003, TXG-CFG-009, TXG-CFG-011 to TXG-CFG-014 and TXG-CFG-016 are current conformance, and
-every other spec here is an obligation of the transaction-graph design's Future roadmap item on
+this build supports, transaction graphs are refused (TXG-CFG-016); there the configuration checks
+TXG-CFG-001 and TXG-CFG-003 to TXG-CFG-016 are current conformance (a refusal lists TXG-CFG-016
+with every other violated condition), and every other spec here is an obligation of the transaction-graph design's Future roadmap item on
 the state layer.
 
 ## Option and configuration checks
