@@ -180,7 +180,8 @@ The launch options are flat `--hf-overrides` keys, which core applies to the ser
   only `--hf-overrides` or an already-translated configuration can supply it.
 - **Nominal context.** Validation sets the configuration's `att_context_right` to the server's
   lookahead.
-- **Native burst.** `experimental_native_burst: true` requires the server's lookahead to be 1.
+- **Native burst.** On a core that runs native burst (not the state layer, which refuses it; Engine
+  settings), `experimental_native_burst: true` requires the server's lookahead to be 1.
 - **Transaction graphs.** The geometry rule of the transaction-graph option (80 or 160 ms) is one of
   that option's configuration checks, which validation calls (Post-override validation); this
   design does not restate it.
@@ -191,7 +192,8 @@ The configuration hook runs twice during startup:
 - `verify_and_update_model_config(model_config)` runs at the end of model configuration, after
   core has applied every override. It resolves the server's geometry (above), sets
   `att_context_right`, and checks: a lookahead is present and is one of the five right contexts;
-  no `supported_num_lookahead_tokens` is present; native burst; the
+  no `supported_num_lookahead_tokens` is present; native burst's lookahead, on a core that runs
+  native burst; the
   control-token layout, `eos_token_id` and `vocab_size` equal the computed values;
   `language_locales`, when given, maps language codes to locales of that language in the locale
   table (a locale's language is the lowercase letters before the first `-` or uppercase letter,
@@ -260,8 +262,9 @@ yet. The plugin refuses:
 The model state's construction re-checks these rules against the final engine configuration, where
 an unset `cudagraph_mode` or compilation mode is not accepted.
 
-Native burst's own configuration check, run at model construction, applies the same rule for a
-setting the build does not define: a parallel size counts as 1 and expert parallelism as off.
+On a core that runs native burst, its own configuration check, run at model construction, applies
+the same rule for a setting the build does not define: a parallel size counts as 1 and expert
+parallelism as off.
 
 ### Runner configurations
 
