@@ -32,12 +32,18 @@ registered before the model is built. When `VLLM_PLUGINS` is set it is an allowl
 entry-point names and must include `nemotron_asr_streaming`; otherwise the parser and tokenizer
 mode below do not exist and core rejects `--config-format nemotron_asr_streaming` as unknown.
 
-`register()` performs the following, and changes no registry until the client-path check has
-passed:
-1. **Client-path check.** `AsyncLLM.generate` must accept `stream_admission` and
-   `AsyncLLM.wait_stream_retired` must exist. A missing one raises, naming it and stating that the
-   plugin needs a vLLM build with RFC 1's stream admission (vllm#67375 on #67374). `register()` initializes no device and loads no model;
-   the imports it needs may pull in engine modules transitively.
+`register()` performs the following, and changes no registry until the core check has passed:
+1. **Core check.** The installed vLLM's `ModelState` must define the six model-state hooks of
+   vllm#67583 (Core hooks, below), and `MambaManager.layer_config` must accept `recomputable`,
+   the parameter through which a state layer declares a KV-cache group that its tokens cannot
+   rebuild. A missing one raises, naming each and stating that the plugin needs a vLLM build with
+   RFC 1's state layer and vllm#67583's model-state hooks. The rest of the state-layer surface the
+   model uses (`SupportsPersistentState`, `MambaAttentionBackendEnum.PERSISTENT_STATE`,
+   `ModelState.take_failed_requests`) is checked when the model class is imported
+   (Model-adapter dependencies). `register()` checks no client call: on the target core
+   `AsyncLLM.generate` admits a persistent-state stream without an admission argument, and the
+   session factory checks its own calls (the `session` design). `register()` initializes no device
+   and loads no model; the imports it needs may pull in engine modules transitively.
 2. **Architecture.** `ModelRegistry.register_model("Nemotron3_5AsrStreamingForRNNT",
    "vllm_nemotron_asr_streaming.model:Nemotron3_5AsrStreamingForRNNT")`, a lazy reference.
 3. **Configuration hook.** `MODELS_CONFIG_MAP["Nemotron3_5AsrStreamingForRNNT"]` set to the
@@ -180,8 +186,9 @@ The launch options are flat `--hf-overrides` keys, which core applies to the ser
   only `--hf-overrides` or an already-translated configuration can supply it.
 - **Nominal context.** Validation sets the configuration's `att_context_right` to the server's
   lookahead.
-- **Native burst.** On a core that runs native burst (not the state layer, which refuses it; Engine
-  settings), `experimental_native_burst: true` requires the server's lookahead to be 1.
+- **Native burst.** On a core that runs native burst (not the target core, whose state layer it is
+  refused on; Engine settings), `experimental_native_burst: true` requires the server's lookahead
+  to be 1.
 - **Transaction graphs.** The geometry rule of the transaction-graph option (80 or 160 ms) is one of
   that option's configuration checks, which validation calls (Post-override validation); this
   design does not restate it.
@@ -233,12 +240,14 @@ previous step is still in flight, so each stream still advances one step at a ti
 also stays one step at a time for the model under either setting: it runs a step's
 `postprocess_state` before it executes the next step, and there the model waits for the step's
 commit event, which follows every device read of the step's staged inputs and state, then reads
-the step's commit status. A request that leaves the engine (finish, abort, preemption, error)
-reaches the model state in the next step's finished request IDs, which core delivers even on a
-step with no forward work, so cleanup never races a step that still reads the request's
-buffers. Native burst, whose sampler reads ahead of the scheduler, is refused on the state layer
-until its port there is specified (Future roadmap 9), so it meets asynchronous scheduling nowhere
-yet. The plugin refuses:
+the step's commit status. A request that leaves the engine (finish, abort, error; core never
+preempts a request whose state cannot be recomputed) reaches the model state through
+`remove_request`, which core calls when it applies the next step's finished request IDs, also on
+a step with no forward work; the model state retires the request at its next call (State-slot
+access), so cleanup never races a step that still reads the request's buffers. Native burst,
+whose sampler reads ahead of the scheduler, is refused on the state layer until its port there is
+specified (Future roadmap 9), so it meets asynchronous scheduling nowhere yet. The plugin
+refuses:
 - on this core, native burst (`experimental_native_burst`), at model construction and in the
   configuration hook, naming the state layer and the remedy of removing it; transaction graphs are
   refused here too, by the transaction-graph component's configuration checks (Future roadmap 8);
@@ -247,14 +256,16 @@ yet. The plugin refuses:
   caching as unsupported when it declares persistent state. A configuration built directly with
   `True` is refused here (and by core's state validation);
 - speculative decoding, KV transfer, dual-batch overlap, sleep mode, the cumem allocator,
-  hierarchical sparse attention, fault tolerance (`parallel_config.enable_fault_tolerance`, which
-  keeps core's JIT kernel warm-up on under `enforce_eager`; that warm-up runs synthetic real steps
-  without state-slot handles; `--fault-tolerance-config` turns it on, and the refusal names that
-  cause) and elastic expert parallelism (`parallel_config.enable_elastic_ep`, whose reconfiguration
-  reruns the worker's warmup and so would call the serving capture again over live state pools;
-  A second serving capture, below). Moving execution preparation into core's profiling step does
-  not make sleep mode or the cumem allocator usable: both stay refused, so there is no wake-up
-  re-preparation;
+  hierarchical sparse attention, fault tolerance (`parallel_config.enable_fault_tolerance`;
+  `--fault-tolerance-config` turns it on, and the refusal names that cause) and elastic expert
+  parallelism (`parallel_config.enable_elastic_ep`, whose reconfiguration reruns the worker's
+  warmup and so would call the serving capture again over live state pages; A second serving
+  capture, below). Core itself refuses fault tolerance and elastic expert parallelism for a model
+  that declines synthetic warmup (Synthetic warmup, below), and refuses prefix caching for every
+  persistent-state model, in its own configuration check, which runs before the configuration
+  hook; the plugin's refusals repeat those rules in the configuration hook and at construction.
+  Moving execution preparation into core's profiling step does not make sleep mode or the cumem
+  allocator usable: both stay refused, so there is no wake-up re-preparation;
 - any tensor, pipeline, data, decode-context or prefill-context parallel size other than 1 (a
   setting the build does not have counts as 1);
 - a runner configuration other than the two of Runner configurations, below.
@@ -265,6 +276,23 @@ an unset `cudagraph_mode` or compilation mode is not accepted.
 On a core that runs native burst, its own configuration check, run at model construction, applies
 the same rule for a setting the build does not define: a parallel size counts as 1 and expert
 parallelism as off.
+
+### Synthetic warmup
+
+The model declines core's synthetic warmup (`persistent_state_accepts_synthetic_warmup = False`,
+Supported tasks). Core's `warmup_kernels` adds warmup requests through the model state's
+`add_request`, each scheduling two tokens with non-greedy sampling. The worker runs them whenever
+JIT warmup or the extensible KV cache is on, and runs the extensible KV cache's sizing warmup, also
+through the model state, whenever that cache is on. The extensible KV cache defaults on for CUDA,
+so both would run under `--enforce-eager` too, where JIT warmup is off. The model state records
+every request `add_request` delivers and refuses a real row that schedules more than one token, so
+a warmup request would fail startup; recognizing warmup requests would need a contract that names
+them, which core does not have. With the declaration core runs neither warmup, and the profiling
+run is the only startup step that runs the model's transaction; the profile transaction at its
+maximum shape (Execution memory) is the model's transient peak there. Core's `kernel_warmup` dummy
+runs, which add no request through the model state, still run (Execution memory, Repeated dummy
+steps). The cost is that the sampler's and other JIT-compiled kernels compile on the first serving
+steps; that latency is unmeasured.
 
 ### Runner configurations
 
@@ -353,7 +381,7 @@ A mode that is not NONE after core's configuration build (FULL_DECODE_ONLY; PIEC
 FULL_AND_PIECEWISE under `VLLM_COMPILE`; FULL_AND_PIECEWISE with breakable graphs on), and that
 core therefore reduces only when it initializes the KV cache, is not identical to an explicit NONE at startup: the
 engine configuration sizes core's graph capture sizes from the requested mode, and core's
-profiling KV-cache initialization, with it the temporary state pools of the profiling capture,
+profiling KV-cache initialization, with it the state group of the profiling capture,
 holds `min(max_num_seqs, the largest capture size) or 1` pages, where an explicit NONE, or a
 mode reduced while the configuration is built, has no capture sizes and so holds one. The model's graphs and its serving pools do
 not change; the profiling capture's transient memory does (Future roadmap 3).
@@ -412,7 +440,7 @@ checkpoint's default lookahead (3, which is 320 ms, on the published card), so i
 nemotron_asr_streaming`, `--tokenizer-mode nemotron_asr_streaming`, one of the two runner
 configurations, chosen from those that acceptance tier 2 has met with the default arms (until the
 hook configuration meets it, `--enforce-eager`) with the runner and scheduling flags tier 2 was met
-with (`--no-async-scheduling` until a tier is met with asynchronous scheduling, which core now
+with (`--no-async-scheduling` until a tier is met with asynchronous scheduling, which core
 resolves on when the option is unset), an explicit `--max-num-seqs` that tier 2 verified
 to fit the A40 at 320 ms in that runner configuration, and `--max-model-len 77000`, which holds a 600 s
 file at 320 ms (core's default decode limit; at most 76,918 tokens: 1,875 whole chunks of 5,120
@@ -460,14 +488,15 @@ used as it stands: an absent `encoder_execution_arm` is the configuration class'
 ## Execution memory
 
 The model's execution retains device memory (long-lived working buffers and the segment graphs),
-and its largest transaction needs transient memory beyond that. Core sizes the KV cache and the
-state pool from the memory profile of its profiling run, and binds state slots only after it
-allocates them (`initialize_state_slots`). #67583 divides model execution memory between two
-hooks, and the model keeps them apart: long-lived working memory outside any graph belongs to
-`prepare_execution_memory`, which every profiled budget counts; graphs captured through
-`capture_cudagraphs` are counted only by core's graph-memory estimate. Under `--enforce-eager`,
-where core runs no capture hook, the model captures its segment graphs on core's profiling dummy
-step, inside the profiled budget.
+and its largest transaction needs transient memory beyond that. Core sizes the KV cache, whose one
+group is the model's state group, from the memory profile of its profiling run, and binds the
+group's pages to the state layer (`MambaBase.bind_kv_cache`) only after it allocates them; the
+model state checks that binding in `initialize_kv_cache` (State-slot access). #67583 divides model
+execution memory between two hooks, and the model keeps them apart: long-lived working memory
+outside any graph belongs to `prepare_execution_memory`, which every profiled budget counts; graphs
+captured through `capture_cudagraphs` are counted only by core's graph-memory estimate. Under
+`--enforce-eager`, where core runs no capture hook, the model captures its segment graphs on core's
+profiling dummy step, inside the profiled budget.
 
 The model prepares in three places, by runner configuration:
 
@@ -481,31 +510,38 @@ The profile transaction's maximum shape is `max_num_seqs` rows at the server's g
 configured CHUNK-bucket graph population; transaction graphs add no shape to it. It sizes the option-off transaction's transient use and its use of core's
 workspace, which core locks after the serving capture.
 
-- **One owner per stage.** `prepare_step` records whether the step is a profiling dummy step; the
-  model's forward on that step is the only place that runs the profile transaction, and under
-  `--enforce-eager` the only place that captures. It returns the dummy output core expects. The
-  forward runs no forward-time profile of an unprepared encoder: none can run once the inventory
-  is sealed.
+- **Step classification.** Core gives the model state no record of why it runs a step, so the
+  model state's `prepare_inputs` classifies each step from what it has seen: a step with a row
+  whose request ID `add_request` never recorded is a *dummy step* (core's dummy batches carry
+  fresh request IDs), every other step is a *real step*, and a dummy step for which core called
+  no `prepare_attn` since the previous `prepare_inputs` is a *profiling dummy step* (core's
+  profiling run builds no attention metadata). A dummy step's projection reads no page
+  (`no_page_io`).
+- **One owner per stage.** The model's forward on the first profiling dummy step is the only place
+  that runs the profile transaction, and under `--enforce-eager` the only place that captures. It
+  returns the dummy output core expects. The forward runs no forward-time profile of an
+  unprepared encoder: none can run once the inventory is sealed.
 - **Dummy output.** Core indexes the profiling step's forward output by its logits indices, computes
   logits and runs the sampler on it. The dummy output matches the input embeddings' token count,
   width, dtype and device, and its carrier column holds a valid decision ID (zeros), so dummy sampling
-  needs no state; dummy sampling, including the native-burst sampler wrapper, reads no state slots.
-- **Repeated profiling steps.** Core runs one profiling run per worker, but its kernel warm-up may run
-  further profiling dummy steps after the state pool exists (FlashInfer autotuning on recent GPUs),
-  with real token IDs and attention metadata, possibly several times. Each is handled as a later
-  profiling step: the inventory is checked (under the hook configuration, segment graphs not yet
-  captured by the serving capture are accepted as pending) and the dummy output returned, with no
-  capture and no pool access.
-- **Other dummy steps.** Core skips its state-slot step bookkeeping on every dummy step, and calls
-  `prepare_inputs` after `prepare_step` returned early, so on a dummy step the model reads no handles,
-  no rows and nothing left from an earlier real step.
-- **No state pool needed.** Preparation, capture and profiling use model-owned scratch state built
-  from the model's `PersistentStateSpec`: segment graphs copy state into and out of their own
-  static buffers, and the gather from and scatter to the pool run outside any segment graph, so
-  neither preparation, the profile transaction nor segment-graph capture reads the state-slot
-  bindings, the pool or its addresses, in either runner configuration. The one exception is the
-  transaction-graph cells, which reach the pools inside `capture_cudagraphs` only through
-  `StateSlotBindings.startup_pool_access`, as the `transaction-graph` design authorizes.
+  needs no state; dummy sampling reads no state page.
+- **Repeated dummy steps.** Core runs one profiling run per worker, but its kernel warm-up
+  (`kernel_warmup`) may run further dummy steps after the state pages are bound (FlashInfer
+  autotuning on recent GPUs), with real token IDs and possibly attention metadata, several times.
+  Whether or not the model state classifies such a step as a profiling dummy step, the forward
+  returns the dummy output with no capture, no profile transaction and no page access; a later profiling dummy step also checks the inventory
+  (under the hook configuration, segment graphs not yet captured by the serving capture are
+  accepted as pending).
+- **Other dummy steps.** On a dummy step the model reads no page, no recorded request and nothing
+  left from an earlier real step. Core's dummy batches carry only fresh request IDs, so no row of
+  a dummy step names a request the model state recorded.
+- **No state page needed.** Preparation, capture and profiling use model-owned scratch state built
+  from the model's state layout (`StateLayout`, built from the checkpoint's state manifest):
+  segment graphs copy state into and out of their own static buffers, and the gather from and
+  scatter to the pages run outside any segment graph, so neither preparation, the profile
+  transaction nor segment-graph capture reads the state layer's views, a page or its address, in
+  either runner configuration. Transaction-graph cells, which would reach the pages from inside
+  their graphs, are refused on the target core (Engine settings).
 - **Once per worker.** A failure of preparation marks the worker failed, discards partial execution
   state and raises, so startup fails; the next attempt is a fresh worker.
 - **Readiness on every real step.** The model refuses any real step that runs model execution unless
@@ -525,12 +561,18 @@ workspace, which core locks after the serving capture.
   Core's elastic expert-parallel scale-up launch skips profiling and is not supported: the plugin
   refuses elastic expert parallelism and any data-parallel size other than 1, and the serving
   guard stops a step that reaches serving unprepared. Core's no-KV-cache path also skips profiling,
-  and cannot apply, because the model declares a state layer. The pool is `max_num_seqs + 1` pages
-  unless the operator overrides the block count.
+  and cannot apply, because the model declares a state layer. When the model declines synthetic
+  warmup, core runs no sizing warmup for an extensible KV cache either (Synthetic warmup).
+- **State pages.** Core sizes the state group's block count from the KV-cache budget as for any
+  `MambaSpec` group, unless the operator overrides the block count. A request holds one block,
+  because the block size is `max_model_len`. The scheduler fails construction unless the group
+  holds a page for every request that can be active (`max_num_active_seqs`, by default
+  `max_num_seqs`) besides core's null block; whether the budget yields that many pages at the
+  README's settings is unmeasured.
 - **Graph runtime.** Graph capture uses core's graph-capture context, forward context and the
   platform's static graph wrapper. Under the hook configuration every capture runs on the `stream`
   core passes, inside `vllm.compilation.cudagraph_pool.capture_pool` with the `graph_pool` core
-  passes; the model creates no stream and no graph pool of its own. At the target heads core has
+  passes; the model creates no stream and no graph pool of its own. The target core has
   no capture-enabled switch, so the model's graph runtime has none;
   capture legality is the model's own ordering above.
 - **Platforms without static graphs.** Where vLLM's platform reports no static graph mode
@@ -541,14 +583,13 @@ workspace, which core locks after the serving capture.
   eager arms'. The model logs one INFO line naming each graphed arm the stand-in serves, so a run
   that asked for graphed arms shows that it executes them eagerly. Only `--enforce-eager` reaches
   this case, because the hook configuration requires a CUDA platform.
-- **Memory contributors.** The model's `PersistentStateSpec` lists in `memory_contributors` each
-  configured option that enlarges its execution memory or graphs: `max_num_seqs`,
-  `encoder_execution_arm` and `decode_dispatch_arm` when graphed execution is configured,
-  `chunk_bucket_graph_populations` when it is non-empty, and `transaction_graph_populations` when
-  the option is on. Whether transaction graphs are on is decided only by the `transaction-graph`
-  design's `transaction_graphs_on` (TXG-CFG-014), which every check, hook and dependency gate here
-  calls, so a malformed value such as `{}` is on, and refused, everywhere. Core adds a note naming them to a failure of its temporary profiling pool, of a
-  capture and of its capacity planning.
+- **Transaction graphs on or off.** Whether transaction graphs are on is decided only by the
+  `transaction-graph` design's `transaction_graphs_on` (TXG-CFG-014), which every check, hook and
+  dependency gate here calls, so a malformed value such as `{}` is on, and refused, everywhere.
+- **Memory diagnostics.** The target core reads no list of the options that enlarge the model's
+  execution memory or graphs, so core's own failures of profiling, capture and capacity planning
+  name none of them. The model's capture line and capture-failure message (Segment-graph memory)
+  name the arms, the geometry, `max_num_seqs` and the remedies (Future roadmap 12).
 
 ### Segment-graph capture on the hook
 
@@ -562,7 +603,7 @@ segment graph.
 | Hook | Segment-graph behaviour |
 | --- | --- |
 | `needs_cudagraph_capture()` | True when the configuration selects a hook-captured graph (Engine settings) and the platform is CUDA. Configuration only, the same value for the model state's lifetime. |
-| `capture_cudagraphs(profile_only=True)` | Runs only when core's graph-memory estimate runs, over core's temporary profiling state pools and into the estimate's throwaway pool. Captures the segment graphs for the server's geometry, then the transaction-graph part; with transaction graphs off, it ends with the charged margin. Logs the capture line. |
+| `capture_cudagraphs(profile_only=True)` | Runs only when core's graph-memory estimate runs, over core's minimal profiling KV cache and into the estimate's throwaway pool. Captures the segment graphs for the server's geometry, then the transaction-graph part; with transaction graphs off, it ends with the charged margin. Logs the capture line. |
 | `clear_cudagraphs()` | Releases every segment graph and its buffers, after the transaction-graph part, and, with transaction graphs off, the margin the profiling capture created (with them on, the transaction-graph part releases it); keeps the profiling figures as host integers. Core calls it also when the profiling capture raised or was never reached, so it tolerates nothing captured. Core also clears every registered static graph wrapper after the estimate, so no profiling entry survives either way. |
 | `capture_cudagraphs(profile_only=False)` | The serving capture: rebuilds the segment graphs by the same procedure, into core's global graph pool, then the transaction-graph part; then the memory comparison. Logs the capture line. |
 | `post_warmup()` | Before the worker serves: every expected segment-graph entry holds its graph; then the transaction-graph verification. The segment-graph check allocates nothing; neither part allocates device memory or replays a graph. Under `--enforce-eager` it makes the same segment-graph check. |
@@ -648,7 +689,7 @@ capture line's retained figure is the span of the call's segment-graph part.
 
 ## Model-state interface
 
-Every `ModelState` method the model state overrides keeps the base signature at the target heads,
+Every `ModelState` method the model state overrides keeps the base signature at the target core,
 because core's model runner calls them positionally; a test binds each override against the base
 signature. In particular the profiling path reaches the forward through
 `dummy_inputs_embeds(num_tokens, input_ids=None)`. The model state returns its pre-allocated
@@ -656,40 +697,130 @@ embeddings buffer sliced to `num_tokens` in both cases: when core passes randomi
 the contents stay unused, because the model's dummy forward reads no embedding values and returns
 the dummy output.
 
+Core gives the model state no step record of its own; the model state rebuilds each step from
+these overrides, which the runner calls on the worker:
+
+| Method | What the model state does |
+| --- | --- |
+| `add_request(req_index, new_req_data)` | Decides a pending removal, records the request (its prompt, slot, admission generation and `NewRequestData`) and takes a file request's samples (State-slot access; the `transcription` design). |
+| `remove_request(req_id)` | Records one pending removal, which the model state's next call decides (State-slot access). |
+| `initialize_kv_cache(kv_cache_config, block_tables)` | Checks that the one KV-cache group holds exactly the state layer and that core bound its pages, then the resolved runner mode (REG-ENG-017). |
+| `prepare_inputs(input_batch, req_states)` | Classifies the step (Execution memory), refuses a real row that schedules more than one token, binds the step's rows to their slots and plans the step once. |
+| `prepare_attn(...)` | Builds no attention metadata and returns `{}`; refuses a capture, a FULL step and a micro-batch (REG-ENG-029). |
+| `postprocess_state(...)` | Waits for the step's commit event, collects the step's commit status, applies file queue counts, and records the step's failed requests (Row failure, below). |
+| `take_failed_requests()` | Returns the requests `postprocess_state` recorded as failed and clears the record. |
+
+The six graph hooks, `get_additional_cg_support`, `prepare_dummy_inputs` and
+`get_supported_generation_tasks` are described under Execution memory, Engine settings and
+Supported tasks.
+
+**Row failure.** A step can fail some of its rows and complete the others. A row fails when its
+collected commit status resolves to a nonzero value (the `session` design, Row status in the
+model), when the model state failed it at planning (the `transaction-graph` design, TXG-FAIL-008,
+with transaction graphs on or off), and when it is a file row with no accepted queue count (the
+`transcription` design, Queue counts). `postprocess_state` records each such request and raises
+no error for it. The runner asks once per step, after `postprocess_state`, through
+`take_failed_requests`, which returns the recorded request IDs and clears the record; it returns
+`None` when none is recorded, and a dummy step records none. The IDs are the worker's request
+IDs, which are the IDs core's scheduler holds. Core's scheduler discards those rows' sampled
+tokens and finishes each such request alone with finish reason `error`, publishing a terminal
+output for a state stream, and ignores an ID it no longer holds. The failed request's record,
+file buffer and progress are retired like those of any finished request, after core's
+`remove_request`. The channel adds no host synchronization: `postprocess_state` already waits for
+the step's commit event before it reads the commit status (Engine settings).
+
 ## State-slot access
 
-- `prepare_step` reads only the scheduler output, including its state-slot handles; the bindings
-  give no row access there.
-- During scheduled execution, the model binds rows inside the step, after core begins the step and
-  activates its requests:
-  `bind_rows` for the step's ordered requests and their handles, then
-  `StateSlotRows.component_pools` and `slot_indices_cpu`. Transaction-graph capture reaches the
-  pools only through the startup access the `transaction-graph` design governs (TXG-CAP-008).
-- Before committing state, the model re-reads `component_pools`, which core refuses outside the live
-  step, so a commit outside the live step fails before it writes.
-- The model's projection of pools into named state tensors takes the component pools and the
-  model's spec and reads no other member of the rows.
-- The persistent-state spec is the layout and the memory contributors:
-  `PersistentStateSpec(descriptors=..., page_size_bytes=..., block_size=1, memory_contributors=...)`,
-  with no state name (Execution memory, Memory contributors).
-- Core sends no token IDs for scheduled cached requests unless pipeline parallelism is on, which the
-  plugin refuses. `prepare_step` therefore records each request's prompt when core delivers it as a
-  new request (a session turn arrives that way, with its prompt from position zero) and reads a
-  cached row's scheduled tokens from that record. A position past the recorded prompt holds a token
-  the sampler produced on the device; the host does not read it (that would synchronize with the
-  device), and no sampled token is a CHUNK carrier, so the row is planned as a non-CHUNK row. The
-  record is dropped when the request finishes. For a file request this classifies only the
-  scheduled token's origin: the file step rule (`transcription`, FILE-ROW-002) decides whether the
-  row executes as CHUNK, before transaction classification.
+The model's state is one page per request in one KV-cache group. The state layer
+(`NemotronStateLayer`, a `MambaBase` layer registered under its prefix in the static forward
+context) declares a `MambaSpec` whose states are the state layout's descriptors in manifest order,
+with `state_alignment` 1 (the manifest publishes its padding explicitly), `block_size` equal to
+`max_model_len` (so a request holds one block) and `mamba_type` `PERSISTENT_STATE`, and returns
+`MambaManager.layer_config(spec, recomputable=False)` as its KV-cache configuration. The spec's
+page size must equal the layout's page size. Core refuses a group its tokens cannot rebuild
+unless the group's spec is a `MambaSpec` of `mamba_type` `PERSISTENT_STATE`, and it resolves that
+type to its persistent-state attention backend, whose metadata the model never builds. Core
+allocates the request's block when it first schedules the request, keeps it while a stream waits
+for its next input, frees it when the request finishes, and never preempts the request. It binds
+the group's memory through `MambaBase.bind_kv_cache`, one view per state with one row per block,
+and binds it again when the extensible KV cache grows, so the layer replaces its views on every
+binding.
+
+- **Slot.** A request's slot is its one block, `block_ids[0][0]` of the `NewRequestData` core
+  delivers to `add_request`; block 0 is core's null block, so a valid slot lies between 1 and the
+  bound block count minus 1. The model state pairs the slot with an admission generation from its
+  own counter, new for every request that does not continue a live one (`SlotHandle`). The
+  `transcription` design records a file's host buffer with that pair.
+- **Fresh page.** A row is fresh when its `num_computed_tokens` is 0; core delivers that count
+  exactly on the request's first step, the step on which its page is new. Core initializes a new
+  page before the step's forward (`StatePageInitializer`, writing each state's entry of the spec's
+  `initial_values`, zeros because the layer sets none). The model's forward then initializes each
+  fresh row's page through the layer's `initialize_pages` before its transaction: it zeroes every
+  byte and writes each descriptor's non-zero initializer (the label book's blank label). Both
+  writes run on the current stream before any read of the page. The layout has no bytes outside
+  its states, so core's zeroing and the layer's agree on every byte except the blank labels
+  (Future roadmap 11).
+- **Turn continuation.** For each input after a stream's first, core calls `remove_request` and
+  then `add_request` for the same request, with the compacted prompt and `num_computed_tokens` 1
+  (Recorded prompt, below); for a finished request it calls `remove_request` alone, and before it
+  adds any request it calls `remove_request` for that request's ID, which for an ID the model state
+  does not hold only decides an earlier pending removal. The model state therefore records one
+  pending removal and decides it at its next call. An `add_request` of the same request, with
+  `num_computed_tokens` above 0 and the same slot, continues the request: it keeps the request's
+  admission generation, file buffer and progress and replaces its recorded prompt. Every other call
+  retires the pending request first, dropping its record, its file buffer and progress, and its
+  failed-file mark. An `add_request` with `num_computed_tokens` above 0 that continues no live
+  request on its slot raises, naming the request, as does an `add_request` for a live request that
+  no removal preceded.
+- **Views per step.** During a real step, the model reads state only through the layer's views
+  as bound at that step (`component_pools`, read when the step's `StateBatch` is built), for the
+  slots of the step's rows, and refuses a slot outside the bound pages before it reads any.
+- **Commit check.** Before committing a step's state, the model checks that the commit's row order
+  and slots equal the step's bindings, and writes no state if they differ.
+- **Projection.** The model's projection of the views into named state tensors
+  (`project_nemotron_state_pools`) takes the views and the model's `StateLayout` and reads nothing
+  else.
+- **Recorded prompt.** Core sends no token IDs for scheduled cached requests unless pipeline
+  parallelism is on, which the plugin refuses. The model state therefore records each request's
+  prompt (`prefill_token_ids`) at its latest `add_request` and reads a row's scheduled token from
+  that record at the row's `num_computed_tokens`. A stream's first input arrives with its prompt
+  from position zero. Every KV-cache group of this model is non-recomputable, so core compacts a
+  stream's history: when it folds a later input into the stream, it drops the earlier tokens and
+  the last sampled token (the park), keeps one frontier token followed by the new input as the
+  prompt, and sets `num_computed_tokens` to 1. The recorded prompt is then that compacted prompt,
+  and the row reads the new input from position 1. A position past the recorded prompt holds a
+  token the sampler produced on the device; the host does not read it (that would synchronize
+  with the device), and no sampled token is a CHUNK carrier, so the row is planned as a non-CHUNK
+  row. The record is dropped when the request is retired. For a file request this classifies only
+  the scheduled token's origin: the file step rule (`transcription`, FILE-ROW-002) decides whether
+  the row executes as CHUNK, before transaction classification.
+- **File requests.** When `add_request` delivers a request whose scheduled token is the file
+  carrier, the model state takes the file's samples and header from the `NewRequestData` and host
+  data only (the `transcription` design, Request-owned host buffer).
 
 ## Supported tasks
 
-The model class declares `supports_realtime`, `supports_persistent_state` and
-`SupportsTranscription` with `supports_transcription_only = False`. Core would also infer
-`generate` from the presence of `compute_logits`, so the model's model state overrides
-`get_supported_generation_tasks()` to return exactly `("transcription", "realtime")`. A frontend
-requiring `realtime` loads; one that needs complete-file transcription checks for
-`transcription`.
+The model class declares `supports_realtime`, `SupportsTranscription` with
+`supports_transcription_only = False`, and `SupportsPersistentState` with three settings that
+core reads from the class:
+- **`persistent_state_reads_positions = False`.** The forward discards `positions` and reads every
+  other value in the token-index space of the request's recorded prompt. Core compacts this
+  model's history whatever the setting, because its only KV-cache group is non-recomputable; with
+  the setting false, compaction adds no position offset. True would add every dropped token to the
+  request's position offset, which core counts against `max_model_len`, so a long session would
+  end with a length cap for no gain.
+- **`persistent_state_accepts_synthetic_warmup = False`.** The model state cannot serve core's
+  warmup requests (Engine settings, Synthetic warmup).
+- **`persistent_state_resumable_stops = frozenset({"eos"})`.** The park token is the tokenizer's
+  only EOS and ends every unit, so a stream resumes only at a stop-free EOS. A unit that reaches
+  its `max_tokens` without parking has broken the model's per-unit emission bound
+  (`realtime_max_tokens`), and ends the stream; making that stop resumable would fold the next
+  input into a stream whose last unit never parked.
+
+Core would also infer `generate` from the presence of `compute_logits`, so the model's model
+state overrides `get_supported_generation_tasks()` to return exactly
+`("transcription", "realtime")`. A frontend requiring `realtime` loads; one that needs
+complete-file transcription checks for `transcription`.
 
 ## Model-adapter dependencies
 
@@ -703,16 +834,17 @@ is imported:
 | `vllm.compilation.breakable_cudagraph` | `is_breakable_cudagraph_enabled` |
 | `vllm.v1.attention.backend` | `AttentionCGSupport` |
 | `vllm.v1.core.sched.output` | `NewRequestData`, `SchedulerOutput` |
-| `vllm.v1.kv_cache_interface` | `KVCacheConfig`, `StateSlotHandle` |
+| `vllm.v1.kv_cache_interface` | `KVCacheConfig`, `KVCacheLayerConfig`, `MambaSpec` |
+| `vllm.model_executor.layers.mamba.abstract` | `MambaBase` |
+| `vllm.v1.core.single_type_kv_cache_manager` | `MambaManager`, with the `recomputable` parameter of its `layer_config` |
+| `vllm.v1.attention.backends.registry` | `MambaAttentionBackendEnum`, with its member `PERSISTENT_STATE` |
+| `vllm.model_executor.models.interfaces` | `SupportsPersistentState` |
 | `vllm.v1.worker.gpu.input_batch` | `InputBatch` |
-| `vllm.v1.worker.gpu.model_states.interface` | `ModelState`, with its hooks `prepare_execution_memory`, `needs_cudagraph_capture`, `capture_cudagraphs`, `clear_cudagraphs`, `post_warmup` and `shutdown`, and its `get_additional_cg_support` |
-| `vllm.v1.worker.gpu.state_slots` | `StateSlotBindings`, `StateSlotRows` |
+| `vllm.v1.worker.gpu.model_states.interface` | `ModelState`, with its hooks `prepare_execution_memory`, `needs_cudagraph_capture`, `capture_cudagraphs`, `clear_cudagraphs`, `post_warmup` and `shutdown`, its `get_additional_cg_support` and its `take_failed_requests` |
 | `vllm.v1.worker.gpu.states` | `RequestState` |
 | `vllm.v1.worker.utils` | `AttentionGroup` |
-| `vllm.model_executor.layers.state` | `PersistentStateLayerBase` |
 | `vllm.multimodal` | `MULTIMODAL_REGISTRY` |
 | `vllm.v1.attention.backends.utils` | `NULL_BLOCK_ID` |
-| `vllm.v1.kv_cache_interface` (state layout) | `PersistentStateSpec` (with its `memory_contributors` argument), `PersistentStateDescriptor` |
 | `vllm.v1.worker.gpu.sample.output` | `SamplerOutput` |
 | `vllm.distributed.parallel_state` | `graph_capture` |
 | `vllm.forward_context` | `BatchDescriptor`, `set_forward_context` |
@@ -720,21 +852,23 @@ is imported:
 | `vllm.utils.import_utils` | `resolve_obj_by_qualname` |
 | `vllm.compilation.cudagraph_pool` | `capture_pool` |
 | `vllm.envs` | `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` |
-| `vllm.v1.worker.gpu.state_slots` (transaction graphs, on a core that runs them; not checked on the state layer) | `StateSlotBindings.startup_pool_access`, `StateSlotBindings.pool_layout` |
 | `vllm.utils.torch_utils` | `direct_register_custom_op` |
 | `vllm.model_executor.determinism.batch_invariant` | the batch-invariant matmul used by the batch-invariant mode |
 
-Three groups of rows are conditional. The graph-runtime rows (`graph_capture`, `BatchDescriptor`,
+Two groups of rows are conditional. The graph-runtime rows (`graph_capture`, `BatchDescriptor`,
 `set_forward_context`, `current_platform`, `resolve_obj_by_qualname`, `capture_pool` and
 `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS`) are imported when graphed execution is configured; the
-transaction-graph rows while transaction graphs are on (TXG-CFG-014; the `transaction-graph`
-design, Permitted dependencies, lists their use); the batch-invariant row when that mode is. The
-import-time check covers the rest, the six hooks of `ModelState` and its `get_additional_cg_support` included. vLLM's model-registration, config
+batch-invariant row when that mode is. The import-time check covers the rest, the six hooks of
+`ModelState`, its `get_additional_cg_support` and `take_failed_requests`, the `recomputable`
+parameter and the `PERSISTENT_STATE` member included. The table has no transaction-graph row:
+transaction graphs are refused on the target core before any dependency of theirs is needed
+(Engine settings; Future roadmap 8). vLLM's model-registration, config
 parser, tokenizer and renderer registries, model configuration hooks (`VerifyAndUpdateConfig`,
 `MODELS_CONFIG_MAP`), speech-to-text configuration, multimodal processing, `SupportsTranscription`,
 logging and Hub file helpers, which out-of-tree models use, are outside this table, as is the public
 client surface that the session and `register()` use (`AsyncLLM`, `StreamingInput`, `SamplingParams`,
-`RequestOutputKind`, `StreamAdmissionError`, `EngineDeadError`; see the HLD's Engine surface constraint). Adding a dependency means
+`RequestOutputKind`, and `StreamAdmissionError` and `EngineDeadError` from
+`vllm.v1.engine.exceptions`; see the HLD's Engine surface constraint). Adding a dependency means
 adding it here and to the import-time check.
 
 ## Implementation notes
@@ -761,7 +895,7 @@ adding it here and to the import-time check.
 | Where launch options are resolved | Post-override validation of the final configuration; the parser reads only the checkpoint | Reading `hf_overrides` inside the parser; a plugin-specific environment variable | Core gives the parser only flat overrides, applies dictionary overrides after it, and also calls it with none when deriving a generation configuration |
 | Control tokens in the tokenizer | A registered tokenizer mode that appends them as special tokens, with park as the tokenizer's EOS | Publishing a modified tokenizer; leaving them unknown | Core detokenizes every token; unknown IDs break detokenization and unmarked ones appear in text; the card must stay usable unmodified |
 | Context ceiling | Translation sets `max_position_embeddings` to 2^24 | Requiring `VLLM_ALLOW_LONG_MAX_MODEL_LEN` | The model has no positional limit; long files need a context far above the card's 32,768 |
-| Where model execution memory is prepared | Long-lived working memory in `prepare_execution_memory`; the profile transaction on core's first profiling dummy step (flagged by `prepare_step`); segment graphs on that step under `--enforce-eager` and in `capture_cudagraphs` under the hook configuration | `initialize_state_slots` or first serving step: graphs created after core sized the KV cache and state pool, so their memory is unbudgeted. Capturing in `prepare_execution_memory`: the hook's contract forbids capture there. Capturing on the profiling step under the hook configuration too: core's estimate would not see those graphs as graph memory, and the profiling and serving captures would differ | Each stage runs where #67583 budgets it. A failed preparation ends worker startup and the engine is restarted: partial preparation is not safely retryable in the worker, and no serving state outlives the failure |
+| Where model execution memory is prepared | Long-lived working memory in `prepare_execution_memory`; the profile transaction on core's first profiling dummy step (classified in `prepare_inputs`); segment graphs on that step under `--enforce-eager` and in `capture_cudagraphs` under the hook configuration | `initialize_kv_cache` or first serving step: graphs created after core sized the KV cache, so their memory is unbudgeted. Capturing in `prepare_execution_memory`: the hook's contract forbids capture there. Capturing on the profiling step under the hook configuration too: core's estimate would not see those graphs as graph memory, and the profiling and serving captures would differ | Each stage runs where #67583 budgets it. A failed preparation ends worker startup and the engine is restarted: partial preparation is not safely retryable in the worker, and no serving state outlives the failure |
 | Served geometry | One per server, fixed at startup: `num_lookahead_tokens` when given, else the card's `default_num_lookahead_tokens`; any of the five implemented lookaheads; `supported_num_lookahead_tokens` refused | A served set with a default (every geometry warmed and captured, multiplying graph memory and startup time); requiring the override (ignores what the checkpoint declares); ignoring `supported_num_lookahead_tokens` silently (an old serve command would start at a geometry its operator did not choose); only the card's four lookaheads (drops the tested 160 ms geometry) | One geometry keeps graph memory and capture time to one set of segment graphs, and matches how a Hugging Face Transformers model fixes its lookahead |
 | Default segment arms | `eager-graphed` encoder and `dense-graphed` decoder, declared at translation; overrides kept | The eager arms by default; the compiled `dense-graphed` encoder | The pair measured fastest with equal transcripts (HLD, Key Design Decisions); the eager arms stay selectable as the reference |
 | Arms under the hook configuration | The `eager-graphed` encoder and `dense-graphed` decoder (and transaction graphs); the compiled `dense-graphed` encoder and CHUNK-bucket graphs refused there | Capture every graphed arm in the hook; capture the unsupported ones on the profiling step | Capture of the compiled encoder and of CHUNK-bucket graphs through the hook is not yet specified or qualified, and the HLD forbids profiling-step capture in the hook configuration; both stay available under `--enforce-eager`. The refusal holds until their hook capture is specified and measured (Future roadmap 4); nothing technical prevents it |
@@ -771,7 +905,12 @@ adding it here and to the import-time check.
 | Compilation modes | Accept NONE, `DYNAMO_TRACE_ONCE` and `VLLM_COMPILE`, which compile nothing in an undecorated model, and a requested `STOCK_TORCH_COMPILE` that core sets to NONE; refuse `STOCK_TORCH_COMPILE` that would reach the runner | Require compilation off; accept every mode | The model has no `CustomOp` subclass, whose dispatch the compilation mode's `custom_ops` selects, so a compilation mode changes no operator dispatch in the model; `STOCK_TORCH_COMPILE` compiles the whole model with `fullgraph=True`, which a forward with host reads cannot pass |
 | Asynchronous scheduling | Accepted | Refuse it | Core's per-request barrier for state models runs each stream one step at a time, which is the property the model needs; the model reads commit status in `postprocess_state`, before the next step executes |
 | Core hooks | Required in every configuration; a core without them is refused | Detect them and fall back to profiling-step capture | One core API to test (HLD, Key Design Decisions, Core API) |
-| Load-time checks | Client calls in `register()`; adapter symbols at model import | All checks in `register()` | `register()` and the session factory do not import the model class modules, so loading the plugin stays cheap; core's speech-to-text serving imports the model class in the API server when it starts, so importing it initializes no device and loads no weights |
+| Load-time checks | The model-state hooks and the `recomputable` parameter in `register()`; every adapter symbol at model import | All checks in `register()`; a check of client calls in `register()` | `register()` and the session factory do not import the model class modules, so loading the plugin stays cheap; core's speech-to-text serving imports the model class in the API server when it starts, so importing it initializes no device and loads no weights. The target core admits a stream without a client call to check, and the session factory checks its own calls |
+| Whether the forward reads positions | `persistent_state_reads_positions = False`, declared | Core's default, True | The forward discards `positions`. Core compacts this model's history either way, because its only KV-cache group is non-recomputable; with True, compaction adds every dropped token to the request's position offset, which core counts against `max_model_len`, so a long session would end with a length cap for no gain |
+| Core's synthetic warmup | Declined: `persistent_state_accepts_synthetic_warmup = False` | Core's default, True; recognizing warmup requests in the model state and serving them | Warmup requests schedule two tokens with non-greedy sampling, which the model state refuses, and they run by default on CUDA, where the extensible KV cache defaults on, even under `--enforce-eager`. No contract names a warmup request, so the model state could recognize one only by guessing. The cost is JIT compilation on the first serving steps |
+| Resumable stops | `persistent_state_resumable_stops = frozenset({"eos"})`, declared | `{"eos", "max_tokens"}`; `{"max_tokens"}` alone or an empty set | The park token is the only EOS and ends every unit. A resumable `max_tokens` stop would hide a unit that never parked and leave the session waiting for a park; without `"eos"`, every park would end the stream after one unit |
+| State group type | `MambaSpec` with `mamba_type` `PERSISTENT_STATE` | `SHORT_CONV`, the short-convolution type with the same KV-cache shape handling; another Mamba type | Core refuses a group its tokens cannot rebuild unless its spec is a `MambaSpec` of `mamba_type` `PERSISTENT_STATE`. The model builds no attention metadata, so the backend the type selects changes nothing else for it |
+| Per-request failure | `postprocess_state` records the step's failed rows and `take_failed_requests` returns them, so core finishes each failed request alone with finish reason `error` | Raise from `postprocess_state`; retry or roll back the row in the model | A raise ends the engine, and with it every stream on the server, for one row's failure. A retry or rollback cannot recover a row: a stream row's status is final, and a file row's position has already advanced (the `transcription` design). Core's channel needs no host synchronization beyond the wait `postprocess_state` already makes |
 | `generate` task | Not advertised (model-state override) | Advertise for compatibility | The model emits transcript labels, not text generation |
 
 ## References
@@ -779,8 +918,15 @@ adding it here and to the import-time check.
 - vLLM config parsers: `vllm/transformers_utils/config.py` (`register_config_parser`, the parser
   call and override application), `vllm/transformers_utils/config_parser_base.py`.
 - Model configuration hooks: `vllm/model_executor/models/config.py` (`MODELS_CONFIG_MAP`).
-- Supported tasks and model-state hooks: `vllm/v1/worker/gpu/model_states/interface.py` (hooks from
-  vllm#67583); graph-pool routing: `vllm/compilation/cudagraph_pool.py`.
+- Supported tasks, model-state hooks and `take_failed_requests`:
+  `vllm/v1/worker/gpu/model_states/interface.py` (hooks from vllm#67583); graph-pool routing:
+  `vllm/compilation/cudagraph_pool.py`.
+- The target core's state layer (`pdtgct/vllm` at `ac2ef47540`): `SupportsPersistentState` in
+  `vllm/model_executor/models/interfaces.py`; the state-group check
+  `verify_persistent_state_groups` in `vllm/v1/core/kv_cache_utils.py`; `MambaSpec` and its
+  `initial_values` in `vllm/v1/kv_cache_interface.py`; `StatePageInitializer` in
+  `vllm/v1/worker/utils.py`; the synthetic-warmup decision in `vllm/v1/worker/gpu_worker.py`;
+  compaction and the failed-request path in `vllm/v1/core/sched/scheduler.py`.
 - Plugin loading: `vllm/plugins/__init__.py`.
 - Card translation: `nemotron_asr/configuration_nemotron_asr.py`; geometries:
   `nemotron_asr/manifests.py` and `lookahead.py`.
@@ -789,9 +935,9 @@ adding it here and to the import-time check.
 
 Each item names what is deferred, the trigger that reopens it and the shape of the change.
 
-1. **Version gate.** A version check for clean vLLM releases. Trigger: RFC 1's stream admission
-   ships in a release. Shape: `register()` checks the release version; until then the client-path
-   check is the gate.
+1. **Version gate.** A version check for clean vLLM releases. Trigger: RFC 1's state layer
+   ships in a release. Shape: `register()` checks the release version; until then the core check
+   is the gate.
 2. **Projected capture failure.** Projecting the segment graphs' total from the first captured
    encoder counts and failing before capturing the rest, to save startup time on a
    `max_num_seqs` that cannot fit. Trigger: A40 measurements that validate a projection rule.
@@ -832,11 +978,34 @@ Each item names what is deferred, the trigger that reopens it and the shape of t
    accessor in the hook configuration at the 80 and 160 ms geometries, accepted only with an
    explicit `cudagraph_mode` NONE, compilation mode NONE and synchronous scheduling (the cells'
    baseline `B_hook`) until the transaction-graph qualification covers the reduced modes, whose
-   profiling state pools hold more pages, and asynchronous scheduling.
-9. **Native burst with asynchronous scheduling.** Native burst is refused on this core. Trigger:
-   native burst returns on the state layer. Shape: decide whether its read-ahead sampler composes
-   with core's per-request barrier; refuse the pair until a GPU tier shows equal transcripts.
+   profiling state pools hold more pages, and asynchronous scheduling. The accessor's members join
+   the dependency table as conditional rows, checked while transaction graphs are on (REG-018).
+9. **Native burst on the state layer, with asynchronous scheduling.** Native burst is refused on
+   this core: its history check requires a turn with `num_computed_tokens` 0 whose prompt is its
+   whole history, and core delivers each later input compacted, with `num_computed_tokens` 1
+   (State-slot access, Recorded prompt). Trigger: a native-burst history rule for compacted
+   turns is specified. Shape: the history check reads the compacted prompt; decide whether the
+   read-ahead sampler composes with core's per-request barrier; refuse the pair until a GPU tier
+   shows equal transcripts.
 10. **Overlap under asynchronous scheduling.** The commit sink waits for each step's commit event
     in `postprocess_state`, so asynchronous scheduling overlaps little for this model. Trigger: a
     latency A/B that shows the wait on the critical path. Shape: read the commit status one step
     later, from a ring of pinned buffers.
+11. **Page initial values in core.** The layer's `initialize_pages` writes each fresh page after
+    core's `StatePageInitializer` has zeroed it. Every descriptor's initializer is zero or one
+    scalar (the blank label), and the layout has no bytes outside its states, so the spec's
+    `initial_values`, one scalar per state, can carry the layout's initializers. Trigger: the next
+    change to the state layer, or a measurement that shows the second write on a fresh row's first
+    step. Shape: the layer builds `initial_values` from the layout's descriptors; `initialize_pages`
+    and its call in the forward go; REG-STATE-010 names core's initialization; a test shows equal
+    pages.
+12. **Memory contributors in core's failures.** The target core reads no list of the options that
+    enlarge the model's memory (Execution memory, Memory diagnostics). Trigger: core accepts such
+    a list from a model. Shape: the model passes `max_num_seqs` and the two segment arms when
+    graphed execution is configured, `chunk_bucket_graph_populations` when it is non-empty and
+    `transaction_graph_populations` while transaction graphs are on; core names them in a failure
+    of profiling, capture or capacity planning.
+13. **Session factory on the target core.** The session factory is not available on the target
+    core (HLD, Approach, section 2). Trigger and shape: the HLD's and the `session` design's Future
+    roadmap. Registration's part: `register()` keeps checking no client call, and the
+    `StreamAdmissionError` import stays on `vllm.v1.engine.exceptions`.

@@ -379,3 +379,25 @@ part of that later design.
 - Envelope and geometries: `nemotron_asr/advance.py`, `nemotron_asr/manifests.py`; unit timestamps:
   `nemotron_asr/accepted_audio.py`, `nemotron_asr/plan.py`; transcript bound:
   `nemotron_asr/transcript.py`; endpointing: `nemotron_asr/endpointing.py`.
+
+## Future roadmap
+
+Each item names what is deferred, the trigger that reopens it and the shape of the change. The
+deferred utterance finals are under Open Questions & Future Decisions.
+
+1. **Session factory on core's automatic admission.** This design binds a session to stream
+   admission (`generate(..., stream_admission=True)`, rejection outputs, `update_seq`,
+   `StreamAdmissionResult`, `wait_stream_retired`). The plugin's target core, RFC 1's state layer
+   (the HLD, Constraints), has none of them: `AsyncLLM.generate` admits a persistent-state stream
+   automatically when given an input generator, raises `StreamAdmissionError` (from
+   `vllm.v1.engine.exceptions`, reasons `engine_paused` and `active_limit`) before it reads any
+   input, and ends the stream with an error output when it refuses a later input. On that core
+   `create_session_factory` refuses (SESS-FAC-003), so the factory is not available; core's
+   `/v1/realtime` and transcription routes serve the model. Trigger: the model meets acceptance
+   tier 2 on stage 1 through core's routes. Shape: Discovery checks for automatic admission
+   instead of the two calls; Engine binding opens the stream with no admission argument, and a
+   refused input ends the session (`rejected_input`) with no resend, so the `engine_paused` and
+   `mm_cache_miss` resends go; Factory ownership takes retirement from the stream's terminal
+   output, which core publishes after it frees the page, instead of `wait_stream_retired`; the
+   error contract's refusal reasons become `engine_paused` and `active_limit`; the specs of those
+   sections change with them.

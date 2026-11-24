@@ -10,14 +10,19 @@ vLLM only as whole files, bounded by the encoder's position limit and `max_model
 live streams.
 
 Two proposals to vLLM core supply the missing pieces:
-- **RFC 1** ([vllm#65543](https://github.com/vllm-project/vllm/issues/65543)): a scheduler-owned
-  persistent-state primitive with one state slot per request
-  ([vllm#67374](https://github.com/vllm-project/vllm/pull/67374)), and resumable stream admission
-  on `AsyncLLM` ([vllm#67375](https://github.com/vllm-project/vllm/pull/67375), stacked on
-  #67374). A third PR, [vllm#67583](https://github.com/vllm-project/vllm/pull/67583) (stacked on
-  #67375), adds model-state hooks: execution-memory preparation, post-warmup and shutdown hooks,
-  and a model-state CUDA graph capture hook that core calls whatever the runner's
-  `cudagraph_mode` is. The three PRs supersede the earlier single draft PR #65544.
+- **RFC 1** ([vllm#65543](https://github.com/vllm-project/vllm/issues/65543)): persistent state
+  as a standard state layer. A model declares `SupportsPersistentState` and keeps the per-request
+  state its tokens cannot rebuild in a `MambaSpec` KV-cache group whose manager configuration is
+  not recomputable. Core never preempts such a request, keeps its page while the stream waits for
+  its next input, and folds each streaming input into the same request. This plugin serves on that
+  design's implementation, `pdtgct/vllm` branch `pstate-impl-20261122` at `ac2ef47540`, called
+  *the target core* below. The target core also carries the model-state hooks of
+  [vllm#67583](https://github.com/vllm-project/vllm/pull/67583): execution-memory preparation,
+  post-warmup and shutdown hooks, and a model-state CUDA graph capture hook that core calls
+  whatever the runner's `cudagraph_mode` is. The state layer replaces the state pool and stream
+  admission of the draft PRs [vllm#67374](https://github.com/vllm-project/vllm/pull/67374) and
+  [vllm#67375](https://github.com/vllm-project/vllm/pull/67375), which this plugin does not
+  support.
 - **RFC 2** ([vllm#65545](https://github.com/vllm-project/vllm/issues/65545), draft PR
   [#65546](https://github.com/vllm-project/vllm/pull/65546)): lifecycle hooks for endpoint plugins,
   so a protocol frontend such as a Riva-compatible gRPC API can run inside `vllm serve`.
@@ -31,11 +36,12 @@ model code in vLLM itself.
 ### 1. One stateful model serving every surface
 
 The plugin registers the model as a vLLM general plugin. The model keeps its encoder caches and
-decoder state in an RFC 1 state slot, so the same transition serves:
-- live streams: core's native `/v1/realtime`, and the frontend's gRPC `StreamingRecognize` and NIM
-  WebSocket through the session factory (section 2);
+decoder state in one page of its RFC 1 state group, which core allocates per request, so the same
+transition serves:
+- live streams: core's native `/v1/realtime`, and, once the session factory runs on the target
+  core (section 2), the frontend's gRPC `StreamingRecognize` and NIM WebSocket through it;
 - complete files: core's `POST /v1/audio/transcriptions` and the frontend's gRPC `Recognize`, via
-  `SupportsTranscription`. A file is walked on its own state slot in bounded steps of at most one
+  `SupportsTranscription`. A file is walked on its own state page in bounded steps of at most one
   cadence chunk, so no file length is limited by the model and whole-file work per step is
   bounded; its effect on stream latency is measured by the mixed-load goal, not assumed.
 
@@ -45,12 +51,18 @@ Frontends built as RFC 2 endpoint plugins do not import this package. They disco
 factory through the entry-point group `vllm_riva_frontend.session_factories` and use it through a
 structural protocol: open a session at a locale (the server's geometry fixes the cadence), feed audio, flush for the final
 transcript, abort, and release once the slot has retired. The factory owns every engine-facing
-task it starts, so a frontend's drain and stop can reason about them. The factory uses the RFC 1
-client path (`AsyncLLM.generate(..., stream_admission=True)`, `wait_stream_retired`), which
-reports rejected inputs without ending the stream and tells the caller when a slot has retired.
-Core's `/v1/realtime` drives the model as a streaming request without stream admission, so there a
-rejected input ends the stream. The reference consumer is
+task it starts, so a frontend's drain and stop can reason about them. The reference consumer is
 [`pdtgct/vllm-riva-frontend`](https://github.com/pdtgct/vllm-riva-frontend).
+
+The factory is designed for a client path with explicit stream admission
+(`AsyncLLM.generate(..., stream_admission=True)` and `wait_stream_retired`), which reports a
+rejected input without ending the stream and tells the caller when a slot has retired. The target
+core has neither call: `AsyncLLM.generate` admits a persistent-state stream automatically when it
+is given an input generator, refuses admission with `StreamAdmissionError` before it reads any
+input, and ends the stream with an error when it refuses a later input. On the target core
+`create_session_factory` therefore refuses, and the session factory is not available; core's
+`/v1/realtime` and transcription routes serve the model. Porting the factory to automatic
+admission is a separate change (Future roadmap).
 
 ### 3. One packer for audio
 
@@ -61,7 +73,7 @@ core's `/v1/realtime`, so the two streaming paths cannot segment audio different
 
 ### 4. Opt-in whole-step graph replay
 
-A streaming step is one model-defined transaction over resident state slots: host validation of
+A streaming step is one model-defined transaction over resident state pages: host validation of
 the row plan, a device body (gathers, frontend, encoder, RNN-T decode, projection) and predicated
 scatters back into the state pages. Only a step's CHUNK rows run the encoder and decoder, grouped
 by their exact count; its REPLAY and FLUSH rows (label drain, echo validation and the end step)
@@ -90,12 +102,14 @@ reaches its outputs or its new state, as in the option-off transaction.
 
 The model captures these graphs through #67583's model-state capture hook, into core's graph pool
 and on core's capture stream: when core runs its graph-memory estimate, first over core's
-profiling state pools so that the estimate charges their memory before state pages are planned,
-and then, always, over the serving pools. The
+minimal profiling KV cache so that the estimate charges their memory before state pages are planned,
+and then, always, over the serving state pages. The
 plugin keeps no graph pool of its own. The option runs without `--enforce-eager` and is refused
 with it, because core runs no capture hook under `--enforce-eager`; the outer runner still
 captures nothing (`cudagraph_mode` NONE). In its first release the option is offered at the
-80 ms and 160 ms geometries, and it is off by default.
+80 ms and 160 ms geometries, and it is off by default. The cells bake in state-page addresses,
+which the target core's state layer exposes through no accessor, so the option is refused on the
+target core (Future roadmap).
 
 ### 5. Graphed segments by default
 
@@ -170,9 +184,8 @@ the first captured counts and fail before capturing the rest. The eager arms (`e
 
 ## Non-Goals
 
-- Running on released vLLM. The plugin needs the RFC 1 primitive; until it is released, the
-  supported engines are the stage 1 and stage 2 builds of upstream `main` with the open PRs
-  (Constraints).
+- Running on released vLLM. The plugin needs RFC 1's state layer; until it is released, the
+  supported engines are the stage 1 and stage 2 builds (Constraints).
 - A second decoding algorithm. There is no full-context or non-streaming decoder; complete files
   use the streaming transition.
 - Translation, diarization, word timestamps or beam search.
@@ -205,13 +218,13 @@ flowchart LR
       PK["packer"]
       M["model: Nemotron3_5AsrStreamingForRNNT<br/>SupportsRealtime + SupportsTranscription"]
     end
-    ENG["AsyncLLM + RFC 1 state slots"]
+    ENG["AsyncLLM + RFC 1 state layer<br/>(the target core)"]
   end
   FE -- "entry point group<br/>vllm_riva_frontend.session_factories" --> SF
   FE -- "Recognize: file" --> CORE_TX
   SF --> PK
   CORE_RT -- "buffer_realtime_audio" --> PK
-  SF -- "generate(stream_admission=True)" --> ENG
+  SF -. "stream admission:<br/>not on the target core" .-> ENG
   CORE_RT --> ENG
   CORE_TX -- "get_generation_prompt" --> ENG
   ENG --> M
@@ -221,8 +234,8 @@ Components, each a leaf design under `docs/intent/`:
 
 | Component | Owns |
 | --- | --- |
-| `registration` | the `vllm.general_plugins` entry point, the architecture key, the config parser (`--config-format nemotron_asr_streaming`) and post-override validation, engine-flag refusals, the enumerated model-adapter dependencies |
-| `session` | the session factory and lease on the RFC 1 client path, the packer and its use by `buffer_realtime_audio`, transcript projection, the error contract |
+| `registration` | the `vllm.general_plugins` entry point, the architecture key, the config parser (`--config-format nemotron_asr_streaming`) and post-override validation, engine-flag refusals, the model's `SupportsPersistentState` declaration and state layer, the model state's request bookkeeping and per-request failure channel, the enumerated model-adapter dependencies |
+| `session` | the session factory and lease on the stream-admission client path (not available on the target core; Future roadmap), the packer and its use by `buffer_realtime_audio`, transcript projection, the error contract |
 | `transcription` | `SupportsTranscription`, the request guards in `get_generation_prompt`, and the model seams it adds: whole-file metadata on the stream row roles, the request-owned host buffer and its cleanup when the request ends, the continuation token, at most one chunk per step |
 | `transaction-graph` | the `transaction_graph_populations` option and its configuration checks, the chunk and echo cells and the split of a step between them, capture and release through #67583's model-state capture hook, replay and counted option-off fallback, post-warmup verification, failure containment, graph-memory guards, the replay and fallback counters and the per-worker capture record, and the README's serve command for the option |
 
@@ -251,20 +264,23 @@ the leaf designs cite them where they depend on them.
 
 ### Constraints
 
-- **Engine.** The plugin requires the model API of the RFC 1 PRs #67374 (state lifetime), #67375
-  (stream admission) and #67583 (model-state hooks and graph capture), and no earlier RFC 1 head;
-  core keeps no compatibility interfaces for the superseded #65544 API. Two builds of upstream
-  vLLM `main` are targets:
-  - **Stage 1, the model alone** on core's `/v1/realtime` and `/v1/audio/transcriptions`:
-    #67374, #67375, #67583, and the speech-to-text PRs #67144 and #67151 (Whole-file serving,
-    below).
+- **Engine.** The plugin requires the model API of the target core, RFC 1's state layer at
+  `ac2ef47540` with #67583's model-state hooks, and no other RFC 1 head: neither the state pool
+  and stream admission of #67374 and #67375 nor the earlier single draft #65544. The model
+  declares `SupportsPersistentState` and one state group of `mamba_type` `PERSISTENT_STATE`, and
+  reports failed rows through the model state's `take_failed_requests` (the `registration`
+  design). Two builds are targets:
+  - **Stage 1, the model alone** on core's `/v1/realtime` and `/v1/audio/transcriptions`: the
+    target core with the speech-to-text PRs #67144 and #67151 (Whole-file serving, below).
   - **Stage 2, with a frontend:** stage 1 plus RFC 2 (#65546 and #67294) and a frontend
-    endpoint plugin such as `vllm-riva-frontend`.
+    endpoint plugin such as `vllm-riva-frontend`. A frontend's routes that use the session
+    factory do not run on it (Approach, section 2).
 
-  The plugin refuses to start on a core without #67583's model-state hooks, naming the missing
-  hooks. `docs/evidence.md` records the commits each acceptance tier was actually met on, and claims only
-  the tiers met; a tier met only on a build without #67583 is a historical record until it is met
-  again on stage 1. Python `>=3.11,<3.15`.
+  The plugin refuses to start on a core without #67583's model-state hooks or the state layer,
+  naming what is missing. `docs/evidence.md` records the commits each acceptance tier was actually
+  met on, and claims only the tiers met; a tier met on another core (the state pool of #67374 and
+  #67375, or a build without #67583) is a historical record until it is met again on stage 1.
+  Python `>=3.11,<3.15`.
 - **Engine settings.** The resolved engine settings must be no prefix caching and a runner that
   captures no CUDA graph over the model's forward and compiles none of the model, and the plugin
   refuses to start otherwise. Asynchronous scheduling is accepted: core's per-request barrier
@@ -294,19 +310,22 @@ the leaf designs cite them where they depend on them.
   unset; the `registration` design states the rule for each setting.
 - **Model-owned execution memory.** The model's long-lived working memory outside any graph, the
   peak transient memory of its execution and, under `--enforce-eager`, its captured segment graphs
-  must be in place or exercised before core's memory profiling measures the budget that the state
-  pool and the KV cache must fit; graphs captured through the hook follow the next two
-  constraints. Core binds state slots only after it allocates the state pool
-  and the KV cache. #67583 divides this between two hooks, and the model keeps them apart:
+  must be in place or exercised before core's memory profiling measures the budget that the KV
+  cache, whose one group is the model's state group, must fit; graphs captured through the hook
+  follow the next two constraints. Core binds the state pages to the model's state layer only
+  after it allocates them. The model declines core's synthetic warmup requests, which its state
+  cannot serve, so the profiling run is the only startup step that runs the model's transaction
+  (the `registration` design, Engine settings). #67583 divides this between two hooks, and the
+  model keeps them apart:
   long-lived working memory outside any graph is allocated in `prepare_execution_memory`, which
   every profiled budget counts; graphs captured through `capture_cudagraphs` are counted only by
   core's graph-memory estimate, which runs only with a profiled budget and the estimate enabled.
   Under `--enforce-eager` the `registration` design settles where the model captures its own
   graphs, using only the permitted model-adapter dependencies.
 - **The hook's capture lifecycle.** With the graph-memory estimate running, core first captures
-  over temporary state pools that have the serving page count, then releases that capture
-  through `clear_cudagraphs` and plans the state pages, then rebinds the state over the serving
-  pools and captures again. The model's profiling capture therefore captures the same graphs as
+  over a minimal profiling KV cache, whose state group holds at most `max_num_seqs` pages, then
+  releases that capture through `clear_cudagraphs` and plans the state pages, then binds the
+  serving state pages and captures again. The model's profiling capture therefore captures the same graphs as
   its serving capture, or graphs with at least their memory, and the model keeps nothing derived
   from the profiling pools once `clear_cudagraphs` returns. Core locks the workspace after the
   serving capture, so all workspace-backed memory is sized by the time that capture returns.
@@ -334,8 +353,8 @@ the leaf designs cite them where they depend on them.
   for every persistent-state model (core, and `registration`'s REG-ENG-003).
 - **Engine surface.** Session operations use only `AsyncLLM` / `EngineClient` public and
   RFC-proposed calls, never `engine_core` or scheduler internals. The model adapter's own
-  dependencies (model-state interface, state-slot bindings, scheduler output types) are an
-  enumerated, permitted set kept in the `registration` design.
+  dependencies (model-state interface, the state layer's `MambaSpec` and manager configuration,
+  scheduler output types) are an enumerated, permitted set kept in the `registration` design.
 - **One geometry per server, chosen at startup.** The implementation has five geometries (80, 160,
   320, 560 and 1120 ms; right context 0, 1, 3, 6 and 13 frames), all tested, sharing one state
   layout. The checkpoint's card declares lookaheads 0, 3, 6 and 13; the server also accepts the
@@ -351,6 +370,7 @@ the leaf designs cite them where they depend on them.
   v0.4.0b1 reads the factory's served cadences when it starts and passes a cadence to `open`, so
   it fails startup against this plugin. The experimental native-burst mode requires the
   160 ms geometry. Transaction graphs require the 80 or 160 ms geometry and native burst off.
+  The plugin refuses both on the target core (the `registration` design, Engine settings).
 - **Completeness.** The model and the session factory treat a transcript as complete only after
   EOS following the final flush; a session that ends any other way fails. How core's own routes
   report a request that ends without EOS is core's behaviour, not the plugin's:
@@ -391,10 +411,11 @@ the leaf designs cite them where they depend on them.
 | Architecture key | `Nemotron3_5AsrStreamingForRNNT`, selected through a registered config parser; the Hub card's `Nemotron3_5AsrForRNNT` stays the offline plugin's key | Register the card's key: zero-configuration serving, but it would override the offline plugin when both are installed and remove whole-file service from released-vLLM users. Consolidation onto one key is planned with the offline plugin's author (below) |
 | Relationship to the offline plugin | Independent package now; planned merge with the offline plugin into one package under the card's key, choosing the implementation at startup by whether the engine provides the RFC 1 primitive | Replace the offline implementation outright: breaks released-vLLM users until RFC 1 ships. Keep two packages permanently: users must choose between two packages for one model |
 | Complete files | This model's own stateful path (`SupportsTranscription`), at most one chunk per step | A full-file forward pass: stalls the batch and is bounded by encoder positions. Delegating files to the offline plugin: a second implementation on the same server and the same ~400 s bound |
-| Core API | Only the model API of #67374, #67375 and #67583; the plugin adapts to it | Make #67583 optional and detect it at startup: two core APIs to detect and test, and transaction graphs, the default-on goal, absent on one of them. Ask core for compatibility interfaces with #65544's API: core would carry API that no proposal needs. Support both APIs in the plugin: two code paths for one model, and #65544 is superseded |
+| Core API | Only the model API of the target core, RFC 1's state layer at `ac2ef47540` with #67583's hooks; the plugin adapts to it | Stay on the state pool and stream admission of #67374 and #67375: RFC 1 proposes the state layer in their place, so the plugin would serve on API that no proposal carries. Support both the state pool and the state layer: two code paths for one model. Make #67583 optional and detect it at startup: two core APIs to detect and test, and transaction graphs, the default-on goal, absent on one of them. Ask core for compatibility interfaces with an earlier head (#65544, #67374): core would carry API that no proposal needs |
+| Session factory on the target core | Not available: the factory keeps its stream-admission design and `create_session_factory` refuses on the target core; core's routes serve the model; the factory's port is a separate change (Future roadmap) | Port the factory to core's automatic admission in the same change as the model: the session's engine binding, ownership, retirement and error contract all change with it, so one change would redesign two components at once, while the model's port is usable on its own through core's routes |
 | Frontend coupling | Structural protocol plus an entry-point group owned by the frontend; neither package imports the other | A shared interface package: a third release to coordinate for a small protocol |
 | Whole-step graph replay | A `transaction-graph` component in this repository, designed against #67583's model-state capture hook; an unpublished whole-transaction prototype on an earlier in-tree copy of the model is its measured evidence base, not its source | Import the prototype's modules from a vLLM build: they are in no core proposal, and core would carry model code. Transplant the prototype's patches: they target an in-tree copy of the model that has diverged from this one, and they carry a model-owned memory admission that the hook makes unnecessary |
-| Graph-memory accounting | Core's graph-memory estimate, through the capture hook: the profiling capture over core's profiling state pools, then the serving capture into core's graph pool | A model-owned admission inventory and graph pool, retained through the profiling window and checked against the serving capture: core's estimate already measures the same graphs before planning, and the inventory needs its own fit rule and release check. Extrapolating from one captured cell: unsound, because cells do not share memory predictably |
+| Graph-memory accounting | Core's graph-memory estimate, through the capture hook: the profiling capture over core's minimal profiling KV cache, then the serving capture into core's graph pool | A model-owned admission inventory and graph pool, retained through the profiling window and checked against the serving capture: core's estimate already measures the same graphs before planning, and the inventory needs its own fit rule and release check. Extrapolating from one captured cell: unsound, because cells do not share memory predictably |
 | Served geometry | One per server, any of the five implemented geometries, fixed at startup; the checkpoint's default lookahead unless `num_lookahead_tokens` overrides it | A served set with a cadence chosen per stream: every geometry is warmed and captured, multiplying graph memory and startup time (the default segment graphs retain about 2.3 GiB at 64 rows at 320 ms, and capture takes about a minute), and a model loaded in Hugging Face Transformers already fixes its lookahead the same way. Only the card's four lookaheads: drops the tested 160 ms geometry. A fixed plugin default such as 160 ms: overrides what the checkpoint declares |
 | Transaction graphs by geometry | First release: the 80 and 160 ms geometries; cells are keyed by geometry so that more geometries add cells, not a redesign | All five at once: the 320 to 1120 ms geometries have no exactness or latency evidence for transactions the replay accepts; they are needed for default-on and follow as measured increments |
 | Steps that mix CHUNK and other rows under transaction graphs | Split by kind: a chunk graph at the step's CHUNK count and an echo graph at its other rows' count, two launches under one reservation; freshness and file membership are per-row masks | One graph per exact (row count, CHUNK count): one launch, but P + 1 graphs per row count (98 for counts 1, 31 and 63; about 594 for 1 to 33). Pad the other rows into a chunk graph: changes the encoder's batch dimension, so bitwise equality is unlikely. Run mixed steps without transaction graphs: if streams are paced independently and 90 % of rows are CHUNK, an illustrative estimate puts about 57 %, 81 % and 97 % of steps at 8, 16 and 32 rows as mixed, so under that assumption the option would cover few steps (the served mix is unmeasured) |
@@ -418,9 +439,9 @@ implementations differ:
 | | Offline plugin | This plugin (target design; installed-engine validation pending) |
 | --- | --- | --- |
 | Engine | released vLLM; Transformers modules | the stage 1 build (stage 2 for frontends), defined in Constraints; native vLLM implementation |
-| Execution | one encoder pass over the whole file, per-request RNN-T decoder state; no live audio continuation | encoder caches and decoder state carried in a state slot from chunk to chunk |
-| Live streaming (`/v1/realtime`, frontends) | no | designed for it |
-| Whole-file length | encoder frames ≤ min(5000, `max_model_len`): files above about 164 s are refused at the default `max_model_len` of 2048, above about 400 s at 5000 | no model limit by design; one state slot walks the file in bounded steps |
+| Execution | one encoder pass over the whole file, per-request RNN-T decoder state; no live audio continuation | encoder caches and decoder state carried in a state page from chunk to chunk |
+| Live streaming (`/v1/realtime`, frontends) | no | designed for it (frontends once the session factory runs on the target core) |
+| Whole-file length | encoder frames ≤ min(5000, `max_model_len`): files above about 164 s are refused at the default `max_model_len` of 2048, above about 400 s at 5000 | no model limit by design; one state page walks the file in bounded steps |
 | Lookahead | accepted by the model per request; its transcription API sets only the language, so the processor default applies | the server's one geometry, fixed at startup, for streams and files alike |
 | Engine settings | Model Runner V2, `--enforce-eager`, TP = PP = 1; no quantization or speculative decoding | no prefix caching, a runner that captures no graph over the forward under any accepted `cudagraph_mode`; asynchronous scheduling accepted (Constraints) |
 
@@ -429,15 +450,16 @@ implementations differ:
 Acceptance is tiered; a claim names the tier it has met and the build (stage 1 or stage 2) it was
 met on. Stage 1 can meet every tier on core's routes. The CPU seam conformance suite needs only the frontend and
 its `vllm-riva-frontend-dev` test distribution installed at the pinned release tag. Only legs served through a
-frontend (`Recognize`, a frontend's streaming endpoint) need stage 2; the session factory driven
-directly through `AsyncLLM`, with stream admission, runs on stage 1.
+frontend (`Recognize`, a frontend's streaming endpoint) need stage 2. The session factory runs
+on neither build until its port (Future roadmap); until then the legs that drive it through a
+real engine are not claimed.
 
 1. **CPU conformance.** Unit and contract tests, including the frontend's seam conformance suite run
    against this plugin's real factory, pass without a GPU.
 2. **Installed-engine cycle.** On the target build with the plugin installed: plugin load →
-   stream started → audio → final transcript → slot retired, for one and for concurrent sessions.
-   On stage 1 the stream is a `/v1/realtime` session; on stage 2 it is also a frontend session through
-   the factory, admitted with stream admission. In the default configuration the startup log reports the
+   stream started → audio → final transcript → state page freed, for one and for concurrent
+   sessions. On stage 1 the stream is a `/v1/realtime` session; on stage 2 it is also a frontend
+   session through the factory, once the factory runs on the target core. In the default configuration the startup log reports the
    segment graphs' retained memory and capture time; both are measured at each geometry before
    that geometry is claimed.
 3. **Equivalence.** On public clips from 20 s to over 400 s, whole-file transcripts (core
@@ -498,7 +520,7 @@ that retained more graph memory than that profiling capture.
 
 ## References
 
-- RFC 1: [vllm#65543](https://github.com/vllm-project/vllm/issues/65543), PRs [#67374](https://github.com/vllm-project/vllm/pull/67374) (state lifetime), [#67375](https://github.com/vllm-project/vllm/pull/67375) (stream admission) and [#67583](https://github.com/vllm-project/vllm/pull/67583) (model-state hooks and graph capture); superseded draft [#65544](https://github.com/vllm-project/vllm/pull/65544)
+- RFC 1: [vllm#65543](https://github.com/vllm-project/vllm/issues/65543); the state-layer implementation, `pdtgct/vllm` branch `pstate-impl-20261122` at `ac2ef47540` (`SupportsPersistentState` in `vllm/model_executor/models/interfaces.py`, the state-group check `verify_persistent_state_groups` in `vllm/v1/core/kv_cache_utils.py`, `ModelState.take_failed_requests` in `vllm/v1/worker/gpu/model_states/interface.py`); [#67583](https://github.com/vllm-project/vllm/pull/67583) (model-state hooks and graph capture); drafts the state layer replaces: [#67374](https://github.com/vllm-project/vllm/pull/67374) (state pool), [#67375](https://github.com/vllm-project/vllm/pull/67375) (stream admission), [#65544](https://github.com/vllm-project/vllm/pull/65544)
 - Speech-to-text core PRs: [#67144](https://github.com/vllm-project/vllm/pull/67144) (fail `error` and `abort` endings), [#67151](https://github.com/vllm-project/vllm/pull/67151) (request fields; fail server-caused `length` endings)
 - RFC 2: [vllm#65545](https://github.com/vllm-project/vllm/issues/65545), PRs [#65546](https://github.com/vllm-project/vllm/pull/65546) and [#67294](https://github.com/vllm-project/vllm/pull/67294) (readiness and draining)
 - Model card: [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
@@ -513,3 +535,12 @@ that retained more graph memory than that profiling capture.
   items 5 to 7.
 - **Transaction graphs on the state layer.** Trigger: core provides a state-group layout accessor
   with fixed page addresses. Shape: the `registration` design, Future roadmap item 8.
+- **Session factory on core's automatic admission.** On the target core the factory is not
+  available (Approach, section 2), so frontends' streaming routes do not run. Trigger: the model
+  meets acceptance tier 2 on stage 1 through core's routes. Shape: the factory opens a session
+  with `AsyncLLM.generate(input_generator, ...)` and no admission argument; it maps
+  `StreamAdmissionError` (from `vllm.v1.engine.exceptions`, reasons `engine_paused` and
+  `active_limit`) to `SessionRefused`; it treats an error output for a refused input as the end
+  of the stream, with no resend; and it takes retirement from the stream's terminal output, which
+  core publishes after it frees the page. The `session` design's discovery, engine binding,
+  factory ownership and error contract change with it (the `session` design, Future roadmap).
