@@ -258,8 +258,10 @@ the device.
 
 The buffer is freed when the request leaves the engine for any reason (finish, abort, preemption,
 error), which the model state learns from the next step's finished request IDs; the engine
-delivers that cleanup even when the step has no forward work. Under synchronous scheduling no step
-that reads the buffer is still in flight then. A slot handle seen again with a new generation
+delivers that cleanup even when the step has no forward work. No step that reads the buffer is
+still in flight then, under synchronous or asynchronous scheduling: the worker runs each step's
+`postprocess_state`, where the model waits for the step's commit event, before it executes the
+next step (the `registration` design, Engine settings). A slot handle seen again with a new generation
 drops any stale buffer recorded for the old one. A request aborted before its first schedule never
 creates one.
 
@@ -509,7 +511,7 @@ submission (Request guards), so neither can truncate a transcript.
 | Chunks per step | At most one | Up to `k > 1` | One chunk keeps a file row within the encoder's captured populations and profiled memory and fits the one-token-per-step queue; `k > 1` needs capture and profiling for `k ×` rows and a queue holding `k` bursts |
 | Cadence | The server's one geometry, from the shared geometry function | A cadence chosen per request (for example through `vllm_xargs`) | A server warms and captures graphs for one geometry only (HLD Constraints), so another cadence would have no warmed path; core's transcription request has no lookahead field |
 | Where samples live | Request-owned host buffer, one chunk staged per step | A device copy of the file; reading from the encoder cache | A device copy grows with file length; core may drop encoder-cache entries once the prompt is consumed |
-| When the buffer is freed | When the request is reported finished (any reason) | A release-fence hook | The engine exposes no model hook at the release fence; under synchronous scheduling no in-flight step reads the buffer |
+| When the buffer is freed | When the request is reported finished (any reason) | A release-fence hook | The engine exposes no model hook at the release fence; the model's commit wait in `postprocess_state` completes every step that reads the buffer before the worker executes the next step |
 | Repeated uploads | A random per-request multimodal UUID | A nonce in the header; disabling the multimodal cache | Core hashes items by their UUID, so no header field is needed, and the server's cache settings stay untouched |
 | Silence | A continuation token | Emitting nothing; the park/EOS token | Every step emits a token; EOS would end the request |
 | Distinguishing file rows | A dedicated file-carrier prompt token at the first schedule, kept as host metadata for the request's life | The stream carrier with a different header field | The first scheduled token is host authority the model state reads before any device work |
@@ -534,9 +536,6 @@ submission (Request guards), so neither can truncate a transcript.
    `n × max_model_len` engine requests per upload, one per beam per pass (Request guards), so the route is not to be exposed to untrusted
    clients on such a core.
 
-### Deferred
-1. `k > 1` chunks per step, if measured file latency needs it.
-
 ## References
 
 - `SupportsTranscription`, `SpeechToTextConfig`: `vllm/model_executor/models/interfaces.py`,
@@ -547,3 +546,9 @@ submission (Request guards), so neither can truncate a transcript.
   `nemotron_asr/state_profile.py`, `nemotron_asr/manifests.py`; commit status and queue-count
   transport: `nemotron_asr/commit_sink.py`; file planning: `nemotron_asr/file_rows.py`,
   `nemotron_asr/model_state_v2.py`.
+
+## Future roadmap
+
+- **More than one chunk per step.** Trigger: measured file latency needs `k > 1` chunks per
+  step. Shape: the file row stages up to `k` chunks and plans them as consecutive CHUNK work in one
+  step, with the per-step copy and commit status sized for `k`.

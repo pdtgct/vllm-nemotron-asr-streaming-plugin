@@ -16,8 +16,8 @@ Two proposals to vLLM core supply the missing pieces:
   on `AsyncLLM` ([vllm#67375](https://github.com/vllm-project/vllm/pull/67375), stacked on
   #67374). A third PR, [vllm#67583](https://github.com/vllm-project/vllm/pull/67583) (stacked on
   #67375), adds model-state hooks: execution-memory preparation, post-warmup and shutdown hooks,
-  and a model-state CUDA graph capture hook that runs while the outer runner's `cudagraph_mode`
-  is NONE. The three PRs supersede the earlier single draft PR #65544.
+  and a model-state CUDA graph capture hook that core calls whatever the runner's
+  `cudagraph_mode` is. The three PRs supersede the earlier single draft PR #65544.
 - **RFC 2** ([vllm#65545](https://github.com/vllm-project/vllm/issues/65545), draft PR
   [#65546](https://github.com/vllm-project/vllm/pull/65546)): lifecycle hooks for endpoint plugins,
   so a protocol frontend such as a Riva-compatible gRPC API can run inside `vllm serve`.
@@ -290,9 +290,8 @@ the leaf designs cite them where they depend on them.
     have been met on it. Likewise a tier met only with the eager segment arms is a historical record
     for the default configuration until it is met again with the graphed arms.
 
-  Settings that core resolves to the required value for a model that declares persistent state
-  (an unset `async_scheduling` or prefix-caching option) are accepted unset; the `registration`
-  design states the rule for each setting.
+  Prefix caching, which core resolves off for a model that declares persistent state, is accepted
+  unset; the `registration` design states the rule for each setting.
 - **Model-owned execution memory.** The model's long-lived working memory outside any graph, the
   peak transient memory of its execution and, under `--enforce-eager`, its captured segment graphs
   must be in place or exercised before core's memory profiling measures the budget that the state

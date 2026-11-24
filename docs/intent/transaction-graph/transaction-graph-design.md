@@ -134,7 +134,8 @@ the compilation mode after the configuration hook.
 
 Every comparison in this design ("the option-off transaction", "option-off run") is against
 **baseline `B_hook`**: the same engine configuration with `transaction_graph_populations` absent.
-That is the hook configuration with `-cc.cudagraph_mode none` and `-cc.mode none` (no `--enforce-eager`), with
+That is the hook configuration with `-cc.cudagraph_mode none`, `-cc.mode none` and
+`--no-async-scheduling` (no `--enforce-eager`), with
 the default segment arms captured through the hook (`eager-graphed` encoder at every CHUNK count
 from 1 to `max_num_seqs`, `dense-graphed` decoder at its tiers), no CHUNK-bucket graphs, native
 burst off, and the same geometry, batching limits, dtype, device and budget setting, so the option
@@ -895,7 +896,9 @@ the slot for a new generation, which initializes it. Qualification tests this pa
 until the next step's launches; the commit stage and the escaped-row copy consume them first.
 
 **Invariants.** No slot is freed or reassigned between the reservation and the sink's
-collection, which synchronous scheduling places before the next step's planning. A request abort
+collection, which the worker places before the next step's planning under either scheduling
+setting: it runs the step's `postprocess_state`, where the sink is collected, before it executes
+the next step. A request abort
 is not ticket cancellation: a launched step completes its stage and collection, and core
 suppresses the aborted output and fences the slot. Cells may share graph-pool memory for
 intermediates, and nested segment-binding scratch is shared with the option-off transaction; no
@@ -1397,3 +1400,15 @@ by locale only.
   `nemotron_asr.py`, `decode_graph.py`, `encoder_execution.py`, `state_scatter.py`,
   `file_rows.py`; and `vllm_nemotron_asr_streaming/engine_flags.py`.
 - Sibling designs: `registration`, `transcription`, `session`.
+
+## Future roadmap
+
+- **Transaction graphs on the state layer.** The model refuses `transaction_graph_populations` on
+  a core whose state layer offers no state-group layout accessor. Trigger: core provides that
+  accessor with fixed page addresses. Shape: the cells capture through the accessor in the hook
+  configuration at 80 and 160 ms, under the runner rule of the `registration` design.
+- **More geometries, encoder arms, endpoint policies.** Deferred items 4 to 6 above. Trigger: each
+  item's exactness and latency evidence at the geometry or arm. Shape: new cells with their own
+  warm-up domains and qualification rows.
+- **Runner-captured graphs.** Cells replayed inside core's breakable graphs. Trigger and shape:
+  the `registration` design, Future roadmap items 5 and 6.
