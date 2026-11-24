@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """The transaction-graph option and its configuration checks (TXG-CFG-001 to
-TXG-CFG-015).
+TXG-CFG-016).
+
+Every core this build supports has a state layer without a state-group layout
+accessor, so whenever transaction graphs are on the checks also return
+TXG-CFG-016's state-layer condition (``errors_for`` asserts it and returns the
+other conditions).
 
 CPU tests on configuration doubles (``support.txg_fakes``), except the
 callers of TXG-CFG-011, which use the stage 1 build (``engine``). The checks'
@@ -15,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 from support import txg_api as api
@@ -24,7 +30,24 @@ KEY = api.KEY
 VALID = [4]
 
 
+def is_state_layer_condition(error: str) -> bool:
+    """TXG-CFG-016's condition: the option, the state layer, and its removal
+    as the remedy."""
+    lowered = error.lower()
+    return KEY in error and "state layer" in lowered and "remov" in lowered
+
+
+def without_state_layer(errors):
+    """The conditions other than TXG-CFG-016's, after asserting that it is
+    among ``errors`` exactly once (transaction graphs are on)."""
+    found = [e for e in errors if is_state_layer_condition(e)]
+    assert len(found) == 1, errors
+    return [e for e in errors if not is_state_layer_condition(e)]
+
+
 def errors_for(populations=VALID, **kwargs):
+    """The conditions other than the state-layer one (TXG-CFG-016) for a
+    configuration with transaction graphs on; asserts that one is there."""
     hf_kwargs = {
         k: kwargs.pop(k)
         for k in list(kwargs)
@@ -37,8 +60,8 @@ def errors_for(populations=VALID, **kwargs):
             "chunk_populations",
         )
     }
-    return api.config_errors(
-        engine_config(hf_config(populations, **hf_kwargs), **kwargs)
+    return without_state_layer(
+        api.config_errors(engine_config(hf_config(populations, **hf_kwargs), **kwargs))
     )
 
 
@@ -129,7 +152,7 @@ def test_option_is_read_only_from_its_key():
 # @spec TXG-CFG-001, TXG-CFG-004
 @pytest.mark.parametrize("value", ON_VALUES[1:])
 def test_malformed_values_are_on_and_refused(value):
-    errors = api.config_errors(engine_config(hf_config(value)))
+    errors = without_state_layer(api.config_errors(engine_config(hf_config(value))))
     # required information: the option's name and the offending value, in
     # whatever quoting the diagnostic uses
     assert [e for e in mentioning(errors, KEY) if shows_value(e, value)], errors
@@ -388,7 +411,7 @@ def test_runner_and_platform_conditions_are_not_repeated(setting):
     assert errors_for(**setting) == []
 
 
-# @spec TXG-CFG-003
+# @spec TXG-CFG-003, TXG-CFG-016
 def test_every_violated_condition_is_returned():
     from support.txg_fakes import _ABSENT
 
@@ -482,12 +505,23 @@ def _patch_predicate(monkeypatch, value: bool) -> None:
 
 
 def _hook_refusals(hf):
+    """The hook configuration's unmet conditions (REG-ENG-021 to REG-ENG-025)
+    at construction, through their one function (REG-ENG-027)."""
+    from vllm.config import CUDAGraphMode
+    from vllm.config.compilation import CompilationMode
+
     from vllm_nemotron_asr_streaming import engine_flags
 
     config = engine_config(hf)
-    return engine_flags.hook_capture_refusals(config, resolved=True)
+    config.compilation_config = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.NONE,
+        mode=CompilationMode.NONE,
+        use_breakable_cudagraph=False,
+    )
+    return engine_flags.runner_mode_refusals(config, stage="constructor")
 
 
+@pytest.mark.engine
 # @spec TXG-CFG-014
 @pytest.mark.parametrize("value", [{}, None, False, "", 0], ids=repr)
 def test_registration_reads_malformed_values_as_on(value):
@@ -499,6 +533,7 @@ def test_registration_reads_malformed_values_as_on(value):
     assert len(on) == len(off) - 1, (off, on)
 
 
+@pytest.mark.engine
 # @spec TXG-CFG-014
 def test_registration_decides_on_off_through_the_predicate(monkeypatch):
     api.config_module()

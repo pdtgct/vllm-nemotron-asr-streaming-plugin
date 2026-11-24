@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Engine settings the model refuses (REG-ENG-001 to REG-ENG-009).
+"""Engine settings the model refuses or accepts (REG-ENG-001 to REG-ENG-026).
 
 ``verify_and_update_config`` is called on ``VllmConfig``-shaped namespaces whose
 attribute paths are the ones core's own persistent-state validation reads
@@ -8,15 +8,63 @@ attribute paths are the ones core's own persistent-state validation reads
 constructs (the hook runs inside ``VllmConfig.__post_init__`` via
 ``try_verify_and_update_config``, ``vllm/config/vllm.py``) and for the
 model-state re-check, which needs configurations the hook would have refused.
+
+The runner configurations (REG-ENG-005, REG-ENG-011, REG-ENG-021 to
+REG-ENG-026) are judged at two stages here: the configuration hook
+(``verify_and_update_config``, requested modes, breakable graphs predicted
+from ``VLLM_USE_BREAKABLE_CUDAGRAPH``) and the construction re-check
+(``_resolved_check``: both modes set, breakable graphs read from
+``compilation_config.use_breakable_cudagraph``). Model and model-state
+construction themselves, the shared ``engine_flags`` function and core's mode
+resolution are in ``test_runner_modes.py``.
 """
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 import pytest
 
 pytestmark = pytest.mark.engine
+
+#: The environment variables core reads while it builds the engine
+#: configuration that the hook predicts from (REG-ENG-022, REG-ENG-023).
+BREAKABLE_ENV = "VLLM_USE_BREAKABLE_CUDAGRAPH"
+COMPILE_DISABLE_ENV = "TORCH_COMPILE_DISABLE"
+
+
+@pytest.fixture(autouse=True)
+def _no_runner_env(monkeypatch):
+    """Neither variable is inherited from the shell running the tests."""
+    monkeypatch.delenv(BREAKABLE_ENV, raising=False)
+    monkeypatch.delenv(COMPILE_DISABLE_ENV, raising=False)
+
+
+@pytest.fixture
+def runner_env(monkeypatch):
+    """``runner_env(breakable=..., compile_disabled=...)``: set the variables
+    the configuration hook predicts from. ``vllm.envs`` reads
+    ``VLLM_USE_BREAKABLE_CUDAGRAPH`` lazily from ``os.environ`` unless its
+    cache is on (``enable_envs_cache``); the cache is bypassed for the test
+    if it is."""
+    import vllm.envs as envs
+
+    if envs._is_envs_cache_enabled():
+        monkeypatch.setattr(envs, "__getattr__", envs.__getattr__.__wrapped__)
+
+    def set_env(*, breakable: bool = False, compile_disabled: bool = False):
+        if breakable:
+            monkeypatch.setenv(BREAKABLE_ENV, "1")
+        else:
+            monkeypatch.delenv(BREAKABLE_ENV, raising=False)
+        if compile_disabled:
+            monkeypatch.setenv(COMPILE_DISABLE_ENV, "1")
+        else:
+            monkeypatch.delenv(COMPILE_DISABLE_ENV, raising=False)
+
+    return set_env
+
 
 #: Words any of which may name a refused setting in the error message.
 NAMES = {
@@ -79,16 +127,20 @@ def test_accepted_engine_configuration_passes(engine_config):
     _hook().verify_and_update_config(engine_config())
 
 
+@pytest.mark.parametrize("value", [True, False, None], ids=repr)
+@pytest.mark.parametrize("runner", ["eager", "hook"])
 # @spec REG-ENG-001
-def test_async_scheduling_enabled_is_refused(engine_config):
-    _refuse(engine_config(async_scheduling=True), "async_scheduling")
-
-
-# @spec REG-ENG-001
-def test_async_scheduling_left_unset_is_not_refused_by_the_hook(engine_config):
-    """The hook runs before core resolves the option, so it sees ``None``;
-    core then resolves it to ``False`` for a persistent-state model."""
-    _hook().verify_and_update_config(engine_config(async_scheduling=None))
+def test_no_async_scheduling_value_is_refused_by_the_hook(
+    engine_config, platform, runner, value
+):
+    """``True``, ``False`` and unset (the hook runs before core resolves the
+    option) are all accepted, in either runner configuration."""
+    if runner == "eager":
+        config = engine_config(async_scheduling=value)
+    else:
+        config = _hook_config(engine_config, platform)
+        config.scheduler_config.async_scheduling = value
+    _hook().verify_and_update_config(config)
 
 
 # @spec REG-ENG-002
@@ -155,16 +207,23 @@ def test_a_missing_parallel_setting_does_not_hide_another_refusal(engine_config)
 
 
 @pytest.mark.parametrize("value", [False, None])
-# @spec REG-ENG-005
-def test_an_outer_runner_that_is_not_eager_is_refused(engine_config, value):
-    """No compilation settings at all: neither runner configuration."""
+# @spec REG-ENG-005, REG-ENG-011, REG-ENG-024
+def test_a_runner_that_is_not_eager_needs_the_hook_configuration(
+    engine_config, platform, value
+):
+    """No compilation settings at all (both modes unset): the hook accepts the
+    unset modes on CUDA with the default arms, and off CUDA refuses with the
+    ``--enforce-eager`` remedy."""
+    platform(True)
+    _hook().verify_and_update_config(engine_config(enforce_eager=value))
+    platform(False)
     _refuse(engine_config(enforce_eager=value), "enforce_eager")
 
 
 # @spec REG-VAL-003
-def test_every_refused_setting_is_listed_in_one_error(engine_config):
+def test_every_refused_setting_is_listed_in_one_error(engine_config, platform):
+    platform(False)
     config = engine_config(
-        async_scheduling=True,
         enable_prefix_caching=True,
         speculative_config=object(),
         kv_transfer_config=object(),
@@ -181,7 +240,7 @@ def test_every_refused_setting_is_listed_in_one_error(engine_config):
         decode_context_parallel_size=2,
         prefill_context_parallel_size=2,
     )
-    _refuse(config, *NAMES)
+    _refuse(config, *(name for name in NAMES if name != "async_scheduling"))
 
 
 # --------------------------------------------------------------------------
@@ -198,14 +257,16 @@ def test_real_vllm_config_with_accepted_settings_constructs(
     assert vllm_config.cache_config.enable_prefix_caching is False
 
 
+@pytest.mark.parametrize("value", [True, False, None], ids=repr)
 # @spec REG-ENG-001
-def test_real_vllm_config_with_async_scheduling_left_unset_constructs(
-    make_model_config, make_vllm_config, card_dir
+def test_real_vllm_config_with_any_async_scheduling_value_constructs(
+    make_model_config, make_vllm_config, card_dir, value
 ):
-    """An unset option is accepted by the hook and core resolves it off for
-    a model that declares persistent state."""
-    vllm_config = make_vllm_config(make_model_config(card_dir), async_scheduling=None)
-    assert vllm_config.scheduler_config.async_scheduling is False
+    """The hook refuses no value; core resolves an unset one."""
+    vllm_config = make_vllm_config(make_model_config(card_dir), async_scheduling=value)
+    assert isinstance(vllm_config.scheduler_config.async_scheduling, bool)
+    if value is not None:
+        assert vllm_config.scheduler_config.async_scheduling is value
 
 
 # @spec REG-ENG-003
@@ -260,7 +321,6 @@ def test_model_state_accepts_the_accepted_configuration(
 
 
 _MUTATIONS = {
-    "async_scheduling": lambda c: setattr(c.scheduler_config, "async_scheduling", True),
     "enable_prefix_caching": lambda c: setattr(
         c.cache_config, "enable_prefix_caching", True
     ),
@@ -295,17 +355,14 @@ def test_model_state_refuses_a_configuration_resolved_after_the_hook(
     assert _names(str(excinfo.value), setting)
 
 
-# @spec REG-ENG-006
-def test_model_state_refuses_a_resolved_async_scheduling_of_none(
-    good_vllm_config, build_model_state
+@pytest.mark.parametrize("value", [True, False, None], ids=repr)
+# @spec REG-ENG-001, REG-ENG-006
+def test_model_state_refuses_no_async_scheduling_value(
+    good_vllm_config, build_model_state, value
 ):
-    """The hook accepts ``None``; at model-state construction the value is
-    resolved, and anything but ``False`` (including ``None``) is refused."""
     config = good_vllm_config()
-    config.scheduler_config.async_scheduling = None
-    with pytest.raises(ValueError) as excinfo:
-        build_model_state(config)
-    assert _names(str(excinfo.value), "async_scheduling")
+    config.scheduler_config.async_scheduling = value
+    build_model_state(config)
 
 
 # @spec REG-ENG-006, REG-VAL-003
@@ -323,6 +380,10 @@ def test_model_state_lists_every_failed_setting_in_one_error(
 
 # --------------------------------------------------------------------------
 # Native burst's configuration check
+#
+# REG-ENG-008 describes cores that support native burst; this build's core
+# (the state layer) refuses native burst outright (REG-ENG-019, in
+# test_runner_modes.py). These are unit tests of the check function only.
 # --------------------------------------------------------------------------
 
 
@@ -393,7 +454,8 @@ def test_native_burst_still_refuses_expert_parallelism():
 
 
 # --------------------------------------------------------------------------
-# The hook configuration (REG-ENG-005, REG-ENG-006)
+# The hook configuration (REG-ENG-005, REG-ENG-006, REG-ENG-011,
+# REG-ENG-021 to REG-ENG-026)
 # --------------------------------------------------------------------------
 
 #: The default segment arms (REG-CARD-008).
@@ -402,6 +464,36 @@ DEFAULT_ARMS = {
     "decode_dispatch_arm": "dense-graphed",
 }
 
+#: Compilation modes by short name (``None``: unset).
+MODES = ("none", "stock", "trace", "compile")
+#: ``cudagraph_mode`` values by short name (``None``: unset).
+GRAPHS = ("none", "piecewise", "full_decode_only", "full_and_piecewise", "full")
+
+#: REG-ENG-011: the graph modes and compilation modes accepted with
+#: breakable graphs off.
+ACCEPTED_GRAPHS = ("none", "piecewise", "full_decode_only", "full_and_piecewise")
+ACCEPTED_MODES = ("none", "trace", "compile")
+#: REG-ENG-026: the graph modes accepted with breakable graphs on.
+BREAKABLE_GRAPHS = ("none", "full_decode_only", "full_and_piecewise")
+
+
+def _compilation_mode(name):
+    from vllm.config.compilation import CompilationMode
+
+    return {
+        None: None,
+        "none": CompilationMode.NONE,
+        "stock": CompilationMode.STOCK_TORCH_COMPILE,
+        "trace": CompilationMode.DYNAMO_TRACE_ONCE,
+        "compile": CompilationMode.VLLM_COMPILE,
+    }[name]
+
+
+def _graph_mode(name):
+    from vllm.config import CUDAGraphMode
+
+    return None if name is None else CUDAGraphMode[name.upper()]
+
 
 def _hook_config(
     engine_config,
@@ -409,23 +501,23 @@ def _hook_config(
     *,
     mode="none",
     cudagraph="none",
+    breakable=None,
     level=None,
     cuda=True,
     **hf,
 ):
     """``enforce_eager`` off with the given compilation settings, platform and
     served-configuration fields (the default arms unless ``hf`` says
-    otherwise)."""
-    from vllm.config import CUDAGraphMode
-    from vllm.config.compilation import CompilationMode
-
-    modes = {"none": CompilationMode.NONE, "compile": CompilationMode.VLLM_COMPILE}
-    graphs = {"none": CUDAGraphMode.NONE, "piecewise": CUDAGraphMode.PIECEWISE}
+    otherwise). ``mode`` / ``cudagraph`` name the modes (``None``: unset);
+    ``breakable`` is ``compilation_config.use_breakable_cudagraph`` (``None``,
+    as core leaves it before it resolves breakable graphs, by default)."""
     platform(cuda)
     return engine_config(
         enforce_eager=False,
         compilation_config=SimpleNamespace(
-            mode=modes.get(mode), cudagraph_mode=graphs.get(cudagraph)
+            mode=_compilation_mode(mode),
+            cudagraph_mode=_graph_mode(cudagraph),
+            use_breakable_cudagraph=breakable,
         ),
         optimization_level=level,
         device="cuda" if cuda else "cpu",
@@ -442,98 +534,348 @@ def _resolved_check(config):
     check_engine_config(config, "test", resolved=True)
 
 
+def _refuse_resolved(config) -> str:
+    with pytest.raises(ValueError) as excinfo:
+        _resolved_check(config)
+    return str(excinfo.value)
+
+
+def _check(config, stage):
+    if stage == "hook":
+        _hook().verify_and_update_config(config)
+    else:
+        _resolved_check(config)
+
+
+def _refused_at(config, stage) -> str:
+    return _refuse(config) if stage == "hook" else _refuse_resolved(config)
+
+
+def _has(message: str, *words: str) -> None:
+    for word in words:
+        assert word.lower() in message.lower(), (word, message)
+
+
+STAGES = pytest.mark.parametrize("stage", ["hook", "constructor"])
+
 _HOOK_ACCEPTED = {
     "default arms": {},
     "graphed encoder only": {"decode_dispatch_arm": "dense-eager"},
     "graphed decoder only": {"encoder_execution_arm": "eager"},
-    "transaction graphs at 80 ms": {
-        "num_lookahead_tokens": 0,
-        "transaction_graph_populations": [2],
-    },
 }
 
 
 @pytest.mark.parametrize("case", list(_HOOK_ACCEPTED))
-@pytest.mark.parametrize("resolved", [False, True], ids=["hook", "model-state"])
+@STAGES
 # @spec REG-ENG-005, REG-ENG-006
-def test_the_hook_configuration_is_accepted(engine_config, platform, case, resolved):
-    config = _hook_config(engine_config, platform, **_HOOK_ACCEPTED[case])
-    if resolved:
-        _resolved_check(config)
-    else:
-        _hook().verify_and_update_config(config)
+def test_the_hook_configuration_is_accepted(engine_config, platform, case, stage):
+    config = _hook_config(
+        engine_config,
+        platform,
+        breakable=None if stage == "hook" else False,
+        **_HOOK_ACCEPTED[case],
+    )
+    _check(config, stage)
 
 
-# @spec REG-ENG-005, REG-ENG-006
-def test_unset_graph_mode_and_O0_are_accepted_only_before_core_resolves_them(
-    engine_config, platform
+@STAGES
+# @spec REG-ENG-005, REG-ENG-006, TXG-CFG-016
+def test_transaction_graphs_at_80_ms_are_refused_on_the_state_layer(
+    engine_config, platform, stage
 ):
-    config = _hook_config(engine_config, platform, mode=None, cudagraph=None, level=0)
+    """Every other condition holds (80 ms, the default arms, NONE/NONE on
+    CUDA); the refusal is the state-layer condition, naming the option's
+    removal."""
+    config = _hook_config(
+        engine_config,
+        platform,
+        breakable=None if stage == "hook" else False,
+        num_lookahead_tokens=0,
+        transaction_graph_populations=[2],
+    )
+    message = _refused_at(config, stage)
+    _has(message, "transaction_graph_populations", "state layer", "remov")
+
+
+@pytest.mark.parametrize("cudagraph", ACCEPTED_GRAPHS)
+@pytest.mark.parametrize("mode", ACCEPTED_MODES)
+@STAGES
+# @spec REG-ENG-011, REG-ENG-005, REG-ENG-006
+def test_graph_and_compilation_modes_with_breakable_graphs_off_are_accepted(
+    engine_config, platform, runner_env, stage, mode, cudagraph
+):
+    runner_env(breakable=False)
+    config = _hook_config(
+        engine_config,
+        platform,
+        mode=mode,
+        cudagraph=cudagraph,
+        breakable=None if stage == "hook" else False,
+    )
+    _check(config, stage)
+
+
+@pytest.mark.parametrize("level", [None, 0, 1, 2, 3])
+@pytest.mark.parametrize(
+    "mode, cudagraph",
+    [
+        (None, None),
+        *((None, g) for g in ACCEPTED_GRAPHS),
+        *((m, None) for m in ACCEPTED_MODES),
+    ],
+    ids=str,
+)
+# @spec REG-ENG-011
+def test_unset_modes_are_accepted_by_the_hook(
+    engine_config, platform, mode, cudagraph, level
+):
+    """The hook runs before core fills the optimization level's defaults, so
+    it does not duplicate core's table."""
+    config = _hook_config(
+        engine_config, platform, mode=mode, cudagraph=cudagraph, level=level
+    )
     _hook().verify_and_update_config(config)
-    with pytest.raises(ValueError) as excinfo:
-        _resolved_check(config)
-    message = str(excinfo.value)
-    assert "cudagraph_mode" in message and "-cc.mode none" in message, message
 
 
-#: case -> (settings, words the refusal must contain: the condition and its
-#: remedy).
+@pytest.mark.parametrize(
+    "unset, mode, cudagraph, words",
+    [
+        ("cudagraph_mode", "none", None, ("cudagraph_mode",)),
+        ("compilation mode", None, "none", ("mode",)),
+        ("both", None, None, ("cudagraph_mode",)),
+    ],
+    ids=lambda v: v if isinstance(v, str) else None,
+)
+# @spec REG-ENG-006
+def test_unset_modes_are_refused_at_construction(
+    engine_config, platform, unset, mode, cudagraph, words
+):
+    config = _hook_config(
+        engine_config, platform, mode=mode, cudagraph=cudagraph, breakable=False
+    )
+    message = _refuse_resolved(config)
+    _has(message, *words)
+    if unset != "cudagraph_mode":
+        assert re.search(
+            r"(?i)compilation mode|-cc\.mode|compilation_config\.mode", message
+        ), message
+
+
+@pytest.mark.parametrize("cudagraph", [None, *ACCEPTED_GRAPHS])
+# @spec REG-ENG-011, REG-ENG-023
+def test_requested_stock_compile_is_accepted_by_the_hook_while_compile_is_disabled(
+    engine_config, platform, runner_env, cudagraph
+):
+    """``TORCH_COMPILE_DISABLE=1``: core sets the compilation mode to NONE."""
+    runner_env(compile_disabled=True)
+    config = _hook_config(engine_config, platform, mode="stock", cudagraph=cudagraph)
+    _hook().verify_and_update_config(config)
+
+
+@pytest.mark.parametrize("cudagraph", [None, *BREAKABLE_GRAPHS])
+@pytest.mark.parametrize("mode", [None, *MODES])
+# @spec REG-ENG-026, REG-ENG-022, REG-ENG-023
+def test_breakable_graphs_on_are_accepted_by_the_hook_with_any_requested_mode(
+    engine_config, platform, runner_env, mode, cudagraph
+):
+    """``VLLM_USE_BREAKABLE_CUDAGRAPH=1``: core turns breakable graphs on and
+    sets the compilation mode to NONE, so even a requested
+    ``STOCK_TORCH_COMPILE`` is accepted."""
+    runner_env(breakable=True)
+    config = _hook_config(engine_config, platform, mode=mode, cudagraph=cudagraph)
+    _hook().verify_and_update_config(config)
+
+
+@pytest.mark.parametrize("cudagraph", BREAKABLE_GRAPHS)
+# @spec REG-ENG-026, REG-ENG-022, REG-ENG-006
+def test_breakable_graphs_on_are_accepted_at_construction_with_compilation_mode_none(
+    engine_config, platform, cudagraph
+):
+    config = _hook_config(
+        engine_config, platform, mode="none", cudagraph=cudagraph, breakable=True
+    )
+    _resolved_check(config)
+
+
+# @spec REG-ENG-022, REG-ENG-006
+def test_construction_reads_breakable_graphs_from_the_resolved_setting(
+    engine_config, platform, runner_env
+):
+    """At construction the resolved ``use_breakable_cudagraph`` decides, not
+    the environment variable."""
+    runner_env(breakable=True)
+    off = _hook_config(
+        engine_config, platform, mode="compile", cudagraph="piecewise", breakable=False
+    )
+    _resolved_check(off)
+    runner_env(breakable=False)
+    on = _hook_config(
+        engine_config, platform, mode="none", cudagraph="piecewise", breakable=True
+    )
+    _has(_refuse_resolved(on), "VLLM_USE_BREAKABLE_CUDAGRAPH=0")
+
+
+#: case -> (stage, environment, settings, words the refusal must contain: the
+#: condition and its remedy). ``stage`` is ``"hook"``, ``"constructor"`` or
+#: ``"both"``.
 _HOOK_REFUSED = {
-    "core graphs": (
-        {"cudagraph": "piecewise"},
-        ("cudagraph_mode", "-cc.cudagraph_mode none"),
+    "full graphs": (
+        "both",
+        {},
+        {"cudagraph": "full"},
+        ("cudagraph_mode", "FULL", "-cc.cudagraph_mode none"),
     ),
-    "torch.compile": ({"mode": "compile"}, ("-cc.mode none",)),
-    "default compile level": ({"mode": None, "level": 2}, ("-cc.mode none",)),
-    "not CUDA": ({"cuda": False}, ("cuda", "--enforce-eager")),
+    "full graphs under breakable graphs": (
+        "both",
+        {"breakable": True},
+        {"cudagraph": "full", "breakable": True},
+        ("cudagraph_mode", "FULL", "-cc.cudagraph_mode none"),
+    ),
+    "breakable piecewise": (
+        "both",
+        {"breakable": True},
+        {"cudagraph": "piecewise", "breakable": True},
+        (
+            "PIECEWISE",
+            "VLLM_USE_BREAKABLE_CUDAGRAPH=0",
+            "-cc.cudagraph_mode none",
+        ),
+    ),
+    "stock torch.compile": (
+        "both",
+        {},
+        {"mode": "stock"},
+        ("stock", "-cc.mode none"),
+    ),
+    "stock torch.compile surviving construction under breakable graphs": (
+        "constructor",
+        {"breakable": True},
+        {"mode": "stock", "breakable": True},
+        ("stock", "-cc.mode none"),
+    ),
+    "stock torch.compile surviving construction under TORCH_COMPILE_DISABLE": (
+        "constructor",
+        {"compile_disabled": True},
+        {"mode": "stock"},
+        ("stock", "-cc.mode none"),
+    ),
+    "not CUDA": ("both", {}, {"cuda": False}, ("cuda", "--enforce-eager")),
     "no hook-captured graph": (
+        "both",
+        {},
         {"encoder_execution_arm": "eager", "decode_dispatch_arm": "dense-eager"},
         ("eager-graphed", "dense-graphed", "--enforce-eager"),
     ),
     "compiled encoder": (
+        "both",
+        {},
         {"encoder_execution_arm": "dense-graphed"},
         ("encoder_execution_arm", "dense-graphed", "--enforce-eager"),
     ),
     "chunk buckets": (
+        "both",
+        {},
         {"chunk_bucket_graph_populations": [1]},
         ("chunk_bucket_graph_populations", "--enforce-eager"),
     ),
 }
 
+_REFUSED_CASES = [
+    pytest.param(case, stage, id=f"{stage}-{case}")
+    for case, (stages, *_rest) in _HOOK_REFUSED.items()
+    for stage in (("hook", "constructor") if stages == "both" else (stages,))
+]
 
-@pytest.mark.parametrize("case", list(_HOOK_REFUSED))
-# @spec REG-ENG-005
+
+@pytest.mark.parametrize("case, stage", _REFUSED_CASES)
+# @spec REG-ENG-005, REG-ENG-006, REG-ENG-021, REG-ENG-022, REG-ENG-023
+# @spec REG-ENG-024, REG-ENG-025
 def test_each_unmet_hook_condition_is_named_with_its_remedy(
-    engine_config, platform, case
+    engine_config, platform, runner_env, case, stage
 ):
-    settings, words = _HOOK_REFUSED[case]
+    _stages, env, settings, words = _HOOK_REFUSED[case]
+    runner_env(**env)
+    settings = dict(settings)
+    if stage == "hook":
+        # Core has not resolved breakable graphs yet: the hook predicts them
+        # from the environment only.
+        settings.pop("breakable", None)
+    else:
+        settings.setdefault("breakable", False)
     config = _hook_config(engine_config, platform, **settings)
-    message = _refuse(config)
-    for word in words:
-        assert word.lower() in message.lower(), (word, message)
+    _has(_refused_at(config, stage), *words)
 
 
-# @spec REG-ENG-005, REG-VAL-003
-def test_every_unmet_hook_condition_is_named_in_one_error(engine_config, platform):
+@STAGES
+# @spec REG-ENG-025
+def test_the_no_hook_captured_graph_remedy_does_not_suggest_transaction_graphs(
+    engine_config, platform, stage
+):
+    """Transaction graphs are refused on this core (TXG-CFG-016), so the
+    remedy names only the graphed arms and ``--enforce-eager``."""
     config = _hook_config(
         engine_config,
         platform,
-        mode="compile",
-        cudagraph="piecewise",
+        breakable=None if stage == "hook" else False,
+        encoder_execution_arm="eager",
+        decode_dispatch_arm="dense-eager",
+    )
+    message = _refused_at(config, stage)
+    assert "transaction" not in message.lower(), message
+
+
+@STAGES
+# @spec REG-ENG-005, REG-ENG-006, REG-VAL-003
+def test_every_unmet_hook_condition_is_named_in_one_error(
+    engine_config, platform, stage
+):
+    config = _hook_config(
+        engine_config,
+        platform,
+        mode="stock",
+        cudagraph="full",
+        breakable=None if stage == "hook" else False,
         cuda=False,
         encoder_execution_arm="dense-graphed",
+        decode_dispatch_arm="dense-eager",
         chunk_bucket_graph_populations=[1],
     )
-    message = _refuse(config)
-    for word in (
+    message = _refused_at(config, stage)
+    _has(
+        message,
         "-cc.cudagraph_mode none",
         "-cc.mode none",
         "cuda",
         "dense-graphed",
+        "eager-graphed",
         "chunk_bucket_graph_populations",
         "--enforce-eager",
-    ):
-        assert word.lower() in message.lower(), (word, message)
+    )
+
+
+@STAGES
+# @spec REG-ENG-005, REG-ENG-006, REG-VAL-003
+def test_breakable_piecewise_is_named_with_the_other_unmet_conditions(
+    engine_config, platform, runner_env, stage
+):
+    runner_env(breakable=stage == "hook")
+    config = _hook_config(
+        engine_config,
+        platform,
+        mode="none",
+        cudagraph="piecewise",
+        breakable=None if stage == "hook" else True,
+        cuda=False,
+        chunk_bucket_graph_populations=[1],
+    )
+    message = _refused_at(config, stage)
+    _has(
+        message,
+        "VLLM_USE_BREAKABLE_CUDAGRAPH=0",
+        "cuda",
+        "chunk_bucket_graph_populations",
+        "--enforce-eager",
+    )
 
 
 @pytest.mark.parametrize(
@@ -633,7 +975,9 @@ def test_every_missing_hook_is_named(engine_config, monkeypatch):
 
     for hook in HOOKS:
         monkeypatch.delattr(ModelState, hook)
-    message = _refuse(engine_config(async_scheduling=True), "async_scheduling")
+    message = _refuse(
+        engine_config(enable_prefix_caching=True), "enable_prefix_caching"
+    )
     for hook in HOOKS:
         assert hook in message, (hook, message)
     assert "67583" in message

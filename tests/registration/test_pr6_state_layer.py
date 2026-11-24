@@ -476,13 +476,53 @@ def test_plugin_load_refuses_a_build_without_the_model_state_hooks(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "overrides",
-    [{"transaction_graph_populations": [1]}, {"experimental_native_burst": True}],
+    "overrides, option",
+    [
+        (
+            {"transaction_graph_populations": [1], "num_lookahead_tokens": 0},
+            "transaction_graph_populations",
+        ),
+        (
+            {"experimental_native_burst": True, "num_lookahead_tokens": 1},
+            "experimental_native_burst",
+        ),
+    ],
     ids=["transaction-graphs", "native-burst"],
 )
-def test_the_poc_refuses_transaction_graphs_and_native_burst(overrides):
-    from vllm_nemotron_asr_streaming.engine_flags import pr6_poc_refusals
+# @spec REG-ENG-019, TXG-CFG-016
+def test_the_state_layer_refuses_transaction_graphs_and_native_burst(
+    engine_config, platform, overrides, option
+):
+    """Through the configuration hook, in the hook configuration on CUDA with
+    the default arms, where every other condition holds: the refusal states
+    that the option is not supported on the state layer and names its
+    removal. Without the option the same configuration is accepted."""
+    from vllm.config import CUDAGraphMode
+    from vllm.config.compilation import CompilationMode
 
-    (message,) = pr6_poc_refusals(SimpleNamespace(**overrides))
-    assert "PR 6" in message
-    assert pr6_poc_refusals(SimpleNamespace()) == []
+    from vllm_nemotron_asr_streaming.streaming_config import (
+        Nemotron3_5AsrStreamingConfig,
+    )
+
+    platform(True)
+
+    def config(hf):
+        return engine_config(
+            enforce_eager=False,
+            compilation_config=SimpleNamespace(
+                mode=CompilationMode.NONE,
+                cudagraph_mode=CUDAGraphMode.NONE,
+                use_breakable_cudagraph=None,
+            ),
+            hf=hf,
+        )
+
+    with pytest.raises(ValueError) as excinfo:
+        Nemotron3_5AsrStreamingConfig.verify_and_update_config(config(overrides))
+    message = str(excinfo.value)
+    assert option in message, message
+    assert "state layer" in message.lower(), message
+    assert "remov" in message.lower(), message
+    Nemotron3_5AsrStreamingConfig.verify_and_update_config(
+        config({"num_lookahead_tokens": overrides["num_lookahead_tokens"]})
+    )
