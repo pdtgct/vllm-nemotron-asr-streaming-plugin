@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Installed engines in fresh child processes, for the installed-engine checks
-(``test_qualification_engine``, ``test_observability_gpu``).
+(``test_qualification_engine``, ``test_observability_gpu``,
+``tests/registration/test_startup_gpu``).
 
 Two things keep these checks out of the pytest process:
 
@@ -25,10 +26,18 @@ Two things keep these checks out of the pytest process:
 The child reads a JSON request and writes a JSON reply:
 
 * request: ``mode``; ``settings`` (``AsyncEngineArgs`` keywords); ``patch``
-  (``None`` or ``"suppress-profiling"``: core's graph-memory estimate,
+  (``None``; ``"suppress-profiling"``: core's graph-memory estimate,
   ``GPUModelRunner.profile_cudagraph_memory``, returns 0 without running the
-  profiling capture); ``reads`` (names in :data:`READS`, each run on the
-  worker through ``collective_rpc``); ``env`` (environment variables the
+  profiling capture; or ``"record-add-request"``: the model state's
+  ``add_request`` records each request ID it receives, which the reply
+  returns as ``reads["add_requests"]``; or ``"profiling-kv-cache-ref"``: the
+  state layer takes a ``StorageWeakRef`` of the storage of the first KV cache
+  core binds to it (the profiling KV cache under core's graph-memory
+  estimate), and the reply's ``reads["profiling_kv_cache_expired"]`` records,
+  at each later ``bind_kv_cache``, whether that reference had expired; both
+  patches need mode ``"llm"``, where the worker runs in the child);
+  ``reads`` (names in :data:`READS`, each run on the worker through
+  ``collective_rpc``); ``env`` (environment variables the
   child sets before it imports vLLM).
 * reply: ``ok``; ``error`` (every message in the failure's chain, its types
   and its formatted traceback) when the engine did not start; ``reads``;
@@ -150,6 +159,49 @@ def _start_async(request: dict[str, Any], reply: dict[str, Any]) -> Any:
     return None
 
 
+def _record_add_request(reply: dict[str, Any]) -> None:
+    """Record every request ID the model state's ``add_request`` receives in
+    ``reply["reads"]["add_requests"]`` (the worker runs in this process)."""
+    from vllm_nemotron_asr_streaming.nemotron_asr.model_state_v2 import (
+        NemotronASRModelState,
+    )
+
+    received: list[str] = []
+    reply["reads"]["add_requests"] = received
+    original = NemotronASRModelState.add_request
+
+    def add_request(self: Any, req_index: int, new_req_data: Any) -> None:
+        received.append(str(new_req_data.req_id))
+        original(self, req_index, new_req_data)
+
+    NemotronASRModelState.add_request = add_request
+
+
+def _profiling_kv_cache_ref(reply: dict[str, Any]) -> None:
+    """See ``"profiling-kv-cache-ref"`` in the module docstring
+    (REG-STATE-019)."""
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    from vllm_nemotron_asr_streaming.nemotron_asr.state_layer import (
+        NemotronStateLayer,
+    )
+
+    refs: list[Any] = []
+    expired: list[bool] = []
+    reply["reads"]["profiling_kv_cache_expired"] = expired
+    original = NemotronStateLayer.bind_kv_cache
+
+    def bind_kv_cache(self: Any, kv_cache: Any) -> None:
+        # core's teardown of the profiling KV cache ran gc.collect already
+        if refs:
+            expired.append(bool(refs[0].expired()))
+        else:
+            refs.append(StorageWeakRef(kv_cache.untyped_storage()))
+        original(self, kv_cache)
+
+    NemotronStateLayer.bind_kv_cache = bind_kv_cache
+
+
 def _child(request_path: str, reply_path: str) -> int:
     request = json.loads(Path(request_path).read_text())
     os.environ.update(request.get("env") or {})
@@ -170,6 +222,10 @@ def _child(request_path: str, reply_path: str) -> int:
             from vllm.v1.worker.gpu import model_runner
 
             model_runner.GPUModelRunner.profile_cudagraph_memory = lambda self: 0
+        if request.get("patch") == "record-add-request":
+            _record_add_request(reply)
+        if request.get("patch") == "profiling-kv-cache-ref":
+            _profiling_kv_cache_ref(reply)
         start = _start_llm if request.get("mode", "llm") == "llm" else _start_async
         try:
             stop = start(request, reply)

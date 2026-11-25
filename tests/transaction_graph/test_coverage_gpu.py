@@ -210,6 +210,23 @@ def test_a_new_bound_method_of_the_same_callable_matches(on_cuda):
 
 
 # @spec TXG-COV-008
+def test_no_fallback_at_n_below_p_max_set_by_the_admission_limit(on_cuda):
+    """``N = min(P_max, admission limit)``: with ``max_num_seqs`` 6 and
+    ``--max-num-active-seqs`` 4, ``N = 4``, and every one-token step of at
+    most four rows (core admits no more) is covered."""
+    env = on_cuda(startup=True, lookahead=0, n=4, max_num_seqs=6, max_num_active_seqs=4)
+    records = env.compare()
+    d = g.Driver(env)
+    for i in range(3):
+        d.add_stream(f"s{i}", [{}, {}, {}])
+    d.add_file("f1", 6000)
+    d.run(80)
+    assert records and all(r.covered for r in records)
+    assert all(len(r.plan.request_ids) <= 4 for r in records)
+    assert not fallbacks(env)
+
+
+# @spec TXG-COV-008
 def test_no_fallback_at_n_equal_p_max(on_cuda):
     env = on_cuda(startup=True, lookahead=0, n=6)
     records = env.compare()

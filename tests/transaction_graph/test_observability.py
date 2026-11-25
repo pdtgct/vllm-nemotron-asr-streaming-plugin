@@ -18,10 +18,9 @@ pytestmark = pytest.mark.engine
 
 
 @pytest.fixture
-def off_model(tmp_path, monkeypatch):
+def off_model(tmp_path):
     from support import model_harness as h
 
-    h.spec_without_state_name(monkeypatch)
     card = h.write_runnable_card(tmp_path / "card")
     config = h.build_vllm_config(card, right_context=0)
     return h.build_model(config)

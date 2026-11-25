@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Whole-file rows through the real model and model state, step by step.
 
-The model, its ``ModelState``, core's ``StateSlotBindings`` and the row
-transaction (scatter, commit sink and collection included) run as core's
-model runner drives them (``support.model_harness``): on CPU with the
-option-off transaction (``engine`` tier), and on CUDA with transaction graphs
-on through core's capture hooks in core's order (``support.core_order``;
-``gpu`` tier, the same test bodies).
+The model, its ``ModelState``, its state layer and the row transaction
+(scatter, commit sink and collection included) run as core's model runner
+drives them (``support.model_harness``): on CPU with the option-off
+transaction (``engine`` tier), and on CUDA with transaction graphs on under
+the restricted startup through core's capture hooks in core's order
+(``support.core_order``; ``gpu`` tier, the same test bodies).
 
 Observation points (all call-through wrappers; nothing in the step is
 replaced unless a test says so):
@@ -22,8 +22,8 @@ replaced unless a test says so):
 * ``NemotronASRModelState.plan_step``: each file row's planned action;
 * the state's ``file_buffers.stage``: the samples staged per step;
 * ``Runner.queue_count_log`` / ``commit_log``: the model's collection, and
-  the step's ``StateCompletion.failed_req_ids``: the requests the model state
-  failed through ``state_slots.fail_requests``.
+  ``Runner.failed_log``: what the model state's ``take_failed_requests``
+  returned after the step (REG-MS-003, REG-MS-004, FILE-QC-012).
 
 Layout addition: the file progress ``state._file_progress[req]``
 holds ``queue_count`` (int), ``queue_count_unknown`` (bool) and
@@ -132,8 +132,6 @@ class Env:
             QUEUE_LEN,
         )
 
-        h.spec_without_state_name(monkeypatch)
-        h.legacy_state_api(monkeypatch)
         self.monkeypatch = monkeypatch
         self.right_context = right_context
         self.geometry = geometry_index(right_context)
@@ -352,8 +350,9 @@ class Env:
         )
         step = Step(scheduled=scheduled)
         self._current = step
+        asked = len(self.runner.failed_log)
         try:
-            _, completion = self.runner.real_step(output)
+            self.runner.real_step(output)
         finally:
             self._current = None
         step.emitted = {r: int(self.runner._sampled[r]) for r in scheduled}
@@ -361,8 +360,8 @@ class Env:
             step.statuses = dict(self.runner.commit_log[-1][0])
         if self.runner.queue_count_log:
             step.collected = tuple(self.runner.queue_count_log[-1])
-        if completion is not None:
-            step.failed = set(completion.completion.failed_req_ids)
+        if len(self.runner.failed_log) > asked:
+            step.failed = set(self.runner.failed_log[-1] or ())
         for req_id in scheduled:
             self.positions[req_id] += 1
             if req_id in self.state._file_progress:

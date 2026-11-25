@@ -3,12 +3,13 @@
 qualification and calibration (TXG-QUAL-*, TXG-CAL-003).
 
 These are the measurement harness's decision arithmetic, written once so the
-preregistered run and its CPU tests use the same code: the step rule
-(TXG-QUAL-013, -014), the body non-regression check (TXG-QUAL-015), the
-``U_api`` gain (TXG-QUAL-017), the void rule (TXG-QUAL-005), the frozen
-preregistration check (TXG-QUAL-018), the choice of ``N`` (TXG-QUAL-025,
--027), and the required contents of the qualification and calibration
-records (TXG-QUAL-019, -020, TXG-CAL-003). Times are milliseconds.
+preregistered run and its CPU tests use the same code: the restricted startup
+every qualifying engine runs under (TXG-QUAL-001, -010, -021, -025), the step
+rule (TXG-QUAL-013, -014), the ``U_api`` procedure and gain (TXG-QUAL-016,
+-017), the void rule (TXG-QUAL-005), the frozen preregistration
+(TXG-QUAL-018), the choice of ``N`` (TXG-QUAL-025, -027), and the required
+contents of the qualification and calibration records (TXG-QUAL-019, -020,
+TXG-CAL-003). Times are milliseconds.
 """
 
 from __future__ import annotations
@@ -21,12 +22,63 @@ from typing import Any
 #: Step-rule legs: 2 warm-up and 21 counted steps (TXG-QUAL-013).
 WARMUP, COUNTED = 2, 21
 MATERIAL_MS = 5.0
-BODY_MS = 1.0
 #: The step rule's populations and split compositions (TXG-QUAL-012).
 ONE_KIND = (1, 31, 63)
 SPLITS = ((31, 27, 4), (31, 16, 15), (63, 55, 8), (63, 32, 31))
 TIER5_FLOOR = 63
 COVERAGE = 0.99
+
+# ---------------------------------------------------------------------------
+# The restricted startup of every qualifying engine
+
+#: Core's graph-memory estimate (enabled for the step rule, the installed
+#: engine checks and the fit of TXG-QUAL-025).
+ESTIMATE_ENV = "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"
+
+
+def restricted_startup(
+    max_num_seqs: int, *, max_num_active_seqs: int | None = None
+) -> dict[str, Any]:
+    """The ``AsyncEngineArgs`` keywords of the restricted startup
+    (TXG-CFG-017 to TXG-CFG-019) under the fixed block count the
+    qualification uses (TXG-QUAL-001, -010, -021): synchronous scheduling,
+    ``cudagraph_mode`` and compilation mode NONE, and
+    ``--num-gpu-blocks-override`` the admission limit plus one. ``B_hook``
+    keeps these settings, the block count included; only
+    ``transaction_graph_populations`` differs."""
+    limit = max_num_seqs if max_num_active_seqs is None else max_num_active_seqs
+    return {
+        "async_scheduling": False,
+        "enable_prefix_caching": False,
+        "compilation_config": {"cudagraph_mode": "NONE", "mode": 0},
+        "num_gpu_blocks_override": int(limit) + 1,
+    }
+
+
+def estimate_enabled() -> dict[str, str]:
+    """The environment that enables core's graph-memory estimate."""
+    return {ESTIMATE_ENV: "1"}
+
+
+def fit_startup(max_num_seqs: int) -> dict[str, Any]:
+    """TXG-QUAL-025's "fits": both captures and their transient peaks
+    succeed under ``--num-gpu-blocks-override`` ``max_num_seqs + 1`` with
+    core's graph-memory estimate enabled (:func:`estimate_enabled`)."""
+    return restricted_startup(max_num_seqs)
+
+
+def served_run_n(
+    p_max: int, admission_limit: int, fits: Mapping[int, bool]
+) -> int | None:
+    """TXG-QUAL-025: the ``N`` of the served ``Q`` run that chooses the
+    inventory: ``min(P_max, admission limit)``, the largest ``N`` that
+    TXG-CFG-004 and TXG-CFG-020 accept, when it fits, otherwise the largest
+    ``N`` below it that fits (``None`` when none does)."""
+    top = min(int(p_max), int(admission_limit))
+    if fits.get(top):
+        return top
+    fitting = [n for n, ok in fits.items() if ok and n <= top]
+    return max(fitting) if fitting else None
 
 
 def counted(samples: Sequence[float]) -> Sequence[float]:
@@ -40,7 +92,7 @@ def counted(samples: Sequence[float]) -> Sequence[float]:
 
 @dataclass(frozen=True)
 class Block:
-    """One block of legs OFF1, ON, OFF2 (or OLD1, NEW, OLD2)."""
+    """One block of legs OFF1, ON, OFF2."""
 
     first: Sequence[float]
     middle: Sequence[float]
@@ -81,29 +133,6 @@ def split_group(results: Mapping[tuple[int, int, int], bool]) -> bool:
     return all(results[c] for c in SPLITS)
 
 
-def body_block_passes(block: Block) -> bool:
-    """TXG-QUAL-015 for one block of OLD1, NEW, OLD2."""
-    old1, new, old2 = block.medians()
-    return new - min(old1, old2) <= max(BODY_MS, abs(old1 - old2))
-
-
-def body_check(blocks: Sequence[Block]) -> bool:
-    if len(blocks) != 2:
-        raise ValueError("the body check runs exactly two blocks")
-    return all(body_block_passes(b) for b in blocks)
-
-
-#: The body check's populations (TXG-QUAL-015).
-BODY_POPULATIONS = (1, 31, 63)
-
-
-def body_check_all(blocks: Mapping[int, Sequence[Block]]) -> bool:
-    """TXG-QUAL-015 at one geometry: every population passes in both blocks."""
-    if set(blocks) != set(BODY_POPULATIONS):
-        raise ValueError(f"the body check covers populations {BODY_POPULATIONS}")
-    return all(body_check(blocks[p]) for p in BODY_POPULATIONS)
-
-
 @dataclass(frozen=True)
 class Bracket:
     """One ``U_api`` bracket: each leg's repeats 0..3 (repeat 0 discarded)."""
@@ -125,6 +154,66 @@ class Bracket:
         return tuple(
             statistics.median(self._counted(x)) for x in (self.off1, self.on, self.off2)
         )
+
+
+#: ``U_api`` (TXG-QUAL-016): five brackets of legs OFF1, ON, OFF2, each leg
+#: repeats 0 to 3 (repeat 0 discarded).
+U_API_BRACKETS = 5
+U_API_LEGS = ("OFF1", "ON", "OFF2")
+U_API_REPEATS = 4
+
+
+def u_api_schedule() -> list[dict[str, Any]]:
+    """TXG-QUAL-016's processes in order: five brackets of legs OFF1, ON,
+    OFF2, each leg a fresh engine process that follows a washout leg of its
+    own arm (``washout``: run, then discarded)."""
+    out = []
+    for bracket in range(U_API_BRACKETS):
+        for leg in U_API_LEGS:
+            arm = "on" if leg == "ON" else "off"
+            for washout in (True, False):
+                out.append(
+                    {"bracket": bracket, "leg": leg, "arm": arm, "washout": washout}
+                )
+    return out
+
+
+def u_api_leg_problems(leg: Mapping[str, Any]) -> list[str]:
+    """TXG-QUAL-016's checks of one recorded leg (``arm`` ``"on"`` or
+    ``"off"``; ``repeats``, each with ``ms``, ``parks``, ``errors``,
+    ``tokens`` (the unit's output tokens, the park included) and, for an ON
+    leg, the counter ``deltas`` over the repeat: ``chunk1`` and ``echo1``
+    (replays of the cells at count 1), ``other_replays`` and ``fallbacks``):
+    repeats 0 to 3, each reaching exactly one park with no error output, and
+    for an ON leg one more chunk-cell replay at 1, one more echo-cell replay
+    at 1 per later step and no fallback."""
+    problems: list[str] = []
+    repeats = list(leg.get("repeats") or ())
+    if len(repeats) != U_API_REPEATS:
+        problems.append(f"{len(repeats)} repeats, not {U_API_REPEATS}")
+    for index, repeat in enumerate(repeats):
+        if repeat.get("parks") != 1:
+            problems.append(f"repeat {index}: {repeat.get('parks')} parks, not 1")
+        if repeat.get("errors"):
+            problems.append(f"repeat {index}: an error output")
+        if leg.get("arm") != "on":
+            continue
+        deltas = repeat.get("deltas") or {}
+        later = int(repeat.get("tokens", 0)) - 1
+        expected = {"chunk1": 1, "echo1": later, "other_replays": 0, "fallbacks": 0}
+        for name, value in expected.items():
+            if deltas.get(name) != value:
+                problems.append(
+                    f"repeat {index}: {name} {deltas.get(name)!r}, not {value}"
+                )
+    return problems
+
+
+def u_api_bracket(legs: Sequence[Mapping[str, Any]]) -> Bracket:
+    """A bracket from its three counted legs in order OFF1, ON, OFF2."""
+    if [leg.get("leg") for leg in legs] != list(U_API_LEGS):
+        raise ValueError(f"a bracket's legs are {U_API_LEGS} in order")
+    return Bracket(*([r["ms"] for r in leg["repeats"]] for leg in legs))
 
 
 def _gain(off1: float, on: float, off2: float) -> bool:
@@ -211,6 +300,41 @@ def frozen_before_counting(record: Mapping[str, Any], run: Mapping[str, Any]) ->
         and all(run["parameters"].get(k) == v for k, v in frozen.items())
         and (set(run["parameters"]) == set(frozen))
     )
+
+
+#: What a qualification run freezes before its first counted sample
+#: (TXG-QUAL-018).
+FROZEN_PARAMETERS = (
+    "scripts",
+    "clock",
+    "concurrencies",
+    "seed_list",
+    "clip_manifest",
+    "file_manifest",
+    "offset_rule",
+    "run_lengths",
+    "file_admission",
+    "idle_clock_rule",
+    "minimum_case_coverage",
+    "step_rule_prefix",
+    "snapshot_rule",
+    "plans",
+    "compositions",
+    "aggregation",
+    "adapter_identity",
+    "u_api_procedure",
+    "u_api_input_generator",
+    "u_api_rules",
+    "u1_audio",
+    "u1_plan",
+    "u1_procedure",
+)
+
+
+def missing_frozen_parameters(record: Mapping[str, Any]) -> list[str]:
+    """TXG-QUAL-018: the frozen parameters the dated record lacks."""
+    frozen = record.get("parameters") or {}
+    return [name for name in FROZEN_PARAMETERS if name not in frozen]
 
 
 def coverage(histogram: Mapping[tuple[int, int], int], n: int) -> float:

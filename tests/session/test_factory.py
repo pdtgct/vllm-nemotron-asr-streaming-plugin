@@ -1,5 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Factory construction, opening and ownership (SESS-FAC, SESS-OPEN, SESS-OWN)."""
+"""Factory construction, opening and ownership (SESS-FAC, SESS-OPEN, SESS-OWN).
+
+SESS-FAC-001 to SESS-FAC-003 are current obligations on the target core
+(``pdtgct/vllm`` at ``ddf6db2ab8``), where ``create_session_factory`` refuses
+the engine client. Every other test here covers the session factory on the
+stream-admission client path, which the session specs' scope separates from the
+target core's obligations (its port to core's admission is the session design's
+Future roadmap 1): it runs against ``support.fake_engine`` and a pass makes no
+claim for the target core.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +32,7 @@ from support.fake_engine import (
     make_hf_config,
     make_model_config,
     refusal,
+    refused,
     run,
     wait_until,
 )
@@ -123,6 +133,26 @@ def test_engine_without_generate_is_refused():
 
     with pytest.raises(Exception, match="generate"):
         create_session_factory(NoGenerate(), make_model_config())
+
+
+# @spec SESS-FAC-003
+@pytest.mark.engine
+def test_the_target_cores_engine_client_is_refused():
+    """The target core's ``AsyncLLM`` admits a persistent-state stream
+    automatically: its ``generate`` takes no ``stream_admission`` and it has
+    no ``wait_stream_retired``, so the factory refuses it, naming a missing
+    call (the session specs' scope: the factory is not available there)."""
+    import inspect as _inspect
+
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    from vllm_nemotron_asr_streaming.session import create_session_factory
+
+    assert "stream_admission" not in _inspect.signature(AsyncLLM.generate).parameters
+    assert not hasattr(AsyncLLM, "wait_stream_retired")
+    client = AsyncLLM.__new__(AsyncLLM)  # the class's calls, not an engine
+    with pytest.raises(Exception, match="stream_admission|wait_stream_retired"):
+        create_session_factory(client, make_model_config())
 
 
 # @spec SESS-FAC-004
@@ -370,16 +400,23 @@ def test_open_maps_admission_refusal_to_session_refused(build, reason):
 
 # @spec SESS-OPEN-007
 @pytest.mark.engine
-def test_admission_doubles_build_the_target_cores_three_field_result():
-    """The doubles use core's own ``StreamAdmissionResult``: three fields,
-    ``accepted``, ``request_id`` and ``reason``, and no status field."""
-    from vllm.v1.engine import StreamAdmissionError, StreamAdmissionResult
+def test_admission_doubles_build_the_client_paths_three_field_result():
+    """The doubles build the stream-admission client path's
+    ``StreamAdmissionResult`` (the session design, Factory ownership,
+    Refusal result): exactly ``accepted``, ``request_id`` and ``reason``, no
+    status field. The target core defines no such type, so the double owns
+    it; the refusal error is the target core's public ``StreamAdmissionError``
+    carrying the result."""
+    import dataclasses
 
-    assert StreamAdmissionResult.__struct_fields__ == (
+    from support.fake_engine import StreamAdmissionResult, admission_error
+    from vllm.v1.engine.exceptions import StreamAdmissionError
+
+    assert [f.name for f in dataclasses.fields(StreamAdmissionResult)] == [
         "accepted",
         "request_id",
         "reason",
-    )
+    ]
     result = refusal("caller", "capacity")
     assert type(result) is StreamAdmissionResult
     assert (result.accepted, result.request_id, result.reason) == (
@@ -387,15 +424,17 @@ def test_admission_doubles_build_the_target_cores_three_field_result():
         "caller",
         "capacity",
     )
-    assert StreamAdmissionError(result).result is result
+    error = admission_error(result)
+    assert isinstance(error, StreamAdmissionError)
+    assert error.result is result and error.reason == "capacity"
 
 
 # @spec SESS-OPEN-004, SESS-OPEN-007
 @pytest.mark.engine
 def test_refusal_reason_reaches_session_refused_from_the_real_error(build):
-    """The engine raises core's ``StreamAdmissionError`` carrying a
+    """The double raises the target core's ``StreamAdmissionError`` carrying a
     three-field result; ``open`` reports that result's ``reason``."""
-    from vllm.v1.engine import StreamAdmissionError
+    from vllm.v1.engine.exceptions import StreamAdmissionError
 
     seen: list = []
 
@@ -591,11 +630,10 @@ RETIREMENT_RESULTS = [
 
 
 def _result(value):
-    from vllm.v1.engine import StreamAdmissionError
     from vllm.v1.engine.exceptions import EngineDeadError
 
     if value == "admission-error":
-        return StreamAdmissionError(refusal("x", "capacity"))
+        return refused("x", "capacity")
     if value == "engine-dead":
         return EngineDeadError()
     return value

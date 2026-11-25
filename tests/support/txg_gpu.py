@@ -7,9 +7,14 @@ in-process, and driven by scheduled real steps (``gpu`` tests).
 the hook configuration (no ``--enforce-eager``, ``cudagraph_mode`` NONE,
 compilation off, the default segment arms), with the option set from
 configuration on, so core's and the plugin's configuration hooks see it. The
-environment's ``core`` (``support.core_order.CoreOrder``) takes it through
-core's startup order with ``graph_capture``'s stream and core's graph pools;
-``build_option_on`` runs that startup unless ``startup=False``.
+environment's ``core`` (``support.txgcap_harness.TxgCoreOrder``, a
+``support.core_order.CoreOrder`` whose bindings set core's state-group layout
+accessor) takes it through core's startup order with ``graph_capture``'s
+stream and core's graph pools; ``build_option_on`` runs that startup unless
+``startup=False``. The configuration meets the restricted startup
+(TXG-CFG-017 to TXG-CFG-019): synchronous scheduling, ``cudagraph_mode`` and
+compilation mode NONE, and ``num_gpu_blocks_override`` the state pools' block
+count, at least the admission limit plus one.
 
 ``GpuEnv.compare`` installs a spy on the binding's ``execute`` (see
 ``support.txg_api``): every covered step is also run as the option-off
@@ -40,8 +45,8 @@ import torch
 from support import model_harness as h
 from support import txg_api as api
 from support import txg_transaction as tx
-from support.core_order import CoreOrder
 from support.txg_fakes import RecordingSink
+from support.txgcap_harness import TxgCoreOrder
 
 KEY = api.KEY
 
@@ -172,7 +177,12 @@ class GpuEnv:
         self.events = events if events is not None else h.Events()
         self.advance = advance
         self.config = model.config
-        self.core = CoreOrder(runner, device="cuda", capacity=capacity, spy=False)
+        # A harness-structure check builds an environment without a runner.
+        self.core = (
+            None
+            if runner is None
+            else TxgCoreOrder(runner, device="cuda", capacity=capacity, spy=False)
+        )
         self.records: list[StepRecord] = []
         self._patches = pytest.MonkeyPatch()
 
@@ -314,6 +324,17 @@ class GpuEnv:
                 final.bias[blank].copy_(original)
 
 
+def set_block_count(vllm_config: Any, blocks: int) -> None:
+    """``--num-gpu-blocks-override blocks``, the restricted startup's block
+    count (TXG-CFG-005, TXG-CFG-019), set on the built configuration without
+    re-running its validators."""
+    cache = vllm_config.cache_config
+    try:
+        cache.num_gpu_blocks_override = blocks
+    except Exception:  # noqa: BLE001 - validated dataclass
+        object.__setattr__(cache, "num_gpu_blocks_override", blocks)
+
+
 def build_option_on(
     tmp_path: Path,
     *,
@@ -321,6 +342,7 @@ def build_option_on(
     n: int = 4,
     max_num_seqs: int | None = None,
     max_num_batched_tokens: int = 64,
+    max_num_active_seqs: int | None = None,
     populations: Sequence[int] | None = None,
     capacity: int | None = None,
     startup: bool = True,
@@ -330,12 +352,11 @@ def build_option_on(
     monkeypatch: Any = None,
 ) -> GpuEnv:
     """See the module docstring. ``max_num_seqs`` defaults to ``n``
-    (``N = P_max``); the weights are seeded, so every environment of a test
-    has the same model. ``startup`` runs ``core.startup(profiling=profile,
-    verify=verify)``."""
+    (``N = P_max``); ``max_num_active_seqs`` sets the admission limit
+    (``--max-num-active-seqs``; unset, it is ``max_num_seqs``). The weights
+    are seeded, so every environment of a test has the same model.
+    ``startup`` runs ``core.startup(profiling=profile, verify=verify)``."""
     patches = monkeypatch or pytest.MonkeyPatch()
-    h.spec_without_state_name(patches)
-    h.legacy_state_api(patches)
     events = h.Events()
     advance = h.AdvanceSpy(events).install(patches)
     max_num_seqs = max_num_seqs or n
@@ -354,6 +375,15 @@ def build_option_on(
         device="cuda",
         enforce_eager=False,
     )
+    if max_num_active_seqs is not None:
+        scheduler = vllm_config.scheduler_config
+        try:
+            scheduler.max_num_active_seqs = max_num_active_seqs
+        except Exception:  # noqa: BLE001 - validated dataclass
+            object.__setattr__(scheduler, "max_num_active_seqs", max_num_active_seqs)
+    capacity = capacity or max_num_seqs + 4
+    assert capacity >= max_num_seqs + 1, "the pools hold the admission limit plus one"
+    set_block_count(vllm_config, capacity)
     torch.manual_seed(0)
     model = h.build_model(vllm_config)
     state = h.build_model_state(vllm_config, model)
@@ -364,7 +394,7 @@ def build_option_on(
         runner=h.Runner(vllm_config, model, state),
         lookahead=lookahead,
         n=n,
-        capacity=capacity or max_num_seqs + 4,
+        capacity=capacity,
         max_num_seqs=max_num_seqs,
         events=events,
         advance=advance,

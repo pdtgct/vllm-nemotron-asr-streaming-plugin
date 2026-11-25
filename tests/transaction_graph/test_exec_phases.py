@@ -2,6 +2,10 @@
 """The streaming transaction's phase split (TXG-TXN-001 to TXG-TXN-008,
 TXG-TXN-010), with transaction graphs off, on CPU.
 
+Rows by token position (TXG-TXN-010) run on composed one-token steps and on
+real steps of the model with a multi-token row (``support.txg_steps``), which
+REG-STATE-014 fails at planning while the step's other rows execute.
+
 The option-off transaction runs on composed steps (``txn_env``,
 ``support.txg_transaction``); the phase functions are named in
 ``support.txg_api.PHASES``. The covered-step order (TXG-TXN-009) and the
@@ -17,7 +21,7 @@ import pytest
 import torch
 from support import txg_api as api
 from support import txg_transaction as tx
-from support.core_order import CoreOrder
+from support.txgcap_harness import TxgCoreOrder
 
 PREPARE, BODY, COMMIT = api.PHASES
 
@@ -149,8 +153,6 @@ def test_the_model_runs_the_phases_through_its_host_staging(tmp_path, monkeypatc
     the model's ``HostStaging``."""
     from support import model_harness as h
 
-    h.spec_without_state_name(monkeypatch)
-    h.legacy_state_api(monkeypatch)
     advance = api.advance_module()
     seen = {}
     real = advance.advance_model_rows
@@ -165,7 +167,7 @@ def test_the_model_runs_the_phases_through_its_host_staging(tmp_path, monkeypatc
     model = h.build_model(config)
     state = h.build_model_state(config, model)
     runner = h.Runner(config, model, state)
-    CoreOrder(runner, spy=False).startup(verify=False)
+    TxgCoreOrder(runner, spy=False).startup(verify=False)
     log = []
     spy_phases(monkeypatch, log)
     stream = tx._stream(model.config, "p1", 0, 0, False)
@@ -467,3 +469,115 @@ def test_a_planning_failed_row_gets_the_rejected_row_output(txn_env):
     assert int(out.status[1]) != 0
     decisions = read_decision_carrier(out.rows)
     assert int(decisions[1]) == env.park
+
+
+def _token_env(off_cpu):
+    from support import model_harness as h
+
+    env = off_cpu(max_num_seqs=3)
+    env.runner.profile_run(core_embeds=False)
+    env.runner.bind_pool(h.real_bindings(h.model_spec(env.model), capacity=8))
+    return env
+
+
+@pytest.mark.engine
+# @spec TXG-TXN-010
+def test_rows_read_and_write_at_their_own_token_positions(off_cpu):
+    """A step of rows scheduling one, two and one tokens: the runner-facing
+    output has one row per scheduled token; each one-token row's output, at
+    its last token position (``query_start_loc[i + 1] - 1``), and its pages
+    equal those of the same rows in a one-token step, so the row after the
+    multi-token row read its own token position and not its step position;
+    both token positions of the multi-token row, which fails at planning
+    (REG-STATE-014), hold the rejected-row output, and its pages stay as the
+    fresh-page initialization left them."""
+    from support import model_harness as h
+    from support import txg_steps as steps
+    from support import txgcap_harness as t
+
+    env = _token_env(off_cpu)
+    fails = t.FailSpy(env.state)
+    before = t.slots_at_step_start(env, (2,))
+    wide = steps.with_tokens(
+        t.stream_unit(env, "b"), int(env.config.audio_chunk_token_id)
+    )
+    counts = [1, 2, 1]
+    hidden, _ = steps.token_step(
+        env.runner,
+        t.stream_unit(env, "a"),
+        wide,
+        t.stream_unit(env, "c"),
+        counts={"b": 2},
+        handles={"a": 1, "b": 2, "c": 3},
+    )
+    assert hidden.shape[0] == sum(counts), "not one output row per scheduled token"
+    positions = steps.token_positions(counts)
+    assert fails.failed == {"b"}, fails.calls
+    statuses, _ = env.runner.commit_log[-1]
+    assert statuses.get("a", 0) == 0 and statuses.get("c", 0) == 0, statuses
+    assert torch.equal(h.slot_bytes(env.runner.bindings, 2), before[2]), (
+        "the multi-token row's page changed"
+    )
+
+    reference = _token_env(off_cpu)
+    alone, _ = steps.token_step(
+        reference.runner,
+        t.stream_unit(reference, "a"),
+        t.stream_unit(reference, "c"),
+        handles={"a": 1, "c": 3},
+    )
+    assert torch.equal(hidden[positions[0][-1]], alone[0]), "row 0's output moved"
+    assert torch.equal(hidden[positions[2][-1]], alone[1]), (
+        "the row after the multi-token row did not read its own token position"
+    )
+    for slot in (1, 3):
+        assert torch.equal(
+            h.slot_bytes(env.runner.bindings, slot),
+            h.slot_bytes(reference.runner.bindings, slot),
+        ), f"slot {slot}'s pages differ"
+    # the rejected-row output, from a step with a planning-failed file row
+    mixed, _ = steps.token_step(
+        reference.runner,
+        t.stream_unit(reference, "g"),
+        t.file_item(reference, "f", n_samples=4000, header_samples=3999),
+        handles={"g": 4, "f": 5},
+    )
+    for position in positions[1]:
+        assert torch.equal(hidden[position], mixed[1]), (
+            f"token position {position} of the multi-token row is not the "
+            "rejected-row output"
+        )
+
+
+@pytest.mark.engine
+# @spec TXG-TXN-010
+def test_a_one_token_step_reads_and_writes_row_i_at_position_i(off_cpu, monkeypatch):
+    """In a one-token step, row ``i``'s token position is ``i``: the
+    transaction receives the runner's ``input_ids`` and ``inputs_embeds`` with
+    one entry per row and returns one output row per row."""
+    from support import txg_steps as steps
+    from support import txgcap_harness as t
+
+    env = _token_env(off_cpu)
+    seen = []
+    advance = api.advance_module()
+    real = advance.advance_model_rows
+
+    def spy(core, input_ids, inputs_embeds, plan, **kwargs):
+        seen.append((input_ids, inputs_embeds, plan))
+        return real(core, input_ids, inputs_embeds, plan, **kwargs)
+
+    monkeypatch.setattr(advance, "advance_model_rows", spy)
+    hidden, _ = steps.token_step(
+        env.runner,
+        t.stream_unit(env, "a"),
+        t.stream_unit(env, "b"),
+        t.stream_unit(env, "c"),
+    )
+    (input_ids, inputs_embeds, plan), *_ = seen
+    population = len(plan.bindings)
+    assert population == 3
+    assert input_ids is None or input_ids.shape[0] == population
+    assert inputs_embeds.shape[0] == population
+    assert hidden.shape[0] == population
+    assert [b.request_id for b in plan.bindings] == ["a", "b", "c"]

@@ -3,9 +3,11 @@
 
 Every nonzero collected stream-row status, of any class, fails that request
 alone, and the step's other rows go on. The status resolution imports no
-vLLM (CPU). The served behaviour, ``postprocess_state`` failing that request
-through ``state_slots.fail_requests`` with transaction graphs on and off, is
-``test_geometry_check_gpu``.
+vLLM (CPU). The model state recording that request for
+``take_failed_requests`` (REG-MS-003, REG-MS-004) is
+``tests/registration/test_state_layer.py`` and, through the model's own
+collection, ``tests/registration/test_execution_memory.py``; the served
+behaviour, with transaction graphs on and off, is ``test_geometry_check_gpu``.
 """
 
 from __future__ import annotations

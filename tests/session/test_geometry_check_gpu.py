@@ -4,13 +4,18 @@ SESS-MODEL-003) on an installed engine with the published card: units sent
 straight to ``AsyncLLM`` (a direct engine client, the only kind that can send
 another geometry) at the server's geometry and at others.
 
-The server runs at 160 ms (``num_lookahead_tokens`` 1), with transaction
-graphs off (``--enforce-eager``) and on (the hook configuration with
-``transaction_graph_populations``; TXG-CFG-006 serves them only at 80 and
-160 ms). Units for another geometry are built with the session packer:
-correct ``valid_samples`` for that geometry and the stream's next
-``chunk_sequence``, so the geometry check, not the envelope check, is what
-fails the row.
+The server runs at 160 ms (``num_lookahead_tokens`` 1), with transaction graphs
+off (``--enforce-eager``) and on (the hook configuration with
+``transaction_graph_populations`` under the restricted startup, TXG-CFG-017 to
+TXG-CFG-019: synchronous scheduling, explicit ``cudagraph_mode`` and
+compilation mode NONE, and a block count of the admission limit plus one;
+TXG-CFG-006 serves them only at 80 and 160 ms). The target core admits each
+stream when ``AsyncLLM.generate`` is given an input generator; there is no
+admission argument, and a failed request ends with finish reason ``error``
+through the model state's ``take_failed_requests`` (REG-MS-003, REG-MS-004).
+Units for another geometry are built with the session packer: correct
+``valid_samples`` for that geometry and the stream's next ``chunk_sequence``,
+so the geometry check, not the envelope check, is what fails the row.
 
 The A40 round installs the plugin with ``pip install -e .`` so the engine-core
 process loads the ``vllm.general_plugins`` entry point; the fixture also calls
@@ -46,6 +51,7 @@ ARMS = {
         enforce_eager=False,
         compilation_config={"mode": "none", "cudagraph_mode": "none"},
         max_num_seqs=4,
+        num_gpu_blocks_override=5,
         hf_overrides={
             "num_lookahead_tokens": SERVER_RIGHT_CONTEXT,
             "transaction_graph_populations": [4],
@@ -134,8 +140,9 @@ def repacked(prompt: Any, right_context: int, geometry: int, sequence: int):
 
 
 async def drive(served, prompts: list[Any]):
-    """Send ``prompts`` as one admitted stream, one at a time, each after the
-    previous unit's park. Return the outputs received."""
+    """Send ``prompts`` as one stream, one at a time, each after the previous
+    unit's park (core admits the stream when ``generate`` is given the input
+    generator). Return the outputs received."""
     from vllm.engine.protocol import StreamingInput
     from vllm.sampling_params import RequestOutputKind, SamplingParams
 
@@ -164,9 +171,7 @@ async def drive(served, prompts: list[Any]):
         skip_special_tokens=True,
     )
     outputs = []
-    async for out in llm.generate(
-        inputs(), params, str(uuid.uuid4()), stream_admission=True
-    ):
+    async for out in llm.generate(inputs(), params, str(uuid.uuid4())):
         outputs.append(out)
         completion = out.outputs[0]
         if list(completion.token_ids)[-1:] == [park]:
@@ -214,7 +219,7 @@ def test_a_stream_at_the_servers_geometry_runs_to_a_normal_close(served_engine):
     assert parked_units(served_engine, outputs) == len(prompts)
 
 
-# @spec SESS-MODEL-001, SESS-MODEL-003
+# @spec SESS-MODEL-001, SESS-MODEL-003, REG-MS-005
 def test_a_later_unit_at_another_geometry_fails_its_row_alone(served_engine):
     faulty = server_prompts(served_engine, 2, seed=1)
     faulty[1] = repacked(faulty[1], LATER_RIGHT_CONTEXT, LATER_GEOMETRY, 1)
@@ -247,7 +252,7 @@ def test_a_first_unit_at_another_geometry_fails_its_row(
     assert good[-1].finished and finish_reason(good) == "stop"
 
 
-# @spec SESS-MODEL-003
+# @spec SESS-MODEL-003, REG-MS-005
 def test_a_row_status_of_another_class_fails_that_request_alone(served_engine):
     """A later unit at the server's geometry whose ``chunk_sequence`` skips
     ahead: the transaction's sequence status (a collected row status of

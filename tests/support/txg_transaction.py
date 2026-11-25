@@ -42,8 +42,8 @@ import pytest
 import torch
 
 from support import model_harness as h
-from support.core_order import CoreOrder
 from support.txg_fakes import RecordingSink
+from support.txgcap_harness import TxgCoreOrder
 
 POOL_TENSORS = (
     "h_pool",
@@ -724,8 +724,6 @@ def build_env(
     count (block 0 is the null page)."""
     geometry = {0: 0, 1: 1, 3: 2, 6: 3, 13: 4}[lookahead]
     with pytest.MonkeyPatch.context() as mp:
-        h.spec_without_state_name(mp)
-        h.legacy_state_api(mp)
         with recording(mp) as recorder:
             card = h.write_runnable_card(tmp_path / f"txg-card-{lookahead}")
             vllm_config = h.build_vllm_config(
@@ -746,7 +744,7 @@ def build_env(
             state = h.build_model_state(vllm_config, model)
             runner = h.Runner(vllm_config, model, state)
             # The eager runner: no capture hook; real steps before post_warmup.
-            CoreOrder(runner, device=device, capacity=capacity, spy=False).startup(
+            TxgCoreOrder(runner, device=device, capacity=capacity, spy=False).startup(
                 verify=False
             )
             calls = _drive(runner, model.config, geometry, lookahead)

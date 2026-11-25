@@ -16,6 +16,7 @@ cells and commit sinks. Imports no vLLM.
 from __future__ import annotations
 
 import dataclasses
+import enum
 from collections.abc import Iterable, Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -64,19 +65,58 @@ def hf_config(
     return SimpleNamespace(**fields)
 
 
+class GraphMode(enum.IntEnum):
+    """Core's ``CUDAGraphMode`` members as a configuration double carries
+    them (name and value; this module imports no vLLM)."""
+
+    NONE = 0
+    PIECEWISE = 1
+    FULL = 2
+
+
+class CompilationMode(enum.IntEnum):
+    """Core's ``CompilationMode`` members (name and value)."""
+
+    NONE = 0
+    STOCK_TORCH_COMPILE = 1
+    DYNAMO_TRACE_ONCE = 2
+    VLLM_COMPILE = 3
+
+
+_DEFAULT = object()
+
+
+def admission_limit(max_num_seqs: Any, max_num_active_seqs: Any) -> Any:
+    """The number of requests core's scheduler admits into RUNNING:
+    ``max_num_active_seqs`` when set, otherwise ``max_num_seqs``."""
+    return max_num_seqs if max_num_active_seqs is None else max_num_active_seqs
+
+
 def engine_config(
     hf: Any = None,
     *,
     max_num_seqs: int | None = 64,
     max_num_batched_tokens: int | None = 8192,
-    num_gpu_blocks_override: int | None = None,
+    max_num_active_seqs: int | None = None,
+    num_gpu_blocks_override: Any = _DEFAULT,
+    kv_cache_memory_bytes: int | None = None,
+    async_scheduling: Any = False,
     enforce_eager: bool = False,
-    cudagraph_mode: Any = 0,
-    compilation_mode: Any = 0,
+    cudagraph_mode: Any = GraphMode.NONE,
+    compilation_mode: Any = CompilationMode.NONE,
     device_type: str = "cuda",
 ) -> SimpleNamespace:
-    """An engine configuration double in core's attribute shape."""
+    """An engine configuration double in core's attribute shape.
+
+    The defaults meet the restricted startup (TXG-CFG-017 to TXG-CFG-019):
+    synchronous scheduling, ``cudagraph_mode`` and compilation mode NONE, and
+    ``num_gpu_blocks_override`` the admission limit plus one (65 while the
+    limit is unresolved). Pass ``num_gpu_blocks_override=None`` for an unset
+    override."""
     hf = hf if hf is not None else hf_config([64])
+    if num_gpu_blocks_override is _DEFAULT:
+        limit = admission_limit(max_num_seqs, max_num_active_seqs)
+        num_gpu_blocks_override = (64 if limit is None else limit) + 1
     return SimpleNamespace(
         model_config=SimpleNamespace(
             hf_config=hf,
@@ -86,10 +126,12 @@ def engine_config(
         scheduler_config=SimpleNamespace(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
-            async_scheduling=False,
+            max_num_active_seqs=max_num_active_seqs,
+            async_scheduling=async_scheduling,
         ),
         cache_config=SimpleNamespace(
             num_gpu_blocks_override=num_gpu_blocks_override,
+            kv_cache_memory_bytes=kv_cache_memory_bytes,
             enable_prefix_caching=False,
         ),
         compilation_config=SimpleNamespace(

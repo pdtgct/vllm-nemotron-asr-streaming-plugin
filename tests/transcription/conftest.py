@@ -251,7 +251,7 @@ def make_step() -> Callable[..., Any]:
 
         from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
-        # PR 6: a new request's slot is its one block (``block_ids``).
+        # A new request's slot is its one block (``block_ids``, REG-STATE-002).
         slots = {r: h[STATE_LAYER].slot for r, h in (handles or {}).items()}
         new = [
             dataclasses.replace(r, block_ids=([slots[r.req_id]],))

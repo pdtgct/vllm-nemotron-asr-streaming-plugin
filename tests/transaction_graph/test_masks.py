@@ -9,7 +9,9 @@ control-flow check is ``test_exec_phases.py``'s
 ``test_body_control_flow_ignores_file_and_fresh_bits``. The cell checks
 (TXG-MASK-002's one launch, TXG-MASK-005) are in ``test_exec_gpu.py``; the
 capture's null-page checks (TXG-CAP-004, TXG-CAP-008) are in
-``test_capture.py``.
+``test_capture.py``. A fallback step's one CHUNK bucket (TXG-MASK-002) runs
+through the model state with transaction graphs on, through the fake-capture
+seam (``on_cpu``).
 """
 
 from __future__ import annotations
@@ -21,8 +23,8 @@ import pytest
 import torch
 from support import txg_api as api
 from support import txg_transaction as tx
-from support.core_order import CoreOrder
 from support.txg_fakes import with_planned_rejection
+from support.txgcap_harness import TxgCoreOrder
 from torch.utils._python_dispatch import TorchDispatchMode
 
 pytestmark = pytest.mark.engine
@@ -129,10 +131,11 @@ def watch_body(env, step, pools):
 # @spec TXG-MASK-001, TXG-MASK-007
 @pytest.mark.parametrize("endpoint", [False, True], ids=["endpoint-off", "on"])
 def test_fresh_rows_gather_zero_initial_state_from_the_null_page(txn_env, endpoint):
-    """Every gather of a zero-initial state tensor reads the null page for
-    each fresh row and the row's own page for each continuing row; the book
-    is gathered by the rows' own pages; and no gathered state is overwritten
-    by a fill (one select on the gather index, not one per state tensor)."""
+    """Every gather of a zero-initial state tensor reads the null page (block
+    0) for each fresh row and the row's own page for each continuing row; the
+    book is gathered by the rows' own pages; no gathered state is overwritten
+    by a fill (one select on the gather index, not one per state tensor); and
+    the null-page gather is read-only: the null page is unchanged."""
     env = txn_env(0)
     configs = [CF, CC, OF, OC, CFF, CCF, OFF, OCF]
     rows = [env.accepted(c) for c in configs]
@@ -150,7 +153,11 @@ def test_fresh_rows_gather_zero_initial_state_from_the_null_page(txn_env, endpoi
         sum(chunk): [v for v, c in zip(initial, chunk) if c],
     }
     assert len(expected) == 2, "the step must tell the two gather kinds apart"
-    watch, _ = watch_body(env, step, step.pools.clone())
+    assert null == 0, "the null page is block 0"
+    pools = step.pools.clone()
+    before = pools.clone()
+    watch, out = watch_body(env, step, pools)
+    assert not out.pools.differences(before, blocks=[null]), "the null page changed"
     zero_initial = {name for name, _ in step.pools.flat()} - {"book_pool"}
     seen = {name for name, _ in watch.gathers}
     assert zero_initial <= seen, sorted(zero_initial - seen)
@@ -278,6 +285,60 @@ def test_fresh_and_continuing_chunk_rows_share_one_bucket(txn_env):
     assert transitions == [4], transitions
 
 
+def _spy_buckets(monkeypatch):
+    """Record the CHUNK-row count of every CHUNK bucket the transaction
+    runs (``advance.advance_chunk_bucket``)."""
+    advance = api.advance_module()
+    real = advance.advance_chunk_bucket
+    sizes = []
+
+    def bucket(core, env, state, **kwargs):
+        sizes.append(int(env.shape[0]))
+        return real(core, env, state, **kwargs)
+
+    monkeypatch.setattr(advance, "advance_chunk_bucket", bucket)
+    return sizes
+
+
+# @spec TXG-MASK-002, TXG-COV-003, TXG-COV-004, TXG-COV-014
+@pytest.mark.parametrize("why", ["k-above-n", "multi-token"])
+def test_a_fallback_step_launches_no_cell_and_keeps_one_chunk_bucket(
+    on_cpu, monkeypatch, why
+):
+    """With transaction graphs on at ``N = 2``, a step that falls back, with
+    ``K = 3 > N`` or with a multi-token row, launches no cell and runs its
+    fresh and continuing CHUNK rows in the option-off transaction's one CHUNK
+    bucket, never split by freshness. The first step (three fresh CHUNK rows,
+    ``K > N``) also falls back, so the continuing rows carry real state."""
+    from support import txg_steps as steps
+    from support import txgcap_harness as t
+
+    run = on_cpu(n=2, max_num_seqs=4)
+    env, core = run.env, run.core
+    core.startup()
+    first = [t.stream_unit(env, r) for r in ("c1", "c2", "c3")]
+    steps.token_step(env.runner, *first, handles={"c1": 1, "c2": 2, "c3": 3})
+    sizes = _spy_buckets(monkeypatch)
+    replays = env.fake.replay_count
+    continuing = [t.stream_unit(env, r, sequence=1) for r in ("c1", "c2")]
+    fresh = t.stream_unit(env, "c4")
+    if why == "k-above-n":
+        handles = {"c1": 1, "c2": 2, "c4": 4}
+        steps.token_step(env.runner, *continuing, fresh, handles=handles)
+        expected = 3
+    else:
+        wide = steps.with_tokens(
+            t.stream_unit(env, "w"), int(env.config.audio_chunk_token_id)
+        )
+        handles = {"c1": 1, "c4": 4, "w": 5}
+        steps.token_step(
+            env.runner, continuing[0], fresh, wide, counts={"w": 2}, handles=handles
+        )
+        expected = 2
+    assert env.fake.replay_count == replays, "a fallback step launched a cell"
+    assert sizes == [expected], f"CHUNK buckets {sizes}, expected one of {expected}"
+
+
 @pytest.fixture
 def stream_only_kwargs(tmp_path, monkeypatch):
     """The transaction arguments of a real stream-only step of the model."""
@@ -285,8 +346,6 @@ def stream_only_kwargs(tmp_path, monkeypatch):
 
     from vllm_nemotron_asr_streaming.nemotron_asr import advance
 
-    h.spec_without_state_name(monkeypatch)
-    h.legacy_state_api(monkeypatch)
     seen = []
     real = advance.advance_model_rows
 
@@ -300,7 +359,7 @@ def stream_only_kwargs(tmp_path, monkeypatch):
     model = h.build_model(config)
     state = h.build_model_state(config, model)
     runner = h.Runner(config, model, state)
-    CoreOrder(runner, spy=False).startup(verify=False)
+    TxgCoreOrder(runner, spy=False).startup(verify=False)
     request = tx._stream(model.config, "s1", 0, 0, False)
     runner.real_step(h.scheduler_output(new=(request,), handles={"s1": 1}))
     plan, kwargs = seen[-1]

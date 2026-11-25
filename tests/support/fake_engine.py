@@ -1,13 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """An in-process fake of the engine client path a streaming session uses.
 
-It models ``AsyncLLM.generate(..., stream_admission=True)`` and
-``AsyncLLM.wait_stream_retired`` of the RFC 1 + RFC 2 build, using the real
-vLLM types (``RequestOutput``, ``CompletionOutput``, ``StreamingInput``,
-``StreamAdmissionError``, ``StreamRejection``, ``EngineDeadError``). Core line
-numbers below are from ``vllm/v1/engine/async_llm.py`` (``AL``),
-``vllm/v1/engine/output_processor.py`` (``OP``) and
-``vllm/v1/engine/__init__.py`` (``EN``) of that build.
+It models the stream-admission client path the session factory is designed
+over (the ``session`` design: ``AsyncLLM.generate(..., stream_admission=True)``,
+rejection outputs and ``AsyncLLM.wait_stream_retired``, vllm#67375). The
+target core (``pdtgct/vllm`` at ``ddf6db2ab8``) provides none of that path:
+its ``generate`` admits a persistent-state stream automatically, so
+``create_session_factory`` refuses there (SESS-FAC-003) and a pass of the
+tests that use this double makes no claim for the target core (the session
+specs' scope; SESS-FAC-007).
+
+Where the target core defines a type the session reads, the double uses it
+(``RequestOutput``, ``CompletionOutput``, ``StreamingInput``,
+``EngineDeadError``, and ``StreamAdmissionError`` from
+``vllm.v1.engine.exceptions``, the public surface the registration design
+names). The path's own types, which the target core does not define, are
+modelled here: ``StreamAdmissionResult`` (exactly ``accepted``,
+``request_id`` and ``reason``; SESS-OPEN-007), carried by the refusal error as
+``result`` (``admission_error``), and ``StreamRejection``, carried by a
+rejection output as ``stream_rejection``. Line references below (``AL``
+``vllm/v1/engine/async_llm.py``, ``OP`` ``vllm/v1/engine/output_processor.py``)
+are to the stream-admission build the path was specified on.
 
 A test scripts the engine with *outcomes*:
 
@@ -49,6 +62,29 @@ ROW_WIDTH = 17_927
 #: ``tests/session/conftest.py``) so a session that hard-codes the card's or
 #: the default fixture's control-token IDs fails under the other layout.
 DEFAULT_BLANK = BLANK
+
+
+# ------------------------------------------- stream-admission client path
+
+
+@dataclass(frozen=True)
+class StreamAdmissionResult:
+    """An admission result of the stream-admission client path (the
+    ``session`` design, Factory ownership, Refusal result): exactly the three
+    fields ``accepted``, ``request_id`` and ``reason`` (SESS-OPEN-007)."""
+
+    accepted: bool
+    request_id: str
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class StreamRejection:
+    """A rejection output's record on the stream-admission client path: the
+    0-based yield position of the refused input and the reason."""
+
+    input_index: int
+    reason: str
 
 
 # ---------------------------------------------------------------- outcomes
@@ -233,15 +269,18 @@ class FakeEngine:
             logprobs=None,
             finish_reason=finish_reason,
         )
-        return RequestOutput(
+        output = RequestOutput(
             request_id=request_id,
             prompt=None,
             prompt_token_ids=None,
             prompt_logprobs=None,
             outputs=[completion],
             finished=finished,
-            stream_rejection=rejection,
         )
+        # The stream-admission path's rejection record; the target core's
+        # RequestOutput has no such field, so it is set as an attribute.
+        output.stream_rejection = rejection
+        return output
 
     def _outputs_for(self, req: FakeRequest, position: int, outcome: Any) -> list:
         rid = req.request_id
@@ -267,8 +306,6 @@ class FakeEngine:
                 self._output(rid, text=outcome.text, token_ids=tuple(outcome.label_ids))
             ]
         if isinstance(outcome, Reject):
-            from vllm.outputs import StreamRejection
-
             index = position if outcome.input_index is None else outcome.input_index
             # OP 1029: StreamRejection(update_seq - 1, ...) == yield position.
             return [self._output(rid, rejection=StreamRejection(index, outcome.reason))]
@@ -376,7 +413,6 @@ class FakeEngine:
         stream_admission: bool = False,
         **kwargs: Any,
     ):
-        from vllm.v1.engine import StreamAdmissionError, StreamAdmissionResult
         from vllm.v1.engine.exceptions import EngineDeadError
 
         call = GenerateCall(
@@ -400,9 +436,7 @@ class FakeEngine:
             # AL 786-790: a reserved caller ID is refused.
             earlier = self.requests.get(request_id)
             if earlier is not None and earlier.reserved:
-                raise StreamAdmissionError(
-                    _refusal(StreamAdmissionResult, request_id, "request_id_in_use")
-                )
+                raise refused(request_id, "request_id_in_use")
             req = FakeRequest(request_id)
             self.requests[request_id] = req
 
@@ -426,9 +460,7 @@ class FakeEngine:
             if isinstance(admission, str):
                 # AL 861-863: ``raise StreamAdmissionError(result)``.
                 self._end(req, None)
-                raise StreamAdmissionError(
-                    _refusal(StreamAdmissionResult, request_id, admission)
-                )
+                raise refused(request_id, admission)
             self._log("admitted", request_id)
             req.input_task = asyncio.ensure_future(self._handle_inputs(req, prompt))
             while True:
@@ -505,7 +537,6 @@ class FakeEngine:
 
     async def wait_stream_retired(self, request_id: str) -> None:
         """Mirrors AL 937-956."""
-        from vllm.v1.engine import StreamAdmissionError, StreamAdmissionResult
         from vllm.v1.engine.exceptions import EngineDeadError
 
         self.wait_calls.append(request_id)
@@ -545,9 +576,7 @@ class FakeEngine:
             raise ValueError(f"Stream {request_id!r} already retired")
         if self.admission is not None and isinstance(self.admission, str):
             if self.admission not in ("hang", "end"):
-                raise StreamAdmissionError(
-                    _refusal(StreamAdmissionResult, request_id, self.admission)
-                )
+                raise refused(request_id, self.admission)
         req.retired = True
         self._log("retired", request_id)
 
@@ -639,8 +668,6 @@ class SeamEngine(FakeEngine):
         stream_admission: bool = False,
         **kwargs: Any,
     ):
-        from vllm.v1.engine import StreamAdmissionError, StreamAdmissionResult
-
         self.engine_calls.setdefault(request_id, []).append("generate")
         if self.next_abort_gates:
             self.abort_gates[request_id] = self.next_abort_gates.pop(0)
@@ -655,9 +682,7 @@ class SeamEngine(FakeEngine):
                         request_id, prompt, sampling_params, stream_admission, kwargs
                     )
                 )
-                raise StreamAdmissionError(
-                    _refusal(StreamAdmissionResult, request_id, refusal_reason)
-                )
+                raise refused(request_id, refusal_reason)
             stream = super().generate(
                 prompt,
                 sampling_params,
@@ -714,17 +739,26 @@ class SeamEngine(FakeEngine):
 # ------------------------------------------------------ admission results
 
 
-def refusal(request_id: str, reason: str) -> Any:
-    """A refused admission as the target core builds it: the three-field
-    ``StreamAdmissionResult(accepted, request_id, reason)`` (EN), imported
-    from core so that a schema change there fails these doubles."""
-    from vllm.v1.engine import StreamAdmissionResult
-
-    return _refusal(StreamAdmissionResult, request_id, reason)
+def refusal(request_id: str, reason: str) -> StreamAdmissionResult:
+    """A refused admission as the stream-admission client path builds it: the
+    three-field ``StreamAdmissionResult(accepted, request_id, reason)``."""
+    return StreamAdmissionResult(accepted=False, request_id=request_id, reason=reason)
 
 
-def _refusal(result_type: Any, request_id: str, reason: str) -> Any:
-    return result_type(accepted=False, request_id=request_id, reason=reason)
+def admission_error(result: StreamAdmissionResult) -> Exception:
+    """The refusal error of the stream-admission client path: the target
+    core's public ``StreamAdmissionError`` (``vllm.v1.engine.exceptions``),
+    whose ``reason`` is the result's, carrying the result as ``result``."""
+    from vllm.v1.engine.exceptions import StreamAdmissionError
+
+    error = StreamAdmissionError(result.reason)
+    error.result = result
+    return error
+
+
+def refused(request_id: str, reason: str) -> Exception:
+    """``admission_error(refusal(request_id, reason))``."""
+    return admission_error(refusal(request_id, reason))
 
 
 # -------------------------------------------------------- unit extraction

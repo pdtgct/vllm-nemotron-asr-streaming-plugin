@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The transaction-level tier 5 qualification driver (TXG-QUAL-002 to -007,
--010 to -015, -019, TXG-CAL-001 to -003).
+"""The transaction-level tier 5 qualification driver (TXG-QUAL-001 to -007,
+-010 to -014, -016, -019, TXG-CAL-001 to -003).
 
 One process per run: ``python -m support.txg_qual_driver SPEC.json OUT.json``
-starts one engine in this process (``LLMEngine`` with
+(``PYTHONPATH`` naming ``tests``). Every engine runs the restricted startup
+under a fixed ``--num-gpu-blocks-override`` with core's graph-memory estimate
+enabled (``txgcap_qual.restricted_startup``; TXG-QUAL-001, -010); ``B_hook``
+is the same settings with ``transaction_graph_populations`` absent. The
+transaction-level modes start one engine in this process (``LLMEngine`` with
 ``VLLM_ENABLE_V1_MULTIPROCESSING=0``, so the engine core and its worker live
-here), with the configuration the spec names, and drives the worker through
-``support.txg_qual_adapter.QualAdapter`` (TXG-QUAL-026). Every pass/fail
-decision is ``support.txgcap_qual``'s.
+here) and drive the worker through ``support.txg_qual_adapter.QualAdapter``
+(TXG-QUAL-026). Every pass/fail decision is ``support.txgcap_qual``'s.
 
 Modes (``spec["mode"]``):
 
@@ -17,13 +20,16 @@ Modes (``spec["mode"]``):
   ``replay`` (a ``qm`` output of the option-on run) the clock replays that
   run's recorded step durations, so an option-off (``B_hook``) process runs
   the same schedule and its transcripts can be compared (TXG-QUAL-006).
-* ``fallback``: steps with ``K > N``, ``E > N`` and forced signature
-  mismatches, each compared with the option-off transaction (TXG-QUAL-007).
+* ``fallback``: steps with ``K > N``, ``E > N``, forced signature
+  mismatches and a multi-token row among one-token rows, each compared with
+  the option-off transaction (TXG-QUAL-007).
 * ``steprule``: the step rule for one population (TXG-QUAL-010 to -014);
   its first composition at population 1 is also the calibration run's U(1)
   (TXG-CAL-001).
-* ``body``: one leg of the body non-regression check (TXG-QUAL-015):
-  option-off one-kind plans at the given populations.
+* ``uapi``: one leg of ``U_api`` (TXG-QUAL-016) in a multiprocess engine
+  (``AsyncLLM``): repeats 0 to 3, each a fresh stream opened with
+  ``AsyncLLM.generate`` and an input generator that yields the plugin
+  packer's ``StreamingInput`` units (:func:`run_u_api_leg`).
 
 Audio is LibriSpeech test-clean (``spec["corpus"]``: the directory holding
 ``test-clean``), in a seeded permutation of the sorted utterance IDs. Stream
@@ -265,6 +271,28 @@ class Requests:
 
         return h.new_request(req_id, int(token))
 
+    def label_tokens(self, count: int) -> list[int]:
+        """``count`` label token IDs: no control token, no blank."""
+        blank = getattr(self.config, "blank_token_id", None)
+        out = [
+            t
+            for t in range(1, int(self.config.vocab_size))
+            if t not in self.controls and t != blank
+        ]
+        return out[:count]
+
+    def multi_token(self, req_id: str, tokens: Sequence[int]) -> Any:
+        """A request with no audio whose prompt is ``tokens``, all scheduled
+        in one step: a multi-token row, as only a direct engine client sends
+        one (REG-STATE-014, TXG-COV-014)."""
+        import dataclasses as dc
+
+        from support import model_harness as h
+
+        tokens = [int(t) for t in tokens]
+        request = h.new_request(req_id, tokens[0])
+        return dc.replace(request, prompt_token_ids=tokens, prefill_token_ids=tokens)
+
 
 def _default_locale_row(table: dict) -> int:
     if not table:
@@ -285,33 +313,35 @@ def mm_hashes(request: Any) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Slots
+# Blocks
 
 
-class Slots:
-    """The adapter's slot authority: the lowest free slot, its generation
-    raised on every reuse (core's scheduler does this in serving)."""
+class Blocks:
+    """The adapter's block authority (TXG-QUAL-026): each request takes the
+    lowest free block at its first step, keeps it until its terminal finish
+    and frees it only then, so a block is reused only after its request
+    finished."""
 
     def __init__(self, capacity: int) -> None:
         self.free = list(range(1, capacity))
-        self.generation: dict[int, int] = {}
-        self.handles: dict[str, tuple[int, int]] = {}
+        self.held: dict[str, int] = {}
 
-    def take(self, req_id: str) -> tuple[int, int]:
-        if req_id not in self.handles:
+    def take(self, req_id: str) -> int:
+        if req_id not in self.held:
             if not self.free:
-                raise RuntimeError("no free state slot")
+                raise RuntimeError("no free state block")
             self.free.sort()
-            slot = self.free.pop(0)
-            generation = self.generation.get(slot, 0) + 1
-            self.generation[slot] = generation
-            self.handles[req_id] = (slot, generation)
-        return self.handles[req_id]
+            self.held[req_id] = self.free.pop(0)
+        return self.held[req_id]
+
+    def of(self, req_ids: Sequence[str]) -> dict[str, int]:
+        """The blocks of ``req_ids``, each taken at its first step."""
+        return {r: self.take(r) for r in req_ids}
 
     def release(self, req_id: str) -> None:
-        handle = self.handles.pop(req_id, None)
-        if handle is not None:
-            self.free.append(handle[0])
+        block = self.held.pop(req_id, None)
+        if block is not None:
+            self.free.append(block)
 
 
 # ---------------------------------------------------------------------------
@@ -581,25 +611,21 @@ class Workload:
                     break
                 self.clock = max(self.clock, upcoming)
                 continue
-            for r in [*(x.req_id for x in new), *cached]:
-                ctx.slots.take(r)
-            handles = {
-                r: ctx.slots.handles[r] for r in [*(x.req_id for x in new), *cached]
-            }
             finished = list(self.pending_finish)
+            for r in finished:
+                ctx.blocks.release(r)
+            blocks = ctx.blocks.of([*(x.req_id for x in new), *cached])
             free = sorted({h for r in new for h in mm_hashes(r)})
             ctx.monitor.begin_step()
             result = ctx.adapter.step(
                 new=new,
                 cached=cached,
                 finished=finished,
-                handles=handles,
+                blocks=blocks,
                 computed=computed,
                 free_mm_hashes=ctx.free_next,
             )
             ctx.free_next = free
-            for r in finished:
-                ctx.slots.release(r)
             self.pending_finish = []
             self._account(result, scheduled)
 
@@ -697,12 +723,10 @@ class Workload:
         finished = list(self.pending_finish) + live
         if finished:
             ctx.monitor.begin_step()
-            ctx.adapter.step(
-                finished=finished, handles={}, free_mm_hashes=ctx.free_next
-            )
+            ctx.adapter.step(finished=finished, blocks={}, free_mm_hashes=ctx.free_next)
             ctx.free_next = []
             for r in finished:
-                ctx.slots.release(r)
+                ctx.blocks.release(r)
         self.pending_finish = []
 
     def summary(self) -> dict[str, Any]:
@@ -741,23 +765,33 @@ class Workload:
 # Forced fallbacks (TXG-QUAL-007)
 
 
+#: TXG-QUAL-007's multi-token fallback reason (TXG-COV-014). The specs do
+#: not name its counter key's kind and count, so the check reads the reason.
+MULTI_TOKEN = "multi-token"
+
+
 def run_fallbacks(ctx: Any, n: int) -> dict[str, Any]:
-    """``K = N + 1`` fresh CHUNK rows, then the same requests as ``N + 1``
-    non-CHUNK rows, then a row with an endpoint policy and a forced-EOU
-    candidate (the signature fallbacks of a direct engine client)."""
+    """TXG-QUAL-007: ``K = N + 1`` fresh CHUNK rows, then the same requests as
+    ``N + 1`` non-CHUNK rows, then a row with an endpoint policy and a
+    forced-EOU candidate (the signature fallbacks of a direct engine client),
+    then a multi-token row among one-token rows (TXG-COV-014), which planning
+    fails alone. Every declined step's outputs are compared with the
+    option-off transaction on a detached pool copy."""
     from support import txg_api
 
     requests = ctx.requests
     before = _fallbacks(ctx.model)
     out: dict[str, Any] = {"steps": []}
 
-    def step(new=(), cached=(), computed=None, label=""):
-        for r in [*(x.req_id for x in new), *cached]:
-            ctx.slots.take(r)
-        handles = {r: ctx.slots.handles[r] for r in [*(x.req_id for x in new), *cached]}
+    def step(new=(), cached=(), computed=None, tokens=None, label=""):
+        blocks = ctx.blocks.of([*(x.req_id for x in new), *cached])
         ctx.monitor.begin_step()
         result = ctx.adapter.step(
-            new=list(new), cached=list(cached), handles=handles, computed=computed or {}
+            new=list(new),
+            cached=list(cached),
+            blocks=blocks,
+            computed=computed or {},
+            tokens=tokens,
         )
         calls = ctx.monitor.calls
         out["steps"].append(
@@ -798,6 +832,18 @@ def run_fallbacks(ctx: Any, n: int) -> dict[str, Any]:
     # parked or not (the planner refuses a non-CHUNK row of an unseen stream).
     eou = requests.special(ids[0], int(requests.config.eou_token_id))
     step(new=[eou], label="forced EOU")
+    # A multi-token row among one-token rows: a stream's next chunk and a
+    # direct client's two-token request, scheduled whole (last, where core's
+    # batch layout puts a row's extra token).
+    _, clip = ctx.corpus.take()
+    one = requests.unit("fb-one-token", requests.units(clip)[0], "0")
+    multi = requests.multi_token("fb-multi-token", requests.label_tokens(2))
+    result = step(
+        new=[one, multi],
+        tokens={multi.req_id: 2},
+        label="multi-token row",
+    )
+    out["multi_token_failed"] = sorted(result.failed)
     after = _fallbacks(ctx.model)
     grown = {
         "|".join(str(x) for x in key): value - before.get(key, 0)
@@ -813,6 +859,10 @@ def run_fallbacks(ctx: Any, n: int) -> dict[str, Any]:
             ("signature", txg_api.ECHO, 1),
         )
     }
+    multi_grown = sum(
+        value for key, value in grown.items() if key.split("|")[0] == MULTI_TOKEN
+    )
+    others = {k: v for k, v in grown.items() if k.split("|")[0] != MULTI_TOKEN}
     problems = [p for s in out["steps"] for c in s["calls"] for p in c["problems"]]
     uncompared = [
         s["label"]
@@ -822,15 +872,22 @@ def run_fallbacks(ctx: Any, n: int) -> dict[str, Any]:
     out.update(
         fallbacks_grown=grown,
         fallbacks_expected=expected,
+        multi_token_fallbacks=multi_grown,
         problems=problems,
         uncompared=uncompared,
-        passed=grown == expected and not problems and not uncompared,
+        passed=(
+            others == expected
+            and multi_grown == 1
+            and out["multi_token_failed"] == [multi.req_id]
+            and not problems
+            and not uncompared
+        ),
     )
-    finished = list(ctx.slots.handles)
+    finished = list(ctx.blocks.held)
     ctx.monitor.begin_step()
-    ctx.adapter.step(finished=finished, handles={})
+    ctx.adapter.step(finished=finished, blocks={})
     for r in finished:
-        ctx.slots.release(r)
+        ctx.blocks.release(r)
     return out
 
 
@@ -842,7 +899,7 @@ def _fallbacks(model: Any) -> dict[tuple, int]:
 
 
 # ---------------------------------------------------------------------------
-# The step rule (TXG-QUAL-010 to -014) and the body check (TXG-QUAL-015)
+# The step rule (TXG-QUAL-010 to -014)
 
 
 def drain_positions(population: int, drains: int) -> list[int]:
@@ -881,12 +938,11 @@ def _one(ctx: Any, stream: PlanStream) -> tuple[Any, Any]:
         stream.delivered += 1
         stream.position = 0
         new, cached, computed = [request], [], {}
-    ctx.slots.take(stream.req_id)
     ctx.monitor.begin_step()
     result = ctx.adapter.step(
         new=new,
         cached=cached,
-        handles={stream.req_id: ctx.slots.handles[stream.req_id]},
+        blocks=ctx.blocks.of([stream.req_id]),
         computed=computed,
         free_mm_hashes=ctx.free_next,
     )
@@ -944,10 +1000,10 @@ def prefix(ctx: Any, kind: str, tag: str, limit: int = 4000) -> PlanStream:
 
 def _finish(ctx: Any, req_ids: Sequence[str]) -> None:
     ctx.monitor.begin_step()
-    ctx.adapter.step(finished=list(req_ids), handles={}, free_mm_hashes=ctx.free_next)
+    ctx.adapter.step(finished=list(req_ids), blocks={}, free_mm_hashes=ctx.free_next)
     ctx.free_next = []
     for r in req_ids:
-        ctx.slots.release(r)
+        ctx.blocks.release(r)
 
 
 def run_composition(
@@ -961,8 +1017,9 @@ def run_composition(
 ) -> dict[str, Any]:
     """The prefix, snapshot and legs of one composition ``(K, E)``. ``legs``
     is the leg order (``OFF``/``ON`` names, e.g. two blocks of OFF1, ON,
-    OFF2). Every step runs the one recorded plan from the snapshot."""
-    from support.txg_qual_adapter import SlotSnapshot
+    OFF2). Every step runs the one recorded plan from the snapshot, restored
+    in place at the blocks of the plan's rows (TXG-QUAL-011)."""
+    from support.txg_qual_adapter import BlockSnapshot
 
     p = k + e
     positions = drain_positions(p, e)
@@ -973,14 +1030,13 @@ def run_composition(
     for position in range(p):
         order.append((next(di) if position in positions else next(ci)).req_id)
     streams = {s.req_id: s for s in [*chunk_streams, *drain_streams]}
-    handles = {r: ctx.slots.handles[r] for r in order}
-    snapshot = SlotSnapshot()
+    blocks = ctx.blocks.of(order)
+    snapshot = BlockSnapshot()
     legs_out = []
     rejected = []
     uncovered = []
     for leg in legs:
-        # Every leg but ON runs the option-off transaction (OFF1, OFF2, and
-        # the body check's OLD and NEW legs, which run with the option off).
+        # Every leg but ON runs the option-off transaction.
         off = leg.upper() != "ON"
         samples = []
         for index in range(warmup + counted):
@@ -991,7 +1047,7 @@ def run_composition(
             result = ctx.adapter.step(
                 new=[s.request for s in chunk_streams],
                 cached=[s.req_id for s in drain_streams],
-                handles=handles,
+                blocks=blocks,
                 computed={s.req_id: 1 for s in drain_streams},
                 order=order,
                 free_mm_hashes=ctx.free_next,
@@ -1030,7 +1086,9 @@ def run_composition(
             for s in (streams[r] for r in order)
         ],
         "legs": legs_out,
+        "blocks": [blocks[r] for r in order],
         "restores": snapshot.restores,
+        "restored": [list(b) for b in snapshot.restored],
         "rejected": rejected[:10],
         "uncovered": uncovered[:10],
         "void": void,
@@ -1067,6 +1125,156 @@ def decide_composition(result: dict[str, Any], warmup: int) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# U_api (TXG-QUAL-016)
+
+
+def _u_api_reading(worker: Any) -> dict[str, Any]:
+    """The worker's replay and fallback counters as plain values, read on
+    the worker through ``AsyncLLM.collective_rpc`` (TXG-OBS-008). The worker
+    process imports this module, so its ``PYTHONPATH`` names ``tests``."""
+    from support import txg_api
+
+    reading = txg_api.counters(worker)
+    if not reading:
+        return {"replays": [], "fallbacks": 0}
+    counters = reading["counters"]
+    return {
+        "replays": [[list(k), int(v)] for k, v in dict(counters["replays"]).items()],
+        "fallbacks": int(sum(dict(counters["fallbacks"]).values())),
+    }
+
+
+def u_api_deltas(before: dict[str, Any], after: dict[str, Any]) -> dict[str, int]:
+    """Counter growth over one repeat: replays of the chunk and echo cells
+    at count 1, replays of every other cell, and fallbacks. A cell key is
+    ``(geometry_index, kind, count)``."""
+    old = {tuple(k): v for k, v in before["replays"]}
+    new = {tuple(k): v for k, v in after["replays"]}
+    grown = {k: new.get(k, 0) - old.get(k, 0) for k in set(old) | set(new)}
+
+    def at_one(kind: str) -> int:
+        return sum(v for k, v in grown.items() if k[1] == kind and int(k[2]) == 1)
+
+    chunk, echo = at_one("chunk"), at_one("echo")
+    return {
+        "chunk1": chunk,
+        "echo1": echo,
+        "other_replays": sum(grown.values()) - chunk - echo,
+        "fallbacks": int(after["fallbacks"]) - int(before["fallbacks"]),
+    }
+
+
+async def u_api_repeat(llm: Any, requests: Requests, samples: np.ndarray) -> dict:
+    """One repeat: a fresh stream opened with ``AsyncLLM.generate`` and an
+    input generator that yields ``StreamingInput`` units the plugin's packer
+    built, timed from before the generator yields the stream's first unit (a
+    fresh stream's first chunk, not final) to the arrival of that unit's
+    parked output (the output whose new token IDs end with the park token).
+    The stream's admission, the counter reads, its close and its terminal
+    output are outside the timer."""
+    import asyncio
+    import uuid
+
+    from vllm.engine.protocol import StreamingInput
+    from vllm.sampling_params import RequestOutputKind, SamplingParams
+
+    from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
+        REALTIME_MAX_TOKENS,
+    )
+
+    units = requests.packer().append(samples)
+    if not units:
+        raise ValueError("the clip is shorter than one chunk")
+    unit = units[0]
+
+    async def read() -> dict[str, Any]:
+        return (await llm.collective_rpc(_u_api_reading))[0]
+
+    before = await read()
+    parked = asyncio.Event()
+    marks: dict[str, float] = {}
+
+    async def inputs():
+        marks["start"] = time.perf_counter()
+        yield StreamingInput(prompt=unit.prompt)
+        await parked.wait()
+
+    params = SamplingParams(
+        n=1,
+        temperature=0,
+        max_tokens=REALTIME_MAX_TOKENS,
+        output_kind=RequestOutputKind.DELTA,
+        skip_special_tokens=False,
+    )
+    tokens: list[int] = []
+    parks = errors = 0
+    async for out in llm.generate(inputs(), params, f"uapi-{uuid.uuid4()}"):
+        completion = out.outputs[0]
+        ids = [int(t) for t in completion.token_ids]
+        if not parks:
+            tokens.extend(ids)
+        if ids[-1:] == [requests.park]:
+            parks += 1
+            marks.setdefault("stop", time.perf_counter())
+            parked.set()
+        if completion.finish_reason == "error":
+            errors += 1
+    after = await read()
+    stop = marks.get("stop", time.perf_counter())
+    return {
+        "ms": (stop - marks["start"]) * 1000.0,
+        "parks": parks,
+        "errors": errors,
+        "tokens": len(tokens),
+        "deltas": u_api_deltas(before, after),
+    }
+
+
+async def run_u_api_leg(spec: dict[str, Any]) -> dict[str, Any]:
+    """One ``U_api`` leg in a fresh multiprocess engine (``AsyncLLM``):
+    repeats 0 to 3 (repeat 0 discarded by the rule), each on the first chunk
+    of the next clip. ``spec["arm"]`` is ``"on"`` or ``"off"``;
+    ``txgcap_qual.u_api_schedule`` orders the legs and their washouts."""
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    from support import txgcap_qual as q
+    from vllm_nemotron_asr_streaming import register
+
+    os.environ.update(engine_env(spec))
+    register()
+    llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**engine_settings(spec)))
+    try:
+        requests = Requests(
+            SimpleNamespace(config=llm.model_config.hf_config),
+            lookahead=int(spec["lookahead"]),
+        )
+        corpus = corpus_of(spec)
+        repeats = []
+        for _ in range(q.U_API_REPEATS):
+            _, clip = corpus.take()
+            repeats.append(await u_api_repeat(llm, requests, clip))
+    finally:
+        llm.shutdown()
+    leg = {
+        "arm": spec["arm"],
+        "leg": spec.get("leg"),
+        "washout": bool(spec.get("washout")),
+        "repeats": repeats,
+    }
+    leg["problems"] = q.u_api_leg_problems(leg)
+    return leg
+
+
+def corpus_of(spec: dict[str, Any]) -> Corpus:
+    """The spec's corpus: LibriSpeech test-clean under ``spec["corpus"]``,
+    or seeded noise clips of ``spec["synthetic_lengths"]`` samples."""
+    if spec.get("corpus"):
+        return Corpus(spec["corpus"], int(spec["seed"]))
+    return SyntheticCorpus(int(spec["seed"]), spec["synthetic_lengths"])
+
+
+# ---------------------------------------------------------------------------
 # The process
 
 
@@ -1075,21 +1283,43 @@ class Context(SimpleNamespace):
 
 
 def engine_settings(spec: dict[str, Any]) -> dict[str, Any]:
+    """The run's ``AsyncEngineArgs`` keywords: the restricted startup under
+    a fixed ``--num-gpu-blocks-override`` (the admission limit plus one
+    unless the spec names one; TXG-QUAL-001, -010). ``B_hook`` is the same
+    spec with ``transaction_graph_populations`` absent from
+    ``hf_overrides``: its block count or budget setting is the option-on
+    run's."""
+    from support import txgcap_qual as q
+
+    max_num_seqs = int(spec["max_num_seqs"])
+    active = spec.get("max_num_active_seqs")
     settings = dict(
         model=spec["card"],
         config_format="nemotron_asr_streaming",
         tokenizer_mode="nemotron_asr_streaming",
         dtype="float32",
         max_model_len=int(spec["max_model_len"]),
-        max_num_seqs=int(spec["max_num_seqs"]),
+        max_num_seqs=max_num_seqs,
         enforce_eager=bool(spec.get("enforce_eager", False)),
-        compilation_config={"cudagraph_mode": "NONE", "mode": 0},
         hf_overrides=dict(spec["hf_overrides"]),
+        **q.restricted_startup(
+            max_num_seqs, max_num_active_seqs=None if active is None else int(active)
+        ),
     )
+    if active is not None:
+        settings["max_num_active_seqs"] = int(active)
     if spec.get("num_gpu_blocks_override"):
         settings["num_gpu_blocks_override"] = int(spec["num_gpu_blocks_override"])
     settings.update(spec.get("engine_extra") or {})
     return settings
+
+
+def engine_env(spec: dict[str, Any]) -> dict[str, str]:
+    """The run's environment: core's graph-memory estimate enabled
+    (TXG-QUAL-010, -021, -025) unless the spec sets it."""
+    from support import txgcap_qual as q
+
+    return {**q.estimate_enabled(), **dict(spec.get("env") or {})}
 
 
 def _worker(worker: Any) -> Any:
@@ -1098,6 +1328,7 @@ def _worker(worker: Any) -> Any:
 
 def start(spec: dict[str, Any]) -> tuple[Any, Any]:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    os.environ.update(engine_env(spec))
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.llm_engine import LLMEngine
 
@@ -1116,6 +1347,7 @@ def identity(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
     import vllm
 
     import vllm_nemotron_asr_streaming as plugin
+    from support.txg_qual_adapter import adapter_identity
 
     out = {
         "plugin_file": plugin.__file__,
@@ -1125,13 +1357,13 @@ def identity(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
         "torch": torch.__version__,
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
         "settings": engine_settings(spec),
+        "env": engine_env(spec),
+        "adapter_identity": adapter_identity(),
         "max_num_batched_tokens": int(
             ctx.adapter.vllm_config.scheduler_config.max_num_batched_tokens
         ),
         "state_capacity": int(ctx.capacity),
-        "state_page_bytes": int(
-            ctx.adapter.bindings.views[ctx.adapter.layer].spec.page_size_bytes
-        ),
+        "state_page_bytes": ctx.adapter.page_bytes,
         "locale_row": ctx.requests.locale_row,
         "corpus_sha256": ctx.corpus.manifest_sha256,
         "corpus_count": ctx.corpus.count,
@@ -1176,8 +1408,7 @@ def build_context(spec: dict[str, Any], engine: Any, worker: Any) -> Context:
 
     adapter = QualAdapter.from_worker(worker)
     model = adapter.model
-    views = adapter.bindings.views[adapter.layer]
-    corpus = Corpus(spec["corpus"], int(spec["seed"]))
+    corpus = corpus_of(spec)
     return Context(
         spec=spec,
         engine=engine,
@@ -1186,8 +1417,8 @@ def build_context(spec: dict[str, Any], engine: Any, worker: Any) -> Context:
         monitor=TransactionMonitor(model, compare=bool(spec.get("compare"))).install(),
         requests=Requests(model, lookahead=int(spec["lookahead"]), engine=engine),
         corpus=corpus,
-        capacity=int(views.capacity),
-        slots=Slots(int(views.capacity)),
+        capacity=adapter.capacity,
+        blocks=Blocks(adapter.capacity),
         free_next=[],
         counter=0,
     )
@@ -1255,7 +1486,7 @@ def run_mode(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
         }
     if mode == "fallback":
         return run_fallbacks(ctx, n)
-    if mode in ("steprule", "body"):
+    if mode == "steprule":
         out = []
         for k, e in spec["compositions"]:
             result = run_composition(
@@ -1266,15 +1497,9 @@ def run_mode(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
                 warmup=int(spec.get("warmup", q.WARMUP)),
                 counted=int(spec.get("counted", q.COUNTED)),
             )
-            if mode == "steprule":
-                result["decision"] = decide_composition(
-                    result, int(spec.get("warmup", q.WARMUP))
-                )
-            else:
-                result["medians"] = [
-                    statistics.median(leg["ms"][int(spec.get("warmup", q.WARMUP)) :])
-                    for leg in result["legs"]
-                ]
+            result["decision"] = decide_composition(
+                result, int(spec.get("warmup", q.WARMUP))
+            )
             out.append(result)
         return {"compositions": out}
     raise ValueError(f"unknown mode {mode!r}")
@@ -1284,6 +1509,20 @@ def main(spec_path: str, out_path: str) -> int:
     spec = json.loads(Path(spec_path).read_text())
     reply: dict[str, Any] = {"spec": spec, "ok": False}
     t0 = time.time()
+    if spec["mode"] == "uapi":
+        import asyncio
+
+        try:
+            reply["result"] = _plain(asyncio.run(run_u_api_leg(spec)))
+            reply["ok"] = True
+        except BaseException as error:  # noqa: BLE001 - reported in the reply
+            reply["error"] = {"type": type(error).__name__, "message": str(error)}
+            reply["traceback"] = traceback.format_exc()
+        reply["elapsed_s"] = round(time.time() - t0, 2)
+        Path(out_path).write_text(json.dumps(reply))
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0 if reply["ok"] else 1)
     try:
         engine, worker = start(spec)
         reply["ready_s"] = round(time.time() - t0, 2)

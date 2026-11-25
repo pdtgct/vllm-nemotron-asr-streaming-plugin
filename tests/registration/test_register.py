@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``register()``, the entry point and import-time behaviour (REG-001 to REG-013).
+"""``register()``, the entry point and import-time behaviour (REG-001 to REG-013;
+REG-011 is deferred).
 
 Tests that need an unregistered process or a clean ``sys.modules`` run a fresh
 interpreter (``run_fresh``).
@@ -46,6 +47,130 @@ def test_single_general_plugin_entry_point(repo_root):
     assert target.__name__ == "register"
 
 
+#: The core check of REG-002: each item, the snippet that removes it in a
+#: fresh interpreter, and the name the refusal must carry.
+_CORE_ITEMS = {
+    "prepare_execution_memory": (
+        "from vllm.v1.worker.gpu.model_states.interface import ModelState\n"
+        "del ModelState.prepare_execution_memory",
+        "prepare_execution_memory",
+    ),
+    "needs_cudagraph_capture": (
+        "from vllm.v1.worker.gpu.model_states.interface import ModelState\n"
+        "del ModelState.needs_cudagraph_capture",
+        "needs_cudagraph_capture",
+    ),
+    "capture_cudagraphs": (
+        "from vllm.v1.worker.gpu.model_states.interface import ModelState\n"
+        "del ModelState.capture_cudagraphs",
+        "capture_cudagraphs",
+    ),
+    "clear_cudagraphs": (
+        "from vllm.v1.worker.gpu.model_states.interface import ModelState\n"
+        "del ModelState.clear_cudagraphs",
+        "clear_cudagraphs",
+    ),
+    "post_warmup": (
+        "from vllm.v1.worker.gpu.model_states.interface import ModelState\n"
+        "del ModelState.post_warmup",
+        "post_warmup",
+    ),
+    "shutdown": (
+        "from vllm.v1.worker.gpu.model_states.interface import ModelState\n"
+        "del ModelState.shutdown",
+        "shutdown",
+    ),
+    "take_failed_requests": (
+        "from vllm.v1.worker.gpu.model_states.interface import ModelState\n"
+        "del ModelState.take_failed_requests",
+        "take_failed_requests",
+    ),
+    "recomputable": (
+        "from vllm.v1.core.single_type_kv_cache_manager import MambaManager\n"
+        "_lc = MambaManager.layer_config\n"
+        "MambaManager.layer_config = classmethod(lambda cls, spec: None)",
+        "recomputable",
+    ),
+    "PERSISTENT_STATE": (
+        "import enum\n"
+        "import vllm.v1.attention.backends.registry as reg\n"
+        "reg.MambaAttentionBackendEnum = enum.Enum(\n"
+        "    'MambaAttentionBackendEnum',\n"
+        "    {m.name: m.value for m in reg.MambaAttentionBackendEnum\n"
+        "     if m.name != 'PERSISTENT_STATE'})",
+        "PERSISTENT_STATE",
+    ),
+    "SupportsPersistentState": (
+        "import vllm.model_executor.models.interfaces as itf\n"
+        "del itf.SupportsPersistentState",
+        "SupportsPersistentState",
+    ),
+}
+
+_CORE_CHECK = (
+    _SNAPSHOT
+    + """
+import vllm_nemotron_asr_streaming as plugin
+__REMOVE__
+before = snap()
+raised = message = None
+try:
+    plugin.register()
+except Exception as exc:
+    raised, message = type(exc).__name__, str(exc)
+names = (
+    "vllm_nemotron_asr_streaming.model",
+    "vllm_nemotron_asr_streaming.nemotron_asr.nemotron_asr",
+)
+emit(
+    raised=raised,
+    message=message,
+    unchanged=before == snap(),
+    after=snap(),
+    model_modules=[n for n in names if n in sys.modules],
+)
+"""
+)
+
+
+def _assert_refused_and_unchanged(out: dict, names: list[str]) -> None:
+    assert out["raised"], "register() accepted a build without the state layer"
+    message = out["message"]
+    for name in names:
+        assert name in message, f"{name!r} not named: {message}"
+    assert "RFC 1's state layer" in message, message
+    assert "vllm#67583's model-state hooks" in message, message
+    assert out["model_modules"] == [], "the core check imported a model module"
+    assert out["unchanged"]
+    after = out["after"]
+    assert ARCH not in after["models"]
+    assert ARCH not in after["cfg"]
+    assert "nemotron_asr_streaming" not in after["parsers"]
+    assert "nemotron_asr_streaming" not in after["tokenizers"]
+
+
+@pytest.mark.engine
+@pytest.mark.parametrize("item", list(_CORE_ITEMS))
+# @spec REG-002
+def test_a_build_without_a_core_item_is_refused_and_changes_no_registry(
+    run_fresh, item
+):
+    """Each item of the core check alone: ``register()`` raises naming it and
+    the build it needs, imports neither model class module and changes no
+    registry, config parser or tokenizer mode."""
+    remove, name = _CORE_ITEMS[item]
+    out = run_fresh(_CORE_CHECK.replace("__REMOVE__", remove))
+    _assert_refused_and_unchanged(out, [name])
+
+
+@pytest.mark.engine
+# @spec REG-002
+def test_every_missing_core_item_is_named_in_one_refusal(run_fresh):
+    remove = "\n".join(code for code, _ in _CORE_ITEMS.values())
+    out = run_fresh(_CORE_CHECK.replace("__REMOVE__", remove))
+    _assert_refused_and_unchanged(out, [name for _, name in _CORE_ITEMS.values()])
+
+
 @pytest.mark.engine
 @pytest.mark.parametrize(
     "missing",
@@ -57,9 +182,10 @@ def test_single_general_plugin_entry_point(repo_root):
     ids=["no-stream_admission", "no-wait_stream_retired", "neither"],
 )
 # @spec REG-002
-def test_missing_client_calls_raise_and_change_no_registry(run_fresh, missing):
-    # Core surface: AsyncLLM.generate(..., stream_admission=...) and
-    # AsyncLLM.wait_stream_retired (vllm/v1/engine/async_llm.py).
+def test_register_checks_no_client_call(run_fresh, missing):
+    """``register()`` checks no ``AsyncLLM`` call: the target core admits a
+    persistent-state stream without an admission argument, and an engine
+    client without ``wait_stream_retired`` registers as one with it."""
     code = (
         _SNAPSHOT
         + """
@@ -70,33 +196,19 @@ if "stream_admission" in MISSING:
     async def generate(self, prompt, sampling_params, request_id):
         yield None
     AsyncLLM.generate = generate
-if "wait_stream_retired" in MISSING:
+if "wait_stream_retired" in MISSING and hasattr(AsyncLLM, "wait_stream_retired"):
     del AsyncLLM.wait_stream_retired
-before = snap()
-raised = message = None
+raised = None
 try:
     plugin.register()
 except Exception as exc:
-    raised, message = type(exc).__name__, str(exc)
-emit(raised=raised, message=message, unchanged=before == snap(), after=snap())
+    raised = f"{type(exc).__name__}: {exc}"
+emit(raised=raised, after=snap())
 """.replace("__MISSING__", json.dumps(missing))
     )
     out = run_fresh(code)
-    assert out["raised"], "register() did not raise on an engine without the calls"
-    for name in missing:
-        assert name in out["message"]
-    # The plugin needs RFC 1's stream admission (vllm#67375 on #67374); the
-    # message names that build, not RFC 2, which the plugin does not need.
-    message = out["message"]
-    assert "RFC 1" in message and "stream admission" in message, message
-    assert "vllm#67375" in message and "#67374" in message, message
-    assert "RFC 2" not in message, message
-    assert out["unchanged"]
-    after = out["after"]
-    assert ARCH not in after["models"]
-    assert ARCH not in after["cfg"]
-    assert "nemotron_asr_streaming" not in after["parsers"]
-    assert "nemotron_asr_streaming" not in after["tokenizers"]
+    assert out["raised"] is None, out["raised"]
+    assert ARCH in out["after"]["models"]
 
 
 @pytest.mark.engine
@@ -292,20 +404,39 @@ emit(cuda_initialized=torch.cuda.is_initialized())
 @pytest.mark.engine
 # @spec REG-010
 def test_missing_adapter_dependencies_named_on_model_import(run_fresh):
+    """Rows of the design's dependency table removed together (a name, a
+    whole module, a ``ModelState`` hook, ``take_failed_requests``, the
+    ``recomputable`` parameter, the ``PERSISTENT_STATE`` member and
+    ``SupportsPersistentState``): importing the model class module raises
+    naming every module and name."""
     out = run_fresh(
         """
-import importlib
+import enum, importlib
 for module in (
-    "vllm.v1.worker.gpu.state_slots",
     "vllm.v1.worker.utils",
     "vllm.v1.kv_cache_interface",
     "vllm.v1.worker.gpu.states",
+    "vllm.v1.worker.gpu.model_states.interface",
+    "vllm.v1.core.single_type_kv_cache_manager",
+    "vllm.v1.attention.backends.registry",
+    "vllm.model_executor.models.interfaces",
 ):
     importlib.import_module(module)
-delattr(sys.modules["vllm.v1.worker.gpu.state_slots"], "StateSlotRows")
 delattr(sys.modules["vllm.v1.worker.utils"], "AttentionGroup")
-delattr(sys.modules["vllm.v1.kv_cache_interface"], "StateSlotHandle")
+delattr(sys.modules["vllm.v1.kv_cache_interface"], "MambaSpec")
 sys.modules["vllm.v1.worker.gpu.states"] = None
+interface = sys.modules["vllm.v1.worker.gpu.model_states.interface"]
+del interface.ModelState.post_warmup
+del interface.ModelState.take_failed_requests
+managers = sys.modules["vllm.v1.core.single_type_kv_cache_manager"]
+managers.MambaManager.layer_config = classmethod(lambda cls, spec: None)
+reg = sys.modules["vllm.v1.attention.backends.registry"]
+reg.MambaAttentionBackendEnum = enum.Enum(
+    "MambaAttentionBackendEnum",
+    {m.name: m.value for m in reg.MambaAttentionBackendEnum
+     if m.name != "PERSISTENT_STATE"},
+)
+del sys.modules["vllm.model_executor.models.interfaces"].SupportsPersistentState
 raised = message = None
 try:
     importlib.import_module("vllm_nemotron_asr_streaming.model")
@@ -316,13 +447,16 @@ emit(raised=raised, message=message)
     )
     assert out["raised"], "model import accepted missing adapter dependencies"
     for needle in (
-        "StateSlotRows",
-        "vllm.v1.worker.gpu.state_slots",
         "AttentionGroup",
         "vllm.v1.worker.utils",
-        "StateSlotHandle",
+        "MambaSpec",
         "vllm.v1.kv_cache_interface",
         "vllm.v1.worker.gpu.states",
+        "post_warmup",
+        "take_failed_requests",
+        "recomputable",
+        "PERSISTENT_STATE",
+        "SupportsPersistentState",
     ):
         assert needle in out["message"], f"{needle!r} not named in the error"
 
@@ -352,3 +486,21 @@ emit(
     )
     assert out["has_class"]
     assert out["cuda_initialized"] is False
+
+
+@pytest.mark.skip(
+    reason="deferred (REG-011 [D]): no vLLM release includes RFC 1's state "
+    "layer yet, so there is no minimum version to check"
+)
+@pytest.mark.engine
+# @spec REG-011
+def test_register_checks_a_minimum_vllm_version(monkeypatch):
+    """Where vLLM releases include the state layer: a version below the
+    minimum is refused, naming it, besides the core check of REG-002."""
+    import vllm
+
+    from vllm_nemotron_asr_streaming import register
+
+    monkeypatch.setattr(vllm, "__version__", "0.0.1")
+    with pytest.raises(Exception, match=r"0\.0\.1"):
+        register()

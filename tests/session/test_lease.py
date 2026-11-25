@@ -4,6 +4,13 @@ SESS-ABORT, SESS-REL, SESS-TEAR, SESS-EXP, SESS-ERR, SESS-TXT, SESS-EP).
 
 Every test here drives a lease through ``support.fake_engine.FakeEngine``,
 which imports vLLM, so all of them are ``engine`` tier.
+
+Scope: the session factory on the stream-admission client path, which the
+session specs' scope separates from the target core's obligations (its port to
+core's admission is the session design's Future roadmap 1). The target core
+provides no such path (``create_session_factory`` refuses there, SESS-FAC-003),
+so these tests run the factory against ``support.fake_engine`` and a pass makes
+no claim for the target core.
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ from support.fake_engine import (
     Silent,
     Text,
     contains_key,
-    refusal,
+    refused,
     run,
     unit_of,
     wait_until,
@@ -828,12 +835,10 @@ def test_release_with_the_task_still_ending_keeps_the_session_owned(build, kind)
     does: a terminal result reached while the cancelled generate() task is
     still ending moves the lease to ``released`` but keeps the record and one
     tracked task, which ``teardown_all`` would cancel, until the task ends."""
-    from vllm.v1.engine import StreamAdmissionError
-
     result = {
         "returns": None,
         "value-error": ValueError("no longer tracked"),
-        "admission-error": StreamAdmissionError(refusal("x", "capacity")),
+        "admission-error": refused("x", "capacity"),
     }[kind]
 
     async def scenario():
@@ -874,12 +879,10 @@ def test_release_waits_for_retirement_of_its_caller_id(build):
 # @spec SESS-REL-001
 @pytest.mark.parametrize("kind", ["value-error", "admission-error"])
 def test_release_resolves_terminal_wait_results_like_cleanup(build, kind):
-    from vllm.v1.engine import StreamAdmissionError
-
     result = (
         ValueError("no longer tracked")
         if kind == "value-error"
-        else StreamAdmissionError(refusal("x", "capacity"))
+        else refused("x", "capacity")
     )
 
     async def scenario():

@@ -745,8 +745,9 @@ which only a client that bypasses the plugin's packer and processor can send.
   server.
 - The server runs on one device. Every parallel size must be 1.
 - Core's `/v1/realtime` serves streams directly, with no frontend. Core sends `session.created`
-  before it admits the stream, so a server at its admission limit refuses a stream only after the
-  client's first commit, as an `error` event with code `processing_error`. An input that core
+  before it admits the stream, so a server that cannot admit it (reason `active_limit`, at core's
+  admission limit, or `engine_paused`) refuses a stream only after the client's first commit, as an
+  `error` event with code `processing_error` whose message names the reason. An input that core
   refuses ends the stream, and core reports a stream done whatever its finish reason.
 - The session factory is not available on the target core, so no frontend serves streams.
 - A direct engine client's prompt or streaming input of more than one token fails its request;

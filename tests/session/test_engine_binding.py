@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Engine binding (SESS-ENG-*): how a session drives ``generate`` with stream
-admission, matches outcomes by input position and retries rejections."""
+admission, matches outcomes by input position and retries rejections.
+
+Scope: the session factory on the stream-admission client path, which the
+session specs' scope separates from the target core's obligations (its port to
+core's admission is the session design's Future roadmap 1). The target core
+provides no such path (``create_session_factory`` refuses there, SESS-FAC-003),
+so these tests run the factory against ``support.fake_engine`` and a pass makes
+no claim for the target core.
+"""
 
 from __future__ import annotations
 

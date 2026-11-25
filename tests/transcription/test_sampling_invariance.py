@@ -25,8 +25,6 @@ pytestmark = pytest.mark.engine
 
 @pytest.fixture
 def file_logits(monkeypatch, tmp_path):
-    h.spec_without_state_name(monkeypatch)
-    h.legacy_state_api(monkeypatch)
     card = h.write_runnable_card(tmp_path / "card")
     vllm_config = h.build_vllm_config(card)
     model = h.build_model(vllm_config)

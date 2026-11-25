@@ -9,10 +9,13 @@ cannot drift apart. Conditional rows are the graph runtime (REG-014), the
 batch-invariant module (REG-015) and the transaction-graph members
 (REG-018); every other row is unconditional (REG-010).
 
-A table entry is a name of its module, or a dotted member path: the six
-``ModelState`` hooks are ``ModelState.<hook>``, the ``memory_contributors``
-argument is ``PersistentStateSpec.memory_contributors``, and the
-transaction-graph rows are ``StateSlotBindings.<member>``.
+A table entry is a name of its module, or a dotted member path: the
+``ModelState`` hooks and members are ``ModelState.<member>`` (the
+transaction-graph row is the property ``ModelState.state_group_layouts``), the
+``PERSISTENT_STATE`` member is ``MambaAttentionBackendEnum.PERSISTENT_STATE``,
+the ``recomputable`` parameter is ``MambaManager.layer_config.recomputable``,
+and the layout attributes read through the accessor are
+``StateGroupLayout.layers`` and ``StateComponentLayout.tensor``.
 ``engine_flags.ADAPTER_DEPENDENCIES`` lists the unconditional entries in that
 form.
 
@@ -21,8 +24,9 @@ modules are imported once (so core's own modules are loaded and keep the
 names they bound), then the plugin's modules are dropped from
 ``sys.modules``, the names are removed from core's modules (a lazily resolved
 module attribute, such as ``vllm.envs``' variables, is made to raise; a class
-member is deleted; an argument is removed by standing in a class whose
-constructor lacks it), and the plugin is imported again. Only the plugin's
+member is deleted; an enum member is removed by standing in an enum without
+it; an argument is removed by standing in a callable whose signature lacks
+it), and the plugin is imported again. Only the plugin's
 own imports can then notice.
 """
 
@@ -53,12 +57,6 @@ GRAPH_RUNTIME = (
 #: REG-015: the conditional batch-invariant dependency (a whole module).
 BATCH_INVARIANT = "vllm.model_executor.determinism.batch_invariant"
 
-#: REG-018: the conditional transaction-graph dependencies.
-TRANSACTION_GRAPH = (
-    ("vllm.v1.worker.gpu.state_slots", "StateSlotBindings.startup_pool_access"),
-    ("vllm.v1.worker.gpu.state_slots", "StateSlotBindings.pool_layout"),
-)
-
 #: REG-010: the members and the argument the unconditional rows name.
 HOOK_MODULE = "vllm.v1.worker.gpu.model_states.interface"
 HOOKS = (
@@ -69,7 +67,30 @@ HOOKS = (
     "post_warmup",
     "shutdown",
 )
-ARGUMENT = ("vllm.v1.kv_cache_interface", "PersistentStateSpec.memory_contributors")
+#: The other ``ModelState`` members the unconditional row names.
+MODEL_STATE_MEMBERS = ("get_additional_cg_support", "take_failed_requests")
+ARGUMENT = (
+    "vllm.v1.core.single_type_kv_cache_manager",
+    "MambaManager.layer_config.recomputable",
+)
+PERSISTENT_STATE = (
+    "vllm.v1.attention.backends.registry",
+    "MambaAttentionBackendEnum.PERSISTENT_STATE",
+)
+SUPPORTS_PERSISTENT_STATE = (
+    "vllm.model_executor.models.interfaces",
+    "SupportsPersistentState",
+)
+
+#: REG-018: the conditional transaction-graph dependency, the accessor
+#: property, checked at model construction while transaction graphs are on.
+TRANSACTION_GRAPH = ((HOOK_MODULE, "ModelState.state_group_layouts"),)
+#: REG-018: the attributes of the layouts the accessor returns, read without
+#: importing their classes (so no import or class member can be removed).
+LAYOUT_ATTRIBUTES = (
+    ("vllm.v1.worker.utils", "StateGroupLayout.layers"),
+    ("vllm.v1.worker.utils", "StateComponentLayout.tensor"),
+)
 
 #: The interfaces the design excludes from the table ("vLLM's
 #: model-registration, config parser, tokenizer and renderer registries, model
@@ -122,23 +143,23 @@ EXCLUDED = {
 
 #: The public client surface the session and ``register()`` use (design:
 #: ``AsyncLLM``, ``StreamingInput``, ``SamplingParams``, ``RequestOutputKind``,
-#: ``StreamAdmissionError``, ``EngineDeadError``); outside the adapter, so
-#: only these files may use it.
+#: and ``StreamAdmissionError`` and ``EngineDeadError`` from
+#: ``vllm.v1.engine.exceptions``); outside the adapter, so only these files
+#: may use it.
 CLIENT_SURFACE_FILES = ("plugin.py", "session/")
 CLIENT_SURFACE = {
     "vllm.v1.engine.async_llm": {"AsyncLLM"},
     "vllm.engine.protocol": {"StreamingInput"},
     "vllm.sampling_params": {"RequestOutputKind", "SamplingParams"},
-    "vllm.v1.engine": {"StreamAdmissionError"},
-    "vllm.v1.engine.exceptions": {"EngineDeadError"},
+    "vllm.v1.engine.exceptions": {"StreamAdmissionError", "EngineDeadError"},
 }
 
 
 def _cell_names(cell: str) -> tuple[str, ...]:
     """Backticked identifiers (dotted paths allowed) of a table cell. Names
     after "with its" are members of the name before it (``ModelState``, with
-    its hooks ...; ``PersistentStateSpec`` (with its ``memory_contributors``
-    argument))."""
+    its hooks ...; ``MambaAttentionBackendEnum``, with its member ...), and
+    "with the `X` parameter of its `Y`" names the parameter ``Owner.Y.X``."""
 
     def names(text: str) -> list[str]:
         return [
@@ -147,6 +168,12 @@ def _cell_names(cell: str) -> tuple[str, ...]:
             if all(part.isidentifier() for part in n.split("."))
         ]
 
+    parameter = re.search(r"with the `(\w+)` parameter of its `(\w+)`", cell)
+    if parameter is not None:
+        owners = names(cell[: parameter.start()])
+        assert owners, f"a parameter without an owner in: {cell}"
+        argument, method = parameter.groups()
+        return (*owners, f"{owners[-1]}.{method}.{argument}")
     head, _, members = cell.partition("with its")
     owners = names(head)
     result = list(owners)
@@ -176,7 +203,7 @@ def design_table(repo_root: Path) -> list[tuple[str, tuple[str, ...]]]:
     return rows
 
 
-CONDITIONAL = set(GRAPH_RUNTIME) | set(TRANSACTION_GRAPH)
+CONDITIONAL = set(GRAPH_RUNTIME) | set(TRANSACTION_GRAPH) | set(LAYOUT_ATTRIBUTES)
 
 
 def unconditional_rows(repo_root: Path) -> list[tuple[str, str]]:
@@ -197,9 +224,11 @@ def test_design_table_has_the_rows_the_tests_assume(repo_root):
     pairs = {(m, n) for m, names in rows for n in names}
     assert set(GRAPH_RUNTIME) <= pairs
     assert set(TRANSACTION_GRAPH) <= pairs
+    assert set(LAYOUT_ATTRIBUTES) <= pairs
     assert (BATCH_INVARIANT, ()) in rows
     assert {(HOOK_MODULE, f"ModelState.{h}") for h in HOOKS} <= pairs
-    assert ARGUMENT in pairs
+    assert {(HOOK_MODULE, f"ModelState.{m}") for m in MODEL_STATE_MEMBERS} <= pairs
+    assert {ARGUMENT, PERSISTENT_STATE, SUPPORTS_PERSISTENT_STATE} <= pairs
     assert all(names for module, names in rows if module != BATCH_INVARIANT), rows
 
 
@@ -503,8 +532,8 @@ def outside_table(repo_root: Path, root: Path) -> list[str]:
         if not names:
             whole_modules[module] = None
         for name in names:
-            if (module, name) == ARGUMENT:
-                continue  # an argument, not an object a module can export
+            if (module, name) == ARGUMENT or (module, name) in LAYOUT_ATTRIBUTES:
+                continue  # an argument or instance attribute, not an export
             try:
                 permitted_objects.append(_resolve(module, name))
             except (ImportError, AttributeError):
@@ -562,8 +591,8 @@ def test_import_time_check_lists_exactly_the_unconditional_rows(repo_root):
 SELF_TEST_CASES = {
     "allowed-aliased": (
         "import vllm.v1.worker.gpu.states as states\n"
-        "from vllm.v1.kv_cache_interface import StateSlotHandle as Handle\n"
-        "def f():\n    return states.RequestState, Handle\n",
+        "from vllm.v1.kv_cache_interface import MambaSpec as Spec\n"
+        "def f():\n    return states.RequestState, Spec\n",
         False,
     ),
     "unlisted-direct": ("from vllm.v1.outputs import ModelRunnerOutput\n", True),
@@ -696,10 +725,35 @@ def remove(module, name=None):
             delattr(sys.modules[parent], child)
         return
     target = importlib.import_module(module)
+    if name.count(".") == 2:
+        # ``Owner.method.argument``: stand in the method without the argument.
+        class_name, method, argument = name.split(".")
+        owner = getattr(target, class_name, None)
+        bound = getattr(owner, method, None)
+        if bound is None:
+            return
+        signature = inspect.signature(bound)
+        kept = [p for p in signature.parameters.values() if p.name != argument]
+        def without(cls, *args, **kwargs):
+            if argument in kwargs:
+                raise TypeError(f"unexpected keyword argument {argument!r}")
+            return bound(*args, **kwargs)
+        without.__signature__ = signature.replace(parameters=kept)
+        setattr(owner, method, classmethod(without))
+        return
     if "." in name:
         class_name, member = name.split(".", 1)
         owner = getattr(target, class_name, None)
         if owner is None:
+            return
+        import enum
+        if isinstance(owner, enum.EnumMeta) and member in owner.__members__:
+            stand_in = enum.Enum(
+                owner.__name__,
+                {m.name: m.value for m in owner if m.name != member},
+            )
+            stand_in.__module__ = owner.__module__
+            setattr(target, class_name, stand_in)
             return
         if member in vars(owner) and callable(vars(owner)[member]):
             delattr(owner, member)
@@ -868,11 +922,14 @@ emit(results=results)
 @pytest.mark.parametrize(
     "pair",
     [
-        ("vllm.v1.kv_cache_interface", "PersistentStateSpec"),
+        ("vllm.v1.kv_cache_interface", "MambaSpec"),
         ("vllm.v1.worker.gpu.sample.output", "SamplerOutput"),
         ("vllm.utils.torch_utils", "direct_register_custom_op"),
         *((HOOK_MODULE, f"ModelState.{hook}") for hook in HOOKS),
+        *((HOOK_MODULE, f"ModelState.{member}") for member in MODEL_STATE_MEMBERS),
         ARGUMENT,
+        PERSISTENT_STATE,
+        SUPPORTS_PERSISTENT_STATE,
     ],
     ids=lambda p: p[1],
 )
@@ -974,7 +1031,7 @@ emit(raised=raised, message=message)
 
 
 # --------------------------------------------------------------------------
-# REG-018: transaction-graph rows
+# REG-018: the state-group layout accessor
 # --------------------------------------------------------------------------
 
 
@@ -983,11 +1040,12 @@ emit(raised=raised, message=message)
     "after", [None, {"transaction_graph_populations": []}], ids=["absent", "empty"]
 )
 # @spec REG-018
-def test_missing_transaction_graph_members_do_not_prevent_import_or_construction(
+def test_a_missing_accessor_prevents_neither_import_nor_construction_while_off(
     run_fresh, repo_root, after
 ):
-    """Transaction graphs off: the default arms construct without the
-    members."""
+    """Transaction graphs off (TXG-CFG-001): model import does not check
+    ``ModelState.state_group_layouts``, and the default arms construct
+    without it."""
     out = run_fresh(
         _REIMPORT
         + _CONSTRUCT
@@ -1008,14 +1066,12 @@ emit(imported=imported, raised=raised, message=message)
 
 @pytest.mark.engine
 @pytest.mark.parametrize("value", [[2], {}], ids=["list", "malformed-on"])
-@pytest.mark.parametrize("pair", TRANSACTION_GRAPH, ids=lambda p: p[1])
 # @spec REG-018
-def test_missing_transaction_graph_member_fails_construction_while_on(
-    run_fresh, repo_root, pair, value
+def test_a_missing_accessor_fails_construction_while_on_naming_it(
+    run_fresh, repo_root, value
 ):
     """Transaction graphs on (TXG-CFG-001; ``{}`` is on): construction
-    raises naming the missing member."""
-    module, name = pair
+    raises naming ``ModelState.state_group_layouts``."""
     out = run_fresh(
         _REIMPORT
         + _CONSTRUCT
@@ -1027,14 +1083,41 @@ vllm_config = configure(
 # The option runs under the hook configuration only; leave the dependency
 # gate as the first thing construction can refuse.
 vllm_config.model_config.enforce_eager = False
-remove({module!r}, {name!r})
+for module, name in {json.dumps(TRANSACTION_GRAPH)}:
+    remove(module, name)
 raised, message = construct(vllm_config)
 emit(raised=raised, message=message)
 """,
         env=_tests_path_env(repo_root),
     )
-    assert out["raised"], "construction accepted a missing transaction-graph member"
-    assert name.split(".")[-1] in out["message"], out["message"]
+    assert out["raised"], "construction accepted a missing state-group layout accessor"
+    assert "ModelState.state_group_layouts" in out["message"], out["message"]
+
+
+@pytest.mark.engine
+# @spec REG-018
+def test_the_accessor_counts_as_defined_as_a_property(run_fresh, repo_root):
+    """On the target core ``state_group_layouts`` is a property, not a
+    callable; with transaction graphs on, construction does not refuse it as
+    missing."""
+    out = run_fresh(
+        _REIMPORT
+        + _CONSTRUCT
+        + f"""
+from vllm.v1.worker.gpu.model_states.interface import ModelState
+is_property = isinstance(vars(ModelState)["state_group_layouts"], property)
+vllm_config = configure(
+    {GRAPHED_CONFIGURATIONS["default arms"]!r},
+    after={{"transaction_graph_populations": [2]}},
+)
+vllm_config.model_config.enforce_eager = False
+raised, message = construct(vllm_config)
+emit(is_property=is_property, raised=raised, message=message)
+""",
+        env=_tests_path_env(repo_root),
+    )
+    assert out["is_property"]
+    assert "state_group_layouts" not in (out["message"] or ""), out["message"]
 
 
 # --------------------------------------------------------------------------

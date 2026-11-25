@@ -281,6 +281,73 @@ def test_recycled_pages_of_fresh_rows_do_not_matter(
     assert int(a.status[-1]) != 0, "the rejected fresh row was accepted"
 
 
+def _served_step(off_cpu, fill: str, rows: str):
+    """One real step of the model (option off) admitting fresh streams at
+    slots 1 to 3 whose recycled pages hold ``fill`` as the step starts: two
+    accepted rows and, with ``rows == "with-rejected"``, a third whose chunk
+    sequence the transaction rejects. Returns the step's output, statuses,
+    the pages of every slot after it, each slot's pages as the step's
+    transaction found them (after the fresh-page initialization,
+    REG-STATE-010) and the failed requests."""
+    from support import model_harness as h
+    from support import txgcap_harness as t
+
+    env = off_cpu(max_num_seqs=3)
+    env.runner.profile_run(core_embeds=False)
+    bindings = env.runner.bind_pool(
+        h.real_bindings(h.model_spec(env.model), capacity=8)
+    )
+    for slot in (1, 2, 3):
+        page = h.slot_bytes(bindings, slot)
+        if fill == "nan":
+            page.fill_(0xFF)  # every float32 is a NaN
+        elif fill == "random":
+            generator = torch.Generator().manual_seed(slot)
+            page.copy_(
+                torch.randint(0, 256, page.shape, generator=generator).to(page.dtype)
+            )
+    fails = t.FailSpy(env.state)
+    start = t.slots_at_step_start(env, (1, 2, 3))
+    new = [t.stream_unit(env, "a"), t.stream_unit(env, "b")]
+    if rows == "with-rejected":
+        new.append(t.stream_unit(env, "c", sequence=3))
+    hidden, _ = env.runner.real_step(
+        h.scheduler_output(
+            new=tuple(new), handles={r.req_id: i + 1 for i, r in enumerate(new)}
+        )
+    )
+    statuses, _ = env.runner.commit_log[-1]
+    pages = {slot: h.slot_bytes(bindings, slot).clone() for slot in (1, 2, 3)}
+    return hidden, dict(statuses), pages, start, fails.failed
+
+
+@pytest.mark.engine
+# @spec TXG-EQ-006, TXG-MASK-001, TXG-MASK-006
+@pytest.mark.parametrize("pattern", ["nan", "random"])
+@pytest.mark.parametrize("rows", ["accepted", "with-rejected"])
+def test_a_served_step_does_not_depend_on_recycled_fresh_pages(off_cpu, pattern, rows):
+    """In a served step, a fresh row's recycled page is initialized
+    (REG-STATE-010) before the transaction, so every output and status equals
+    the same step over zeroed pages; accepted rows store equal pages, and a
+    rejected row's pages equal that run's own snapshot as the transaction
+    started, which is the page as the initialization left it."""
+    zero = _served_step(off_cpu, "zero", rows)
+    dirty = _served_step(off_cpu, pattern, rows)
+    assert torch.equal(zero[0], dirty[0]), "an output depends on a recycled page"
+    assert zero[1] == dirty[1], (zero[1], dirty[1])
+    for slot in (1, 2):
+        assert zero[1].get("ab"[slot - 1], 0) == 0, zero[1]
+        assert torch.equal(zero[2][slot], dirty[2][slot]), f"slot {slot} differs"
+    if rows == "with-rejected":
+        for run in (zero, dirty):
+            assert run[1].get("c", 0) != 0, run[1]
+            assert torch.equal(run[2][3], run[3][3]), "the rejected row's page changed"
+            assert run[4] == {"c"}, run[4]
+        assert torch.equal(zero[3][3], dirty[3][3]), (
+            "the fresh-page initialization depends on the recycled page"
+        )
+
+
 # ---------------------------------------------------------------------------
 # 160 ms rows
 

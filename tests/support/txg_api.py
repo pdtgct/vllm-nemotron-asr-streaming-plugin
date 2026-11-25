@@ -22,13 +22,23 @@ Configuration module (imports no vLLM; TXG-CFG-012)
   ``transaction_graph_populations`` or its value is ``[]``.
 * ``largest_population(hf_config) -> int``: ``N``; raises ``ValueError`` for
   a value TXG-CFG-004 refuses and when transaction graphs are off.
-* ``transaction_graph_config_errors(vllm_config) -> list[str]`` (TXG-CFG-003).
-  It reads, duck-typed: ``vllm_config.model_config.hf_config``,
+* ``transaction_graph_config_errors(vllm_config, *, has_state_group_layouts)
+  -> list[str]`` (TXG-CFG-003). ``has_state_group_layouts`` is whether the
+  running core's ``ModelState`` defines ``state_group_layouts`` (a property
+  counts), which the module cannot import and its callers determine through
+  ``engine_flags`` and pass in (TXG-CFG-016). It reads, duck-typed:
+  ``vllm_config.model_config.hf_config``,
   ``vllm_config.model_config.enforce_eager``,
-  ``vllm_config.scheduler_config.max_num_seqs`` and
-  ``.max_num_batched_tokens`` (``None`` while unresolved, TXG-CFG-015) and
-  ``vllm_config.cache_config.num_gpu_blocks_override``; the geometry through
-  ``lookahead.served_lookahead(hf_config)`` (REG-LA-001).
+  ``vllm_config.scheduler_config.max_num_seqs``,
+  ``.max_num_batched_tokens`` (``None`` while unresolved, TXG-CFG-015),
+  ``.max_num_active_seqs`` (``None`` when unset: the admission limit is then
+  ``max_num_seqs``, TXG-CFG-005, TXG-CFG-020) and ``.async_scheduling``
+  (TXG-CFG-017); ``vllm_config.cache_config.num_gpu_blocks_override`` and
+  ``.kv_cache_memory_bytes`` (TXG-CFG-005, TXG-CFG-019);
+  ``vllm_config.compilation_config.cudagraph_mode`` and ``.mode`` (``None``
+  while unset; NONE is a mode whose value is 0, TXG-CFG-018); the geometry
+  through ``lookahead.served_lookahead(hf_config)`` (REG-LA-001).
+  :func:`config_errors` passes the capability as that keyword.
 
 Model module
 ------------
@@ -99,8 +109,9 @@ KEY = "transaction_graph_populations"
 CHUNK = "chunk"
 ECHO = "echo"
 
-#: Fallback reasons (TXG-COV-003 to TXG-COV-007, TXG-COV-012).
+#: Fallback reasons (TXG-COV-003 to TXG-COV-007, TXG-COV-012, TXG-COV-014).
 REASONS = (
+    "multi-token",
     "chunk-uncovered",
     "echo-uncovered",
     "signature",
@@ -198,8 +209,40 @@ def transaction_graphs_on(hf_config: Any) -> bool:
     return config_module().transaction_graphs_on(hf_config)
 
 
-def config_errors(vllm_config: Any) -> list[str]:
-    return config_module().transaction_graph_config_errors(vllm_config)
+#: The keyword through which callers pass the state-layer capability.
+STATE_LAYER_KEYWORD = "has_state_group_layouts"
+
+
+def takes_state_layer_keyword() -> bool:
+    """Whether ``transaction_graph_config_errors`` takes
+    :data:`STATE_LAYER_KEYWORD` (TXG-CFG-016)."""
+    import inspect
+
+    fn = config_module().transaction_graph_config_errors
+    return STATE_LAYER_KEYWORD in inspect.signature(fn).parameters
+
+
+def config_errors(vllm_config: Any, *, state_group_layouts: bool = True) -> list[str]:
+    """``transaction_graph_config_errors`` on ``vllm_config`` for a core whose
+    ``ModelState`` defines ``state_group_layouts`` (the target core) or, with
+    ``state_group_layouts=False``, lacks it (TXG-CFG-016).
+
+    A function that does not take the keyword yet is called without it for
+    the target core's capability, so the tests of the other conditions keep
+    their own signal; the tests of TXG-CFG-016 fail on it
+    (``test_config.py``), as does every call for a core without the
+    accessor."""
+    fn = config_module().transaction_graph_config_errors
+    if takes_state_layer_keyword():
+        return fn(vllm_config, **{STATE_LAYER_KEYWORD: state_group_layouts})
+    if not state_group_layouts:
+        raise AssertionError(
+            "transaction_graph_config_errors takes no "
+            f"{STATE_LAYER_KEYWORD!r} keyword: its callers cannot pass whether "
+            "the running core's ModelState defines state_group_layouts "
+            "(TXG-CFG-016)"
+        )
+    return fn(vllm_config)
 
 
 def largest_population(hf_config: Any) -> int:

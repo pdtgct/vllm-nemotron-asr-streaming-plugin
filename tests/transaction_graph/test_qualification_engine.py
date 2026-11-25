@@ -1,10 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tier 5 pass/fail checks that run on an A40 (``gpu``).
 
+Every engine runs the restricted startup (``txgcap_qual.restricted_startup``:
+``--no-async-scheduling``, ``-cc.cudagraph_mode none -cc.mode none`` and a
+fixed ``--num-gpu-blocks-override`` of the admission limit plus one) with
+core's graph-memory estimate enabled, unless a check varies one of them;
+``B_hook`` is the same settings with ``transaction_graph_populations``
+absent, its block count or budget setting included (TXG-QUAL-001).
+
 Installed-engine checks (``card``: the published checkpoint named by
-``NEMOTRON_CARD_DIR``): startup refusals (TXG-QUAL-023), the uncharged
-WARNING and the required-but-suppressed profiling capture (TXG-QUAL-022),
-and core's graph-memory estimate against ``B_hook`` (TXG-QUAL-021). Each
+``NEMOTRON_CARD_DIR``): startup refusals, each naming its remedy
+(TXG-QUAL-023), the uncharged WARNING under a fixed
+``--kv-cache-memory-bytes`` and the required-but-suppressed profiling capture
+(TXG-QUAL-022), core's graph-memory estimate against ``B_hook`` under the
+fixed block count (TXG-QUAL-021), and one ``U_api`` leg of each arm through
+``AsyncLLM`` (TXG-QUAL-016; the qualifying brackets are preregistered runs of
+the same driver mode). Each
 engine runs in a fresh child process with its engine core and worker in that
 process (``support.engine_child``: ``LLMEngine`` with
 ``VLLM_ENABLE_V1_MULTIPROCESSING=0``; ``AsyncLLM`` always runs the engine core
@@ -16,7 +27,8 @@ depend on which in-process CUDA tests ran before it.
 
 Harness checks (the runnable synthetic card, ``support.txgcap_harness``):
 the expected fallbacks of ``K > N`` and ``E > N`` steps with outputs equal to
-``B_hook``'s (TXG-QUAL-007) and recovery after a worker-fatal fault
+``B_hook``'s, and of a multi-token row among one-token rows through the
+qualification adapter (TXG-QUAL-007), and recovery after a worker-fatal fault
 (TXG-QUAL-024). The served halves of TXG-QUAL-007 (a forced signature
 mismatch) and TXG-QUAL-024 (``EngineDeadError`` at the client) are
 qualification-run obligations.
@@ -24,15 +36,21 @@ qualification-run obligations.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import subprocess
+import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
 from support import model_harness as h
 from support import txg_api
+from support import txg_conditions as c
 from support import txgcap_harness as t
+from support import txgcap_qual as q
 from support.txg_api import Record
 
 pytestmark = [pytest.mark.gpu, pytest.mark.engine]
@@ -41,8 +59,9 @@ N = 64
 
 
 def engine_settings(**overrides: Any) -> dict[str, Any]:
-    """The ``AsyncEngineArgs`` keywords of the hook configuration with the
-    option at ``N`` (``hf`` entries set to ``...`` are removed)."""
+    """The ``AsyncEngineArgs`` keywords of the hook configuration under the
+    restricted startup with the option at ``N`` (``hf`` entries and settings
+    set to ``...`` are removed: an unset setting)."""
     card = os.environ.get("NEMOTRON_CARD_DIR")
     if not card:
         pytest.skip("NEMOTRON_CARD_DIR not set")
@@ -55,15 +74,13 @@ def engine_settings(**overrides: Any) -> dict[str, Any]:
         tokenizer_mode="nemotron_asr_streaming",
         dtype="float32",
         enforce_eager=False,
-        async_scheduling=False,
-        enable_prefix_caching=False,
         max_model_len=4096,
         max_num_seqs=N,
-        compilation_config={"cudagraph_mode": "NONE", "mode": 0},
         hf_overrides=hf,
+        **q.restricted_startup(N),
     )
     settings.update(overrides)
-    return settings
+    return {k: v for k, v in settings.items() if v is not ...}
 
 
 def engine_args(**overrides: Any) -> Any:
@@ -83,45 +100,88 @@ def create_config(args: Any) -> Any:
 # TXG-QUAL-023: refusals
 
 
-REFUSALS = {
-    "enforce-eager": dict(enforce_eager=True),
-    "320-ms": dict(hf={"num_lookahead_tokens": 3}),
+ARMS = re.compile(r"eager-graphed|dense-graphed")
+EAGER = re.compile(r"--enforce-eager")
+
+#: case -> (settings, the remedy patterns its refusal names).
+REFUSALS: dict[str, tuple[dict[str, Any], tuple[re.Pattern[str], ...]]] = {
+    "enforce-eager": (dict(enforce_eager=True), (EAGER, c.REMOVAL)),
+    "320-ms": (dict(hf={"num_lookahead_tokens": 3}), (c.LOOKAHEAD,)),
     # At lookahead 1, where native burst is otherwise valid: at lookahead 0
     # the model configuration hook refuses native burst first (REG-LA-007),
     # before the configuration hook evaluates the transaction-graph checks
     # (REG-VAL-008); each hook lists its own failed checks (REG-VAL-003).
-    "native-burst": dict(
-        hf={"experimental_native_burst": True, "num_lookahead_tokens": 1}
+    "native-burst": (
+        dict(hf={"experimental_native_burst": True, "num_lookahead_tokens": 1}),
+        (),
     ),
-    "not-a-list": dict(hf={t.OPTION: N}),
-    "bool": dict(hf={t.OPTION: [True]}),
-    "duplicate": dict(hf={t.OPTION: [N, N]}),
-    "zero": dict(hf={t.OPTION: [0]}),
-    "above-p-max": dict(hf={t.OPTION: [N + 1]}),
-    "block-override": dict(num_gpu_blocks_override=8, hf={t.OPTION: [8]}),
-    "eager-encoder": dict(hf={"encoder_execution_arm": "eager"}),
-    "dense-graphed-encoder": dict(hf={"encoder_execution_arm": "dense-graphed"}),
-    "eager-decoder": dict(hf={"decode_dispatch_arm": "compact-eager"}),
-    "cudagraph-mode": dict(compilation_config={"cudagraph_mode": "FULL", "mode": 0}),
+    "not-a-list": (dict(hf={t.OPTION: N}), ()),
+    "bool": (dict(hf={t.OPTION: [True]}), ()),
+    "duplicate": (dict(hf={t.OPTION: [N, N]}), ()),
+    "zero": (dict(hf={t.OPTION: [0]}), ()),
+    "above-p-max": (dict(hf={t.OPTION: [N + 1]}), ()),
+    # TXG-CFG-005: fewer than the admission limit plus one blocks.
+    "block-override-small": (
+        dict(num_gpu_blocks_override=8, hf={t.OPTION: [8]}),
+        (c.BLOCKS_OVERRIDE,),
+    ),
+    "block-override-n": (dict(num_gpu_blocks_override=N), (c.BLOCKS_OVERRIDE,)),
+    "eager-encoder": (dict(hf={"encoder_execution_arm": "eager"}), (ARMS,)),
+    "dense-graphed-encoder": (
+        dict(hf={"encoder_execution_arm": "dense-graphed"}),
+        (ARMS,),
+    ),
+    "eager-decoder": (dict(hf={"decode_dispatch_arm": "compact-eager"}), (ARMS,)),
+    # The restricted startup (TXG-CFG-017 to TXG-CFG-019).
+    "async-scheduling": (dict(async_scheduling=True), (c.NO_ASYNC_SCHEDULING,)),
+    "async-scheduling-unset": (dict(async_scheduling=...), (c.NO_ASYNC_SCHEDULING,)),
+    **{
+        f"cudagraph-mode-{mode.lower()}": (
+            dict(compilation_config={"cudagraph_mode": mode, "mode": 0}),
+            (c.RUNNER_MODES_NONE,),
+        )
+        for mode in ("PIECEWISE", "FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE")
+    },
+    "cudagraph-mode-unset": (
+        dict(compilation_config={"mode": 0}),
+        (c.RUNNER_MODES_NONE,),
+    ),
+    **{
+        f"compilation-mode-{value}": (
+            dict(compilation_config={"cudagraph_mode": "NONE", "mode": value}),
+            (c.RUNNER_MODES_NONE,),
+        )
+        for value in (1, 2, 3)
+    },
+    "compilation-mode-unset": (
+        dict(compilation_config={"cudagraph_mode": "NONE"}),
+        (c.RUNNER_MODES_NONE,),
+    ),
+    "no-block-count-or-budget": (
+        dict(num_gpu_blocks_override=...),
+        (c.BLOCKS_OVERRIDE, c.KV_BYTES),
+    ),
+    "zero-budget": (
+        dict(num_gpu_blocks_override=..., kv_cache_memory_bytes=0),
+        (c.BLOCKS_OVERRIDE, c.KV_BYTES),
+    ),
+    # TXG-CFG-020: a population above the admission limit
+    # --max-num-active-seqs sets (the block count holds that limit).
+    "above-admission-limit": (
+        dict(max_num_active_seqs=N // 2, num_gpu_blocks_override=N + 1),
+        (c.ACTIVE_SEQS,),
+    ),
 }
-NAMES_OPTION = {
-    "enforce-eager",
-    "320-ms",
-    "native-burst",
-    "not-a-list",
-    "bool",
-    "duplicate",
-    "zero",
-    "above-p-max",
-    "block-override",
-    "eager-encoder",
-    "dense-graphed-encoder",
-    "eager-decoder",
-}
+
+
+def refusal(case: str, settings: dict[str, Any]) -> str:
+    error = h.call_with(create_config, engine_args(**settings))
+    assert error is not None, f"{case} was accepted"
+    return t.text(error)
 
 
 @pytest.mark.card
-# @spec TXG-QUAL-023
+# @spec TXG-QUAL-001, TXG-QUAL-023
 def test_the_valid_hook_configuration_starts_configuration():
     create_config(engine_args())
 
@@ -130,18 +190,30 @@ def test_the_valid_hook_configuration_starts_configuration():
 @pytest.mark.parametrize("case", list(REFUSALS))
 # @spec TXG-QUAL-023
 def test_startup_is_refused_for_each_unsupported_condition(case):
-    error = h.call_with(create_config, engine_args(**dict(REFUSALS[case])))
-    assert error is not None, f"{case} was accepted"
-    if case in NAMES_OPTION:
-        assert t.OPTION in t.text(error), t.text(error)
+    settings, remedies = REFUSALS[case]
+    message = refusal(case, dict(settings))
+    conditions = [part for part in re.split(r"[;\n]", message) if t.OPTION in part]
+    assert conditions, message
+    for remedy in remedies:
+        assert c.found(remedy, message), (case, remedy.pattern, message)
     if case == "native-burst":
         # The transaction-graph check's own refusal, not another one that
         # names the option: one aggregated condition names both.
-        conditions = re.split(r"[;\n]", t.text(error))
-        assert any(
-            t.OPTION in part and "experimental_native_burst" in part
-            for part in conditions
-        ), t.text(error)
+        assert any("experimental_native_burst" in part for part in conditions), message
+
+
+@pytest.mark.card
+# @spec TXG-QUAL-023
+def test_startup_is_refused_on_a_core_without_the_state_group_layouts(monkeypatch):
+    """TXG-CFG-016: the refusal names core's accessor and removing the
+    option."""
+    from vllm.v1.worker.gpu.model_states import interface
+
+    monkeypatch.delattr(interface.ModelState, "state_group_layouts")
+    message = refusal("no state_group_layouts", {})
+    assert any(
+        c.is_state_layer_condition(part) for part in re.split(r"[;\n]", message)
+    ) or c.is_state_layer_condition(message), message
 
 
 @pytest.mark.card
@@ -159,14 +231,25 @@ def test_startup_is_refused_on_a_core_without_the_model_state_hooks(monkeypatch)
 
 
 def _run(settings: dict[str, Any], *, patch=None, reads=()) -> dict[str, Any]:
-    return {"mode": "llm", "settings": settings, "patch": patch, "reads": list(reads)}
+    """An engine run with core's graph-memory estimate enabled."""
+    return {
+        "mode": "llm",
+        "settings": settings,
+        "patch": patch,
+        "reads": list(reads),
+        "env": q.estimate_enabled(),
+    }
 
 
 #: The engine runs of this module's checks, by name. The conftest starts the
 #: selected ones before any test runs (``support.engine_child.prestart``).
+#: Every run but ``fixed-budget`` holds the fixed block count of the
+#: restricted startup; ``fixed-budget`` holds a fixed KV budget instead
+#: (TXG-CFG-019, TXG-QUAL-022).
 ENGINE_RUNS = {
     "fixed-budget": lambda: _run(
-        engine_settings(kv_cache_memory_bytes=8 << 30), reads=("record",)
+        engine_settings(kv_cache_memory_bytes=8 << 30, num_gpu_blocks_override=...),
+        reads=("record",),
     ),
     "suppressed-profiling": lambda: _run(engine_settings(), patch="suppress-profiling"),
     "b-hook-1": lambda: _run(engine_settings(hf={t.OPTION: ...}), reads=("estimate",)),
@@ -188,7 +271,7 @@ def started(reply):
 
 @pytest.mark.card
 @pytest.mark.installed_engine("fixed-budget")
-# @spec TXG-QUAL-022
+# @spec TXG-QUAL-022, TXG-QUAL-001
 def test_a_fixed_budget_logs_the_uncharged_warning_with_its_figures(tmp_path):
     reply = started(engine("fixed-budget", tmp_path))
     warnings = [
@@ -214,7 +297,7 @@ def test_a_suppressed_required_profiling_capture_fails_startup(tmp_path):
 
 @pytest.mark.card
 @pytest.mark.installed_engine("b-hook-1", "b-hook-2", "option-on")
-# @spec TXG-QUAL-021
+# @spec TXG-QUAL-021, TXG-QUAL-001
 def test_cores_estimate_charges_the_profiling_transaction_total(tmp_path, capsys):
     baseline = [
         started(engine(name, tmp_path))["reads"]["estimate"]
@@ -316,3 +399,89 @@ def test_a_fresh_process_recovers_after_a_worker_fatal_fault(on_cuda, monkeypatc
     fresh_out, _ = run_steps(on_cuda(n=2), one_stream)
     off_out, _ = run_steps(b_hook(on_cuda, n=2), one_stream)
     assert torch.equal(fresh_out[0], off_out[0])
+
+
+# @spec TXG-QUAL-007
+def test_a_multi_token_row_among_one_token_rows_falls_back_once(on_cuda):
+    """A direct client's two-token request beside a stream's chunk, through
+    the qualification adapter: the step falls back once with reason
+    ``multi-token``, planning fails the multi-token row alone, and the
+    option-off transaction equals its reference on a detached pool copy."""
+    from support import txg_qual_driver as d
+    from support.txg_qual_adapter import QualAdapter, TransactionMonitor
+
+    env = on_cuda(n=2, max_num_seqs=3)
+    env.core.startup()
+    adapter = QualAdapter(vllm_config=env.vllm_config, model=env.model, state=env.state)
+    monitor = TransactionMonitor(env.model, compare=True).install()
+    requests = d.Requests(env.model, lookahead=env.lookahead)
+    blocks = d.Blocks(adapter.capacity)
+    before = dict(t.counter(env, "fallbacks"))
+    try:
+        multi = requests.multi_token("multi-token", requests.label_tokens(2))
+        monitor.begin_step()
+        result = adapter.step(
+            new=[t.stream_unit(env, "one-token"), multi],
+            blocks=blocks.of(["one-token", "multi-token"]),
+            tokens={"multi-token": 2},
+        )
+    finally:
+        monitor.uninstall()
+    after = dict(t.counter(env, "fallbacks"))
+    grown = {k: v - before.get(k, 0) for k, v in after.items() if v != before.get(k, 0)}
+    assert [k[0] for k in grown] == [d.MULTI_TOKEN] and sum(grown.values()) == 1, grown
+    assert result.failed == {"multi-token"}, result.failed
+    calls = {call.kind: call for call in monitor.calls}
+    assert calls["execute"].covered is False
+    assert calls["off"].compared and not calls["off"].problems, calls["off"].problems
+
+
+@pytest.mark.card
+@pytest.mark.parametrize("arm", ["off", "on"])
+# @spec TXG-QUAL-016
+def test_a_u_api_leg_parks_each_repeat_once_with_the_counted_replays(arm, tmp_path):
+    """One ``U_api`` leg in a fresh multiprocess engine (the driver's
+    ``uapi`` mode): ``AsyncLLM.generate`` with an input generator of the
+    plugin packer's ``StreamingInput`` units, repeats 0 to 3, each timed to
+    its unit's parked output and reaching exactly one park with no error; an
+    ON leg replays the chunk cell at 1 once and the echo cell at 1 once per
+    later step, with no fallback. The audio here is seeded noise; the
+    qualifying brackets run test-clean under their frozen record."""
+    card = os.environ.get("NEMOTRON_CARD_DIR")
+    if not card:
+        pytest.skip("NEMOTRON_CARD_DIR not set")
+    hf = {"num_lookahead_tokens": 0}
+    if arm == "on":
+        hf[t.OPTION] = [4]
+    spec = {
+        "mode": "uapi",
+        "arm": arm,
+        "leg": "ON" if arm == "on" else "OFF1",
+        "card": card,
+        "max_model_len": 4096,
+        "max_num_seqs": 4,
+        "lookahead": 0,
+        "hf_overrides": hf,
+        "seed": 0,
+        "synthetic_lengths": [16000] * q.U_API_REPEATS,
+        "engine_extra": {"gpu_memory_utilization": 0.5},
+    }
+    path, out = tmp_path / "spec.json", tmp_path / "out.json"
+    path.write_text(json.dumps(spec))
+    tests = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(tests), env.get("PYTHONPATH", "")) if p
+    )
+    subprocess.run(
+        [sys.executable, "-m", "support.txg_qual_driver", str(path), str(out)],
+        cwd=tests,
+        env=env,
+        timeout=1800,
+        check=False,
+    )
+    reply = json.loads(out.read_text())
+    assert reply["ok"], reply.get("traceback")
+    leg = reply["result"]
+    assert leg["problems"] == [], leg
+    assert all(r["ms"] > 0 for r in leg["repeats"]), leg

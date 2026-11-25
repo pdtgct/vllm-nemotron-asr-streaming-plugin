@@ -11,14 +11,13 @@ real cells.
 from __future__ import annotations
 
 import gc
-import weakref
+import re
 
 import pytest
 import torch
 from support import model_harness as h
 from support import txg_eager as eager
 from support import txgcap_harness as t
-from support.core_order import CoreOrder
 from support.txg_api import Record
 
 from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
@@ -289,8 +288,14 @@ def test_scatter_warm_up_names_each_pools_first_free_page_before_the_first_cell(
         if capture == "serving":
             core.clear()
             core.bind_serving()
-        bindings = env.runner.bindings
-        layout = h.core_bindings(bindings).pool_layout(h.STATE_LAYER)
+        # The component pools: the state layer's bound views, as core's
+        # state-group layout holds them at the call (TXG-CAP-008).
+        components = [
+            address
+            for _layer, layouts in t.component_layouts(env.state)
+            for address, *_ in layouts
+        ]
+        assert components, "core set no state-group layout"
         mark = len(env.events)
         core.capture(profile_only=capture == "profiling")
         first_cell = next(
@@ -308,10 +313,8 @@ def test_scatter_warm_up_names_each_pools_first_free_page_before_the_first_cell(
         launched = [
             e[1] for e in env.events[after_segments:first_cell] if e[0] == "scatter"
         ]
-        warm = launched[: len(layout)]
-        assert sorted(c["pool"] for c in warm) == sorted(
-            v.data_ptr for v in layout.values()
-        ), (
+        warm = launched[: len(components)]
+        assert sorted(c["pool"] for c in warm) == sorted(components), (
             capture,
             warm,
         )
@@ -323,9 +326,12 @@ def test_scatter_warm_up_names_each_pools_first_free_page_before_the_first_cell(
         # over the component pools, launched once. The first cell is the
         # count-N chunk cell, whose rows are N > 1, so no other launch here
         # has the warm-up's shape.
-        views = [c for c in launched[len(layout) :] if t.is_scatter_warmup(c)]
-        addresses = {v.data_ptr for v in layout.values()}
-        assert views and all(c["pool"] in addresses for c in views), (capture, views)
+        views = [c for c in launched[len(components) :] if t.is_scatter_warmup(c)]
+        pool = h.pool_tensor(env.runner.bindings)
+        assert views and all(t.within(pool, c["pool"]) for c in views), (
+            capture,
+            views,
+        )
         layouts = [c["layout"] for c in (*warm, *views)]
         assert len(set(layouts)) == len(layouts), (
             capture,
@@ -342,49 +348,140 @@ def test_cells_are_captured_largest_first_chunk_then_echo(on_cpu):
         assert t.cell_order(env, capture) == t.largest_first(env.n), capture
 
 
-# @spec TXG-CAP-008
-def test_cells_reach_the_pools_only_through_startup_access_during_the_call(
+def _dead(refs) -> bool:
+    gc.collect()
+    return all(ref() is None for ref in refs)
+
+
+# @spec TXG-CAP-008, TXG-LIFE-003
+def test_cells_reach_the_pools_only_through_the_state_group_layouts_in_the_call(
     on_cpu, monkeypatch
 ):
-    from vllm.v1.worker.gpu.state_slots import StateSlotBindings
-
-    accesses, inside = [], {"call": False}
-    original = StateSlotBindings.startup_pool_access
-
-    def startup_pool_access(self, layer):
-        assert inside["call"], "startup pool access outside a capture call"
-        access = original(self, layer)
-        accesses.append(weakref.ref(access))
-        return access
-
-    monkeypatch.setattr(StateSlotBindings, "startup_pool_access", startup_pool_access)
+    """The transaction-graph part reads ``ModelState.state_group_layouts``
+    inside each capture call and nowhere else (not at core's binding, not in
+    ``post_warmup`` or a step), stores to no page of either pool (the null
+    page included), and keeps no layout object and no tensor the accessor
+    returned: once core releases the profiling KV cache and binds the
+    serving one, and once core releases the serving layout, every object the
+    accessor returned inside a call is gone."""
     run = on_cpu(n=2)
-    core = run.core
-    capture = core.capture
-
-    def tracked(**kwargs):
-        inside["call"] = True
-        try:
-            capture(**kwargs)
-        finally:
-            inside["call"] = False
-
-    core.capture = tracked
+    env, core = run.env, run.core
+    spy = t.AccessorSpy(monkeypatch, env.state)
     core.prepare()
     core.bind_profiling()
     before = pool_snapshot(core.profiling_bindings)
     core.profiling_capture()
     assert_pools_equal(before, pool_snapshot(core.profiling_bindings))
+    # Inside the call any reader counts: the model state may read the
+    # accessor and hand the layouts to the binding (implementation layout,
+    # ``check_bindings``); outside it, no transaction-graph frame may read it.
+    profiling = [r for r in spy.reads if r["inside"]]
+    assert profiling, "the profiling capture never read the state-group layouts"
     core.clear()
     core.bind_serving()
     before = pool_snapshot(core.serving_bindings)
+    mark = len(spy.reads)
     core.serving_capture()
     assert_pools_equal(before, pool_snapshot(core.serving_bindings))
-    gc.collect()
-    assert accesses, "the cells never used startup pool access"
-    assert all(ref() is None for ref in accesses), (
-        "a startup access object was retained"
+    serving = [r for r in spy.reads[mark:] if r["inside"]]
+    assert serving, "the serving capture never read the state-group layouts"
+    core.post_warmup()
+    core.step(t.stream_unit(env, "s1"))
+    assert spy.txg_reads(inside=False) == [], (
+        "the transaction-graph part read the state-group layouts outside a capture call"
     )
+    # The spies' recorded transaction arguments hold pools; drop them.
+    h.drop_advance_records()
+    assert _dead(ref for r in profiling for ref in (*r["layouts"], *r["tensors"])), (
+        "a profiling layout or one of its tensors outlived core's release"
+    )
+    env.state._state_group_layouts = ()  # core's release of the serving cache
+    assert _dead(ref for r in serving for ref in r["layouts"]), (
+        "the serving capture retained a layout object"
+    )
+
+
+def _break_layouts(env, broken):
+    """Core's state-group layout with one part of its contract broken."""
+    layer = t.state_layer_of(env)
+    views = t.bound_views(env)
+    other = "nemotron.other_state"
+    return {
+        "no-layout": (),
+        "two-layouts": t.make_layouts({layer.prefix: views}, {layer.prefix: views}),
+        "another-layer": t.make_layouts({other: views}),
+        "extra-layer": t.make_layouts({layer.prefix: views, other: views}),
+        "copied-view": t.make_layouts({layer.prefix: (views[0].clone(), *views[1:])}),
+    }[broken]
+
+
+#: What each broken condition's error names (TXG-CAP-008).
+BROKEN = {
+    "no-layout": r"(?i)layout",
+    "two-layouts": r"(?i)layout",
+    "another-layer": r"nemotron\.other_state|nemotron\.state",
+    "extra-layer": r"nemotron\.other_state",
+    "copied-view": None,  # the component's name, below
+}
+
+
+@pytest.mark.parametrize("broken", list(BROKEN))
+# @spec TXG-CAP-008, TXG-MEM-010
+def test_a_broken_layout_contract_fails_pool_access_with_no_remedy(on_cpu, broken):
+    """A layout count other than one, a layout that does not hold exactly the
+    state layer, or a component tensor that is not the layer's bound view
+    fails the pool-access phase naming the broken condition, and gives no
+    configuration remedy: no setting repairs core's contract. The fixed
+    budget needs no profiling capture, so the serving capture is the call."""
+    from support import txg_conditions as c
+
+    run = on_cpu(n=2, kv_cache_memory_bytes=1 << 30)
+    env, core = run.env, run.core
+    core.prepare()
+    core.bind_serving()
+    env.state._state_group_layouts = _break_layouts(env, broken)
+    before = pool_snapshot(core.serving_bindings)
+    error = h.call_with(core.serving_capture)
+    assert error is not None, f"a {broken} layout passed pool access"
+    message = t.text(error)
+    assert t.OPTION in str(error) and "pool access" in str(error).lower(), message
+    needle = BROKEN[broken]
+    if needle is None:
+        needle = re.escape(h.model_spec(env.model).names[0])
+    assert re.search(needle, message), (broken, message)
+    if broken == "two-layouts":
+        assert c.shows_number(message, 2), message
+    assert c.configuration_remedies(message) == [], (
+        "a contract break gave a configuration remedy",
+        c.configuration_remedies(message),
+        message,
+    )
+    assert t.fake_graph_count(env) == 0, "a cell was captured past pool access"
+    assert_pools_equal(before, pool_snapshot(core.serving_bindings))
+
+
+@pytest.mark.parametrize(
+    "limit, passes", [(2, True), (None, False)], ids=["active-seqs-2", "max-seqs-3"]
+)
+# @spec TXG-CAP-008
+def test_the_block_count_check_uses_the_admission_limit(on_cpu, limit, passes):
+    """Pool access needs the admission limit plus one blocks, not ``N + 1``:
+    three blocks hold the two capture rows of ``N = 2`` beside the null page,
+    and pass with an admission limit of 2 (``max_num_active_seqs``) and fail
+    with 3 (``max_num_seqs``). The block-count failure's message is
+    ``test_memory.py``'s (TXG-MEM-017)."""
+    run = on_cpu(
+        n=2,
+        max_num_seqs=3,
+        max_num_active_seqs=limit,
+        kv_cache_memory_bytes=1 << 30,
+        capacity=3,
+    )
+    run.core.prepare()
+    run.core.bind_serving()
+    error = h.call_with(run.core.serving_capture)
+    assert (error is None) is passes, (limit, error and t.text(error))
+    assert t.fake_graph_count(run.env) == (2 * run.env.n if passes else 0)
 
 
 # @spec TXG-CAP-009
@@ -532,9 +629,8 @@ def assert_scatter_arguments_were_launched_at_startup(
 def test_the_masked_scatter_receives_only_arguments_launched_at_startup(
     on_cpu, monkeypatch
 ):
-    run = on_cpu(n=2, max_num_seqs=3)
-    env = run.env
-    core = CoreOrder(env.runner, capture_stream=env.capture_stream, capacity=12)
+    run = on_cpu(n=2, max_num_seqs=3, capacity=12)
+    env, core = run.env, run.core
     core.startup()
     # The cells compute, so the covered step's scatters are compared too.
     eager.EagerCells(env.model).install(monkeypatch)

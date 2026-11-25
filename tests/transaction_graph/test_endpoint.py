@@ -305,9 +305,8 @@ def test_every_cell_is_captured_with_the_endpoint_arguments(on_cpu):
     # The capture's transactions received both endpoint pools: the cells'
     # signatures list them with the other projected resident-pool views.
     pools = signature_fields(next(iter(binding.cells.values())))["pools"]
-    layout = h.core_bindings(core.serving_bindings).pool_layout(h.STATE_LAYER)
-    history = layout["endpoint.history"]
-    assert history.data_ptr in {entry[0] for entry in pools}, "no endpoint pool"
+    history = t.state_layer_of(env).component_pools["endpoint.history"]
+    assert history.data_ptr() in {entry[0] for entry in pools}, "no endpoint pool"
 
 
 def one_warning(caplog, field):
@@ -601,11 +600,11 @@ def test_every_transaction_of_a_real_step_receives_the_endpoint_arguments(
     assert {name for name, _ in received} == (
         {"execute", "advance"} if on else {"advance"}
     )
-    layout = h.core_bindings(core.serving_bindings).pool_layout(h.STATE_LAYER)
+    views = t.state_layer_of(env).component_pools
     for name, transaction in received:
         assert transaction["eou_token_id"] == int(env.config.eou_token_id), name
         history = transaction["endpoint_history_pool"]
         book = transaction["endpoint_book_pool"]
         assert history is not None and book is not None, name
-        assert history.data_ptr() == layout["endpoint.history"].data_ptr, name
+        assert history.data_ptr() == views["endpoint.history"].data_ptr(), name
         assert book.shape[1] == 6, name

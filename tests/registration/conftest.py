@@ -214,14 +214,17 @@ def make_vllm_config(registered) -> Callable[..., Any]:
 def engine_config() -> Callable[..., SimpleNamespace]:
     """A ``VllmConfig``-shaped namespace for ``verify_and_update_config``.
 
-    Attribute paths are the ones core's own persistent-state validation reads
-    (``validate_state_config`` in ``vllm/v1/core/state_slot_manager.py``) plus
+    Attribute paths are the ones core's own persistent-state check reads
+    (``VllmConfig._verify_persistent_state_config`` in ``vllm/config/vllm.py``
+    of the target core) plus
     ``model_config.enforce_eager``, the compilation settings of the hook
     configuration (``compilation_config.mode`` / ``.cudagraph_mode``,
     ``optimization_level``), ``device_config`` and ``model_config.hf_config``.
     Defaults are the accepted ``--enforce-eager`` configuration with the card's
     default arms, no lookahead override (the attribute is absent) and no
-    transaction graphs. ``drop`` names
+    transaction graphs, no explicit block count or KV budget
+    (``num_gpu_blocks_override``, ``kv_cache_memory_bytes``) and no
+    ``max_num_active_seqs``. ``drop`` names
     ``parallel_config`` attributes to leave undefined; ``hf`` updates the
     served configuration's fields.
     """
@@ -251,6 +254,9 @@ def engine_config() -> Callable[..., SimpleNamespace]:
             "device": "cuda",
             "max_num_seqs": 64,
             "max_num_batched_tokens": 2048,
+            "max_num_active_seqs": None,
+            "num_gpu_blocks_override": None,
+            "kv_cache_memory_bytes": None,
         }
         unknown = set(settings) - set(values)
         assert not unknown, unknown
@@ -282,11 +288,12 @@ def engine_config() -> Callable[..., SimpleNamespace]:
                 async_scheduling=values["async_scheduling"],
                 max_num_seqs=values["max_num_seqs"],
                 max_num_batched_tokens=values["max_num_batched_tokens"],
+                max_num_active_seqs=values["max_num_active_seqs"],
             ),
             cache_config=SimpleNamespace(
                 enable_prefix_caching=values["enable_prefix_caching"],
-                num_gpu_blocks_override=None,
-                kv_cache_memory_bytes=None,
+                num_gpu_blocks_override=values["num_gpu_blocks_override"],
+                kv_cache_memory_bytes=values["kv_cache_memory_bytes"],
                 enable_extensible_kv_cache=False,
             ),
             parallel_config=SimpleNamespace(**parallel),

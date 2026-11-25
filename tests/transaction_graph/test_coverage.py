@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cells and classification on CPU (TXG-CELL-001, TXG-CELL-002, TXG-COV-001,
-TXG-COV-002, TXG-COV-004, TXG-COV-006 to TXG-COV-010, TXG-COV-013).
+TXG-COV-002, TXG-COV-004, TXG-COV-006 to TXG-COV-010, TXG-COV-013,
+TXG-COV-014).
 
 ``classify`` is called on CPU row plans (``plan_builder``) with a fake cell
 inventory (``cell_inventory``), as ``support.txg_api`` documents. Signature
 comparison, counting and execution are ``execute``'s and are tested on CUDA
-(``test_coverage_gpu.py``, ``test_exec_gpu.py``).
+(``test_coverage_gpu.py``, ``test_exec_gpu.py``). A step with a multi-token
+row (TXG-COV-014) runs through the model state on CPU with transaction graphs
+on, through the fake-capture seam (``on_cpu``; ``support.txg_steps`` lays
+out its token axis): a fake cell computes nothing, so those tests read the
+counters, launches and transactions, and the output's shape.
 """
 
 from __future__ import annotations
@@ -200,6 +205,35 @@ def test_ineligible_modes_are_never_covered(plan_builder, cell_inventory, mode, 
 
 
 # @spec TXG-COV-008
+@pytest.mark.parametrize(
+    "seqs, tokens, active",
+    [(6, 8192, None), (6, 4, None), (6, 8192, 3), (6, 4, 5), (6, 8192, 6)],
+    ids=["seqs", "tokens", "active", "tokens-below-active", "equal"],
+)
+def test_n_is_the_smaller_of_p_max_and_the_admission_limit(
+    plan_builder, cell_inventory, seqs, tokens, active
+):
+    """``N = min(P_max, admission limit)`` is the largest population the
+    configuration checks accept (TXG-CFG-004, TXG-CFG-020), and at that ``N``
+    every one-token step of ``1 <= P <= N`` rows is covered."""
+    from support.txg_fakes import admission_limit, engine_config, hf_config
+
+    limits = dict(
+        max_num_seqs=seqs, max_num_batched_tokens=tokens, max_num_active_seqs=active
+    )
+    n = min(seqs, tokens, admission_limit(seqs, active))
+    assert api.config_errors(engine_config(hf_config([n]), **limits)) == []
+    assert api.config_errors(engine_config(hf_config([n + 1]), **limits)), (
+        f"N = {n + 1} above min(P_max, admission limit) was accepted"
+    )
+    cells = cell_inventory(n)
+    for p in range(1, n + 1):
+        for k in range(p + 1):
+            result = classify(plan_builder(interleaved(k, p - k, p)), cells, n)
+            assert result.reason is None, (p, k, result.reason)
+
+
+# @spec TXG-COV-008
 @pytest.mark.parametrize("p_max", [1, 6])
 def test_every_population_is_covered_at_n_equal_p_max(
     plan_builder, cell_inventory, p_max
@@ -256,3 +290,125 @@ def test_classification_never_raises_on_an_unusual_plan(plan_builder, cell_inven
     for spec in ("", "c", "o", "ccc", "ooo", "cccooo"):
         result = classify(plan_builder(spec), cells, 2)
         assert result.reason in (None, *api.REASONS)
+
+
+# ---------------------------------------------------------------------------
+# Multi-token rows (CPU, the model state with transaction graphs on)
+
+
+def _fallback_growth(before, after):
+    return {
+        key: after[key] - before.get(key, 0)
+        for key in after
+        if after[key] != before.get(key, 0)
+    }
+
+
+@pytest.mark.engine
+# @spec TXG-COV-014, TXG-COV-002, TXG-COV-003, TXG-MASK-002
+@pytest.mark.parametrize("chunk_rows", [1, 3], ids=["covered-shape", "k-above-n"])
+def test_a_step_with_a_multi_token_row_falls_back_by_multi_token(on_cpu, chunk_rows):
+    """A step that holds a multi-token row among one-token rows is not
+    covered even when cells exist for its shape (only a one-token step is,
+    TXG-COV-002), and falls back with reason ``multi-token`` before any
+    reason of TXG-COV-004 (``K = 3 > N = 2`` here), without raising: one
+    fallback count, no cell launched, and one option-off transaction over the
+    whole row plan, whose output has one row per scheduled token."""
+    from support import txg_steps as steps
+    from support import txgcap_harness as t
+
+    run = on_cpu(n=2, max_num_seqs=4)
+    env, core = run.env, run.core
+    core.startup()
+    before = dict(t.counter(env, "fallbacks"))
+    replays, advances = env.fake.replay_count, len(env.advance.calls)
+    rows = [t.stream_unit(env, f"a{i}") for i in range(chunk_rows)]
+    wide = steps.with_tokens(
+        t.stream_unit(env, "wide"), int(env.config.audio_chunk_token_id)
+    )
+    hidden, _ = steps.token_step(
+        env.runner,
+        *rows,
+        wide,
+        counts={"wide": 2},
+        handles={r.req_id: i + 1 for i, r in enumerate([*rows, wide])},
+    )
+    grown = _fallback_growth(before, dict(t.counter(env, "fallbacks")))
+    assert len(grown) == 1 and list(grown.values()) == [1], grown
+    ((reason, _kind, _count),) = grown
+    assert reason == "multi-token", grown
+    assert env.fake.replay_count == replays, "a step with a multi-token row launched"
+    assert len(env.advance.calls) == advances + 1, (
+        "the option-off transaction did not run once over the whole row plan"
+    )
+    assert hidden.shape[0] == chunk_rows + 2, "not one output row per scheduled token"
+
+
+@pytest.mark.engine
+# @spec TXG-COV-002, TXG-COV-008
+def test_a_one_token_step_within_n_is_covered(on_cpu):
+    """The same rows, each scheduling one token, are covered: no fallback,
+    one launch per kind present."""
+    from support import txg_steps as steps
+    from support import txgcap_harness as t
+
+    run = on_cpu(n=2, max_num_seqs=4)
+    env, core = run.env, run.core
+    core.startup()
+    before = dict(t.counter(env, "fallbacks"))
+    replays = env.fake.replay_count
+    hidden, _ = steps.token_step(
+        env.runner, t.stream_unit(env, "a"), t.stream_unit(env, "b")
+    )
+    assert _fallback_growth(before, dict(t.counter(env, "fallbacks"))) == {}
+    assert env.fake.replay_count == replays + 1, "one chunk cell launch expected"
+    assert hidden.shape[0] == 2
+
+
+@pytest.mark.engine
+# @spec TXG-COV-014, TXG-COV-012
+def test_multi_token_takes_precedence_over_an_endpoint_signature(on_cpu):
+    """A step with a multi-token row and an endpoint-policy row falls back
+    once, by ``multi-token``: the reason classification assigns first takes
+    precedence over the signature comparison's ``endpoint_policy``."""
+    from support import txg_steps as steps
+    from support import txgcap_harness as t
+
+    run = on_cpu(n=2, max_num_seqs=3)
+    env, core = run.env, run.core
+    core.startup()
+    before = dict(t.counter(env, "fallbacks"))
+    policy = t.with_endpoint_policy(t.stream_unit(env, "p"))
+    wide = steps.with_tokens(
+        t.stream_unit(env, "wide"), int(env.config.audio_chunk_token_id)
+    )
+    steps.token_step(
+        env.runner, policy, wide, counts={"wide": 2}, handles={"p": 1, "wide": 2}
+    )
+    grown = _fallback_growth(before, dict(t.counter(env, "fallbacks")))
+    assert [key[0] for key in grown] == ["multi-token"], grown
+    assert list(grown.values()) == [1], grown
+
+
+@pytest.mark.engine
+# @spec TXG-EXEC-012, TXG-COV-011
+def test_dummy_steps_never_call_execute_on_cpu(on_cpu, monkeypatch):
+    """The dummy steps core runs after startup, as the model state's
+    ``prepare_inputs`` classifies them (REG-MEM-001: the profiling dummy step
+    and the warm-up dummy steps), call no ``execute``, replay no cell and
+    count no fallback."""
+    from support import txgcap_harness as t
+
+    run = on_cpu(n=2)
+    env, core = run.env, run.core
+    core.startup()
+    calls = []
+    t.wrap_execute(monkeypatch, env.model, lambda call: calls.append(1) or call())
+    before = dict(t.counter(env, "fallbacks"))
+    replays = env.fake.replay_count
+    env.runner.profile_run(core_embeds=False)
+    core.warmup_step()
+    env.runner.dummy_step(is_profile=False, randomize_inputs=True, core_embeds=False)
+    assert calls == [], "a dummy step called execute"
+    assert env.fake.replay_count == replays, "a dummy step replayed a cell"
+    assert dict(t.counter(env, "fallbacks")) == before, "a dummy step was counted"

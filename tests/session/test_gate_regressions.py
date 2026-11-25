@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regressions from the code gate: terminal output before the close, and
-ownership of the generate task through orphan cleanup."""
+ownership of the generate task through orphan cleanup.
+
+Scope: the session factory on the stream-admission client path, which the
+session specs' scope separates from the target core's obligations (its port to
+core's admission is the session design's Future roadmap 1). The target core
+provides no such path (``create_session_factory`` refuses there, SESS-FAC-003),
+so these tests run the factory against ``support.fake_engine`` and a pass makes
+no claim for the target core.
+"""
 
 from __future__ import annotations
 
@@ -80,13 +88,12 @@ def test_cleanup_keeps_the_generate_task_owned_until_it_ends(build):
 
 
 def _retirement(kind):
-    from support.fake_engine import refusal
-    from vllm.v1.engine import StreamAdmissionError
+    from support.fake_engine import refused
     from vllm.v1.engine.exceptions import EngineDeadError
 
     return {
         "returns": None,
-        "admission-error": StreamAdmissionError(refusal("x", "capacity")),
+        "admission-error": refused("x", "capacity"),
         "value-error": ValueError("not tracked"),
         "engine-dead": EngineDeadError(),
     }[kind]

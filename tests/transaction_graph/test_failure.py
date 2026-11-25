@@ -11,8 +11,16 @@ cancelled, launched or fell back, never its outputs.
 A transaction-validation rejection is made by a stream's first unit that
 carries a later chunk sequence (the device protocol check rejects it). A
 planning-failed row is a whole file whose header names another geometry
-(FILE-PROMPT-007) or disagrees with its samples (a malformed item), or a
-stream's first unit at another geometry (SESS-MODEL-002).
+(FILE-PROMPT-007) or disagrees with its samples (a malformed item), a
+stream's first unit at another geometry (SESS-MODEL-002), or a row that
+schedules more than one token (REG-STATE-014; ``support.txg_steps``).
+
+A failed request reaches core through the model state's
+``take_failed_requests`` (REG-MS-003, REG-MS-004), which ``t.FailSpy``
+records; core then ends it with finish reason ``error`` (REG-MS-005, the
+``gpu`` tier). A rejected row's pages are compared with the pages as the
+step's fresh-page initialization (REG-STATE-010) left them
+(``t.slots_at_step_start``): preservation starts after initialization.
 """
 
 from __future__ import annotations
@@ -26,6 +34,7 @@ from pathlib import Path
 import pytest
 import torch
 from support import model_harness as h
+from support import txg_steps as steps
 from support import txgcap_harness as t
 
 from vllm_nemotron_asr_streaming.nemotron_asr.frontend import ROW_STATUS_SEQUENCE
@@ -70,10 +79,13 @@ PLANNING_FAILURES = ["file-geometry", "file-malformed", "stream-geometry"]
 
 # @spec TXG-FAIL-001
 def test_a_rejected_row_keeps_its_pages_while_the_others_commit(off_cpu):
+    """The rejected fresh row's pages stay as the fresh-page initialization
+    left them while the other row commits; its request alone fails, through
+    ``take_failed_requests``, and the step neither raises nor latches."""
     env = off_cpu()
     bindings = ready_off(env)
-    fails = t.FailSpy(bindings)
-    before = t.slots_at_step_start(bindings, (1, 2))
+    fails = t.FailSpy(env.state)
+    before = t.slots_at_step_start(env, (1, 2))
     step(env, t.stream_unit(env, "good"), t.stream_unit(env, "bad", sequence=3))
     statuses, failed = env.runner.commit_log[-1]
     # the intended outcome first: good accepted, bad rejected by the
@@ -108,13 +120,16 @@ def test_step_outputs_do_not_depend_on_scratch_left_by_an_earlier_step(off_cpu):
 
 
 @pytest.mark.parametrize("kind", PLANNING_FAILURES)
-# @spec TXG-FAIL-008
+# @spec TXG-FAIL-008, TXG-MASK-006
 def test_planning_failed_rows_fail_from_the_planning_failed_set(off_cpu, kind):
+    """A planning-failed row fails through ``take_failed_requests`` even when
+    the sink's collection reports nothing for it, and its fresh page stays as
+    the fresh-page initialization left it."""
     env = off_cpu()
     bindings = ready_off(env)
-    fails = t.FailSpy(bindings)
+    fails = t.FailSpy(env.state)
     t.silence_collection(env, {"bad"})  # no status reaches collection
-    before = t.slots_at_step_start(bindings, (2,))
+    before = t.slots_at_step_start(env, (2,))
     step(env, t.stream_unit(env, "good"), planning_failed(env, kind, "bad"))
     assert fails.failed == {"bad"}, fails.calls
     assert torch.equal(h.slot_bytes(bindings, 2), before[2]), (
@@ -128,10 +143,11 @@ def test_planning_failed_rows_fail_once_when_collection_also_reports_them(
     off_cpu, kind
 ):
     env = off_cpu()
-    bindings = ready_off(env)
-    fails = t.FailSpy(bindings)
+    ready_off(env)
+    fails = t.FailSpy(env.state)
     step(env, t.stream_unit(env, "good"), planning_failed(env, kind, "bad"))
     assert fails.failed == {"bad"}, fails.calls
+    assert fails.take() is None, "take_failed_requests did not clear its record"
 
 
 @pytest.mark.parametrize("kind", PLANNING_FAILURES)
@@ -140,11 +156,11 @@ def test_an_all_failed_step_runs_no_transaction_and_returns_rejected_rows(
     off_cpu, kind
 ):
     env = off_cpu()
-    bindings = ready_off(env)
+    ready_off(env)
     # the rejected-row output, from a mixed step that reaches the transaction
     mixed, _ = step(env, t.stream_unit(env, "good"), planning_failed(env, kind, "bad"))
     reference = mixed[1].clone()
-    fails = t.FailSpy(bindings)
+    fails = t.FailSpy(env.state)
     advances = len(env.advance.calls)
     hidden, _ = step(
         env,
@@ -159,6 +175,40 @@ def test_an_all_failed_step_runs_no_transaction_and_returns_rejected_rows(
     assert fails.failed == {"b1", "b2"}, fails.calls
 
 
+# @spec TXG-FAIL-009, TXG-TXN-010
+def test_an_all_failed_step_returns_the_rejected_row_output_at_every_token(off_cpu):
+    """An all-failed step whose rows schedule one, two and one tokens returns
+    the rejected-row output at each of its four token positions, in the
+    runner's order, and runs no transaction; every request fails alone."""
+    env = off_cpu(max_num_seqs=3)
+    ready_off(env)
+    mixed, _ = step(
+        env, t.stream_unit(env, "good"), planning_failed(env, "file-malformed", "bad")
+    )
+    reference = mixed[1].clone()
+    fails = t.FailSpy(env.state)
+    fails.take()
+    advances = len(env.advance.calls)
+    wide = steps.with_tokens(
+        t.stream_unit(env, "b2"), int(env.config.audio_chunk_token_id)
+    )
+    hidden, _ = steps.token_step(
+        env.runner,
+        planning_failed(env, "file-malformed", "b1"),
+        wide,
+        planning_failed(env, "stream-geometry", "b3"),
+        counts={"b2": 2},
+        handles={"b1": 3, "b2": 4, "b3": 5},
+    )
+    assert len(env.advance.calls) == advances, "an all-failed step ran the transaction"
+    assert hidden.shape[0] == 4, "one output row per scheduled token"
+    for position, row in enumerate(hidden):
+        assert torch.equal(row, reference), (
+            f"token position {position} is not the rejected-row output"
+        )
+    assert fails.failed == {"b1", "b2", "b3"}, fails.calls
+
+
 # @spec TXG-FAIL-009
 def test_an_all_failed_step_launches_nothing_with_the_option_on(on_cpu, monkeypatch):
     run = on_cpu(n=2)
@@ -166,7 +216,7 @@ def test_an_all_failed_step_launches_nothing_with_the_option_on(on_cpu, monkeypa
     core.startup()
     calls = []
     t.wrap_execute(monkeypatch, env.model, lambda call: calls.append(1) or call())
-    fails = t.FailSpy(core.serving_bindings)
+    fails = t.FailSpy(env.state)
     replays, advances = env.fake.replay_count, len(env.advance.calls)
     core.step(planning_failed(env, "file-malformed", "b1"))
     assert calls == [], "an all-failed step called execute"
@@ -349,8 +399,8 @@ def test_a_rejected_row_under_replay_keeps_its_pages_cuda(on_cuda):
     core = env.core
     core.startup()
     bindings = core.serving_bindings
-    fails = t.FailSpy(bindings)
-    before = t.slots_at_step_start(bindings, (1, 2))
+    fails = t.FailSpy(env.state)
+    before = t.slots_at_step_start(env, (1, 2))
     core.step(t.stream_unit(env, "good"), t.stream_unit(env, "bad", sequence=3))
     statuses, _ = env.runner.commit_log[-1]
     assert statuses.get("good", 0) == 0 and statuses.get("bad", 0) != 0

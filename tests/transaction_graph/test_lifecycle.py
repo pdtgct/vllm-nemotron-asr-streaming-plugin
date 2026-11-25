@@ -135,34 +135,56 @@ def test_profiling_forward_captures_and_replays_no_cell(on_cpu):
 
 
 # ---------------------------------------------------------------------------
-# initialize_state_slots, the captures and clear_cudagraphs
+# Core's KV-cache binding, the captures and clear_cudagraphs
+
+
+def _component_addresses(env):
+    """The addresses of the component pools core's state-group layout holds
+    now (the state layer's bound views)."""
+    return {
+        address
+        for _layer, layouts in t.component_layouts(env.state)
+        for address, *_ in layouts
+    }
+
+
+def _held(binding):
+    """What the binding holds, by attribute and object identity."""
+    return {k: id(v) for k, v in getattr(binding, "__dict__", {}).items()}
 
 
 # @spec TXG-LIFE-003
-def test_cells_exist_only_from_their_capture_over_the_current_bindings(on_cpu):
+def test_cells_exist_only_from_their_capture_over_the_current_layouts(on_cpu):
+    """Core's binding of either KV cache (``bind_kv_cache``, the layout and
+    ``initialize_kv_cache``) leaves the binding as it was; each capture
+    takes its pools from the layout current at the call: the serving
+    capture's scatter warm-up names the serving pools and none of the
+    profiling ones."""
+    from support import txg_api
+
     run = on_cpu(n=2)
     env, core = run.env, run.core
+    binding = txg_api.binding_of(env.model)
     core.prepare()
-    profiling = core.bind_profiling()
+    held = _held(binding)
+    core.bind_profiling()
+    assert _held(binding) == held, "the binding recorded core's profiling binding"
+    profiling_pools = _component_addresses(env)
     assert t.fake_graph_count(env) == 0, "cells before the profiling capture"
     core.profiling_capture()
     assert t.fake_graph_count(env) == 2 * env.n
     core.clear()
     assert t.fake_graph_count(env) == 0, "profiling cells outlived clear_cudagraphs"
-    serving = core.bind_serving()
+    held = _held(binding)
+    core.bind_serving()
+    assert _held(binding) == held, "the binding recorded core's serving binding"
+    serving_pools = _component_addresses(env)
     assert t.fake_graph_count(env) == 0, "cells before the serving capture"
     mark = len(env.events)
     core.serving_capture()
     assert t.fake_graph_count(env) == 2 * env.n
-    layer = h.STATE_LAYER
-    serving_pools = {
-        v.data_ptr for v in h.core_bindings(serving).pool_layout(layer).values()
-    }
-    profiling_pools = {
-        v.data_ptr for v in h.core_bindings(profiling).pool_layout(layer).values()
-    }
     warmed = {env.events[mark + i][1]["pool"] for i in scatter_warmups(env, mark)}
-    assert warmed and warmed <= serving_pools, (warmed, serving_pools)
+    assert serving_pools and serving_pools <= warmed, (warmed, serving_pools)
     assert not warmed & profiling_pools, "the serving capture used the profiling pools"
 
 
@@ -186,6 +208,18 @@ def test_profiling_capture_runs_segments_warm_up_cells_then_the_margin(on_cpu):
     assert env.fake.live_margins() == 1, "the margin was not held after the call"
     pools = {e[1][1] for e in env.events[mark:] if e[0] == "cuda.graph.capture_begin"}
     assert pools == {"profiling-pool"}, pools
+    # Over the profiling pools: core's profiling KV cache, which holds
+    # num_gpu_blocks_override blocks under the restricted startup.
+    blocks = env.vllm_config.cache_config.num_gpu_blocks_override
+    assert blocks is not None, "the environment is not the restricted startup"
+    assert {
+        shape[0]
+        for _, layouts in t.component_layouts(env.state)
+        for _, shape, *_ in layouts
+    } == {blocks}
+    profiling_pool = h.pool_tensor(core.profiling_bindings)
+    warmed = [env.events[mark + i][1] for i in warmups]
+    assert all(t.within(profiling_pool, c["pool"]) for c in warmed), warmed
 
 
 # @spec TXG-LIFE-005
@@ -391,31 +425,58 @@ def test_a_retry_after_a_failed_serving_capture_is_refused_with_the_option_off(
 
 
 # @spec TXG-LIFE-009
-def test_repeated_bindings_with_the_captured_layout_change_nothing(on_cpu):
+def test_a_rebinding_with_the_captured_layout_changes_nothing(on_cpu):
+    """Core binds the same serving pages again (new view objects over the
+    same storage): the plain-value layout equals the captured one, so the
+    binding changes nothing and the worker still verifies and serves."""
+    from support import txg_api
+
     run = on_cpu(n=2)
     env, core = run.env, run.core
     core.startup(verify=False)
+    binding = txg_api.binding_of(env.model)
     mark = len(env.events)
-    env.state.initialize_state_slots(core.serving_bindings)
+    core.bind_serving(core.serving_bindings)
     assert t.captures_since(env, mark) == []
     assert t.fake_graph_count(env) == 2 * env.n
+    assert binding.failed is False
     core.post_warmup()  # still verifies
+    core.step(t.stream_unit(env, "s1"))
 
 
+@pytest.mark.parametrize("attempt", ["succeeded", "failed"])
 # @spec TXG-LIFE-009
-def test_repeated_bindings_with_another_layout_latch_and_raise(on_cpu):
-    run = on_cpu(n=2)
+def test_a_rebinding_with_another_layout_latches_and_raises(on_cpu, attempt):
+    """After a serving capture was attempted, whether or not it succeeded,
+    core binding the state layer's views over other pages (another
+    plain-value layout) latches the binding and raises; every later step
+    then raises the fresh-engine error."""
+    from support import txg_api
+
+    run = on_cpu(n=2, kv_cache_memory_bytes=1 << 30)
     env, core = run.env, run.core
-    core.startup()
-    other = core.bindings()
-    error = h.call_with(env.state.initialize_state_slots, other)
+    core.prepare()
+    core.bind_serving()
+    if attempt == "failed":
+        env.fake.fail["capture"] = env.fake.capture_attempts + 1
+        assert h.call_with(core.serving_capture) is not None
+        env.fake.fail.clear()
+    else:
+        core.serving_capture()
+        core.post_warmup()
+    binding = txg_api.binding_of(env.model)
+    error = h.call_with(core.bind_serving)  # a fresh pool: other addresses
     assert error is not None, "a different serving layout was accepted"
-    error = h.call_with(core.step, t.stream_unit(env, "s1"))
-    assert error is not None and t.FRESH_ENGINE.search(t.text(error)), error
+    assert binding.failed is True, "the binding did not latch"
+    later = h.call_with(core.step, t.stream_unit(env, "s1"))
+    assert later is not None and t.FRESH_ENGINE.search(t.text(later)), later
 
 
 # @spec TXG-LIFE-009
-def test_profiling_bindings_take_no_part_in_the_layout_comparison(on_cpu):
+def test_bindings_before_the_serving_capture_take_no_part_in_the_comparison(on_cpu):
+    """Core's profiling KV cache, bound twice here, and a serving binding
+    replaced before the serving capture are not compared: the serving
+    capture records the layout current at its call."""
     core = on_cpu(n=2).core
     core.prepare()
     core.bind_profiling()
@@ -423,6 +484,7 @@ def test_profiling_bindings_take_no_part_in_the_layout_comparison(on_cpu):
     core.profiling_capture()
     core.clear()
     core.bind_serving()
+    core.bind_serving()  # other pages, before the serving capture
     core.serving_capture()
     core.post_warmup()
 
@@ -499,9 +561,19 @@ def test_option_off_hooks_allocate_capture_verify_and_release_nothing(
         env.state = h.build_model_state(env.vllm_config, env.model)
         env.runner = h.Runner(env.vllm_config, env.model, env.state)
         env.capture_stream = fake.new_stream(name="core-capture")
-    t.core_of(env).startup()
+    spy = t.AccessorSpy(monkeypatch, env.state)
+    core = t.core_of(env)
+    core.startup()
+    # Core binds the state layer's views again after the serving capture: with
+    # the option off the state layer reports nothing to compare.
+    assert h.call_with(core.bind_serving) is None, (
+        "a rebinding raised with the option off"
+    )
     env.state.clear_cudagraphs()
     env.state.shutdown()
+    assert spy.txg_reads(inside=True) == spy.txg_reads(inside=False) == [], (
+        "the transaction-graph part read the state-group layouts with the option off"
+    )
     assert fake.graphs == [], "a transaction-graph cell was created with the option off"
     assert fake.pinned_allocations == 0, (
         "the step arena was allocated with the option off"
@@ -636,8 +708,7 @@ def test_cells_replay_only_in_their_own_validation_and_on_verified_steps(on_cpu)
     assert env.fake.replay_count == replays, "a cell replayed before verification"
     core.post_warmup()
     mark = len(env.events)
-    # s0 still holds slot 1: core refuses a held slot at the same generation
-    # before the model runs.
+    # s1 takes a block of its own: s0 was added before its step raised.
     core.step(t.stream_unit(env, "s1"), handles={"s1": 2})
     replayed = [e[1] for e in env.events[mark:] if e[0] == "cuda.graph.replay"]
     assert replayed, "the verified covered step replayed no cell"

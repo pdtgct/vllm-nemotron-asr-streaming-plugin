@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Engine settings the model refuses or accepts (REG-ENG-001 to REG-ENG-026).
 
-``verify_and_update_config`` is called on ``VllmConfig``-shaped namespaces whose
-attribute paths are the ones core's own persistent-state validation reads
-(``validate_state_config``, ``vllm/v1/core/state_slot_manager.py``) plus
+Core's persistent-state check runs first while core builds a configuration and
+names the first setting it refuses; the tests of REG-ENG-002 to REG-ENG-004
+therefore call ``verify_and_update_config`` directly, on ``VllmConfig``-shaped
+namespaces whose attribute paths are the ones core's check reads
+(``VllmConfig._verify_persistent_state_config``, ``vllm/config/vllm.py``) plus
 ``model_config.enforce_eager``. A real ``VllmConfig`` on CPU is used where it
 constructs (the hook runs inside ``VllmConfig.__post_init__`` via
 ``try_verify_and_update_config``, ``vllm/config/vllm.py``) and for the
@@ -242,6 +244,26 @@ def test_every_refused_setting_is_listed_in_one_error(engine_config, platform):
         prefill_context_parallel_size=2,
     )
     _refuse(config, *(name for name in NAMES if name != "async_scheduling"))
+
+
+# @spec REG-VAL-003, REG-ENG-019, REG-ENG-009
+def test_native_burst_and_missing_hooks_are_listed_with_the_other_failures(
+    engine_config, platform, monkeypatch
+):
+    """``verify_and_update_config`` called directly (core's own check would
+    name prefix caching first): one ``ValueError`` lists the refused
+    setting, native burst on the state layer and a missing core hook."""
+    from vllm.v1.worker.gpu.model_states.interface import ModelState
+
+    platform(True)
+    monkeypatch.delattr(ModelState, "post_warmup")
+    config = engine_config(
+        enable_prefix_caching=True,
+        hf={"experimental_native_burst": True, "num_lookahead_tokens": 1},
+    )
+    message = _refuse(config, "enable_prefix_caching")
+    assert re.search(r"(?i)experimental_native_burst|native burst", message), message
+    assert "post_warmup" in message, message
 
 
 # --------------------------------------------------------------------------
@@ -581,14 +603,43 @@ def test_the_hook_configuration_is_accepted(engine_config, platform, case, stage
     _check(config, stage)
 
 
+def _no_state_layer_refusal(message: str) -> None:
+    """The target core defines ``ModelState.state_group_layouts``: nothing in
+    the refusal says transaction graphs are refused on the state layer or for
+    a missing layout accessor (TXG-CFG-016)."""
+    assert not rc.LAYOUT_ACCESSOR.search(message), message
+    assert rc.state_layer_mentions(message) == 0, message
+
+
 @STAGES
-# @spec REG-ENG-005, REG-ENG-006, TXG-CFG-016, TXG-CFG-011
-def test_transaction_graphs_at_80_ms_are_refused_on_the_state_layer(
+# @spec REG-ENG-005, REG-ENG-006, REG-ENG-025, TXG-CFG-016
+def test_transaction_graphs_at_80_ms_are_accepted_under_the_restricted_startup(
     engine_config, platform, stage
 ):
-    """Every other condition holds (80 ms, the default arms, NONE/NONE on
-    CUDA); the refusal carries the state-layer condition exactly once
-    (``support.runner_conditions.assert_one_state_layer_condition``)."""
+    """80 ms, the default arms, NONE/NONE on CUDA, synchronous scheduling and
+    a block count of the admission limit plus one: accepted on the target
+    core."""
+    config = _hook_config(
+        engine_config,
+        platform,
+        breakable=None if stage == "hook" else False,
+        num_lookahead_tokens=0,
+        transaction_graph_populations=[2],
+    )
+    config.cache_config.num_gpu_blocks_override = (
+        config.scheduler_config.max_num_seqs + 1
+    )
+    _check(config, stage)
+
+
+@STAGES
+# @spec REG-ENG-005, REG-ENG-006, TXG-CFG-016, TXG-CFG-019, TXG-CFG-011
+def test_transaction_graphs_without_a_block_count_are_refused_for_that_alone(
+    engine_config, platform, stage
+):
+    """Every other condition holds; without an explicit block count or KV
+    budget the refusal names the pool condition (TXG-CFG-019) and nothing
+    refuses transaction graphs for the state layer itself."""
     config = _hook_config(
         engine_config,
         platform,
@@ -597,7 +648,92 @@ def test_transaction_graphs_at_80_ms_are_refused_on_the_state_layer(
         transaction_graph_populations=[2],
     )
     message = _refused_at(config, stage)
-    rc.assert_one_state_layer_condition(message, config)
+    assert re.search(r"num[_-]gpu[_-]blocks[_-]override", message), message
+    assert rc.TRANSACTION_GRAPH_KEY in message, message
+    _no_state_layer_refusal(message)
+
+
+def _restricted(config):
+    """The block count of the restricted startup (TXG-CFG-019): the
+    admission limit plus one."""
+    config.cache_config.num_gpu_blocks_override = (
+        config.scheduler_config.max_num_seqs + 1
+    )
+    return config
+
+
+@pytest.mark.parametrize("value", [True, None], ids=repr)
+@STAGES
+# @spec REG-ENG-001, TXG-CFG-017
+def test_transaction_graphs_refuse_any_async_scheduling_but_false(
+    engine_config, platform, stage, value
+):
+    """REG-ENG-001's exception: while transaction graphs are on, an
+    ``async_scheduling`` that is not ``False`` is refused, naming the value
+    and ``--no-async-scheduling``."""
+    config = _restricted(
+        _hook_config(
+            engine_config,
+            platform,
+            breakable=None if stage == "hook" else False,
+            num_lookahead_tokens=0,
+            transaction_graph_populations=[2],
+        )
+    )
+    config.scheduler_config.async_scheduling = value
+    message = _refused_at(config, stage)
+    assert "--no-async-scheduling" in message, message
+    assert rc.TRANSACTION_GRAPH_KEY in message, message
+
+
+#: REG-ENG-005 while transaction graphs are on: each condition's one remedy,
+#: and the alternatives it must not offer (TXG-CFG-018 accepts only an
+#: explicit NONE).
+_TXG_ONLY_REMEDY = {
+    "graph mode": (
+        {"cudagraph": "full"},
+        r"(?i)-cc\.cudagraph_mode[ =]none",
+        (r"(?i)\bunset\b",),
+    ),
+    "breakable piecewise": (
+        {"cudagraph": "piecewise", "breakable": True},
+        r"(?i)-cc\.cudagraph_mode[ =]none",
+        (r"VLLM_USE_BREAKABLE_CUDAGRAPH=0",),
+    ),
+    "compilation mode": (
+        {"mode": "stock"},
+        r"(?i)-cc\.mode[ =]none",
+        (r"(?i)\bunset\b",),
+    ),
+}
+
+
+@pytest.mark.parametrize("condition", list(_TXG_ONLY_REMEDY))
+# @spec REG-ENG-005, REG-ENG-021, REG-ENG-022, REG-ENG-023
+def test_with_transaction_graphs_on_each_mode_remedy_is_the_explicit_none_alone(
+    engine_config, platform, condition
+):
+    """At model-state construction (the modes as core's build left them):
+    the clause naming the condition gives ``-cc.cudagraph_mode none`` or
+    ``-cc.mode none`` and no other alternative."""
+    modes, remedy, forbidden = _TXG_ONLY_REMEDY[condition]
+    settings = {"breakable": False, **modes}
+    config = _restricted(
+        _hook_config(
+            engine_config,
+            platform,
+            num_lookahead_tokens=0,
+            transaction_graph_populations=[2],
+            **settings,
+        )
+    )
+    message = _refuse_resolved(config)
+    found = [c for c in rc.clauses(message) if rc.names_condition(c, condition)]
+    assert found, (condition, message)
+    for clause in found:
+        assert re.search(remedy, clause), (condition, clause)
+        for alternative in forbidden:
+            assert not re.search(alternative, clause), (condition, clause)
 
 
 @pytest.mark.parametrize("cudagraph", ACCEPTED_GRAPHS)
@@ -873,8 +1009,8 @@ def test_an_enforce_eager_remedy_names_removing_transaction_graphs(
 ):
     """At 80 ms with the default arms, transaction graphs on: the clause
     carrying the ``--enforce-eager`` remedy itself names removing
-    ``transaction_graph_populations`` (TXG-CFG-016's own condition, which
-    names the option too, is a separate clause)."""
+    ``transaction_graph_populations`` (the transaction-graph conditions,
+    which name the option too, are separate clauses)."""
     config = _hook_config(
         engine_config,
         platform,
@@ -1051,13 +1187,15 @@ def test_model_state_refuses_a_core_without_the_hooks(
 def test_model_state_reruns_the_transaction_graph_checks(
     good_vllm_config, build_model_state
 ):
-    """The option turned on after the hook ran (under ``--enforce-eager``)
-    is refused at construction, naming the option, with the state-layer
-    condition exactly once."""
+    """The option turned on after the hook ran (under ``--enforce-eager``,
+    with no block count) is refused at construction, naming the option and
+    the conditions it violates (the eager runner, TXG-CFG-009; the pool,
+    TXG-CFG-019), and nothing refuses it for the state layer itself."""
     config = good_vllm_config()
     config.model_config.hf_config.transaction_graph_populations = [2]
     with pytest.raises(ValueError) as excinfo:
         build_model_state(config)
     message = str(excinfo.value)
     assert "transaction_graph_populations" in message
-    rc.assert_one_state_layer_condition(message, config)
+    assert "--enforce-eager" in message, message
+    _no_state_layer_refusal(message)

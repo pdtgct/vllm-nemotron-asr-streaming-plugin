@@ -22,8 +22,20 @@ Two ways to hold a model state on CPU (the CUDA environment is
   then core's hook configuration (``enforce_eager`` off, ``cudagraph_mode``
   NONE, compilation off).
 * ``on_cpu`` pairs an option-on environment with its
-  ``support.core_order.CoreOrder`` (``core_of``), which calls the model
-  state's hooks in core's order, one call at a time.
+  ``support.core_order.CoreOrder`` (``core_of``, a :class:`TxgCoreOrder`),
+  which calls the model state's hooks in core's order, one call at a time.
+
+Every environment built here follows core's state-group layout accessor
+(:func:`follow_state_group_layouts`): when core binds the state layer's
+views it sets ``ModelState._state_group_layouts`` from them before the model
+state's ``initialize_kv_cache``, and core's release of the profiling KV cache
+(after ``clear_cudagraphs``) resets it to ``()``. Transaction graphs read the
+state pools only through that accessor during a capture call (TXG-CAP-008,
+TXG-LIFE-003).
+
+Failed requests reach core through the model state's
+``take_failed_requests`` (REG-MS-003, REG-MS-004, TXG-FAIL-008):
+:class:`FailSpy` records every set it returns.
 
 The reader, the binding, the counter names, the capture-record keys
 (``txg_api.Record``) and the fallback key fields
@@ -54,6 +66,11 @@ DEFAULT_ARMS = {
     "decode_dispatch_arm": "dense-graphed",
 }
 FRESH_ENGINE = re.compile(r"fresh engine", re.IGNORECASE)
+#: The block count of every state pool a CPU environment's ``CoreOrder``
+#: binds, and its ``num_gpu_blocks_override`` under the restricted startup.
+CAPACITY = 8
+#: ``build_on_cpu``'s default block-count setting: the restricted startup's.
+RESTRICTED = object()
 
 
 # ---------------------------------------------------------------------------
@@ -271,12 +288,189 @@ def run_fallback_classes(env: Any, core: Any, *, first_slot: int = 1) -> list[st
 
 
 # ---------------------------------------------------------------------------
+# Core's state-group layout accessor (TXG-CAP-008, TXG-LIFE-003)
+
+
+def state_layer_of(env_or_runner: Any) -> Any:
+    """The model's state layer (``NemotronStateLayer``)."""
+    model = getattr(env_or_runner, "model", env_or_runner)
+    return model._persistent_state_layer
+
+
+def layouts_from_bound_views(runner: Any) -> tuple[Any, ...]:
+    """What core's ``get_state_group_layouts`` builds from the views it just
+    bound (``vllm/v1/worker/utils.py``): one ``StateGroupLayout`` for the one
+    non-recomputable group, holding the state layer's bound ``kv_cache``
+    views in the layer's spec order. Built with core's own function over a
+    ``KVCacheConfig`` double of the fields it reads."""
+    from vllm.v1.worker.utils import get_state_group_layouts
+
+    layer = state_layer_of(runner)
+    group = SimpleNamespace(
+        manager_config=SimpleNamespace(recomputable=False),
+        kv_cache_specs={layer.prefix: None},
+    )
+    return get_state_group_layouts(
+        SimpleNamespace(kv_cache_groups=[group]),
+        runner.vllm_config.compilation_config.static_forward_context,
+    )
+
+
+def follow_state_group_layouts(runner: Any) -> Any:
+    """Make ``runner``'s pool bindings set ``ModelState._state_group_layouts``
+    as core's model runner does: from the views it just bound, before the
+    model state's ``initialize_kv_cache`` (``model_runner.py``,
+    ``initialize_kv_cache``). Returns ``runner``. Idempotent with a harness
+    that sets them itself: both set the same layouts."""
+    state = runner.state
+    original = state.initialize_kv_cache
+    if getattr(original, "_txg_follows_layouts", False):
+        return runner
+
+    def initialize_kv_cache(*args: Any, **kwargs: Any) -> Any:
+        state._state_group_layouts = layouts_from_bound_views(runner)
+        return original(*args, **kwargs)
+
+    initialize_kv_cache._txg_follows_layouts = True  # type: ignore[attr-defined]
+    state.initialize_kv_cache = initialize_kv_cache
+    return runner
+
+
+def release_profiling_layouts(state: Any) -> None:
+    """Core's release of the profiling KV cache after ``clear_cudagraphs``
+    (``cudagraph_utils.py``, ``_teardown_profiling_state``): the accessor
+    returns ``()`` until the serving cache is bound."""
+    state._state_group_layouts = ()
+
+
+def component_layouts(state: Any) -> list[tuple[str, tuple[Any, ...]]]:
+    """The plain values of the accessor's current layouts, per state layer
+    and component in order: ``(layer, ((address, shape, strides, dtype),
+    ...))``. Empty when core has bound no KV cache."""
+    out = []
+    for layout in state.state_group_layouts:
+        for name, components in layout.layers.items():
+            out.append(
+                (
+                    name,
+                    tuple(pool_layout_of(component.tensor) for component in components),
+                )
+            )
+    return out
+
+
+TRANSACTION_GRAPH_SOURCE = "nemotron_asr/transaction_graph.py"
+
+
+def _called_from(source: str) -> bool:
+    import sys
+
+    frame = sys._getframe(2)
+    while frame is not None:
+        if frame.f_code.co_filename.replace("\\", "/").endswith(source):
+            return True
+        frame = frame.f_back
+    return False
+
+
+class AccessorSpy:
+    """Records every read of ``ModelState.state_group_layouts`` on ``state``
+    (the property, shadowed on the model state's class for the test): whether
+    it happened inside a ``capture_cudagraphs`` call, whether the
+    transaction-graph module (``transaction_graph.py``) made it, and weak
+    references to each layout object and component tensor it returned
+    (TXG-CAP-008, TXG-LIFE-003)."""
+
+    def __init__(self, monkeypatch: Any, state: Any) -> None:
+        import weakref
+
+        self.reads: list[dict[str, Any]] = []
+        self.inside = False
+        spy = self
+
+        def state_group_layouts(self: Any) -> Any:
+            layouts = self._state_group_layouts
+            spy.reads.append(
+                {
+                    "inside": spy.inside,
+                    "txg": _called_from(TRANSACTION_GRAPH_SOURCE),
+                    "layouts": [weakref.ref(layout) for layout in layouts],
+                    "tensors": [
+                        weakref.ref(component.tensor)
+                        for layout in layouts
+                        for components in layout.layers.values()
+                        for component in components
+                    ],
+                }
+            )
+            return layouts
+
+        monkeypatch.setattr(
+            type(state), "state_group_layouts", property(state_group_layouts)
+        )
+        capture = state.capture_cudagraphs
+
+        def capture_cudagraphs(*args: Any, **kwargs: Any) -> Any:
+            spy.inside = True
+            try:
+                return capture(*args, **kwargs)
+            finally:
+                spy.inside = False
+
+        state.capture_cudagraphs = capture_cudagraphs
+
+    def txg_reads(self, *, inside: bool) -> list[dict[str, Any]]:
+        """The transaction-graph module's reads inside (or outside) a
+        capture call."""
+        return [r for r in self.reads if r["txg"] and r["inside"] is inside]
+
+
+def make_layouts(*groups: dict[str, tuple[Any, ...]]) -> tuple[Any, ...]:
+    """State-group layouts in core's types: one per ``{layer: (tensor,
+    ...)}`` mapping, numbered from 0."""
+    from types import MappingProxyType
+
+    from vllm.v1.worker.utils import StateComponentLayout, StateGroupLayout
+
+    return tuple(
+        StateGroupLayout(
+            group_id,
+            MappingProxyType(
+                {
+                    name: tuple(StateComponentLayout(t) for t in tensors)
+                    for name, tensors in layers.items()
+                }
+            ),
+        )
+        for group_id, layers in enumerate(groups)
+    )
+
+
+def bound_views(env: Any) -> tuple[Any, ...]:
+    """The state layer's bound per-state views, in its spec order (what
+    core's layout holds)."""
+    return tuple(state_layer_of(env).kv_cache)
+
+
+class TxgCoreOrder(CoreOrder):
+    """``CoreOrder`` whose bindings follow core's state-group layout accessor
+    (:func:`follow_state_group_layouts`) and whose ``clear`` is followed by
+    core's release of the profiling KV cache
+    (:func:`release_profiling_layouts`)."""
+
+    def __init__(self, runner: Any, **kwargs: Any) -> None:
+        super().__init__(follow_state_group_layouts(runner), **kwargs)
+
+    def clear(self) -> None:
+        super().clear()
+        release_profiling_layouts(self.state)
+
+
+# ---------------------------------------------------------------------------
 # Builders
 
 
 def _common_spies(monkeypatch: Any, events: h.Events) -> SimpleNamespace:
-    h.spec_without_state_name(monkeypatch)
-    h.legacy_state_api(monkeypatch)
     return SimpleNamespace(
         profile=h.ProfileSpy(events).install(monkeypatch),
         advance=h.AdvanceSpy(events).install(monkeypatch),
@@ -320,7 +514,7 @@ def build_off(
         model=model,
         state=state,
         config=model.config,
-        runner=h.Runner(vllm_config, model, state),
+        runner=follow_state_group_layouts(h.Runner(vllm_config, model, state)),
         events=events,
         geometry=geometry_of(right_context),
         max_num_seqs=max_num_seqs,
@@ -348,10 +542,20 @@ def build_on_cpu(
     populations: Any = None,
     right_context: int = 0,
     max_num_seqs: int = 2,
+    max_num_active_seqs: int | None = None,
     kv_cache_memory_bytes: int | None = None,
+    num_gpu_blocks_override: Any = RESTRICTED,
+    capacity: int = CAPACITY,
     extensible_kv_cache: bool | None = False,
 ) -> SimpleNamespace:
-    """Transaction graphs on (``N = n``) through the fake-capture seam."""
+    """Transaction graphs on (``N = n``) through the fake-capture seam, under
+    the restricted startup (TXG-CFG-017 to TXG-CFG-019): synchronous
+    scheduling, an explicit NONE runner and compilation mode, and, unless
+    ``kv_cache_memory_bytes`` fixes a budget, ``num_gpu_blocks_override``
+    set to ``capacity``, the block count of every state pool the
+    environment's ``CoreOrder`` binds (core's profiling and serving KV caches
+    both hold the override's blocks, TXG-LIFE-004). ``max_num_active_seqs``
+    sets the admission limit below ``max_num_seqs``."""
     events = h.Events()
     spies = _common_spies(monkeypatch, events)
     vllm_config = h.build_vllm_config(
@@ -361,8 +565,12 @@ def build_on_cpu(
         overrides=dict(DEFAULT_ARMS),
     )
     _hook_configuration(vllm_config, [n] if populations is None else populations)
+    if num_gpu_blocks_override is RESTRICTED:
+        num_gpu_blocks_override = None if kv_cache_memory_bytes else capacity
     set_cache(vllm_config, kv_cache_memory_bytes=kv_cache_memory_bytes)
+    set_cache(vllm_config, num_gpu_blocks_override=num_gpu_blocks_override)
     set_cache(vllm_config, enable_extensible_kv_cache=extensible_kv_cache)
+    set_scheduler(vllm_config, max_num_active_seqs=max_num_active_seqs)
     monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
     _set_env_attr(monkeypatch, "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", True)
     fake = FakeCuda(events).install(monkeypatch)
@@ -374,22 +582,30 @@ def build_on_cpu(
         model=model,
         state=state,
         config=model.config,
-        runner=h.Runner(vllm_config, model, state),
+        runner=follow_state_group_layouts(h.Runner(vllm_config, model, state)),
         events=events,
         fake=fake,
         scatter=scatter,
         geometry=geometry_of(right_context),
         max_num_seqs=max_num_seqs,
+        admission_limit=max_num_seqs
+        if max_num_active_seqs is None
+        else max_num_active_seqs,
+        capacity=capacity,
         n=n,
         capture_stream=fake.new_stream(name="core-capture"),
         **vars(spies),
     )
 
 
-def core_of(env: Any) -> CoreOrder:
+def core_of(env: Any) -> TxgCoreOrder:
     """The ``CoreOrder`` of a CPU environment: its runner, its capture
     stream."""
-    return CoreOrder(env.runner, capture_stream=getattr(env, "capture_stream", None))
+    return TxgCoreOrder(
+        env.runner,
+        capture_stream=getattr(env, "capture_stream", None),
+        capacity=getattr(env, "capacity", CAPACITY),
+    )
 
 
 def on_cpu(monkeypatch: Any, tmp_path: Any, **kwargs: Any) -> SimpleNamespace:
@@ -408,6 +624,17 @@ def set_cache(vllm_config: Any, **values: Any) -> None:
             setattr(cache, key, value)
         except Exception:  # noqa: BLE001 - validated dataclass
             object.__setattr__(cache, key, value)
+
+
+def set_scheduler(vllm_config: Any, **values: Any) -> None:
+    """Set scheduler values (``max_num_active_seqs``) on a built
+    configuration, as ``set_cache`` does."""
+    scheduler = vllm_config.scheduler_config
+    for key, value in values.items():
+        try:
+            setattr(scheduler, key, value)
+        except Exception:  # noqa: BLE001 - validated dataclass
+            object.__setattr__(scheduler, key, value)
 
 
 def _set_env_attr(monkeypatch: Any, name: str, value: Any) -> None:
@@ -563,61 +790,83 @@ class SinkSpy:
 
 
 class FailSpy:
-    """Records every ``state_slots.fail_requests`` call (TXG-FAIL-008)."""
+    """Records every request set the model state's ``take_failed_requests``
+    returns (REG-MS-003, REG-MS-004, TXG-FAIL-008): core's runner calls it
+    after each step's ``postprocess_state``, and each call returns the
+    requests recorded since the previous one and clears the record.
 
-    def __init__(self, bindings: Any) -> None:
+    Wraps the method on the model state instance, so a harness that calls it
+    after each step and a test that calls it (``failed`` takes once more,
+    draining what the harness left) see the same sets."""
+
+    def __init__(self, state: Any) -> None:
         self.calls: list[set[str]] = []
-        core = h.core_bindings(bindings)
-        original = core.fail_requests
+        self._state = state
+        original = state.take_failed_requests
 
-        def fail_requests(request_ids):
-            self.calls.append(set(request_ids))
-            return original(request_ids)
+        def take_failed_requests() -> Any:
+            result = original()
+            if result:
+                self.calls.append(set(result))
+            return result
 
-        object.__setattr__(core, "fail_requests", fail_requests)
+        state.take_failed_requests = take_failed_requests
+
+    def take(self) -> Any:
+        """One ``take_failed_requests`` call, as core makes after a step."""
+        return self._state.take_failed_requests()
 
     @property
     def failed(self) -> set[str]:
+        """Every request returned so far, after one more drain."""
+        self.take()
         return set().union(*self.calls) if self.calls else set()
 
 
-def slots_at_step_start(bindings: Any, slots: Any) -> dict[int, torch.Tensor]:
-    """The pages of ``slots`` as core's slot initialization leaves them at
-    the start of the next step (after ``activate_requests``), filled when
-    that step runs. A rejected row's pages must equal these (TXG-FAIL-001,
-    TXG-FAIL-008)."""
-    core = h.core_bindings(bindings)
-    original = core.activate_requests
-    taken: dict[int, torch.Tensor] = {}
+def _after_initialization(env: Any, take: Any) -> None:
+    """Call ``take()`` now, and again right after the state layer's next
+    fresh-page initialization (``initialize_pages``, REG-STATE-010), which
+    runs before the step's transaction reads or writes a page."""
+    take()
+    layer = state_layer_of(env)
+    original = layer.initialize_pages
 
-    def activate_requests(*args: Any, **kwargs: Any) -> Any:
-        result = original(*args, **kwargs)
-        for slot in slots:
-            taken[slot] = h.slot_bytes(bindings, slot).clone()
-        object.__setattr__(core, "activate_requests", original)
+    def initialize_pages(slots: Any) -> Any:
+        result = original(slots)
+        take()
+        layer.initialize_pages = original
         return result
 
-    object.__setattr__(core, "activate_requests", activate_requests)
+    layer.initialize_pages = initialize_pages
+
+
+def slots_at_step_start(env: Any, slots: Any) -> dict[int, torch.Tensor]:
+    """The pages of ``slots`` as the next step's transaction finds them: the
+    pages now, replaced by the state layer's fresh-page initialization
+    (REG-STATE-010) once the next step runs it. A rejected row's pages must
+    equal these (TXG-FAIL-001, TXG-FAIL-008, TXG-MASK-006): preservation
+    starts after initialization."""
+    taken: dict[int, torch.Tensor] = {}
+
+    def take() -> None:
+        for slot in slots:
+            taken[slot] = h.slot_bytes(env.runner.bindings, slot).clone()
+
+    _after_initialization(env, take)
     return taken
 
 
-def pool_at_step_start(bindings: Any) -> dict[str, torch.Tensor]:
-    """The whole state pool as core's slot initialization leaves it at the
-    start of the next step (after ``activate_requests``: core zeroes and
-    initializes the page of every newly bound slot), under key ``"pool"``
-    once that step runs. A step that fails before it writes a page must leave
-    the pool equal to this (TXG-EXEC-003)."""
-    core = h.core_bindings(bindings)
-    original = core.activate_requests
+def pool_at_step_start(env: Any) -> dict[str, torch.Tensor]:
+    """The whole state pool as the next step's transaction finds it (the
+    pool now, replaced after the step's fresh-page initialization,
+    REG-STATE-010), under key ``"pool"``. A step that fails before it writes
+    a page must leave the pool equal to this (TXG-EXEC-003)."""
     taken: dict[str, torch.Tensor] = {}
 
-    def activate_requests(*args: Any, **kwargs: Any) -> Any:
-        result = original(*args, **kwargs)
-        taken["pool"] = h.pool_tensor(bindings).clone()
-        object.__setattr__(core, "activate_requests", original)
-        return result
+    def take() -> None:
+        taken["pool"] = h.pool_tensor(env.runner.bindings).clone()
 
-    object.__setattr__(core, "activate_requests", activate_requests)
+    _after_initialization(env, take)
     return taken
 
 

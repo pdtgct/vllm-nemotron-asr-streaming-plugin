@@ -50,6 +50,10 @@ def test_first_schedule_takes_samples_into_a_request_owned_buffer(
     )
     assert "f1" in state.file_buffers
     np.testing.assert_array_equal(state.file_buffers.stage("f1", 0, 20_000), original)
+    # recorded with the request's slot and admission generation (REG-STATE-002)
+    record = state.file_buffers._entries["f1"]
+    assert record.slot == 2
+    assert record.generation == state._requests["f1"].handle.generation
 
     assert state.file_buffers.header("f1").dtype == np.int64
     assert state.file_buffers.header("f1").tolist() == [3, LOCALES["en-GB"], 20_000]
@@ -84,11 +88,14 @@ def test_stream_carrier_request_gets_no_file_buffer(file_model_state, make_step)
     assert "s1" not in state.file_buffers
 
 
-# @spec FILE-BUF-003
+# @spec FILE-BUF-003, REG-STATE-016
 @pytest.mark.parametrize("with_other_work", [False, True])
-def test_finished_request_frees_buffer_even_without_forward_work(
+def test_remove_request_frees_the_buffer_even_without_forward_work(
     file_model_state, make_step, with_other_work
 ):
+    """Core calls ``remove_request`` for a finished request, also on a step
+    with no forward work (nothing scheduled: no other model-state call
+    follows); the buffer is freed within that call."""
     state = file_model_state()
     run_step(
         state,
@@ -115,8 +122,13 @@ def test_finished_request_frees_buffer_even_without_forward_work(
     assert "f2" in state.file_buffers
 
 
-# @spec FILE-BUF-003
-def test_preempted_or_aborted_ids_are_just_finished_ids(file_model_state, make_step):
+# @spec FILE-BUF-003, REG-STATE-016
+def test_remove_request_frees_the_buffer_for_any_finish_and_a_repeat_is_harmless(
+    file_model_state, make_step
+):
+    """Whatever the finish reason (stop, length, abort, error), core's call is
+    the same ``remove_request``; a second one for the same ID changes
+    nothing."""
     state = file_model_state()
     run_step(
         state,
@@ -125,9 +137,10 @@ def test_preempted_or_aborted_ids_are_just_finished_ids(file_model_state, make_s
             handles={"f1": make_step.handle(1, 1)},
         ),
     )
-    run_step(state, make_step.step(finished=["f1"]))
+    state.remove_request("f1")
+    assert "f1" not in state.file_buffers, "not freed within the call"
+    state.remove_request("f1")  # a repeat is harmless
     assert "f1" not in state.file_buffers
-    run_step(state, make_step.step(finished=["f1"]))  # a repeat is harmless
 
 
 # @spec FILE-BUF-004

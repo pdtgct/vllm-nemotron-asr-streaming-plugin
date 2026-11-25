@@ -167,12 +167,11 @@ def test_a_pre_launch_failure_propagates_without_latching(on_cuda, monkeypatch, 
     d.add_stream("s1", [{}])
     if where == "prepare":
         spy_phase(monkeypatch, events, api.PHASES[0], fail=injected)
-    # The pages at the step's start: core's slot initialization of the new
-    # request's slot (``activate_requests``) precedes the model's step.
-    start = t.pool_at_step_start(env.bindings)
+    # The pages as the step's transaction finds them: the fresh-page
+    # initialization of the new request's slot (REG-STATE-010) precedes it.
+    start = t.pool_at_step_start(env)
     with pytest.raises(RuntimeError, match="injected"):
         d.step()
-    assert "pool" in start, "the step never reached activate_requests"
     assert torch.equal(start["pool"], h.pool_tensor(env.bindings)), "a page changed"
     assert env.binding.failed is False
     assert not [e for e in events if e[0] == "replay"]
@@ -227,6 +226,102 @@ def test_one_host_to_device_copy_per_covered_step(on_cuda, monkeypatch):
         counts = g.memcpy_counts(prof)
         assert counts["HtoD"] == 1, counts
         assert counts["DtoD"] >= 2, counts
+
+
+# @spec TXG-EXEC-007, TXG-COV-002
+def test_covered_steps_are_one_token_steps_read_from_the_static_inputs(on_cuda):
+    """Every covered step schedules one token per row, so its ``input_ids``
+    and ``inputs_embeds`` hold ``P`` entries, row ``i`` at step position
+    ``i``, which the two device copies place in the first ``P`` rows of the
+    static inputs; the cells' gathers from them by step position reproduce
+    the option-off transaction (``GpuEnv.compare``)."""
+    env = on_cuda(startup=True, lookahead=0, n=N)
+    records = env.compare()
+    d = g.Driver(env)
+    d.add_stream("s1", [{}, {}, {}])
+    d.add_stream("s2", [{}, {}])
+    d.add_file("f1", 5000)
+    d.run(15)
+    covered = [r for r in records if r.covered]
+    assert covered, "no step was covered"
+    for record in covered:
+        population = len(record.plan.request_ids)
+        assert record.inputs_embeds.shape[0] == population
+        assert record.input_ids is None or record.input_ids.shape[0] == population
+        assert not record.problems, record.problems
+
+
+# @spec TXG-EXEC-010
+def test_the_reservation_reads_the_views_bound_at_the_step(on_cuda):
+    """Every resident pool a covered step reserves and commits through is a
+    view of the state layer's per-state views as core bound them at that step
+    (``component_pools``)."""
+    from support import txgcap_harness as t
+
+    env = on_cuda(startup=True, lookahead=0, n=N)
+    records = env.compare()
+    seen = []
+    real = env.binding.execute
+
+    def execute(core, input_ids, inputs_embeds, plan, **kwargs):
+        layer = t.state_layer_of(env)
+        views = list(layer.component_pools.values())
+        seen.append((views, g.tx.pools_of(kwargs)))
+        return real(core, input_ids, inputs_embeds, plan, **kwargs)
+
+    env._patches.setattr(env.binding, "execute", execute)
+    d = g.Driver(env)
+    d.add_stream("s1", [{}, {}])
+    d.add_stream("s2", [{}])
+    d.run(8)
+    assert any(r.covered for r in records)
+    for views, pools in seen:
+        for name, pool in pools.flat():
+            assert any(t.within(view, pool) for view in views), (
+                f"{name} is not a view of the state layer's bound views"
+            )
+
+
+# @spec TXG-EXEC-010, TXG-EXEC-003
+def test_a_commit_whose_rows_disagree_with_the_step_bindings_writes_nothing(on_cuda):
+    """A covered step whose row order no longer equals the step's row
+    bindings (REG-STATE-004) is refused before its first launch: it
+    propagates, launches no cell, changes no page and holds no reservation."""
+    import dataclasses
+
+    from support import model_harness as h
+    from support import txgcap_harness as t
+
+    env = on_cuda(startup=True, lookahead=0, n=N)
+    events = []
+
+    def swap(kwargs, plan):
+        if len(plan.bindings) < 2:
+            return kwargs, plan
+        order = [1, 0, *range(2, len(plan.bindings))]
+        index = torch.tensor(order)
+        moved = dataclasses.replace(
+            plan,
+            bindings=tuple(plan.bindings[i] for i in order),
+            request_ids=tuple(plan.request_ids[i] for i in order),
+            state_indices_p=plan.state_indices_p[index],
+        )
+        return kwargs, moved
+
+    records = env.compare(mutate=swap, events=events)
+    env.spy_replays(events)
+    d = g.Driver(env)
+    d.add_stream("s1", [{}])
+    d.add_stream("s2", [{}])
+    # the pages as the transaction finds them, after the step's fresh-page
+    # initialization (REG-STATE-010)
+    start = t.pool_at_step_start(env)
+    with pytest.raises(Exception):
+        d.step()
+    assert not [e for e in events if e[0] == "replay"], "a cell launched"
+    assert records and all(r.cancelled for r in records[-1].sink.reservations)
+    assert torch.equal(start["pool"], h.pool_tensor(env.bindings)), "a page changed"
+    assert env.binding.failed is False
 
 
 # @spec TXG-EXEC-010, TXG-QC-002

@@ -26,7 +26,18 @@ LIVENESS_SPEC = "TXG-MODEL-004"
 #: Actions TXG-MODEL-002 requires, as identifier stems (case and underscores
 #: ignored).
 ACTION_STEMS = [
-    "initializestateslots",
+    # Core binds the profiling and the serving KV cache's views, setting the
+    # state-group layout at each binding, and clears it when it releases the
+    # profiling KV cache after clear_cudagraphs; a binding after the serving
+    # capture with an equal and with a changed layout (TXG-LIFE-009).
+    "bindkvcache",
+    "stategrouplayout",
+    "releaseprofilingkvcache",
+    # The pool-access check of TXG-CAP-008, able to fail.
+    "poolaccess",
+    # The restricted startup's block-count or budget setting (TXG-CFG-019).
+    "blockcount",
+    "budget",
     "prepareexecutionmemory",
     "capturecudagraphs",
     "clearcudagraphs",
@@ -115,6 +126,33 @@ def test_models_have_every_required_action(models_dir):
     text = normalized(" ".join(t.read_text() for t in specs(models_dir)))
     missing = [stem for stem in ACTION_STEMS if stem not in text]
     assert not missing, f"no action for {missing}"
+
+
+# @spec TXG-MODEL-002, TXG-MODEL-006
+def test_models_follow_the_state_layer_not_the_deleted_slot_bindings(models_dir):
+    """The capture lifecycle reaches the pools through core's state-group
+    layout; the deleted ``initialize_state_slots`` hook and its startup
+    access are no longer core's."""
+    text = normalized(" ".join(t.read_text() for t in specs(models_dir)))
+    stale = [s for s in ("initializestateslots", "startuppoolaccess") if s in text]
+    assert not stale, f"the models still model {stale}"
+
+
+# @spec TXG-MODEL-008
+def test_the_profiling_invariant_covers_the_state_group_layout(models_dir):
+    """TXG-MODEL-008 also checks that the transaction-graph part reads the
+    state-group layout only inside a capture call: a checked model's header
+    explains it with the invariant it cites."""
+    heads = [
+        header(tla.read_text())
+        for tla in specs(models_dir)
+        if checked_names(tla.with_suffix(".cfg").read_text())
+    ]
+    citing = [h for h in heads if "TXG-MODEL-008" in h]
+    assert citing, "no checked model cites TXG-MODEL-008"
+    assert any("stategrouplayout" in normalized(h.replace("-", "")) for h in citing), (
+        "no header citing TXG-MODEL-008 explains the state-group layout read"
+    )
 
 
 def assert_cited(models_dir, spec_ids):

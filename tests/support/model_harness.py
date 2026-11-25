@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The real model and model state on CPU, driven as core's model runner drives
-them at the stage 1 tree (``vllm/v1/worker/gpu/model_runner.py``:
+them on the target core, ``pdtgct/vllm`` at ``ddf6db2ab8``
+(``vllm/v1/worker/gpu/model_runner.py``:
 ``execute_model``, ``_dummy_run``, ``profile_run``, ``_dummy_sampler_run``;
 ``vllm/model_executor/warmup/kernel_warmup.py`` for later profiling steps).
 
@@ -31,8 +32,9 @@ Omissions from core's step, by design of a CPU harness:
   branches, and core's ``Sampler`` (a GPU module): real steps call
   ``compute_sample_logits`` but sample nothing; dummy sampling uses the
   caller's recording sampler (``RecordingSampler``).
-* ``finish_step`` creates a CUDA event; on CPU it runs with a silent
-  ``support.fake_cuda.FakeEvent``, everything else in it is core's.
+* Core's ``ModelRunnerOutput``: after ``postprocess_state`` the runner asks
+  ``take_failed_requests`` once per step, as core's does, and records the
+  answer in ``Runner.failed_log`` (REG-MS-004); it builds no output.
 * ``StepRequestStates`` stands in for the runner's ``RequestState``; the model
   state reads only ``req_id_to_index``.
 
@@ -48,10 +50,6 @@ Seams the doubles rely on (call-time lookups in the plugin):
 * ``decode_graph.platform_graph_runtime``, also bound by name in
   ``chunk_bucket_graph`` and ``encoder_execution`` (``FakeGraphRuntime``
   replaces it, since CPU cannot capture graphs).
-
-Migration-blocker isolation: ``spec_without_state_name`` and
-``legacy_state_api`` patched the deleted ``PersistentStateSpec`` and
-``StateSlotBindings``; on the PR 6 build they do nothing.
 """
 
 from __future__ import annotations
@@ -103,6 +101,7 @@ def build_vllm_config(
     overrides: dict[str, Any] | None = None,
     device: str = "cpu",
     enforce_eager: bool = True,
+    num_gpu_blocks_override: int | None = None,
 ) -> Any:
     """The engine configuration of a server at lookahead ``right_context``.
 
@@ -112,7 +111,10 @@ def build_vllm_config(
     builds the hook configuration (REG-ENG-005: ``-cc.mode none`` and
     ``-cc.cudagraph_mode none``), which transaction graphs require
     (TXG-CFG-009); ``support.core_order.CoreOrder`` then runs core's capture
-    hooks. The CPU tests keep the eager runner."""
+    hooks. The CPU tests keep the eager runner. While ``overrides`` turn
+    transaction graphs on, the configuration is the restricted startup
+    (TXG-CFG-017 to TXG-CFG-019: synchronous scheduling, both modes NONE, and
+    ``num_gpu_blocks_override`` the admission limit plus one unless given)."""
     from vllm.config import (
         CacheConfig,
         CompilationConfig,
@@ -141,10 +143,16 @@ def build_vllm_config(
         compilation["compilation_config"] = CompilationConfig(
             mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE
         )
+    populations = (overrides or {}).get("transaction_graph_populations")
+    if num_gpu_blocks_override is None and populations not in (None, []):
+        num_gpu_blocks_override = max_num_seqs + 1
     return VllmConfig(
         model_config=model_config,
         device_config=DeviceConfig(device=device),
-        cache_config=CacheConfig(enable_prefix_caching=False),
+        cache_config=CacheConfig(
+            enable_prefix_caching=False,
+            num_gpu_blocks_override=num_gpu_blocks_override,
+        ),
         **compilation,
         scheduler_config=SchedulerConfig.default_factory(
             async_scheduling=False,
@@ -153,16 +161,6 @@ def build_vllm_config(
             enable_chunked_prefill=True,
         ),
     )
-
-
-def spec_without_state_name(monkeypatch: Any) -> None:
-    """See the module docstring (a no-op on the PR 6 build)."""
-    del monkeypatch
-
-
-def legacy_state_api(monkeypatch: Any, **parts: bool) -> None:
-    """See the module docstring (a no-op on the PR 6 build)."""
-    del monkeypatch, parts
 
 
 def build_model(vllm_config: Any) -> Any:
@@ -360,6 +358,37 @@ def pool_tensor(bindings: Any) -> torch.Tensor:
 def slot_bytes(bindings: Any, slot: int) -> torch.Tensor:
     page = core_bindings(bindings).layout.page_size_bytes
     return pool_tensor(bindings)[slot * page : (slot + 1) * page]
+
+
+def state_layer_of(model: Any) -> Any:
+    """The model's state layer, through a ``support.state_layer.ViewTrap``
+    standing in for it."""
+    layer = model._persistent_state_layer
+    return getattr(layer, "_layer", layer)
+
+
+def state_group_layouts(layer: Any) -> tuple[Any, ...]:
+    """What core's ``get_state_group_layouts`` returns for the model's one
+    state group: its layer's bound ``kv_cache`` views, in order."""
+    from types import MappingProxyType
+
+    from vllm.v1.worker.utils import StateComponentLayout, StateGroupLayout
+
+    components = tuple(StateComponentLayout(view) for view in layer.kv_cache)
+    return (StateGroupLayout(0, MappingProxyType({layer.prefix: components})),)
+
+
+def release_profiling_kv_cache(state: Any, model: Any) -> None:
+    """Core's teardown of the profiling KV cache after ``clear_cudagraphs``
+    (``_teardown_profiling_state``): the state-group layouts emptied, the
+    layer's ``kv_cache`` cleared (``clear_layer_kv_caches``), a collection."""
+    import gc
+
+    from vllm.v1.worker.utils import clear_layer_kv_caches
+
+    state._state_group_layouts = ()
+    clear_layer_kv_caches([state_layer_of(model)])
+    gc.collect()
 
 
 def kv_cache_config(model: Any, num_blocks: int) -> Any:
@@ -747,8 +776,8 @@ def scheduler_output(
     (default 1). ``handles`` maps request IDs to a slot or ``(slot,
     generation)``; a new request's slot becomes its ``block_ids`` (the
     generation is the model state's, so the given one is not sent).
-    ``cleanup`` and ``step_seq`` are accepted and not sent (PR 6 has
-    neither). When ``encoder_inputs`` is ``None``, every new request with a
+    ``cleanup`` and ``step_seq`` are accepted and not sent (the target core
+    has neither). When ``encoder_inputs`` is ``None``, every new request with a
     multimodal feature has its feature scheduled, as core schedules it on
     first sight."""
     from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
@@ -860,13 +889,14 @@ class Runner:
         self._execution_memory_prepared = False
         self.req_states = StepRequestStates()
         self._prompts: dict[str, list[int]] = {}
-        #: The token fed at each position of each live request, and its
-        #: multimodal features: what PR 6's scheduler re-sends at a turn.
+        #: The token fed at each position of each live request's current
+        #: prompt, and its multimodal features: the history core compacts
+        #: when it folds the request's next turn in.
         self._fed: dict[str, list[int]] = {}
         self._features: dict[str, list[Any]] = {}
-        #: Where each request's current turn starts in its cumulative
-        #: prompt: tests count a turn's cached positions from 0, as the
-        #: earlier core did; the harness adds this base.
+        #: Where each request's current turn starts in its prompt: tests
+        #: count a turn's cached positions from 0, as an earlier core did;
+        #: the harness adds this base (1 after compaction: the frontier).
         self._turn_base: dict[str, int] = {}
         #: The tokens the current step feeds and its new requests' features,
         #: recorded once it completes.
@@ -877,6 +907,9 @@ class Runner:
         self._sampled: dict[str, int] = {}
         #: ``(statuses, failed)`` of every real step's commit, in order.
         self.commit_log: list[tuple[dict[str, int], set[str]]] = []
+        #: What ``take_failed_requests`` returned after each real step's
+        #: ``postprocess_state``, in order (core asks once per step).
+        self.failed_log: list[set[str] | None] = []
         #: The ``QueueCount`` values of every real step's collection, in
         #: order (FILE-QC-005), as ``collect_commit_status`` returned them.
         self.queue_count_log: list[tuple[Any, ...]] = []
@@ -912,9 +945,14 @@ class Runner:
 
     def bind_pool(self, bindings: Any) -> Any:
         """Core's ``initialize_kv_cache``: bind the pool to the state layer
-        (``bind_kv_cache``), then the model state's ``initialize_kv_cache``."""
+        (``bind_kv_cache``), install the state-group layout core builds from
+        the layer's bound ``kv_cache`` (``get_state_group_layouts``, as
+        ``ModelState._state_group_layouts``), then the model state's
+        ``initialize_kv_cache``."""
         pool = core_bindings(bindings)
-        self.model._persistent_state_layer.bind_kv_cache(pool.tensor)
+        layer = state_layer_of(self.model)
+        layer.bind_kv_cache(pool.tensor)
+        self.state._state_group_layouts = state_group_layouts(layer)
         self.state.initialize_kv_cache(kv_cache_config(self.model, pool.capacity), None)
         self.bindings = bindings
         if isinstance(bindings, BindingsSpy):
@@ -1113,6 +1151,8 @@ class Runner:
             torch.ones(batch.num_reqs, dtype=torch.int32, device=state.device),
             None,
         )
+        # core's runner asks once per step, after ``postprocess_state``
+        self.failed_log.append(state.take_failed_requests())
         self._phase("finish_step")
         # A step that raised fed nothing: core would have stopped the engine.
         for req_id, position, token in self._step_fed:
@@ -1125,8 +1165,8 @@ class Runner:
     def _record_binding(self, kwargs: dict[str, Any]) -> None:
         """Record the rows the step bound (``BindingsSpy.bind_calls``): the
         layer, the request IDs in row order, their ``SlotHandle``s and the
-        phase. PR 6 has no ``bind_rows``; the model state binds the rows when
-        it builds the step's state batch in ``prepare_inputs``."""
+        phase. The target core has no ``bind_rows``; the model state binds the
+        rows when it builds the step's state batch in ``prepare_inputs``."""
         snapshot = kwargs.get("persistent_state_projection")
         spy = self.bindings
         if not isinstance(spy, BindingsSpy) or snapshot is None:
@@ -1143,65 +1183,55 @@ class Runner:
         )
 
     def _as_session_turns(self, output: Any) -> Any:
-        """Re-deliver a session's next turn as PR 6's scheduler does. A test
-        sends a live request again as a new request with no computed tokens
-        (the earlier core replaced the prompt each turn); PR 6 sends it with
-        its cumulative prompt (every token fed so far, then the new input),
-        ``num_computed_tokens`` at the end of what was fed, and every earlier
-        feature (its data stripped once covered) before the new ones, whose
-        offsets move to the new input's position."""
+        """Re-deliver a session's next turn as the target core does (the
+        registration design, Recorded prompt; REG-STATE-008, REG-STATE-011).
+        A test sends a live request again as a new request with no computed
+        tokens; core folds the turn into the same request and compacts its
+        history: it drops the last sampled token (the park) and every earlier
+        token but the frontier (the last token fed), delivers the frontier
+        followed by the new input as the prompt with ``num_computed_tokens``
+        1 on the same slot, and keeps only the new input's features, at
+        offsets past the frontier. The runner's ``remove_request`` before the
+        ``add_request`` is core's."""
         from vllm.multimodal.inputs import PlaceholderRange
 
         new_reqs = []
         self._step_features = {}
-        encoder_inputs = dict(output.scheduled_encoder_inputs)
         changed = False
         for request in output.scheduled_new_reqs:
             history = self._fed.get(request.req_id)
             self._turn_base[request.req_id] = 0
             if history and int(request.num_computed_tokens) == 0:
-                base = len(history)
-                self._turn_base[request.req_id] = base
-                previous = [
-                    dataclasses.replace(f, data=None)
-                    for f in self._features.get(request.req_id, [])
-                ]
+                frontier = int(history[-1])
+                self._turn_base[request.req_id] = 1
+                self._fed[request.req_id] = [frontier]
                 shifted = [
                     dataclasses.replace(
                         f,
-                        identifier=f"{f.identifier}-at-{base}",
                         mm_position=PlaceholderRange(
-                            offset=int(f.mm_position.offset) + base,
+                            offset=int(f.mm_position.offset) + 1,
                             length=int(f.mm_position.length),
                         ),
                     )
                     for f in request.mm_features
                 ]
-                prompt = list(history) + list(request.prefill_token_ids)
+                prompt = [frontier, *request.prefill_token_ids]
                 request = dataclasses.replace(
                     request,
                     prompt_token_ids=prompt,
                     prefill_token_ids=prompt,
-                    mm_features=previous + shifted,
-                    num_computed_tokens=base,
+                    mm_features=shifted,
+                    num_computed_tokens=1,
                 )
-                if request.req_id in encoder_inputs:
-                    encoder_inputs[request.req_id] = [
-                        len(previous) + int(i) for i in encoder_inputs[request.req_id]
-                    ]
                 changed = True
             self._step_features[request.req_id] = list(request.mm_features)
             new_reqs.append(request)
         if not changed:
             return output
-        return dataclasses.replace(
-            output,
-            scheduled_new_reqs=new_reqs,
-            scheduled_encoder_inputs=encoder_inputs,
-        )
+        return dataclasses.replace(output, scheduled_new_reqs=new_reqs)
 
     def _finish(self, output: Any) -> Any:
-        """PR 6 has no step completion: nothing is returned."""
+        """The target core has no step completion: nothing is returned."""
         del output
         return None
 

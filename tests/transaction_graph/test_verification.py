@@ -4,8 +4,9 @@
 CPU tests (``engine``) perturb one recorded quantity at a time after the
 serving capture, through the fake-capture seam, and require ``post_warmup``
 to fail, latch and report the first failing check in TXG-VER-001's order.
-Perturbations use public objects (core's ``pool_layout``, the cells' graph
-objects, a model parameter's storage, the per-operation precision setting)
+Perturbations use public objects (the state layer's currently bound views,
+``component_pools``, the cells' graph objects, a model parameter's storage,
+the per-operation precision setting)
 and one model-internal seam, the dense decode binding's per-key callable
 cache (``_decode_fns``), for the callable-identity check. The projected
 resident layout per role (check 2) is exercised only through its effect in
@@ -28,22 +29,20 @@ def captured(run):
 
 
 def perturb_layout(monkeypatch, env):
-    from vllm.v1.worker.gpu.state_slots import StateSlotBindings
-
-    original = StateSlotBindings.pool_layout
-
-    def pool_layout(self, layer):
-        live = dict(original(self, layer))
-        name = sorted(live)[0]
-        live[name] = type(live[name])(
-            live[name].data_ptr + 4096,
-            live[name].shape,
-            live[name].stride,
-            live[name].dtype,
+    """The state layer's currently bound views (``component_pools``) no
+    longer have the plain-value layout the serving capture recorded: one
+    component is a copy at another address, as a rebinding the binding never
+    saw would leave it."""
+    layer = t.state_layer_of(env)
+    pools = dict(layer.component_pools)
+    name = next(iter(pools))
+    pools[name] = pools[name].clone()
+    if isinstance(getattr(type(layer), "component_pools", None), property):
+        monkeypatch.setattr(
+            type(layer), "component_pools", property(lambda self: pools)
         )
-        return live
-
-    monkeypatch.setattr(StateSlotBindings, "pool_layout", pool_layout)
+    else:
+        monkeypatch.setattr(layer, "component_pools", pools)
 
 
 def perturb_cells(monkeypatch, env):

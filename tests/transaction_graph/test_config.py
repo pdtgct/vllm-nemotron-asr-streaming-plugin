@@ -1,56 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
 """The transaction-graph option and its configuration checks (TXG-CFG-001 to
-TXG-CFG-016).
+TXG-CFG-020).
 
-Every core this build supports has a state layer without a state-group layout
-accessor, so whenever transaction graphs are on the checks also return
-TXG-CFG-016's state-layer condition (``errors_for`` asserts that exactly one
-condition mentions the state layer, that it is TXG-CFG-016's in full, and
-returns the other conditions).
+The target core's ``ModelState`` defines ``state_group_layouts``, so the
+checks return TXG-CFG-016's state-layer condition only for a core without
+it; ``api.config_errors`` passes that capability (``state_group_layouts``,
+default the target core's). The configuration doubles
+(``support.txg_fakes.engine_config``) meet the restricted startup by default
+(TXG-CFG-017 to TXG-CFG-019): synchronous scheduling, ``cudagraph_mode`` and
+compilation mode NONE, and ``num_gpu_blocks_override`` the admission limit
+plus one. A test that violates one condition therefore sees exactly that
+condition.
 
 CPU tests on configuration doubles (``support.txg_fakes``), except the
-callers of TXG-CFG-011, which use the stage 1 build (``engine``). The checks'
-interface is documented in ``support.txg_api``.
+callers of TXG-CFG-011 and TXG-CFG-016, which use the stage 1 build
+(``engine``). The checks' interface is documented in ``support.txg_api``;
+the remedy patterns are ``support.txg_conditions``'.
 """
 
 from __future__ import annotations
 
-import contextlib
 import copy
-import json
 import os
 import subprocess
 import sys
 from types import SimpleNamespace
 
 import pytest
-from support import runner_conditions as rc
 from support import txg_api as api
-from support.txg_fakes import engine_config, hf_config
+from support import txg_conditions as cond
+from support.txg_fakes import CompilationMode, GraphMode, engine_config, hf_config
 
 KEY = api.KEY
 VALID = [4]
+shows_value = cond.shows_value
 
 
-def without_state_layer(errors, value):
-    """The conditions other than TXG-CFG-016's, after asserting that exactly
-    one condition mentions the state layer and that it is TXG-CFG-016's in
-    full: the option, the rejected ``value`` (TXG-CFG-003), the missing
-    state-group layout accessor and the option's removal. A condition that
-    folded another violation into the state-layer one would be the one
-    mentioning it, so it is not silently dropped: the other conditions are
-    still asserted by the callers."""
-    found = [e for e in errors if rc.state_layer_mentions(e)]
-    assert len(found) == 1, errors
-    (condition,) = found
-    assert rc.is_state_layer_condition(condition), condition
-    assert shows_value(condition, value), (value, condition)
-    return [e for e in errors if e != condition]
-
-
-def errors_for(populations=VALID, **kwargs):
-    """The conditions other than the state-layer one (TXG-CFG-016) for a
-    configuration with transaction graphs on; asserts that one is there."""
+def errors_for(populations=VALID, *, state_group_layouts=True, **kwargs):
+    """The conditions for a configuration with transaction graphs on."""
     hf_kwargs = {
         k: kwargs.pop(k)
         for k in list(kwargs)
@@ -63,9 +50,9 @@ def errors_for(populations=VALID, **kwargs):
             "chunk_populations",
         )
     }
-    return without_state_layer(
-        api.config_errors(engine_config(hf_config(populations, **hf_kwargs), **kwargs)),
-        populations,
+    return api.config_errors(
+        engine_config(hf_config(populations, **hf_kwargs), **kwargs),
+        state_group_layouts=state_group_layouts,
     )
 
 
@@ -73,16 +60,12 @@ def mentioning(errors, *needles):
     return [e for e in errors if all(n.lower() in e.lower() for n in needles)]
 
 
-def shows_value(error, value):
-    """Whether ``error`` shows ``value``: its ``repr``, ``str`` or JSON
-    rendering, or a string bare or in any common quotes. An empty rendering
-    shows nothing, so ``""`` must appear quoted."""
-    forms = {repr(value), str(value)}
-    with contextlib.suppress(TypeError, ValueError):
-        forms.add(json.dumps(value))
-    if isinstance(value, str):
-        forms |= {f"'{value}'", f'"{value}"', f"`{value}`"}
-    return any(form and form.lower() in error.lower() for form in forms)
+def only(errors):
+    """The one condition of a configuration that violates exactly one."""
+    assert len(errors) == 1, errors
+    (error,) = errors
+    assert KEY in error, error
+    return error
 
 
 def patch_served_lookahead(monkeypatch, fn):
@@ -156,9 +139,7 @@ def test_option_is_read_only_from_its_key():
 # @spec TXG-CFG-001, TXG-CFG-004
 @pytest.mark.parametrize("value", ON_VALUES[1:])
 def test_malformed_values_are_on_and_refused(value):
-    errors = without_state_layer(
-        api.config_errors(engine_config(hf_config(value))), value
-    )
+    errors = api.config_errors(engine_config(hf_config(value)))
     # required information: the option's name and the offending value, in
     # whatever quoting the diagnostic uses
     assert [e for e in mentioning(errors, KEY) if shows_value(e, value)], errors
@@ -168,15 +149,25 @@ def test_malformed_values_are_on_and_refused(value):
 
 # @spec TXG-CFG-003
 @pytest.mark.parametrize("value", OFF_VALUES)
-def test_no_condition_while_off(value):
+@pytest.mark.parametrize("state_group_layouts", [True, False], ids=["accessor", "none"])
+def test_no_condition_while_off(value, state_group_layouts):
     """With the option off, nothing this function checks is reported, even
-    for settings that the option on would refuse."""
+    for settings that the option on would refuse, on a core with or without
+    the state-group layout accessor."""
     hf = served(value)
     hf.num_lookahead_tokens = 3
     hf.experimental_native_burst = True
     hf.encoder_execution_arm = "eager"
-    config = engine_config(hf, enforce_eager=True, num_gpu_blocks_override=2)
-    assert api.config_errors(config) == []
+    config = engine_config(
+        hf,
+        enforce_eager=True,
+        num_gpu_blocks_override=None,
+        async_scheduling=None,
+        cudagraph_mode=None,
+        compilation_mode=None,
+        max_num_active_seqs=1,
+    )
+    assert api.config_errors(config, state_group_layouts=state_group_layouts) == []
 
 
 # ---------------------------------------------------------------------------
@@ -212,22 +203,36 @@ def test_entries_other_than_the_largest_are_validated():
         pytest.param([4, 4], id="duplicate"),
         pytest.param([0], id="zero"),
         pytest.param([-1], id="negative"),
-        pytest.param([65], id="above-max-num-seqs"),
         pytest.param((4,), id="tuple"),
         pytest.param({4}, id="set"),
     ],
 )
 def test_populations_condition(value):
-    errors = errors_for(value, max_num_seqs=64, max_num_batched_tokens=8192)
-    found = mentioning(errors, KEY)
-    assert len(found) == 1, errors
-    assert repr(value) in found[0] or str(value) in found[0], found
-    if value == [65]:
-        # The batching limit is engine configuration that ``largest_population``
-        # does not see; only the configuration check can refuse this value.
-        return
+    error = only(errors_for(value, max_num_seqs=64, max_num_batched_tokens=8192))
+    assert repr(value) in error or str(value) in error, error
     with pytest.raises(ValueError):
         api.largest_population(hf_config(value))
+
+
+# @spec TXG-CFG-004, TXG-CFG-020
+def test_an_entry_above_max_num_seqs_is_refused_by_both_bounds():
+    """``65`` exceeds ``P_max`` (TXG-CFG-004) and the admission limit
+    ``max_num_seqs`` (TXG-CFG-020): both conditions are returned. The
+    batching limit is engine configuration that ``largest_population`` does
+    not see, so only the configuration check refuses this value."""
+    errors = errors_for(
+        [65],
+        max_num_seqs=64,
+        max_num_batched_tokens=8192,
+        num_gpu_blocks_override=None,
+        kv_cache_memory_bytes=1 << 30,
+    )
+    assert len(errors) == 2, errors
+    admission = [e for e in errors if cond.is_admission_condition(e)]
+    assert len(admission) == 1, errors
+    others = [e for e in errors if e not in admission and "65" in e]
+    assert len(others) == 1, errors
+    assert api.largest_population(hf_config([65])) == 65
 
 
 # @spec TXG-CFG-004
@@ -251,15 +256,6 @@ def test_every_accepted_value_yields_its_largest_entry():
         api.largest_population(hf_config())
 
 
-# @spec TXG-CFG-005
-def test_populations_are_bounded_by_the_non_null_pages():
-    assert errors_for([32], num_gpu_blocks_override=33) == []
-    found = mentioning(errors_for([33], num_gpu_blocks_override=33), KEY, "33")
-    assert found, errors_for([33], num_gpu_blocks_override=33)
-    assert mentioning(errors_for([4, 33], num_gpu_blocks_override=33), KEY)
-    assert errors_for([64], num_gpu_blocks_override=None) == []
-
-
 # @spec TXG-CFG-015
 @pytest.mark.parametrize(
     "limits, value, refused",
@@ -275,10 +271,155 @@ def test_populations_are_bounded_by_the_non_null_pages():
 )
 def test_unresolved_limits_bound_nothing(limits, value, refused):
     """At the configuration hook an unresolved limit bounds nothing; the
-    other conditions still apply."""
+    other conditions still apply. A fixed KV budget keeps the block-count
+    condition (TXG-CFG-005) out of the comparison."""
     seqs, tokens = limits
-    errors = errors_for(value, max_num_seqs=seqs, max_num_batched_tokens=tokens)
+    errors = errors_for(
+        value,
+        max_num_seqs=seqs,
+        max_num_batched_tokens=tokens,
+        num_gpu_blocks_override=None,
+        kv_cache_memory_bytes=1 << 30,
+    )
     assert bool(mentioning(errors, KEY)) is refused, errors
+
+
+# ---------------------------------------------------------------------------
+# Admission limit (TXG-CFG-020) and block count (TXG-CFG-005)
+
+
+# @spec TXG-CFG-020, TXG-CFG-003
+def test_an_entry_above_max_num_active_seqs_is_refused_with_its_remedies():
+    """The admission limit is ``max_num_active_seqs`` when set: an entry above
+    it can never run. The condition names the entry, the limit, the setting
+    it came from and both remedies."""
+    error = only(
+        errors_for(
+            [4, 16], max_num_seqs=64, max_num_active_seqs=8, num_gpu_blocks_override=17
+        )
+    )
+    assert cond.is_admission_condition(error), error
+    assert cond.shows_number(error, 16), error
+    assert cond.shows_number(error, 8), error
+    assert "max_num_active_seqs" in error, error
+    # remedies: a largest population of at most the limit, or a larger
+    # --max-num-active-seqs (at most max_num_seqs) or none
+    assert cond.found(cond.ACTIVE_SEQS, error), error
+    assert mentioning([error], "population"), error
+
+
+# @spec TXG-CFG-020
+def test_an_entry_at_the_admission_limit_is_accepted():
+    assert errors_for([8], max_num_seqs=64, max_num_active_seqs=8) == []
+    assert errors_for([1, 8], max_num_seqs=8) == []
+
+
+# @spec TXG-CFG-020
+def test_the_admission_limit_from_max_num_seqs_is_named():
+    """Without ``max_num_active_seqs`` the limit is ``max_num_seqs``; an
+    entry above it is also above ``P_max``, so both conditions are
+    returned, the admission one naming ``max_num_seqs``."""
+    errors = errors_for([16], max_num_seqs=8)
+    admission = [e for e in errors if cond.is_admission_condition(e)]
+    assert len(admission) == 1, errors
+    assert "max_num_seqs" in admission[0], admission
+    assert cond.shows_number(admission[0], 16), admission
+    assert cond.shows_number(admission[0], 8), admission
+
+
+# @spec TXG-CFG-020
+def test_an_unknown_admission_limit_bounds_nothing():
+    """Before ``max_num_seqs`` is resolved and with ``max_num_active_seqs``
+    unset, the configuration hook does not know the limit."""
+    errors = errors_for(
+        [512],
+        max_num_seqs=None,
+        max_num_batched_tokens=None,
+        num_gpu_blocks_override=None,
+        kv_cache_memory_bytes=1 << 30,
+    )
+    assert errors == [], errors
+
+
+# @spec TXG-CFG-020
+def test_a_set_max_num_active_seqs_bounds_before_max_num_seqs_is_resolved():
+    errors = errors_for(
+        [16],
+        max_num_seqs=None,
+        max_num_batched_tokens=None,
+        max_num_active_seqs=8,
+        num_gpu_blocks_override=None,
+        kv_cache_memory_bytes=1 << 30,
+    )
+    admission = [e for e in errors if cond.is_admission_condition(e)]
+    assert len(admission) == 1, errors
+
+
+@pytest.mark.parametrize(
+    "limits, setting",
+    [
+        pytest.param({"max_num_seqs": 8}, "max_num_seqs", id="max-num-seqs"),
+        pytest.param(
+            {"max_num_seqs": 64, "max_num_active_seqs": 8},
+            "max_num_active_seqs",
+            id="max-num-active-seqs",
+        ),
+    ],
+)
+# @spec TXG-CFG-005, TXG-CFG-003
+def test_a_block_count_below_the_admission_limit_plus_one_is_refused(limits, setting):
+    """``override − 1`` non-null pages fewer than the admission limit: core's
+    scheduler, built after both captures, would refuse to start. The
+    condition names the override, the limit and its setting, and the
+    remedies: an override of at least the limit plus one, or a lower
+    admission limit with the largest population at most it."""
+    error = only(errors_for([4], num_gpu_blocks_override=8, **limits))
+    assert cond.is_block_count_condition(error), error
+    assert cond.shows_number(error, 8), error
+    assert setting in error, error
+    assert cond.found(cond.BLOCKS_OVERRIDE, error), error
+    assert cond.shows_number(error, 9), error  # the limit plus one
+    assert cond.lower_admission_limit(error), error
+
+
+# @spec TXG-CFG-005
+def test_a_block_count_of_the_admission_limit_plus_one_is_accepted():
+    assert errors_for([4], max_num_seqs=8, num_gpu_blocks_override=9) == []
+    assert (
+        errors_for(
+            [4], max_num_seqs=64, max_num_active_seqs=8, num_gpu_blocks_override=9
+        )
+        == []
+    )
+
+
+# @spec TXG-CFG-005, TXG-CFG-015
+def test_an_unknown_admission_limit_compares_the_override_with_the_entries():
+    """Before the admission limit is known, the configuration hook compares
+    the override with the entries only; model-state construction applies the
+    full condition."""
+    unresolved = dict(max_num_seqs=None, max_num_batched_tokens=None)
+    assert errors_for([32], num_gpu_blocks_override=33, **unresolved) == []
+    error = only(errors_for([33], num_gpu_blocks_override=33, **unresolved))
+    assert cond.is_block_count_condition(error), error
+    assert cond.shows_number(error, 33), error
+    assert errors_for([4, 33], num_gpu_blocks_override=33, **unresolved), (
+        "every entry counts"
+    )
+
+
+# @spec TXG-CFG-005
+def test_a_set_max_num_active_seqs_is_a_known_admission_limit():
+    errors = errors_for(
+        [4],
+        max_num_seqs=None,
+        max_num_batched_tokens=None,
+        max_num_active_seqs=40,
+        num_gpu_blocks_override=33,
+    )
+    error = only(errors)
+    assert cond.is_block_count_condition(error), error
+    assert "max_num_active_seqs" in error, error
 
 
 # ---------------------------------------------------------------------------
@@ -291,17 +432,16 @@ def test_80_and_160_ms_are_accepted(lookahead):
     assert errors_for(lookahead=lookahead) == []
 
 
-# @spec TXG-CFG-006
+# @spec TXG-CFG-006, TXG-CFG-003
 @pytest.mark.parametrize(
     "lookahead", [3, 6, 13, None], ids=["3", "6", "13", "card-default-3"]
 )
 def test_other_geometries_are_refused_with_the_remedy(lookahead):
-    errors = errors_for(lookahead=lookahead)
-    found = mentioning(errors, KEY, "num_lookahead_tokens", "--hf-overrides")
-    assert len(found) == 1, errors
+    error = only(errors_for(lookahead=lookahead))
+    assert mentioning([error], KEY, "num_lookahead_tokens", "--hf-overrides"), error
     shown = 3 if lookahead is None else lookahead
-    assert str(shown) in found[0], found
-    assert "0" in found[0] and "1" in found[0], found
+    assert str(shown) in error, error
+    assert "0" in error and "1" in error, error
 
 
 # @spec TXG-CFG-006
@@ -335,15 +475,16 @@ def test_geometry_comes_from_served_lookahead(monkeypatch):
     assert errors_for(lookahead=6) == []
 
 
-# @spec TXG-CFG-007
+# @spec TXG-CFG-007, TXG-CFG-003
 def test_native_burst_is_refused():
-    errors = errors_for(native_burst=True)
-    found = mentioning(errors, KEY, "experimental_native_burst")
-    assert len(found) == 1, errors
+    error = only(errors_for(native_burst=True))
+    assert "experimental_native_burst" in error, error
+    assert shows_value(error, True), error
+    assert cond.found(cond.REMOVAL, error), error
     assert errors_for(native_burst=False) == []
 
 
-# @spec TXG-CFG-008
+# @spec TXG-CFG-008, TXG-CFG-003
 @pytest.mark.parametrize(
     "encoder, decoder, names",
     [
@@ -378,14 +519,16 @@ def test_native_burst_is_refused():
 def test_segment_arms_other_than_the_defaults_are_refused(encoder, decoder, names):
     from support.txg_fakes import _ABSENT
 
-    errors = errors_for(
-        encoder_arm=_ABSENT if encoder == "unset" else encoder,
-        decoder_arm=_ABSENT if decoder == "unset" else decoder,
+    error = only(
+        errors_for(
+            encoder_arm=_ABSENT if encoder == "unset" else encoder,
+            decoder_arm=_ABSENT if decoder == "unset" else decoder,
+        )
     )
-    found = mentioning(errors, KEY, *[n for n, _ in names])
-    assert len(found) == 1, errors
     for arm, value in names:
-        assert value in found[0], (arm, value, found)
+        assert arm in error and value in error, (arm, value, error)
+    # the remedy: the default arms
+    assert "eager-graphed" in error and "dense-graphed" in error, error
 
 
 # @spec TXG-CFG-008
@@ -395,53 +538,230 @@ def test_default_arms_are_accepted_and_chunk_graphs_are_left_to_registration():
     assert not mentioning(errors, "chunk_bucket_graph_populations"), errors
 
 
-# @spec TXG-CFG-009
+# @spec TXG-CFG-009, TXG-CFG-003
 def test_enforce_eager_is_refused_naming_both():
-    errors = errors_for(enforce_eager=True)
-    found = mentioning(errors, KEY, "--enforce-eager")
-    assert len(found) == 1, errors
-    assert "hook" in found[0].lower(), found
+    error = only(errors_for(enforce_eager=True))
+    assert "--enforce-eager" in error, error
+    assert "hook" in error.lower(), error
+    assert cond.found(cond.REMOVAL, error), error
 
 
 # @spec TXG-CFG-010
+def test_the_platform_condition_is_not_repeated():
+    assert errors_for(device_type="cpu") == []
+
+
+# @spec TXG-CFG-010, TXG-CFG-018
 @pytest.mark.parametrize(
-    "setting",
+    "setting, shown",
     [
-        {"cudagraph_mode": 2},
-        {"compilation_mode": 3},
-        {"device_type": "cpu"},
-        {"cudagraph_mode": None, "compilation_mode": None},
+        ({"cudagraph_mode": GraphMode.FULL}, "FULL"),
+        ({"cudagraph_mode": GraphMode.PIECEWISE}, "PIECEWISE"),
+        ({"compilation_mode": CompilationMode.STOCK_TORCH_COMPILE}, "STOCK_TORCH"),
     ],
+    ids=["full", "piecewise", "stock-torch-compile"],
 )
-def test_runner_and_platform_conditions_are_not_repeated(setting):
-    assert errors_for(**setting) == []
+def test_the_hook_conditions_are_not_repeated_beside_the_runner_mode_one(
+    setting, shown
+):
+    """A mode the hook configuration refuses (REG-ENG-021 to REG-ENG-023)
+    gives this function's one runner-mode condition only: the hook
+    configuration's own condition is ``registration``'s and is not
+    repeated."""
+    error = only(errors_for(**setting))
+    assert cond.found(cond.RUNNER_MODES_NONE, error), error
+    assert shown in error, error
 
 
-# @spec TXG-CFG-003, TXG-CFG-016
-def test_every_violated_condition_is_returned():
-    from support.txg_fakes import _ABSENT
+# ---------------------------------------------------------------------------
+# The restricted startup (TXG-CFG-017 to TXG-CFG-019)
 
-    # The whole list: the state-layer condition is one entry among six, and
-    # each other violation is its own entry beside it.
-    errors = api.config_errors(
-        engine_config(
-            hf_config([0], lookahead=3, native_burst=True, encoder_arm=_ABSENT),
-            enforce_eager=True,
+
+# @spec TXG-CFG-017, TXG-CFG-003
+@pytest.mark.parametrize("value", [True, None], ids=["async", "unset"])
+def test_scheduling_other_than_synchronous_is_refused(value):
+    """``True``, or unset, which the target core resolves to asynchronous
+    scheduling: the condition names the value and ``--no-async-scheduling``."""
+    error = only(errors_for(async_scheduling=value))
+    assert "async_scheduling" in error, error
+    assert shows_value(error, value) or (value is None and "unset" in error), error
+    assert cond.found(cond.NO_ASYNC_SCHEDULING, error), error
+    assert errors_for(async_scheduling=False) == []
+
+
+# @spec TXG-CFG-018, TXG-CFG-003
+@pytest.mark.parametrize(
+    "setting, shown",
+    [
+        ({"cudagraph_mode": GraphMode.FULL}, ["FULL"]),
+        ({"cudagraph_mode": None}, [None]),
+        ({"compilation_mode": CompilationMode.VLLM_COMPILE}, ["VLLM_COMPILE"]),
+        ({"compilation_mode": None}, [None]),
+        (
+            {
+                "cudagraph_mode": GraphMode.PIECEWISE,
+                "compilation_mode": CompilationMode.VLLM_COMPILE,
+            },
+            ["PIECEWISE", "VLLM_COMPILE"],
+        ),
+    ],
+    ids=["graph-full", "graph-unset", "compile", "compile-unset", "both"],
+)
+def test_runner_modes_other_than_none_are_refused(setting, shown):
+    """Each mode that is not NONE (an unset mode included) is named, in one
+    runner-mode condition, with the remedy ``-cc.cudagraph_mode none
+    -cc.mode none``."""
+    error = only(errors_for(**setting))
+    for value in shown:
+        if value is None:
+            assert "unset" in error.lower() or shows_value(error, None), error
+        else:
+            assert value in error, (value, error)
+    assert cond.found(cond.RUNNER_MODES_NONE, error), error
+
+
+# @spec TXG-CFG-018
+@pytest.mark.engine
+def test_core_none_modes_are_accepted_and_others_refused():
+    """Core's own enum members, as model construction sees them."""
+    from vllm.config import CUDAGraphMode
+    from vllm.config.compilation import CompilationMode as CoreCompilationMode
+
+    assert (
+        errors_for(
+            cudagraph_mode=CUDAGraphMode.NONE,
+            compilation_mode=CoreCompilationMode.NONE,
+        )
+        == []
+    )
+    error = only(
+        errors_for(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            compilation_mode=CoreCompilationMode.NONE,
         )
     )
-    assert len(errors) == 6, errors
+    assert "FULL_AND_PIECEWISE" in error, error
+
+
+# @spec TXG-CFG-019, TXG-CFG-003
+@pytest.mark.parametrize("budget", [None, 0], ids=["unset", "zero"])
+def test_neither_a_block_count_nor_a_kv_budget_is_refused(budget):
+    """The pool condition: an explicit block count or KV budget, which turns
+    core's extensible KV cache off; remedies a ``--num-gpu-blocks-override``
+    of at least the admission limit plus one or a positive
+    ``--kv-cache-memory-bytes``."""
+    error = only(
+        errors_for(
+            max_num_seqs=64, num_gpu_blocks_override=None, kv_cache_memory_bytes=budget
+        )
+    )
+    assert cond.is_pool_condition(error), error
+    assert cond.found(cond.EXTENSIBLE, error), error
+    assert cond.shows_number(error, 65), error  # the admission limit plus one
+
+
+# @spec TXG-CFG-019
+def test_a_positive_kv_budget_meets_the_pool_condition():
+    """A fixed budget's block count is known only at the serving capture,
+    where the pool-access check compares it (TXG-CAP-008)."""
+    assert (
+        errors_for(
+            max_num_seqs=64,
+            num_gpu_blocks_override=None,
+            kv_cache_memory_bytes=1 << 30,
+        )
+        == []
+    )
+
+
+# ---------------------------------------------------------------------------
+# The state layer (TXG-CFG-016)
+
+
+# @spec TXG-CFG-016
+def test_the_checks_take_the_state_layer_capability():
+    """Callers determine whether the running core's ``ModelState`` defines
+    ``state_group_layouts`` and pass it in (the module imports no vLLM)."""
+    assert api.takes_state_layer_keyword(), (
+        f"transaction_graph_config_errors takes no {api.STATE_LAYER_KEYWORD!r}"
+    )
+
+
+# @spec TXG-CFG-016, TXG-CFG-003
+@pytest.mark.parametrize("value", [[4], [1, 31, 63], 63, None, {}], ids=repr)
+def test_a_core_without_the_accessor_is_refused(value):
+    errors = errors_for(value, state_group_layouts=False)
+    found = [e for e in errors if cond.is_state_layer_condition(e)]
+    assert len(found) == 1, errors
+    assert found[0] in errors
+
+
+# @spec TXG-CFG-016
+@pytest.mark.parametrize("value", [[4], [1, 31, 63], 63, None, {}], ids=repr)
+def test_a_core_with_the_accessor_gets_no_state_layer_condition(value):
+    errors = errors_for(value)
+    assert not [e for e in errors if cond.found(cond.ACCESSOR, e)], errors
+
+
+# @spec TXG-CFG-016
+def test_the_state_layer_condition_is_its_own_entry():
+    errors = errors_for(state_group_layouts=False)
+    error = only(errors)
+    assert cond.is_state_layer_condition(error), error
+
+
+# ---------------------------------------------------------------------------
+# Every condition
+
+
+# @spec TXG-CFG-003, TXG-CFG-011
+def test_every_violated_condition_is_returned():
+    """Each violated condition is its own entry, naming the option: here
+    every condition but the block count's (the pool condition is its
+    alternative), ten in all."""
+    from support.txg_fakes import _ABSENT
+
+    errors = errors_for(
+        [0, 70],
+        state_group_layouts=False,
+        lookahead=3,
+        native_burst=True,
+        encoder_arm=_ABSENT,
+        enforce_eager=True,
+        max_num_seqs=64,
+        async_scheduling=None,
+        cudagraph_mode=None,
+        compilation_mode=None,
+        num_gpu_blocks_override=None,
+    )
+    assert len(errors) == 10, errors
     for error in errors:
         assert KEY in error, error
-    others = without_state_layer(errors, [0])
-    assert len(others) == 5, errors
+    for check in (
+        cond.is_state_layer_condition,
+        cond.is_admission_condition,
+        cond.is_pool_condition,
+    ):
+        assert len([e for e in errors if check(e)]) == 1, (check.__name__, errors)
     for needle in (
-        "0",
+        "[0, 70]",
         "num_lookahead_tokens",
         "experimental_native_burst",
         "encoder_execution_arm",
         "--enforce-eager",
+        "--no-async-scheduling",
     ):
-        assert mentioning(others, needle), (needle, errors)
+        assert mentioning(errors, needle), (needle, errors)
+    assert [e for e in errors if cond.found(cond.RUNNER_MODES_NONE, e)], errors
+
+
+# @spec TXG-CFG-003, TXG-CFG-005
+def test_the_block_count_condition_is_returned_with_the_others():
+    errors = errors_for(
+        [4], max_num_seqs=8, num_gpu_blocks_override=4, async_scheduling=True
+    )
+    assert len(errors) == 2, errors
+    assert len([e for e in errors if cond.is_block_count_condition(e)]) == 1, errors
 
 
 # ---------------------------------------------------------------------------
@@ -479,14 +799,26 @@ def test_configuration_module_imports_no_vllm(repo_root):
         ([4, 2], {}),
         ([0, 0], {"enforce_eager": True, "num_gpu_blocks_override": 2}),
         ({}, {"max_num_seqs": None}),
+        (
+            [70],
+            {
+                "max_num_active_seqs": 8,
+                "async_scheduling": None,
+                "cudagraph_mode": None,
+                "compilation_mode": None,
+                "num_gpu_blocks_override": None,
+                "kv_cache_memory_bytes": 0,
+            },
+        ),
     ],
 )
-def test_checks_modify_no_configuration(populations, extra):
+@pytest.mark.parametrize("state_group_layouts", [True, False], ids=["accessor", "none"])
+def test_checks_modify_no_configuration(populations, extra, state_group_layouts):
     config = engine_config(
         hf_config(populations, lookahead=3, native_burst=True), **extra
     )
     before = copy.deepcopy(config)
-    api.config_errors(config)
+    api.config_errors(config, state_group_layouts=state_group_layouts)
     api.transaction_graphs_on(config.model_config.hf_config)
     assert config == before
 
@@ -520,14 +852,14 @@ def _hook_refusals(hf):
     """The hook configuration's unmet conditions (REG-ENG-021 to REG-ENG-025)
     at construction, through their one function (REG-ENG-027)."""
     from vllm.config import CUDAGraphMode
-    from vllm.config.compilation import CompilationMode
+    from vllm.config.compilation import CompilationMode as CoreCompilationMode
 
     from vllm_nemotron_asr_streaming import engine_flags
 
     config = engine_config(hf)
     config.compilation_config = SimpleNamespace(
         cudagraph_mode=CUDAGraphMode.NONE,
-        mode=CompilationMode.NONE,
+        mode=CoreCompilationMode.NONE,
         use_breakable_cudagraph=False,
     )
     return engine_flags.runner_mode_refusals(config, stage="constructor")
@@ -559,6 +891,14 @@ def test_registration_decides_on_off_through_the_predicate(monkeypatch):
     assert len(_hook_refusals(hf_config([4], **eager))) == len(off)
 
 
+def _verify(config) -> None:
+    from vllm_nemotron_asr_streaming.streaming_config import (
+        Nemotron3_5AsrStreamingConfig,
+    )
+
+    Nemotron3_5AsrStreamingConfig.verify_and_update_config(config)
+
+
 @pytest.mark.engine
 # @spec TXG-CFG-011
 def test_configuration_hook_reports_the_transaction_graph_conditions(tmp_path):
@@ -566,25 +906,20 @@ def test_configuration_hook_reports_the_transaction_graph_conditions(tmp_path):
 
     card = h.write_runnable_card(tmp_path / "card")
     with pytest.raises(ValueError) as caught:
-        config = h.build_vllm_config(card, right_context=0, overrides={KEY: [0, 0]})
-        from vllm_nemotron_asr_streaming.streaming_config import (
-            Nemotron3_5AsrStreamingConfig,
-        )
-
-        Nemotron3_5AsrStreamingConfig.verify_and_update_config(config)
+        _verify(h.build_vllm_config(card, right_context=0, overrides={KEY: [0, 0]}))
     message = str(caught.value)
     assert KEY in message and "[0, 0]" in message, message
     assert "--enforce-eager" in message, message
 
 
 @pytest.mark.engine
-# @spec TXG-CFG-011, TXG-CFG-015
-def test_model_state_construction_reruns_the_checks(tmp_path, monkeypatch):
+# @spec TXG-CFG-011, TXG-CFG-015, TXG-CFG-020
+def test_model_state_construction_reruns_the_checks(tmp_path):
     """A value the configuration hook did not see is refused when the model
-    state is built against the final engine configuration."""
+    state is built against the final engine configuration: ``[3]`` exceeds
+    ``P_max`` and the admission limit ``max_num_seqs`` 2."""
     from support import model_harness as h
 
-    h.spec_without_state_name(monkeypatch)
     card = h.write_runnable_card(tmp_path / "card")
     config = h.build_vllm_config(card, right_context=0, max_num_seqs=2)
     model = h.build_model(config)
@@ -593,6 +928,7 @@ def test_model_state_construction_reruns_the_checks(tmp_path, monkeypatch):
         h.build_model_state(config, model)
     message = str(caught.value)
     assert KEY in message and "[3]" in message, message
+    assert cond.found(cond.ACTIVE_SEQS, message), message
 
 
 def _install_checks(monkeypatch, fn) -> None:
@@ -624,25 +960,91 @@ def test_both_callers_use_the_one_function(tmp_path, monkeypatch):
     real = module.transaction_graph_config_errors
     sentinel = f"{KEY}: sentinel condition from the one function"
 
-    def with_sentinel(vllm_config):
-        return [*real(vllm_config), sentinel]
+    def with_sentinel(vllm_config, **kwargs):
+        return [*real(vllm_config, **kwargs), sentinel]
 
-    def plain(vllm_config):
-        return real(vllm_config)
+    def plain(vllm_config, **kwargs):
+        return real(vllm_config, **kwargs)
 
-    h.spec_without_state_name(monkeypatch)
     card = h.write_runnable_card(tmp_path / "card")
     _install_checks(monkeypatch, with_sentinel)
     with pytest.raises(ValueError, match="sentinel condition"):
-        config = h.build_vllm_config(card, right_context=0)
-        from vllm_nemotron_asr_streaming.streaming_config import (
-            Nemotron3_5AsrStreamingConfig,
-        )
-
-        Nemotron3_5AsrStreamingConfig.verify_and_update_config(config)
+        _verify(h.build_vllm_config(card, right_context=0))
     _install_checks(monkeypatch, plain)
     config = h.build_vllm_config(card, right_context=0)
     model = h.build_model(config)
     _install_checks(monkeypatch, with_sentinel)
     with pytest.raises(ValueError, match="sentinel condition"):
         h.build_model_state(config, model)
+
+
+def _record_capability(monkeypatch) -> list:
+    """Wrap the one function so each call records the state-layer capability
+    its caller passed (``None`` when the caller passed none)."""
+    module = api.config_module()
+    real = module.transaction_graph_config_errors
+    seen: list = []
+
+    def recording(vllm_config, **kwargs):
+        seen.append(kwargs.get(api.STATE_LAYER_KEYWORD))
+        return real(vllm_config, **kwargs)
+
+    _install_checks(monkeypatch, recording)
+    return seen
+
+
+def _without_the_accessor(monkeypatch) -> None:
+    """A running core whose ``ModelState`` lacks ``state_group_layouts``."""
+    from vllm.v1.worker.gpu.model_states.interface import ModelState
+
+    monkeypatch.delattr(ModelState, "state_group_layouts")
+
+
+@pytest.mark.engine
+# @spec TXG-CFG-016, TXG-CFG-011
+@pytest.mark.parametrize("accessor", [True, False], ids=["accessor", "none"])
+def test_the_configuration_hook_passes_the_running_cores_capability(
+    tmp_path, monkeypatch, accessor
+):
+    """``verify_and_update_config`` determines whether the running core's
+    ``ModelState`` defines ``state_group_layouts`` and passes it; the
+    state-layer condition appears exactly when it does not."""
+    from support import model_harness as h
+
+    import vllm_nemotron_asr_streaming.streaming_config  # noqa: F401
+
+    card = h.write_runnable_card(tmp_path / "card")
+    seen = _record_capability(monkeypatch)
+    if not accessor:
+        _without_the_accessor(monkeypatch)
+    with pytest.raises(ValueError) as caught:
+        # core runs the configuration hook while it builds the configuration
+        _verify(h.build_vllm_config(card, right_context=0, overrides={KEY: [0, 0]}))
+    assert seen and all(value is accessor for value in seen), seen
+    message = str(caught.value)
+    assert cond.found(cond.ACCESSOR, message) is not accessor, message
+
+
+@pytest.mark.engine
+# @spec TXG-CFG-016, TXG-CFG-011
+@pytest.mark.parametrize("accessor", [True, False], ids=["accessor", "none"])
+def test_model_state_construction_passes_the_running_cores_capability(
+    tmp_path, monkeypatch, accessor
+):
+    """Model-state construction (REG-ENG-006) passes the same capability."""
+    from support import model_harness as h
+
+    from vllm_nemotron_asr_streaming.nemotron_asr import model_state_v2  # noqa: F401
+
+    card = h.write_runnable_card(tmp_path / "card")
+    config = h.build_vllm_config(card, right_context=0, max_num_seqs=2)
+    model = h.build_model(config)
+    config.model_config.hf_config.transaction_graph_populations = [0, 0]
+    seen = _record_capability(monkeypatch)
+    if not accessor:
+        _without_the_accessor(monkeypatch)
+    with pytest.raises(ValueError) as caught:
+        h.build_model_state(config, model)
+    assert seen and all(value is accessor for value in seen), seen
+    message = str(caught.value)
+    assert cond.found(cond.ACCESSOR, message) is not accessor, message

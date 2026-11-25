@@ -2,7 +2,9 @@
 """The runner configurations at model and model-state construction, core's
 mode resolution, and the model state's runner-graph guards (REG-ENG-001,
 REG-ENG-006, REG-ENG-011, REG-ENG-012, REG-ENG-016 to REG-ENG-020,
-REG-ENG-026, REG-ENG-027, REG-VAL-003, TXG-CFG-016).
+REG-ENG-026, REG-ENG-027, REG-VAL-003, TXG-CFG-016: transaction graphs are
+refused only on a core without ``ModelState.state_group_layouts``; the target
+core has it).
 
 The configuration-hook and namespace re-check matrices are in
 ``test_engine_settings.py``. Here the model and its model state are the real
@@ -254,11 +256,51 @@ def test_construction_lists_every_failed_condition_in_one_error(stages, stage):
     assert re.search(r"(?i)prefix caching|enable_prefix_caching", message), message
 
 
+def _no_state_layer_refusal(message: str) -> None:
+    """The target core defines ``ModelState.state_group_layouts``: nothing in
+    a refusal says transaction graphs are refused on the state layer or for a
+    missing layout accessor (TXG-CFG-016)."""
+    assert not rc.LAYOUT_ACCESSOR.search(message), message
+    assert rc.state_layer_mentions(message) == 0, message
+
+
+#: TXG-CFG-019's pool condition: an explicit block count or KV budget.
+_POOL_CONDITION = re.compile(r"num_gpu_blocks_override|num-gpu-blocks-override")
+
+
 @pytest.mark.parametrize("stage", ["model", "model-state"])
-# @spec REG-ENG-006, REG-VAL-008, TXG-CFG-016, TXG-CFG-011
-def test_construction_refuses_transaction_graphs_on_the_state_layer(stages, stage):
-    """Exactly one state-layer condition: the one
-    ``transaction_graph_config_errors`` returns."""
+# @spec REG-ENG-006, REG-VAL-008, REG-018, TXG-CFG-016, TXG-CFG-019
+def test_construction_accepts_transaction_graphs_under_the_restricted_startup(
+    stages, stage
+):
+    """On the target core (``ModelState.state_group_layouts`` defined), with
+    synchronous scheduling, explicit ``cudagraph_mode`` and compilation mode
+    NONE, a block count of the admission limit plus one and a population
+    within the limit, construction accepts transaction graphs."""
+    settings = {"hf": {"transaction_graph_populations": [2]}}
+
+    def restricted(config):
+        config.cache_config.num_gpu_blocks_override = 3  # max_num_seqs 2, + 1
+        return config
+
+    if stage == "model":
+        config = restricted(stages.config(right_context=0, **settings))
+        stages.model(config)
+    else:
+        config = restricted(stages.config(right_context=0))
+        model = stages.model(config)
+        stages.apply(config, **settings)
+        stages.state(config, model)
+
+
+@pytest.mark.parametrize("stage", ["model", "model-state"])
+# @spec REG-ENG-006, REG-VAL-008, TXG-CFG-016, TXG-CFG-019, TXG-CFG-011
+def test_construction_refuses_transaction_graphs_outside_the_restricted_startup(
+    stages, stage
+):
+    """Without an explicit block count or KV budget (TXG-CFG-019) the
+    construction refuses, naming that condition, and refuses nothing for the
+    state layer itself."""
     settings = {"hf": {"transaction_graph_populations": [2]}}
     if stage == "model":
         config = stages.config(right_context=0, **settings)
@@ -268,7 +310,9 @@ def test_construction_refuses_transaction_graphs_on_the_state_layer(stages, stag
         model = stages.model(config)
         stages.apply(config, **settings)
         message = _refusal(stages.state, config, model)
-    rc.assert_one_state_layer_condition(message, config)
+    assert _POOL_CONDITION.search(message), message
+    assert rc.TRANSACTION_GRAPH_KEY in message, message
+    _no_state_layer_refusal(message)
 
 
 # ---------------------------------------------------------------------------
@@ -1125,34 +1169,68 @@ def test_the_commit_event_follows_the_steps_last_read_and_is_waited_on(stages):
 
 
 # ---------------------------------------------------------------------------
-# TXG-CFG-016: transaction graphs are refused on the state layer
+# TXG-CFG-016: transaction graphs are refused only on a core without the
+# state-group layout accessor
 
 
 def _state_layer_conditions(errors):
-    """Every returned condition that mentions the state layer."""
-    return [e for e in errors if rc.state_layer_mentions(e)]
+    """Every returned condition of TXG-CFG-016's kind: it mentions the state
+    layer or the layout accessor."""
+    return [
+        e for e in errors if rc.state_layer_mentions(e) or rc.LAYOUT_ACCESSOR.search(e)
+    ]
 
 
 def _assert_the_state_layer_condition(errors, value) -> str:
-    """Exactly one condition mentions the state layer, and it is TXG-CFG-016's
-    in full: the option, the rejected value (TXG-CFG-003), the missing
-    state-group layout accessor, and removing the option."""
+    """Exactly one condition of TXG-CFG-016's kind, in full: the option, the
+    rejected value (TXG-CFG-003), the missing state-group layout accessor, and
+    removing the option."""
     found = _state_layer_conditions(errors)
     assert len(found) == 1, errors
     (condition,) = found
     assert rc.is_state_layer_condition(condition), condition
+    assert "state_group_layouts" in condition, condition
     assert rc.shows_value(condition, value), (value, condition)
     return condition
 
 
-@pytest.mark.parametrize("value", [[4], [1, 31, 63], 63, None, {}], ids=repr)
+VALUES = [[4], [1, 31, 63], 63, None, {}]
+
+
+@pytest.mark.parametrize("value", VALUES, ids=repr)
 # @spec TXG-CFG-016, TXG-CFG-003
-def test_transaction_graphs_on_always_return_the_state_layer_condition(value):
+def test_a_core_without_the_accessor_returns_the_state_layer_condition(value):
     from support import txg_api as api
     from support.txg_fakes import engine_config, hf_config
 
-    errors = api.config_errors(engine_config(hf_config(value)))
+    errors = api.config_errors(
+        engine_config(hf_config(value)), state_group_layouts=False
+    )
     _assert_the_state_layer_condition(errors, value)
+
+
+@pytest.mark.parametrize("value", VALUES, ids=repr)
+# @spec TXG-CFG-016, TXG-CFG-003
+def test_the_target_core_returns_no_state_layer_condition(value):
+    """``ModelState.state_group_layouts`` is defined: no condition for that
+    reason, whatever else the value violates."""
+    from support import txg_api as api
+    from support.txg_fakes import engine_config, hf_config
+
+    errors = api.config_errors(
+        engine_config(hf_config(value)), state_group_layouts=True
+    )
+    assert _state_layer_conditions(errors) == [], errors
+
+
+# @spec TXG-CFG-016, TXG-CFG-003
+def test_the_target_core_accepts_a_valid_option_under_the_restricted_startup():
+    from support import txg_api as api
+    from support.txg_fakes import engine_config, hf_config
+
+    assert (
+        api.config_errors(engine_config(hf_config([4])), state_group_layouts=True) == []
+    )
 
 
 # @spec TXG-CFG-016, TXG-CFG-003
@@ -1163,7 +1241,8 @@ def test_the_state_layer_condition_is_returned_with_the_other_violations():
     from support.txg_fakes import engine_config, hf_config
 
     errors = api.config_errors(
-        engine_config(hf_config([4], lookahead=3), enforce_eager=True)
+        engine_config(hf_config([4], lookahead=3), enforce_eager=True),
+        state_group_layouts=False,
     )
     condition = _assert_the_state_layer_condition(errors, [4])
     others = [e for e in errors if e != condition]
@@ -1171,10 +1250,11 @@ def test_the_state_layer_condition_is_returned_with_the_other_violations():
     assert [e for e in others if "--enforce-eager" in e], errors
 
 
+@pytest.mark.parametrize("accessor", [True, False], ids=["target-core", "no-accessor"])
 # @spec TXG-CFG-016, TXG-CFG-003
-def test_transaction_graphs_off_return_no_state_layer_condition():
+def test_transaction_graphs_off_return_no_condition(accessor):
     from support import txg_api as api
     from support.txg_fakes import engine_config, hf_config
 
-    assert api.config_errors(engine_config(hf_config())) == []
-    assert api.config_errors(engine_config(hf_config([]))) == []
+    for hf in (hf_config(), hf_config([])):
+        assert api.config_errors(engine_config(hf), state_group_layouts=accessor) == []

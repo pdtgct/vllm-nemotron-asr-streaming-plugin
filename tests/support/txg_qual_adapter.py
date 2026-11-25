@@ -3,24 +3,38 @@
 monitor of TXG-QUAL-003 and TXG-QUAL-013.
 
 ``QualAdapter`` drives the worker of a hook-captured process at the
-transaction level: the model, the model state and the serving
-``StateSlotBindings`` that core bound and captured over. Per step it builds
-the scheduled handle mapping, calls ``begin_step`` on the runner stream,
-runs the step's request cleanup (finished requests, freed encoder outputs),
-calls ``activate_requests``, adds the step's new requests, prepares the
-inputs (the model state calls ``bind_rows`` there), runs the forward on the
-runner stream, calls ``finish_step`` and consumes the step's fenced
-completion (``StateCompletionOutput.get_output``) before it returns, so no
-slot is reused before the step's writes completed. It follows core's
-``GPUModelRunner.execute_model`` order (``vllm/v1/worker/gpu/model_runner.py``)
-and ``support.model_harness.Runner``, without that runner's recording
-wrappers, so it also drives a plugin commit older than the current one.
+transaction level: the model, the model state and the state layer's views
+that core bound and captured over. Per step, as core's
+``GPUModelRunner.execute_model`` does (``vllm/v1/worker/gpu/model_runner.py``:
+``finish_requests``, ``add_requests``, then the forward and
+``sample_tokens``), it:
 
-``before_forward(projection)`` runs inside the step, after ``bind_rows`` and
-before the forward; the step rule restores its snapshot there, through the
-step's ``StateSlotRows.component_pools`` and only at the slots that step
-authorized (TXG-QUAL-011). No replay, restore or store runs outside a step
-the adapter opened.
+1. calls ``remove_request`` for each request that finished, in ascending
+   request-ID order;
+2. for each request the step delivers as ``NewRequestData`` in
+   ``scheduled_new_reqs`` (a new request, or a stream's next turn with its
+   compacted prompt, one frontier token followed by the turn's input, and
+   ``num_computed_tokens`` 1, as core's scheduler compacts a state session),
+   in that list's order, calls ``remove_request`` for that request and then,
+   before any other lifecycle call, its ``add_request``, so removal and
+   addition interleave per request; a cached request (a file's later step, a
+   label drain within a stream's turn) gets neither call;
+3. calls ``prepare_inputs``, runs the forward on the runner stream (the
+   current stream), and calls ``postprocess_state``, which waits for the
+   step's commit event, then ``take_failed_requests``.
+
+Each request holds one block, which the driver assigns at the request's
+first step (``Blocks``), keeps until its terminal finish and reuses only
+after that; the block reaches the model state as the request's
+``block_ids``. The lifecycle calls run outside any timer: the monitor times
+only the transaction call.
+
+``before_forward(blocks, views)`` runs inside the step, after
+``prepare_inputs`` and before the forward, with the blocks of the step's rows
+in row order and the state layer's bound views (core's ``kv_cache``); the
+step rule restores its snapshot there, by an in-place copy into the same pool
+memory on the runner stream, only at those blocks (TXG-QUAL-011). No replay,
+restore or store runs outside a step the adapter runs.
 
 ``TransactionMonitor`` wraps the binding's ``execute`` and
 ``advance.advance_model_rows`` (both looked up at call time by the model's
@@ -29,10 +43,13 @@ forward). It times each transaction call from the call to
 earlier work (the clock of TXG-QUAL-013), captures each call's staged status,
 progress and remaining queue counts through a proxy commit sink, and, with
 ``compare``, runs the option-off transaction of every covered or declined
-step on a layout-preserving copy of the pools taken before the call and
-compares rows, status, progress, queue counts and every page bit for bit
-(TXG-QUAL-003). The pool copy, the option-off reference and the comparison
-are outside the timer. ``force_off`` makes ``execute`` decline without
+step on a detached copy of the pools taken before the call: new storage with
+the same resident layout, test-only storage outside REG-STATE-003 and
+TXG-CAP-013. The reference receives no view of the serving pools, so it can
+neither read nor write them; the monitor checks that, and compares rows,
+status, progress, queue counts and every page bit for bit (TXG-QUAL-003).
+The pool copy, the option-off reference, the checks and the comparison are
+outside the timer. ``force_off`` makes ``execute`` decline without
 counting, so the forward runs the option-off transaction (the step rule's
 OFF legs).
 """
@@ -41,10 +58,11 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import time
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
-from unittest import mock
 
 import numpy as np
 import torch
@@ -53,7 +71,12 @@ from support import txg_transaction as tx
 
 ADVANCE_MODULE = "vllm_nemotron_asr_streaming.nemotron_asr.advance"
 BINDING_ATTRIBUTE = "_transaction_graph_binding"
-EPOCH = "txg-qual"
+
+
+def adapter_identity() -> str:
+    """The adapter's identity, frozen with the run (TXG-QUAL-018): the
+    SHA-256 of this module's source."""
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -75,53 +98,96 @@ class StepResult:
     #: The token each scheduled request emitted (the argmax of the model's
     #: forced logits, which the sampler draws).
     sampled: dict[str, int]
-    #: Requests the step failed (``StateCompletion.failed_req_ids``).
+    #: Requests the step failed (``take_failed_requests``).
     failed: frozenset[str]
     hidden: torch.Tensor | None
 
 
 class QualAdapter:
-    """See the module docstring. ``model``, ``state`` and ``bindings`` are
-    the worker's own objects."""
+    """See the module docstring. ``model`` and ``state`` are the worker's
+    own objects; the state layer's views are read where core bound them."""
 
-    def __init__(
-        self, *, vllm_config: Any, model: Any, state: Any, bindings: Any
-    ) -> None:
-        if bindings is None:
-            raise RuntimeError("the worker has no serving state bindings")
+    def __init__(self, *, vllm_config: Any, model: Any, state: Any) -> None:
         self.vllm_config = vllm_config
         self.model = model
         self.state = state
-        self.bindings = bindings
+        self.layer = model._persistent_state_layer
+        if getattr(self.layer, "kv_cache", None) is None or not len(
+            self.layer.kv_cache
+        ):
+            raise RuntimeError("core has bound no state pool to the state layer")
         self.device = torch.device(state.device)
         self.cuda = self.device.type == "cuda"
-        self.layer = model._persistent_state_layer.prefix
         from support import model_harness as h
 
         self._h = h
         self.req_states = h.StepRequestStates()
+        #: Each live request's recorded prompt, the position of its current
+        #: turn's input in it, and the last token fed (the frontier of its
+        #: next turn).
         self._prompts: dict[str, list[int]] = {}
+        self._base: dict[str, int] = {}
+        self._fed: dict[str, int] = {}
+        #: Each live request's block (``block_ids``).
+        self.blocks: dict[str, int] = {}
         self.sampled: dict[str, int] = {}
-        self.step_seq = 0
 
     @classmethod
     def from_worker(cls, worker: Any) -> QualAdapter:
         runner = runner_of(worker)
         state = runner.model_state
-        bindings = getattr(runner, "state_slots", None) or state.state_slots
-        return cls(
-            vllm_config=runner.vllm_config,
-            model=state.model,
-            state=state,
-            bindings=bindings,
+        return cls(vllm_config=runner.vllm_config, model=state.model, state=state)
+
+    # -- the state layer --------------------------------------------------------
+
+    @property
+    def views(self) -> tuple[torch.Tensor, ...]:
+        """The state layer's per-state views as core bound them."""
+        return tuple(self.layer.kv_cache)
+
+    @property
+    def capacity(self) -> int:
+        """The bound block count, the null block included."""
+        return int(self.views[0].shape[0])
+
+    @property
+    def page_bytes(self) -> int:
+        return int(self.layer.layout.page_size_bytes)
+
+    def last_fed(self, req_id: str) -> int:
+        """The last token ``req_id`` fed: the frontier token of its next
+        turn (core keeps the last computed token and drops the final sampled
+        one)."""
+        return self._fed[req_id]
+
+    # -- scheduler output -------------------------------------------------------
+
+    def next_turn(self, request: Any) -> Any:
+        """``request`` (a turn's input as a fresh ``NewRequestData``) as core
+        delivers a live stream's next turn: the compacted prompt, one
+        frontier token (the last token the request fed) followed by the
+        input, ``num_computed_tokens`` 1, and the input's features moved
+        past the frontier token."""
+        from vllm.multimodal.inputs import PlaceholderRange
+
+        prompt = [self.last_fed(request.req_id), *request.prompt_token_ids]
+        features = [
+            dataclasses.replace(
+                f,
+                mm_position=PlaceholderRange(
+                    offset=int(f.mm_position.offset) + 1,
+                    length=int(f.mm_position.length),
+                ),
+            )
+            for f in request.mm_features or ()
+        ]
+        return dataclasses.replace(
+            request,
+            prompt_token_ids=prompt,
+            prefill_token_ids=prompt,
+            mm_features=features,
+            num_computed_tokens=1,
         )
-
-    # -- scheduler output ------------------------------------------------------
-
-    def handle(self, slot: int, generation: int) -> Any:
-        from vllm.v1.kv_cache_interface import StateSlotHandle
-
-        return StateSlotHandle(EPOCH, int(slot), int(generation))
 
     def scheduler_output(
         self,
@@ -129,42 +195,60 @@ class QualAdapter:
         new: Sequence[Any],
         cached: Sequence[str],
         finished: Sequence[str],
-        handles: dict[str, tuple[int, int]],
+        blocks: dict[str, int],
         computed: dict[str, int],
+        tokens: dict[str, int] | None = None,
         free_mm_hashes: Sequence[str] = (),
     ) -> Any:
+        """The step's ``SchedulerOutput``. A new request of a live stream
+        becomes its next turn (:meth:`next_turn`); every new request carries
+        its block. ``computed`` gives each cached request's position within
+        its turn; ``tokens`` a row's scheduled token count (default 1)."""
         from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
-        scheduled = {r.req_id: 1 for r in new} | {r: 1 for r in cached}
-        output = SchedulerOutput(
-            scheduled_new_reqs=list(new),
+        tokens = dict(tokens or {})
+        finished = set(finished)
+        delivered = []
+        for request in new:
+            if request.req_id in self._prompts and request.req_id not in finished:
+                request = self.next_turn(request)
+            delivered.append(
+                dataclasses.replace(request, block_ids=([int(blocks[request.req_id])],))
+            )
+        scheduled = {r.req_id: tokens.get(r.req_id, 1) for r in delivered}
+        scheduled |= {r: tokens.get(r, 1) for r in cached}
+        return SchedulerOutput(
+            scheduled_new_reqs=delivered,
             scheduled_cached_reqs=CachedRequestData(
                 req_ids=list(cached),
                 new_token_ids=[],
                 new_block_ids=[None for _ in cached],
-                num_computed_tokens=[int(computed[r]) for r in cached],
+                num_computed_tokens=[
+                    self._base.get(r, 0) + int(computed[r]) for r in cached
+                ],
                 num_output_tokens=[1 for _ in cached],
             ),
             num_scheduled_tokens=scheduled,
             total_num_scheduled_tokens=sum(scheduled.values()),
             scheduled_spec_decode_tokens={},
-            scheduled_encoder_inputs={r.req_id: [0] for r in new if r.mm_features},
-            finished_req_ids=set(finished),
-            free_encoder_mm_hashes=list(free_mm_hashes),
-            state_slot_handles={
-                r: {self.layer: self.handle(*handles[r])} for r in scheduled
+            scheduled_encoder_inputs={
+                r.req_id: [len(r.mm_features) - 1] for r in delivered if r.mm_features
             },
+            finished_req_ids=finished,
+            free_encoder_mm_hashes=list(free_mm_hashes),
         )
-        output.state_cleanup_handles = {}
-        output.state_step_seq = self.step_seq
-        return output
 
     # -- one step ----------------------------------------------------------------
 
-    def _main_stream(self) -> Any:
-        return torch.cuda.current_stream() if self.cuda else None
+    def _forget(self, req_id: str) -> None:
+        for table in (self._prompts, self._base, self._fed, self.blocks):
+            table.pop(req_id, None)
+        self.sampled.pop(req_id, None)
 
     def _remove_request(self, req_id: str) -> None:
+        """Core's ``_remove_request``: the model state first; the runner's
+        own request state and the encoder cache only for a request it
+        knows."""
         state = self.state
         state.remove_request(req_id)
         if req_id in self.req_states.req_id_to_index:
@@ -178,48 +262,55 @@ class QualAdapter:
         new: Sequence[Any] = (),
         cached: Sequence[str] = (),
         finished: Sequence[str] = (),
-        handles: dict[str, tuple[int, int]],
+        blocks: dict[str, int],
         computed: dict[str, int] | None = None,
+        tokens: dict[str, int] | None = None,
         order: Sequence[str] | None = None,
         free_mm_hashes: Sequence[str] = (),
-        before_forward: Callable[[Any], None] | None = None,
+        before_forward: Callable[[tuple[int, ...], tuple[torch.Tensor, ...]], None]
+        | None = None,
     ) -> StepResult:
         """One real step. ``order`` is the row order (default: new requests,
-        then cached ones); ``computed`` gives each cached request's
-        ``num_computed_tokens``."""
+        then cached ones); ``computed`` gives each cached request's position
+        within its current turn; ``tokens`` each row's scheduled token count
+        (default 1; core's dummy batch layout puts a row's extra tokens on
+        the last rows, so a multi-token row goes last)."""
         computed = dict(computed or {})
-        self.step_seq += 1
         output = self.scheduler_output(
             new=new,
             cached=cached,
             finished=finished,
-            handles=handles,
+            blocks=blocks,
             computed=computed,
+            tokens=tokens,
             free_mm_hashes=free_mm_hashes,
         )
-        state, bindings, stream = self.state, self.bindings, self._main_stream()
-        state.prepare_step(output, dummy_run=False, is_profile=False)
-        bindings.begin_step(output, stream)
-        for req_id in sorted(set(finished)):
+        state = self.state
+        for req_id in sorted(output.finished_req_ids):
             self._remove_request(req_id)
-        for mm_hash in free_mm_hashes:
+            self._forget(req_id)
+        for mm_hash in output.free_encoder_mm_hashes:
             state.encoder_cache.free_encoder_cache(mm_hash)
-        bindings.activate_requests()
-        for request in new:
+        for request in output.scheduled_new_reqs:
             self._remove_request(request.req_id)
             index = self.req_states.add(request.req_id)
             state.encoder_cache.add_request(request.req_id, request.mm_features)
             state.add_request(index, request)
-        if new:
+            self._prompts[request.req_id] = list(request.prefill_token_ids)
+            self._base[request.req_id] = int(request.num_computed_tokens)
+            self.blocks[request.req_id] = int(request.block_ids[0][0])
+            self.sampled.pop(request.req_id, None)
+        if output.scheduled_new_reqs:
             state.apply_staged_writes()
-        req_ids = [r.req_id for r in new] + list(cached)
+        req_ids = [r.req_id for r in output.scheduled_new_reqs] + list(cached)
         if order is not None:
             if sorted(order) != sorted(req_ids):
                 raise ValueError("the row order must name every scheduled request")
             req_ids = list(order)
         hidden = None
+        failed: frozenset[str] = frozenset()
         if req_ids:
-            batch = self._batch(output, req_ids, computed)
+            batch, fed = self._batch(output, req_ids)
             state.preprocess_state(batch, (), None, None)
             attn = self._attn(batch)
             embeds = state.prepare_inputs_embeds(
@@ -227,28 +318,20 @@ class QualAdapter:
             )
             kwargs = state.prepare_inputs(batch, self.req_states)
             if before_forward is not None:
-                before_forward(kwargs.get("persistent_state_projection"))
+                before_forward(tuple(self.blocks[r] for r in req_ids), self.views)
             hidden = self._forward(batch, embeds, kwargs, attn)
             logits = state.compute_sample_logits(hidden[batch.logits_indices])
-            tokens = logits.argmax(dim=-1).tolist()
-            for req_id, token in zip(batch.req_ids, tokens, strict=True):
+            sampled = logits.argmax(dim=-1).tolist()
+            for req_id, token in zip(batch.req_ids, sampled, strict=True):
                 self.sampled[req_id] = int(token)
             state.postprocess_state(
                 batch.idx_mapping,
                 torch.ones(batch.num_reqs, dtype=torch.int32, device=self.device),
                 None,
             )
-        from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
-
-        event = (
-            contextlib.nullcontext()
-            if self.cuda
-            else mock.patch.object(torch.cuda, "Event", _HostEvent)
-        )
-        with event:
-            completion = bindings.finish_step(EMPTY_MODEL_RUNNER_OUTPUT, stream)
-            result = completion.get_output()
-        failed = frozenset(result.state_completion.failed_req_ids)
+            self._fed.update(fed)
+        taken = state.take_failed_requests()
+        failed = frozenset(taken or ())
         return StepResult(
             req_ids=tuple(req_ids),
             sampled={r: self.sampled[r] for r in req_ids},
@@ -256,40 +339,52 @@ class QualAdapter:
             hidden=hidden,
         )
 
-    def _batch(self, output: Any, req_ids: list[str], computed: dict[str, int]):
-        n = len(req_ids)
-        batch = self._h.dummy_batch(self.state, n, n, is_padding=False)
-        new_ids = {r.req_id for r in output.scheduled_new_reqs}
-        for r in output.scheduled_new_reqs:
-            self._prompts[r.req_id] = list(r.prefill_token_ids)
-            self.sampled.pop(r.req_id, None)
-        tokens = []
-        positions = {}
-        for req_id in req_ids:
-            if req_id in new_ids:
-                tokens.append(self._prompts[req_id][0])
-                positions[req_id] = 0
-                continue
-            position = int(computed[req_id])
-            prompt = self._prompts[req_id]
-            tokens.append(
-                prompt[position] if position < len(prompt) else self.sampled[req_id]
+    def _batch(self, output: Any, req_ids: list[str]) -> tuple[Any, dict[str, int]]:
+        """Core's input batch for the rows in ``req_ids`` order, each at its
+        scheduled position, and the last token each row feeds."""
+        counts = [int(output.num_scheduled_tokens[r]) for r in req_ids]
+        n, total = len(req_ids), sum(counts)
+        batch = self._h.dummy_batch(self.state, n, total, is_padding=False)
+        if [int(c) for c in batch.num_scheduled_tokens] != counts:
+            raise ValueError(
+                f"token counts {counts} do not match core's batch layout "
+                f"{list(batch.num_scheduled_tokens)}: put a multi-token row last"
             )
-            positions[req_id] = position
-        batch.input_ids[:n] = torch.tensor(tokens, device=batch.input_ids.device)
+        cached = output.scheduled_cached_reqs
+        positions = {
+            r.req_id: int(r.num_computed_tokens) for r in output.scheduled_new_reqs
+        }
+        positions |= {
+            r: int(p)
+            for r, p in zip(cached.req_ids, cached.num_computed_tokens, strict=True)
+        }
+        tokens: list[int] = []
+        fed: dict[str, int] = {}
+        for req_id, count in zip(req_ids, counts, strict=True):
+            prompt = self._prompts[req_id]
+            for position in range(positions[req_id], positions[req_id] + count):
+                tokens.append(
+                    prompt[position] if position < len(prompt) else self.sampled[req_id]
+                )
+            fed[req_id] = tokens[-1]
+        batch.input_ids[:total] = torch.tensor(tokens, device=batch.input_ids.device)
         index = np.array(
             [self.req_states.req_id_to_index[r] for r in req_ids], dtype=np.intp
         )
-        return dataclasses.replace(
-            batch,
-            req_ids=list(req_ids),
-            idx_mapping=torch.from_numpy(index).to(self.device),
-            idx_mapping_np=index,
-            num_scheduled_tokens=np.ones(n, dtype=np.int32),
-            num_computed_tokens_np=np.array(
-                [positions[r] for r in req_ids], dtype=np.int32
+        return (
+            dataclasses.replace(
+                batch,
+                req_ids=list(req_ids),
+                idx_mapping=torch.from_numpy(index).to(self.device),
+                idx_mapping_np=index,
+                num_computed_tokens_np=np.array(
+                    [positions[r] for r in req_ids], dtype=np.int32
+                ),
+                prefill_len_np=np.array(
+                    [len(self._prompts[r]) for r in req_ids], dtype=np.int32
+                ),
             ),
-            prefill_len_np=np.ones(n, dtype=np.int32),
+            fed,
         )
 
     def _attn(self, batch: Any) -> Any:
@@ -330,50 +425,36 @@ class QualAdapter:
             )
 
 
-class _HostEvent:
-    """``torch.cuda.Event`` on a host without CUDA (CPU tests only)."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def record(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def synchronize(self) -> None:
-        pass
-
-
 # ---------------------------------------------------------------------------
-# Snapshots of the authorized slots (TXG-QUAL-011)
+# Snapshots of the step's blocks (TXG-QUAL-011)
 
 
-class SlotSnapshot:
+class BlockSnapshot:
     """The step rule's snapshot: taken inside the first plan step, after
-    ``bind_rows`` and before its transaction, from the pages the prefix
-    left; restored inside every later step by an in-place copy into the same
-    pool memory on the runner stream, at the slots that step authorized."""
+    ``prepare_inputs`` and before its transaction, from the pages the prefix
+    left at the blocks of the step's rows; restored inside every later step
+    by an in-place copy into the same pool memory on the runner stream, at
+    those blocks only (the adapter's ``before_forward``)."""
 
     def __init__(self) -> None:
-        self.pages: dict[int, dict[str, torch.Tensor]] | None = None
+        self.pages: dict[int, list[torch.Tensor]] | None = None
         self.restores = 0
+        #: The blocks each restore wrote, in order.
+        self.restored: list[tuple[int, ...]] = []
 
-    def __call__(self, projection: Any) -> None:
-        access = projection.state_batch.access
-        pools = access.component_pools
-        slots = tuple(int(s) for s in access.slot_indices_cpu)
+    def __call__(
+        self, blocks: tuple[int, ...], views: tuple[torch.Tensor, ...]
+    ) -> None:
         if self.pages is None:
-            self.pages = {
-                slot: {name: pool[slot].clone() for name, pool in pools.items()}
-                for slot in slots
-            }
+            self.pages = {b: [view[b].clone() for view in views] for b in blocks}
             return
-        if set(slots) != set(self.pages):
-            raise RuntimeError("a plan step authorized other slots than the snapshot")
-        for slot in slots:
-            saved = self.pages[slot]
-            for name, pool in pools.items():
-                pool[slot].copy_(saved[name])
+        if set(blocks) != set(self.pages):
+            raise RuntimeError("a plan step holds other blocks than the snapshot")
+        for block in blocks:
+            for view, saved in zip(views, self.pages[block], strict=True):
+                view[block].copy_(saved)
         self.restores += 1
+        self.restored.append(tuple(blocks))
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +538,42 @@ class _NoTicket:
         pass
 
 
+def _storage_span(t: torch.Tensor) -> tuple[torch.device, int, int]:
+    storage = t.untyped_storage()
+    return t.device, storage.data_ptr(), storage.data_ptr() + storage.nbytes()
+
+
+def detached_problems(
+    copy: tx.Pools, live: tx.Pools, other: dict[str, Any] | None = None
+) -> list[str]:
+    """Every way a reference run over ``copy`` with the arguments ``other``
+    could read or write the serving pools ``live`` (TXG-QUAL-003): a copy
+    tensor, or a tensor argument, whose storage overlaps a serving pool's."""
+    spans = [(name, _storage_span(t)) for name, t in live.flat()]
+
+    def overlaps(t: torch.Tensor) -> list[str]:
+        device, start, end = _storage_span(t)
+        return [
+            name
+            for name, (d, s, e) in spans
+            if d == device and start < e and s < end and end > start
+        ]
+
+    problems = []
+    for name, tensor in copy.flat():
+        hit = overlaps(tensor)
+        if hit:
+            problems.append(f"the reference copy {name} shares storage with {hit}")
+    for key, value in (other or {}).items():
+        items = value if isinstance(value, (list, tuple)) else [value]
+        for item in items:
+            if isinstance(item, torch.Tensor) and (hit := overlaps(item)):
+                problems.append(
+                    f"the reference argument {key} shares storage with {hit}"
+                )
+    return problems
+
+
 def _sync(cuda: bool) -> None:
     if cuda:
         torch.cuda.synchronize()
@@ -511,10 +628,13 @@ class TransactionMonitor:
     # -- the reference -------------------------------------------------------------
 
     def _reference(self, core, input_ids, inputs_embeds, plan, pools, kwargs):
-        """The option-off transaction on ``pools`` (a copy), outside the
-        timer; returns ``(rows, reservation, pools)``."""
+        """The option-off transaction on ``pools`` (a detached copy), outside
+        the timer; returns ``(rows, reservation, pools, problems)``, the
+        problems being every way the reference could reach the serving pools
+        (:func:`detached_problems`)."""
         sink = _ReferenceSink()
         own = {k: v for k, v in kwargs.items() if k not in tx.STEP_OWNED}
+        problems = detached_problems(pools, tx.pools_of(kwargs), own)
         with torch.inference_mode():
             rows = self._real_advance(
                 core,
@@ -526,12 +646,13 @@ class TransactionMonitor:
                 commit_sink=sink,
                 staging=None,
             )
-        return rows, sink.last, pools
+        return rows, sink.last, pools, problems
 
     def _compare(self, call: Call, reference: Any, live: tx.Pools) -> None:
-        rows, reservation, pools = reference
+        rows, reservation, pools, problems = reference
         call.reference_rows = None if rows is None else rows.detach().clone()
         call.compared = True
+        call.problems.extend(problems)
         for name, mine, theirs in (
             ("rows", call.rows, rows),
             ("status", call.status, reservation.staged),

@@ -293,7 +293,7 @@ def test_a_failure_holding_the_reservation_before_any_write_cancels_it(
     env, step, binding = started(arm, on_cpu, off_cpu)
     replays = env.fake.replay_count if arm == "covered" else 0
     log = inject_sink(arm, env, binding, monkeypatch, {"stage-attribute"})
-    before = t.slots_at_step_start(env.runner.bindings, (1,))
+    before = t.slots_at_step_start(env, (1,))
     error = step("s1", 1)
     assert error is not None and injected(error), error
     assert log == ["reserve", "cancel"], log

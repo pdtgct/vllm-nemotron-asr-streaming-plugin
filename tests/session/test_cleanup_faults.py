@@ -6,6 +6,13 @@ Each fault is checked by identity: recorded exactly once, logged once,
 retained after the session record is removed until one ``drain`` returns it,
 and absent from the next ``drain``. The engine double imports vLLM, so these
 are ``engine`` tier.
+
+Scope: the session factory on the stream-admission client path, which the
+session specs' scope separates from the target core's obligations (its port to
+core's admission is the session design's Future roadmap 1). The target core
+provides no such path (``create_session_factory`` refuses there, SESS-FAC-003),
+so these tests run the factory against ``support.fake_engine`` and a pass makes
+no claim for the target core.
 """
 
 from __future__ import annotations

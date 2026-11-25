@@ -9,7 +9,10 @@ are star-imported below. ``tests/session/conftest.py`` registers the suite
 for assertion rewriting before this import. The ``seam`` fixture is the
 adapter the suite drives: ``PluginSeam`` over the factory that
 ``create_session_factory`` returns for ``Nemotron3_5AsrStreamingForRNNT`` on
-``support.fake_engine.SeamEngine``.
+``support.fake_engine.SeamEngine``. The suite covers the factory's
+stream-admission design, which the session specs' scope separates from the
+target core's obligations: the engine double models that client path, and a
+pass makes no claim for the target core (SESS-FAC-007).
 
 The adapter arranges each case at the engine boundary (a parked admission, a
 refusal, a parked unit outcome, a parked retirement wait, a cancellation

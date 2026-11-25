@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Graph memory (TXG-MEM-001 to TXG-MEM-013).
+"""Graph memory (TXG-MEM-001 to TXG-MEM-013, TXG-MEM-017).
 
 CPU tests (``engine``) read memory through ``FakeCuda``: a completed cell
 capture retains ``capture_cost`` bytes, the charged margin ``m +
 margin_rounding``, and each free-memory reading is logged, so the record's
 figures, the margin's retained charge from its two raw readings, the
 aggregate serving-over-profiling guard, the required-profiling decision and
-every failure message are checked against hand-computed values. ``gpu``
-tests read the real allocator.
+every failure message are checked against hand-computed values. The
+environment runs the restricted startup: ``num_gpu_blocks_override`` fixes
+the block count (``support.txgcap_harness.CAPACITY``) unless a test fixes
+``kv_cache_memory_bytes``. ``gpu`` tests read the real allocator.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from pathlib import Path
 import pytest
 import torch
 from support import model_harness as h
+from support import txg_conditions as c
 from support import txgcap_harness as t
 from support.fake_cuda import MARGIN_BYTES
 from support.txg_api import Record
@@ -417,25 +420,55 @@ def test_a_transaction_graph_part_failure_names_its_phase_and_figures(
         assert not re.search(r"\b(chunk|echo) cell\b", message), message
     assert t.mentions_bytes(message, peak), (peak, message)
     assert ALLOC_CONF in message
-    assert "profiled" in message.lower() and "estimate" in message.lower(), message
+    # The budget setting: a block count fixed at the given
+    # num_gpu_blocks_override, with core's estimate enabled.
+    assert re.search(r"num_gpu_blocks_override|--num-gpu-blocks-override", message)
+    assert c.shows_number(message, t.CAPACITY), message
+    assert re.search(
+        r"(?i)estimate[^;\n]{0,40}enabled|enabled[^;\n]{0,40}estimate", message
+    ), message
 
 
-# @spec TXG-MEM-011
+def assert_profiling_remedies(message):
+    """TXG-MEM-011: a smaller largest population, a smaller ``max_num_seqs``,
+    or transaction graphs off."""
+    assert c.found(c.SMALLER_POPULATION, message), message
+    assert re.search(r"--max-num-seqs|max_num_seqs", message), message
+    assert c.found(c.OPTION_OFF, message) or "off" in message.lower(), message
+
+
+# @spec TXG-MEM-011, TXG-MEM-010
 def test_profiling_failure_remedies(on_cpu):
+    """A profiling capture that fails after pool access gives TXG-MEM-011's
+    remedies, and none of TXG-MEM-017's larger budget or block count."""
     error, _ = _failure(on_cpu(n=2), capture="profiling", phase="capture")
     message = str(error)
     assert t.OPTION in message
-    assert re.search(r"--max-num-seqs|max_num_seqs", message)
-    assert "off" in message.lower() or "remove" in message.lower()
+    assert_profiling_remedies(message)
+    assert not c.found(c.RAISES_BUDGET, message), message
 
 
-# @spec TXG-MEM-012
-def test_serving_failure_under_a_profiled_budget_remedies(on_cpu):
-    error, _ = _failure(on_cpu(n=2), capture="serving", phase="capture")
+# @spec TXG-MEM-012, TXG-MEM-010
+def test_serving_failure_under_a_fixed_block_count_remedies(on_cpu):
+    """Under a fixed ``--num-gpu-blocks-override``, a serving capture that
+    fails after pool access gives TXG-MEM-011's remedies or a smaller
+    override that still holds the admission limit plus one blocks (here
+    ``max_num_seqs`` 2, so 3), stating that it helps only when the state
+    pages leave too little memory for the transient peak; no
+    ``--gpu-memory-utilization`` (the budget is not profiled) and no
+    ``--kv-cache-memory-bytes`` remedy (TXG-MEM-013's case)."""
+    run = on_cpu(n=2)
+    error, _ = _failure(run, capture="serving", phase="capture")
     message = str(error)
-    assert re.search(r"--max-num-seqs|max_num_seqs", message) and t.OPTION in message
-    assert "--gpu-memory-utilization" in message
+    assert t.OPTION in message
+    assert_profiling_remedies(message)
+    assert re.search(
+        r"(?i)(smaller|lower)[^;\n]{0,40}?--num-gpu-blocks-override", message
+    ), message
+    assert c.shows_number(message, run.env.admission_limit + 1), message
     assert "transient peak" in message.lower(), message
+    assert "--gpu-memory-utilization" not in message, message
+    assert not c.found(c.KV_BYTES, message), message
 
 
 @pytest.mark.parametrize(
@@ -469,6 +502,47 @@ def test_serving_failure_under_a_fixed_budget_projects_the_remainder(
         assert "unavailable" in message.lower(), message
     assert "fixed" in message.lower() and t.mentions_bytes(message, budget), message
     assert re.search(r"--max-num-seqs|max_num_seqs", message)
+    # TXG-MEM-010's routing: not TXG-MEM-012's block-count remedy
+    assert not c.found(c.BLOCKS_OVERRIDE, message), message
+
+
+@pytest.mark.parametrize("capture", ["profiling", "serving"])
+# @spec TXG-MEM-017, TXG-MEM-010, TXG-CAP-008
+def test_too_few_blocks_fail_pool_access_with_a_larger_budget_or_lower_limit(
+    on_cpu, capture
+):
+    """The admission limit is ``max_num_seqs`` 4, so pool access needs five
+    blocks; the pool holds three (enough for the two capture rows of
+    ``N = 2``). The serving capture runs under a fixed
+    ``--kv-cache-memory-bytes``, whose block count no configuration check
+    knows; the profiling capture finds a profiling KV cache smaller than the
+    override. The pool-access failure names the block count and the layouts
+    it received, and its remedies are a larger budget or block count, or a
+    lower admission limit, never a smaller budget or block count."""
+    budget = None if capture == "profiling" else 1 << 30
+    run = on_cpu(n=2, max_num_seqs=4, kv_cache_memory_bytes=budget)
+    env, core = run.env, run.core
+    small = h.real_bindings(h.model_spec(env.model), capacity=3)
+    core.prepare()
+    if capture == "profiling":
+        core.bind_profiling(small)
+    else:
+        core.bind_serving(small)
+    error = h.call_with(core.capture, profile_only=capture == "profiling")
+    assert error is not None, "a pool of too few blocks passed pool access"
+    message, full = str(error), t.text(error)
+    assert t.OPTION in message and capture in message.lower(), message
+    assert "pool access" in message.lower(), message
+    assert not re.search(r"\b(chunk|echo) cell\b", message), message
+    assert "layout" in full.lower() and c.shows_number(full, 3), full
+    assert c.shows_number(full, 4) or c.shows_number(full, 5), full
+    assert c.found(c.RAISES_BUDGET, message), message
+    assert c.lower_admission_limit(message), message
+    assert not c.found(c.LOWERS_BUDGET, message), (
+        "a pool-access block-count failure gave a lowering remedy",
+        message,
+    )
+    assert t.fake_graph_count(env) == 0, "a cell was captured past pool access"
 
 
 # ---------------------------------------------------------------------------

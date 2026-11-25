@@ -2,9 +2,10 @@
 """Test tiers.
 
 * unmarked: CPU tests needing only this package and its pure-Python modules.
-* ``engine``: CPU tests that import the PR 6 proof-of-concept vLLM build
-  (pdtgct/vllm#6 with vllm#67583's model-state hooks on ``PYTHONPATH``). Skipped
-  when it does not import.
+* ``engine``: CPU tests that import the stage 1 vLLM build, the target core
+  (``pdtgct/vllm`` at ``ddf6db2ab8``: RFC 1's state layer with vllm#67583's
+  model-state hooks, on ``PYTHONPATH``). Skipped when no state-layer build
+  imports.
 * ``gpu``: installed-engine tests on a CUDA device (``vllm serve`` with the
   plugin installed). Skipped without CUDA.
 * ``card``: tests against a local copy of the published Hub card, named by
@@ -22,10 +23,12 @@ import pytest
 
 
 def _engine_available() -> bool:
-    """The PR 6 proof-of-concept build: ``MambaManager.layer_config`` takes
-    ``recomputable`` (pdtgct/vllm#6)."""
+    """A state-layer build: ``MambaManager.layer_config`` takes
+    ``recomputable`` and ``MambaAttentionBackendEnum`` has
+    ``PERSISTENT_STATE`` (RFC 1's state layer)."""
     try:
         managers = importlib.import_module("vllm.v1.core.single_type_kv_cache_manager")
+        backends = importlib.import_module("vllm.v1.attention.backends.registry")
     except Exception:
         return False
     layer_config = getattr(managers.MambaManager, "layer_config", None)
@@ -33,6 +36,7 @@ def _engine_available() -> bool:
         return (
             layer_config is not None
             and "recomputable" in inspect.signature(layer_config).parameters
+            and "PERSISTENT_STATE" in backends.MambaAttentionBackendEnum.__members__
         )
     except (TypeError, ValueError):
         return False

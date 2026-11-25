@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The tier 5 decision rules (``support.txgcap_qual``) on hand-made figures:
 each biconditional at and across its boundary, the void rule and seed list,
-the preregistration freeze, and the choice of ``N`` (TXG-QUAL-005, -013,
--014, -015, -017, -018, -025, -027). CPU only; no vLLM."""
+the preregistration freeze, the ``U_api`` procedure, the restricted startup
+of every qualifying engine, and the choice of ``N`` (TXG-QUAL-001, -005,
+-010, -013, -014, -016 to -018, -025, -027). CPU only; no vLLM."""
 
 from __future__ import annotations
 
@@ -68,42 +69,6 @@ def test_groups_pass_only_when_every_member_is_material_without_pooling():
 
 
 # ---------------------------------------------------------------------------
-# Body non-regression
-
-
-@pytest.mark.parametrize(
-    "old1,new,old2,expected",
-    [
-        (10.0, 11.0, 10.0, True),  # +1 ms = max(1, 0)
-        (10.0, 11.2, 10.0, False),
-        (10.0, 12.0, 12.5, True),  # +2 ≤ drift 2.5
-        (10.0, 12.6, 12.5, False),
-        (10.0, 8.0, 10.0, True),  # faster
-    ],
-)
-# @spec TXG-QUAL-015
-def test_body_check_block_passes_exactly_at_its_threshold(old1, new, old2, expected):
-    assert q.body_block_passes(block(old1, new, old2)) is expected
-
-
-# @spec TXG-QUAL-015
-def test_body_check_requires_both_blocks():
-    good, bad = block(10, 10, 10), block(10, 12, 10)
-    assert q.body_check([good, good]) is True
-    assert q.body_check([good, bad]) is False
-
-
-# @spec TXG-QUAL-015
-def test_body_check_gates_every_population():
-    good, bad = block(10, 10, 10), block(10, 12, 10)
-    passing = {p: [good, good] for p in q.BODY_POPULATIONS}
-    assert q.body_check_all(passing) is True
-    assert q.body_check_all({**passing, 31: [good, bad]}) is False
-    with pytest.raises(ValueError):
-        q.body_check_all({1: [good, good], 63: [good, good]})
-
-
-# ---------------------------------------------------------------------------
 # U_api
 
 
@@ -134,6 +99,66 @@ def test_u_api_repeat_zero_is_discarded_and_the_pooled_maximum_is_checked():
     mixed = [wide, close, wide, wide, wide]
     assert all(q._gain(*b.u()) for b in mixed)
     assert q.u_api_gain(mixed) is False
+
+
+# @spec TXG-QUAL-016
+def test_u_api_runs_five_brackets_each_leg_after_a_washout_of_its_arm():
+    schedule = q.u_api_schedule()
+    counted = [r for r in schedule if not r["washout"]]
+    assert [(r["bracket"], r["leg"]) for r in counted] == [
+        (b, leg) for b in range(5) for leg in ("OFF1", "ON", "OFF2")
+    ]
+    for washout, leg in zip(schedule[::2], schedule[1::2], strict=True):
+        assert washout["washout"] and not leg["washout"]
+        assert (washout["bracket"], washout["leg"], washout["arm"]) == (
+            leg["bracket"],
+            leg["leg"],
+            leg["arm"],
+        )
+        assert leg["arm"] == ("on" if leg["leg"] == "ON" else "off")
+
+
+def u_leg(arm, *, tokens=3, parks=1, errors=0, deltas=None, repeats=4):
+    on = {"chunk1": 1, "echo1": tokens - 1, "other_replays": 0, "fallbacks": 0}
+    repeat = {
+        "ms": 30.0,
+        "parks": parks,
+        "errors": errors,
+        "tokens": tokens,
+        "deltas": on if deltas is None else deltas,
+    }
+    return {"arm": arm, "leg": arm.upper(), "repeats": [dict(repeat)] * repeats}
+
+
+# @spec TXG-QUAL-016
+def test_each_u_api_repeat_parks_once_and_an_on_leg_replays_the_cells_at_one():
+    assert q.u_api_leg_problems(u_leg("on")) == []
+    assert q.u_api_leg_problems(u_leg("off", deltas={})) == []
+    assert q.u_api_leg_problems(u_leg("on", repeats=3)), "three repeats passed"
+    assert q.u_api_leg_problems(u_leg("off", parks=2)), "two parks passed"
+    assert q.u_api_leg_problems(u_leg("off", parks=0)), "no park passed"
+    assert q.u_api_leg_problems(u_leg("off", errors=1)), "an error output passed"
+    for name, value in (
+        ("chunk1", 2),
+        ("echo1", 1),
+        ("other_replays", 1),
+        ("fallbacks", 1),
+    ):
+        deltas = {"chunk1": 1, "echo1": 2, "other_replays": 0, "fallbacks": 0}
+        deltas[name] = value
+        assert q.u_api_leg_problems(u_leg("on", deltas=deltas)), name
+
+
+# @spec TXG-QUAL-016, TXG-QUAL-017
+def test_a_u_api_bracket_takes_its_legs_in_order():
+    legs = [
+        {"leg": leg, "repeats": [{"ms": ms}] * 4}
+        for leg, ms in (("OFF1", 40.0), ("ON", 30.0), ("OFF2", 40.0))
+    ]
+    bracket = q.u_api_bracket(legs)
+    assert bracket.u() == (40.0, 30.0, 40.0)
+    with pytest.raises(ValueError):
+        q.u_api_bracket(legs[::-1])
 
 
 # @spec TXG-QUAL-017
@@ -188,6 +213,27 @@ def test_seed_list_outcomes():
 
 
 # @spec TXG-QUAL-018
+def test_the_frozen_record_names_the_adapter_and_every_procedure():
+    """The step rule's adapter identity is frozen with the prefix, snapshot
+    rule, plans, compositions and aggregation; there is no body check."""
+    complete = {"parameters": {k: "x" for k in q.FROZEN_PARAMETERS}}
+    assert q.missing_frozen_parameters(complete) == []
+    for name in ("adapter_identity", "snapshot_rule", "u_api_input_generator"):
+        record = {"parameters": dict(complete["parameters"])}
+        del record["parameters"][name]
+        assert q.missing_frozen_parameters(record) == [name]
+    assert not [k for k in q.FROZEN_PARAMETERS if "body" in k]
+
+
+# @spec TXG-QUAL-018
+def test_the_adapter_identity_is_its_source_digest():
+    from support import txg_qual_adapter as adapter
+
+    identity = adapter.adapter_identity()
+    assert len(identity) == 64 and identity == adapter.adapter_identity()
+
+
+# @spec TXG-QUAL-018
 def test_a_run_counts_only_against_a_matching_record_frozen_before_it():
     params = {"seeds": [1, 2], "concurrencies": [1, 32, 64]}
     record = {"frozen_at": 100.0, "parameters": dict(params)}
@@ -208,6 +254,61 @@ def test_a_run_counts_only_against_a_matching_record_frozen_before_it():
 def histogram(at_63=990, above=10):
     """Served ``(K, E)`` steps: most within 63, a tail above."""
     return {(40, 23): at_63, (70, 1): above}
+
+
+# @spec TXG-QUAL-025
+def test_the_served_run_uses_the_largest_accepted_n_when_it_fits():
+    """``N = min(P_max, admission limit)``, else the largest ``N`` below it
+    that fits."""
+    fits = {48: True, 56: True, 64: True}
+    assert q.served_run_n(64, 64, fits) == 64
+    assert q.served_run_n(64, 56, fits) == 56, "the admission limit bounds N"
+    assert q.served_run_n(48, 64, fits) == 48, "P_max bounds N"
+    assert q.served_run_n(64, 64, {48: True, 56: True, 64: False}) == 56
+    assert q.served_run_n(64, 64, {64: False}) is None
+
+
+# @spec TXG-QUAL-025
+def test_fits_means_both_captures_under_max_num_seqs_plus_one_with_the_estimate():
+    settings = q.fit_startup(64)
+    assert settings["num_gpu_blocks_override"] == 65
+    assert q.estimate_enabled() == {q.ESTIMATE_ENV: "1"}
+    assert "kv_cache_memory_bytes" not in settings
+
+
+# @spec TXG-QUAL-001, TXG-QUAL-010
+def test_every_qualifying_engine_runs_the_restricted_startup_with_a_fixed_block_count():
+    settings = q.restricted_startup(64)
+    assert settings["async_scheduling"] is False
+    assert settings["compilation_config"] == {"cudagraph_mode": "NONE", "mode": 0}
+    assert settings["num_gpu_blocks_override"] == 65
+    assert "kv_cache_memory_bytes" not in settings
+    # the admission limit, not max_num_seqs, fixes the block count
+    limited = q.restricted_startup(64, max_num_active_seqs=32)
+    assert limited["num_gpu_blocks_override"] == 33
+
+
+# @spec TXG-QUAL-001, TXG-QUAL-010
+def test_the_driver_runs_b_hook_with_the_same_settings_and_the_estimate():
+    """``B_hook`` differs from the option-on run only by the absent key: the
+    block count included (TXG-QUAL-001); every run enables core's
+    graph-memory estimate (TXG-QUAL-010)."""
+    from support import txg_qual_driver as d
+
+    key = "transaction_graph_populations"
+    on = {
+        "card": "/card",
+        "max_model_len": 4096,
+        "max_num_seqs": 64,
+        "hf_overrides": {"num_lookahead_tokens": 0, key: [64]},
+    }
+    off = on | {"hf_overrides": {"num_lookahead_tokens": 0}}
+    a, b = d.engine_settings(on), d.engine_settings(off)
+    assert {k: v for k, v in a.items() if k != "hf_overrides"} == {
+        k: v for k, v in b.items() if k != "hf_overrides"
+    }
+    assert a["num_gpu_blocks_override"] == 65 and a["async_scheduling"] is False
+    assert d.engine_env(on)[q.ESTIMATE_ENV] == "1"
 
 
 # @spec TXG-QUAL-025

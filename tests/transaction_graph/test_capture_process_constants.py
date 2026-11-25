@@ -72,8 +72,8 @@ def test_a_changed_process_constant_latches_and_raises(
     assert len(env.advance.calls) == advances, (
         "the step fell back under a changed setting"
     )
-    # The later request takes a slot no earlier request holds: core refuses
-    # a held slot at the same generation before the model runs.
+    # The later request takes a block no earlier request holds (one block per
+    # request, kept until its terminal finish).
     later = h.call_with(
         core.step, t.stream_unit(env, "later"), handles={"later": len(rows) + 1}
     )
@@ -107,7 +107,6 @@ def test_a_changed_process_constant_latches_and_raises_cuda(
     error = h.call_with(core.step, t.stream_unit(env, "s1"))
     assert error is not None
     assert len(env.advance.calls) == advances
-    # As on CPU: the later request takes a slot no earlier request holds, since
-    # core refuses a held slot at the same generation before the model runs.
+    # As on CPU: the later request takes a block no earlier request holds.
     later = h.call_with(core.step, t.stream_unit(env, "s2"), handles={"s2": 2})
     assert later is not None and t.FRESH_ENGINE.search(t.text(later)), later

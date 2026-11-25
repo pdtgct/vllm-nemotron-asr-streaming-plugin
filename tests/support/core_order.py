@@ -11,10 +11,12 @@ model and shutting the worker down (``vllm/v1/worker/gpu_worker.py``,
    profiling forward (``profile_run``, which asks for the preparation again;
    the runner's guard makes that a no-op).
 2. ``profile_cudagraph_memory`` (the graph-memory estimate): a temporary
-   profiling state pool bound to the state layer (core's
-   ``initialize_kv_cache(..., is_profiling=True)``), then, when
+   profiling state pool bound to the state layer with its state-group layout
+   (core's ``initialize_kv_cache(..., is_profiling=True)``), then, when
    ``needs_capture()``, ``capture_cudagraphs(profile_only=True)`` into a
-   throwaway graph pool and ``clear_cudagraphs``.
+   throwaway graph pool, ``clear_cudagraphs`` and core's teardown of the
+   profiling KV cache (``_teardown_profiling_state``: the state-group layouts
+   emptied, the layer's ``kv_cache`` cleared, a collection).
 3. ``initialize_from_config``: the serving state pool, bound the same way.
 4. ``compile_or_warm_up_model``: the kernel warm-up dummy step; when
    ``needs_capture()``, ``capture_cudagraphs(profile_only=False)`` into the
@@ -120,8 +122,6 @@ class CoreOrder:
 
     @contextlib.contextmanager
     def _capture_context(self) -> Iterator[Any]:
-        # PR 6 has no startup-access window: the layer's views are always
-        # readable.
         with torch.inference_mode():
             if self.cuda:
                 from vllm.distributed.parallel_state import graph_capture
@@ -163,9 +163,10 @@ class CoreOrder:
         self.capture(profile_only=False, **kwargs)
 
     def clear(self) -> None:
-        """``clear_cudagraphs``, then a collection, as core's profiling
-        teardown flushes the allocator."""
+        """``clear_cudagraphs``, then core's teardown of the profiling KV
+        cache (see the module docstring)."""
         self.state.clear_cudagraphs()
+        h.release_profiling_kv_cache(self.state, self.runner.model)
         gc.collect()
 
     # -- 4. compile_or_warm_up_model ----------------------------------------
