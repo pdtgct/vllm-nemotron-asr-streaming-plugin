@@ -534,6 +534,27 @@ def _overlapping(
     return None
 
 
+def layer_permitted(layer: Any) -> list[Any]:
+    """What the state layer may hold of core's storage (REG-STATE-018): its
+    bound ``kv_cache`` and the objects its ``pages`` and ``component_pools``
+    return (the page view, the views mapping and each view), read only while
+    a ``kv_cache`` is bound. Reading them may build the layer's view cache,
+    which is the layer's own."""
+    bound = getattr(layer, "kv_cache", None)
+    permitted: list[Any] = [] if bound is None else [bound]
+    if bound is None or isinstance(bound, torch.Tensor) or not len(bound):
+        return permitted
+    for name in ("pages", "component_pools"):
+        try:
+            value = getattr(layer, name)
+        except (AttributeError, RuntimeError):
+            continue
+        permitted.append(value)
+        if isinstance(value, dict):
+            permitted.extend(value.values())
+    return permitted
+
+
 def plugin_holds(
     env: Any,
     targets: list[tuple[str, Any]],
@@ -550,10 +571,14 @@ def plugin_holds(
     its model state and the plugin's module namespaces (with its classes'
     attributes) reach, except core's attribute on the model state
     (``_state_group_layouts``; another reference to the same objects
-    counts), the state layer (its bound ``kv_cache`` and its view cache are
-    the layer's, REG-STATE-018), other modules' namespaces, and the
-    harness's and pytest's objects (spies, fakes, the runner). Empty when the
-    plugin holds none (TXG-CAP-008)."""
+    counts), other modules' namespaces, and the harness's and pytest's
+    objects (spies, fakes, the runner). It walks the state layer too: there,
+    and in what the layer holds, only the objects :func:`layer_permitted`
+    lists are the layer's (its bound ``kv_cache`` and its view cache,
+    REG-STATE-018), so anything else on the layer that shares a pool's
+    storage (a pool slice transaction-graph code stored there) is found; the
+    same objects held anywhere else are the plugin's and are found too.
+    Empty when the plugin holds none (TXG-CAP-008)."""
     import sys
     from collections import deque
 
@@ -564,11 +589,16 @@ def plugin_holds(
             storages.append((label, span))
     state = env.state
     layer = h.state_layer_of(env.model)
+    permitted = {id(obj) for obj in layer_permitted(layer)}
     modules = [(n, m) for n, m in list(sys.modules.items()) if m is not None]
-    seen = {id(layer)}
-    seen |= {id(vars(m)) for _, m in modules if hasattr(m, "__dict__")}
-    parent: dict[int, tuple[int | None, str]] = {}
-    queue: deque[Any] = deque()
+    namespaces = {id(vars(m)) for _, m in modules if hasattr(m, "__dict__")}
+    # An object reached inside the layer (where its permitted objects are
+    # skipped) is walked again when reached outside it, so that the layer's
+    # permission never hides what the plugin holds elsewhere; one already
+    # walked outside needs no walk inside.
+    seen: dict[bool, set[int]] = {False: set(namespaces), True: set()}
+    parent: dict[tuple[int, bool], tuple[tuple[int, bool] | None, str]] = {}
+    queue: deque[tuple[Any, bool]] = deque()
     roots: list[tuple[str, Any]] = [("model", env.model), ("model state", state)]
     roots += [
         (f"module {n}", vars(m))
@@ -576,44 +606,61 @@ def plugin_holds(
         if _plugin_name(n) and hasattr(m, "__dict__")
     ]
     for name, root in roots:
-        seen.add(id(root))
-        parent[id(root)] = (None, name)
-        queue.append(root)
+        seen[False].add(id(root))
+        parent[(id(root), False)] = (None, name)
+        queue.append((root, False))
 
-    def path(node: int) -> str:
+    def path(node: tuple[int, bool]) -> str:
         names = []
-        current: int | None = node
+        current: tuple[int, bool] | None = node
         while current is not None:
             current, name = parent[current]
             names.append(name)
         return " -> ".join(reversed(names))
 
     found: list[str] = []
+    reported: set[int] = set()
+
+    def report(key: int, line: str) -> None:
+        if key not in reported:
+            reported.add(key)
+            found.append(line)
+
     while queue:
-        obj = queue.popleft()
+        obj, inside = queue.popleft()
         if obj is state:
             # Core's attribute, not the plugin's: skip that one edge only.
             children = [v for k, v in vars(state).items() if k != CORE_ATTRIBUTE]
+        elif obj is layer:
+            inside = True
+            children = (
+                list(vars(layer).values())
+                if hasattr(layer, "__dict__")
+                else _referents(layer)
+            )
         else:
             children = _referents(obj)
+        node = (id(obj), inside if obj is not layer else False)
         for child in children:
             key = id(child)
-            if key in seen:
+            if inside and key in permitted:
                 continue
-            seen.add(key)
-            parent[key] = (id(obj), type(child).__name__)
+            if key in seen[False] or key in seen[inside]:
+                continue
+            seen[inside].add(key)
+            parent[(key, inside)] = (node, type(child).__name__)
             if key in wanted:
-                found.append(f"{path(key)}: {wanted[key]}")
+                report(key, f"{path((key, inside))}: {wanted[key]}")
                 continue
             if isinstance(child, torch.Tensor):
                 shared = _overlapping(storage_span(child), storages)
                 if shared is not None:
-                    found.append(f"{path(key)}: shares storage with {shared}")
+                    report(key, f"{path((key, inside))}: shares storage with {shared}")
                 continue
             if _harness_object(child):
                 continue
-            queue.append(child)
-            if len(seen) > limit:
+            queue.append((child, inside))
+            if len(seen[False]) + len(seen[True]) > limit:
                 raise AssertionError(f"plugin_holds walked more than {limit} objects")
     return found
 

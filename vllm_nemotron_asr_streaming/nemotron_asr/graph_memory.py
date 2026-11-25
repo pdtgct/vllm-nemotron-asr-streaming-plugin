@@ -250,6 +250,10 @@ class CaptureCall:
     requirement: ProfilingRequirement | None
     #: Whether a profiling capture ran in the worker before this call.
     profiling_ran: bool
+    #: Reads core's ``ModelState.state_group_layouts`` now: the one way the
+    #: transaction-graph part reaches the state pools, and only during this
+    #: call (TXG-CAP-008, TXG-LIFE-003). ``None`` when the caller has none.
+    state_group_layouts: Any = None
 
     @property
     def segment_total(self) -> int | None:

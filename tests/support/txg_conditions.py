@@ -226,22 +226,71 @@ def suggested_changes(message: str, settings: dict[str, object] | None = None) -
     return ";".join(changes)
 
 
+#: What may stand between an option and a value it is named with: a stating
+#: phrase (:data:`_STATED_AS`), a comparison (``>=``, ``at least``) or a
+#: wish (``need``).
+_NAMED_WITH = (
+    r"(?:[\s=:(\"'`]|>=|<=|==|[<>≥≤]"
+    r"|\b(?:fixed|set|at|to|is|of|least|most|need|needs|be)\b)*"
+)
+#: A value: a number, with an optional byte unit.
+_VALUE = r"(\d[\d,_]*(?:\.\d+)?)(?:\s*(KiB|MiB|GiB|TiB|bytes|B)\b)?"
+_UNITS = {"KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40}
+
+
+def _is_value(number: str, unit: str | None, current: object) -> bool:
+    """Whether ``number`` (with ``unit``) renders ``current``: exactly, or,
+    with a binary unit, to the precision of its decimals."""
+    try:
+        amount = float(number.replace(",", "").replace("_", ""))
+        target = float(current)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    scale = _UNITS.get(unit or "", 1)
+    decimals = len(number.split(".", 1)[1]) if "." in number else 0
+    return abs(amount * scale - target) <= 0.5 * 10**-decimals * scale
+
+
+def changed_settings(message: str, settings: dict[str, object]) -> list[str]:
+    """The options of :data:`OPTION_NAMES` that ``message`` names with a
+    value other than their current one in ``settings`` (an option absent from
+    ``settings`` is unset, so every value differs): ``--num-gpu-blocks-override
+    >= 5`` or ``you may need --num-gpu-blocks-override 9`` while the override
+    is unset or another value. Naming an option with a new value suggests that
+    value, whatever the phrasing, so it is a remedy."""
+    changed = []
+    for flag, names in OPTION_NAMES.items():
+        alternatives = "|".join(re.escape(name) for name in names)
+        pattern = rf"(?<![\w-])(?:{alternatives})(?![\w-]){_NAMED_WITH}{_VALUE}"
+        for match in re.finditer(pattern, message):
+            if flag not in settings or not _is_value(
+                match.group(1), match.group(2), settings[flag]
+            ):
+                changed.append(flag)
+                break
+    return changed
+
+
 def configuration_remedies(
     message: str, settings: dict[str, object] | None = None
 ) -> list[str]:
     """The configuration remedies ``message`` gives (empty for a break of
     core's state-group layout contract, TXG-CAP-008, TXG-MEM-010): the
     changes of :data:`CONFIGURATION_REMEDIES` it suggests
-    (:func:`suggested_changes`). An option named in a clause that suggests no
-    change (``budget setting: --kv-cache-memory-bytes fixed at 1073741824``),
-    or named with its current value in ``settings``
-    (:func:`current_settings`), states the configuration, as TXG-MEM-010's
-    budget setting does, and is not a remedy."""
+    (:func:`suggested_changes`) and, given ``settings``, every option it names
+    with a value other than its current one (:func:`changed_settings`). An
+    option named in a clause that suggests no change (``budget setting:
+    --kv-cache-memory-bytes fixed at 1073741824``), or named with its current
+    value in ``settings`` (:func:`current_settings`), states the
+    configuration, as TXG-MEM-010's budget setting does, and is not a remedy.
+    Without ``settings`` no value can be told from the current one, so only
+    suggested changes count."""
     changes = suggested_changes(message, settings)
+    changed = [] if settings is None else changed_settings(message, settings)
     return [
         name
         for name, pattern in CONFIGURATION_REMEDIES.items()
-        if found(pattern, changes)
+        if found(pattern, changes) or name in changed
     ]
 
 

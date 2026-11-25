@@ -16,6 +16,7 @@ the burst through the resumable stop path. Greedy sampling is enforced
 by the replay-echo guard (PORT-DEC-005/007).
 """
 
+import dataclasses
 import json
 import time
 from pathlib import Path
@@ -597,6 +598,9 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
         self._txg_binding: Any = None
         if transaction_graphs_on(hf_config):
             self._txg_binding = self._build_transaction_graph_binding(vllm_config)
+        if self._txg_binding is not None:
+            # TXG-LIFE-009: the state layer reports each binding of its views.
+            self._persistent_state_layer.bind_observer = self._state_layer_bound
 
     def _build_transaction_graph_binding(self, vllm_config: Any) -> Any:
         """The binding for an accepted option value. A configuration the
@@ -632,6 +636,15 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
         if binding is None or config is None or not transaction_graphs_on(config):
             return None
         return binding
+
+    # @spec TXG-LIFE-009, TXG-LIFE-011
+    def _state_layer_bound(self, layer: Any) -> None:
+        """The state layer's report of views core just bound
+        (``bind_kv_cache``): the transaction-graph binding compares them with
+        the layout the serving capture read, once one was attempted."""
+        binding = self._transaction_graph_binding
+        if binding is not None:
+            binding.check_bindings(layer)
 
     def _state_pools(self, projection: Any) -> Any:
         return projection.state_batch.pools
@@ -1171,7 +1184,10 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
     # ``check_capture_entry(profile_only=)`` (TXG-LIFE-007, TXG-LIFE-008),
     # ``check_profiling_requirement(requirement)`` (TXG-MEM-007, TXG-MEM-009),
     # ``capture(call)`` after the segment graphs (TXG-LIFE-004, TXG-LIFE-006,
-    # with the margin and the comparison through ``graph_memory``),
+    # with the margin and the comparison through ``graph_memory``; the call
+    # carries the model state's ``state_group_layouts`` reader, TXG-CAP-008),
+    # ``check_bindings(layer)`` from the state layer's bind observer
+    # (TXG-LIFE-009),
     # ``discard_capture(error)`` on a failed call (TXG-LIFE-012),
     # ``release_profiling()`` (TXG-LIFE-005), ``verify_post_warmup()`` and
     # ``shutdown()`` (TXG-LIFE-010), each before the segment-graph part.
@@ -1207,11 +1223,15 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
         graph_pool: Any,
         stream: Any,
         profile_only: bool,
+        state_group_layouts: Any = None,
     ) -> None:
         """Core's ``capture_cudagraphs``: capture the segment graphs for the
         server's geometry into ``graph_pool`` on ``stream``, then the
         transaction-graph part; a profiling call (``profile_only``) ends with
         the charged margin, a serving call with the memory comparison.
+        ``state_group_layouts`` reads the model state's
+        ``state_group_layouts`` during the call: the transaction-graph part's
+        only way to the state pools (TXG-CAP-008).
 
         A refused call captures nothing. A failure after the entry checks
         discards everything the call created and synchronizes ``stream``
@@ -1281,6 +1301,7 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
                 segment_seconds=seconds,
                 requirement=requirement,
                 profiling_ran=self._profiling_figures is not None,
+                state_group_layouts=state_group_layouts,
             )
             if binding is not None:
                 binding.capture(call)
@@ -1828,6 +1849,15 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
             raise RuntimeError("Nemotron forward requires raw ids")
         if persistent_state_projection is None:
             raise ValueError("Nemotron forward requires an MRv2 state projection")
+        binding = self._transaction_graph_binding
+        if binding is not None and binding.failed:
+            # @spec TXG-FAIL-003, TXG-FAIL-010: a latched worker refuses every
+            # real step that schedules a row, before any other check.
+            from vllm_nemotron_asr_streaming.nemotron_asr.transaction_graph import (
+                LATCHED,
+            )
+
+            raise RuntimeError(LATCHED)
         # @spec REG-MEM-011, REG-MEM-006: a real step runs only on a worker
         # whose preparation succeeded, and never captures while serving.
         if not self._execution_memory_prepared:
@@ -1888,6 +1918,10 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
             num_pool_blocks=int(pools.replay_queue.shape[0]),
             execution_tier=execution_tier,
         )
+        if last_positions is not None:
+            # @spec TXG-COV-014: a step with a multi-token row; its rows were
+            # placed by their token positions above (TXG-TXN-010).
+            plan = dataclasses.replace(plan, multi_token=True)
         native_handoff = self._native_burst_handoff
         if native_handoff is not None:
             if persistent_state_projection is None:

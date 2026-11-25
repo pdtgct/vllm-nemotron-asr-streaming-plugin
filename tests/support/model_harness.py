@@ -650,8 +650,15 @@ def _slot(slot: int | tuple[int, int]) -> int:
 
 
 def with_slot(request: Any, slot: int | tuple[int, int]) -> Any:
-    """``request`` with its one ``MambaManager`` block (``block_ids``)."""
-    return dataclasses.replace(request, block_ids=([_slot(slot)],))
+    """``request`` with its one ``MambaManager`` block (``block_ids``).
+    Attributes set on the request beyond its dataclass fields (a test's
+    endpoint policy) are kept: ``dataclasses.replace`` copies fields only."""
+    new = dataclasses.replace(request, block_ids=([_slot(slot)],))
+    fields = {field.name for field in dataclasses.fields(request)}
+    for name, value in vars(request).items():
+        if name not in fields:
+            setattr(new, name, value)
+    return new
 
 
 def stream_envelope(

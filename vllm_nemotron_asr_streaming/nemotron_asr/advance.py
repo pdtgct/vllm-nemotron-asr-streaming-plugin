@@ -429,6 +429,12 @@ class RowPlan:
     it decides the path on the device. Transaction graphs read it to decline
     a step that holds a candidate.
 
+    ``multi_token``: whether a row of the plan scheduled more than one token
+    (a multi-token row, which planning fails, REG-STATE-014). The rows are
+    then placed by their token positions before the transaction (TXG-TXN-010);
+    the transaction never reads it, and transaction graphs decline the step
+    by ``multi-token`` (TXG-COV-014).
+
     :attr:`is_fresh` is the per-row freshness mask the body's gather index
     and book select read (TXG-MASK-001), derived from
     ``has_initial_states_p``.
@@ -473,6 +479,7 @@ class RowPlan:
     forced_eou_candidate: torch.Tensor = field(
         default_factory=lambda: torch.zeros(0, dtype=torch.bool)
     )
+    multi_token: bool = False
 
     @property
     def is_fresh(self) -> torch.Tensor:

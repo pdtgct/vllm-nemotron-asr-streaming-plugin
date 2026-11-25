@@ -345,7 +345,7 @@ class NemotronASRModelState(ModelState):
             self._needs_cudagraph_capture = answer
         return answer
 
-    # @spec REG-MEM-020, REG-MEM-022
+    # @spec REG-MEM-020, REG-MEM-022, TXG-CAP-008
     def capture_cudagraphs(
         self,
         *,
@@ -358,6 +358,9 @@ class NemotronASRModelState(ModelState):
             graph_pool=graph_pool,
             stream=stream,
             profile_only=profile_only,
+            # TXG-CAP-008: core's state-group layout, read during this call
+            # only, is how the transaction-graph part reaches the pools.
+            state_group_layouts=lambda: self.state_group_layouts,
         )
 
     # @spec REG-MEM-021, REG-STATE-018

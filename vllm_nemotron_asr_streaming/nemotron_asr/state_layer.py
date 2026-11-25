@@ -101,6 +101,10 @@ class NemotronStateLayer(MambaBase, nn.Module):
         self.layout = layout
         #: The view cache (REG-STATE-018); ``None`` until a read builds it.
         self._views: _Views | None = None
+        #: Called with the layer after each ``bind_kv_cache``: the model sets
+        #: it while transaction graphs are on, so the layer reports newly
+        #: bound views to the transaction-graph binding (TXG-LIFE-009).
+        self.bind_observer: Any = None
         forward_context = vllm_config.compilation_config.static_forward_context
         if prefix in forward_context:
             raise ValueError(f"duplicate layer name: {prefix}")
@@ -119,12 +123,15 @@ class NemotronStateLayer(MambaBase, nn.Module):
         check_page_size(spec, self.layout)
         return MambaManager.layer_config(spec, recomputable=False)
 
-    # @spec REG-STATE-018
+    # @spec REG-STATE-018, TXG-LIFE-009
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # Core binds the capacity-sized pool at initialization and rebinds it
         # when the extensible KV cache grows: the views are rebuilt each time.
         self._views = None
         super().bind_kv_cache(kv_cache)
+        observer = self.bind_observer
+        if observer is not None:
+            observer(self)
 
     # @spec REG-STATE-018
     def drop_views(self) -> None:

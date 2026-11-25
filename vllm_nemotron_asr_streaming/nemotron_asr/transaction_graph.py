@@ -65,6 +65,7 @@ KINDS = (CHUNK, ECHO)
 REASONS = (
     "memory-profile",
     "native-burst",
+    "multi-token",
     "empty",
     "multi-geometry",
     "chunk-uncovered",
@@ -126,6 +127,7 @@ SECTION = {CHUNK: 0, ECHO: 1}
 CARRIER_DTYPE = torch.float32
 
 # The phases of a capture call's transaction-graph part (TXG-MEM-010).
+PHASE_POOL_ACCESS = "pool access"
 PHASE_BUFFERS = "binding-buffer allocation"
 PHASE_WARMUP = "scatter warm-up"
 PHASE_REFERENCE = "eager reference"
@@ -169,7 +171,7 @@ class Classification:
 
 
 # @spec TXG-COV-001, TXG-COV-002, TXG-COV-004, TXG-COV-006, TXG-COV-007
-# @spec TXG-COV-009, TXG-COV-010, TXG-CELL-002
+# @spec TXG-COV-009, TXG-COV-010, TXG-COV-014, TXG-CELL-002
 def classify(
     plan: Any,
     *,
@@ -184,8 +186,11 @@ def classify(
     A step with ``K`` CHUNK rows and ``E`` other rows (planning-failed rows
     are bound non-CHUNK, so they count in ``E``) needs the chunk cell at
     ``K`` when ``K > 0`` and the echo cell at ``E`` when ``E > 0``, each at
-    exactly its count. It reads no device memory, changes nothing and never
-    raises on a row plan; signatures are compared by ``execute``.
+    exactly its count. A step that holds a multi-token row
+    (``plan.multi_token``) falls back by ``multi-token`` before any reason of
+    its shape: only a one-token step is covered. It reads no device memory,
+    changes nothing and never raises on a row plan; signatures are compared
+    by ``execute``.
     """
     population = int(plan.num_decodes) + int(plan.num_prefills)
     is_chunk = plan.is_chunk
@@ -203,6 +208,8 @@ def classify(
         return declined("memory-profile")
     if native_burst:
         return declined("native-burst")
+    if bool(getattr(plan, "multi_token", False)):
+        return declined("multi-token")
     if population < 1:
         return declined("empty")
     if chunk_count and bool(
@@ -280,6 +287,44 @@ def callable_identity(fn: Any) -> Any:
 
 def _layout(tensor: torch.Tensor) -> tuple[Any, ...]:
     return (tensor.data_ptr(), tuple(tensor.shape), tensor.stride(), tensor.dtype)
+
+
+def _views_layout(views: Mapping[str, torch.Tensor]) -> dict[str, tuple[Any, ...]]:
+    """The plain-value layout of named views, in their order: address,
+    shape, strides and dtype per view."""
+    return {name: _layout(view) for name, view in views.items()}
+
+
+class _PoolAccessError(RuntimeError):
+    """A failed pool-access check (TXG-CAP-008). ``contract`` is true for a
+    break of core's state-group layout contract, which no configuration
+    setting repairs, and false for too few blocks (TXG-MEM-017)."""
+
+    def __init__(self, message: str, *, contract: bool) -> None:
+        super().__init__(message)
+        self.contract = contract
+
+
+def _describe_layouts(layouts: tuple[Any, ...]) -> str:
+    """The state-group layouts the accessor returned, as plain text: each
+    layout's group and, per layer, its component count and block counts."""
+    parts = []
+    for layout in layouts:
+        layers = []
+        for name, components in dict(getattr(layout, "layers", {})).items():
+            blocks = sorted(
+                {int(component.tensor.shape[0]) for component in components}
+            )
+            layers.append(
+                f"layer {name!r} with {len(components)} components of "
+                f"{' or '.join(str(b) for b in blocks) or 'no'} blocks"
+            )
+        group = getattr(layout, "group_id", "?")
+        parts.append(f"group {group}: {', '.join(layers) or 'no layer'}")
+    noun = "layout" if len(layouts) == 1 else "layouts"
+    return f"{len(layouts)} state-group {noun}" + (
+        f" ({'; '.join(parts)})" if parts else ""
+    )
 
 
 def _first_difference(
@@ -390,9 +435,9 @@ class _CellProgram:
 
 class _CaptureWork:
     """What one capture call's transaction-graph part holds while it runs:
-    the state pools (from core's startup access), their snapshot and the
-    readings. Released before the call ends, so nothing of it outlives the
-    call."""
+    the state pools (from core's state-group layout, read in this call),
+    their snapshot and the readings. Released before the call ends, so
+    nothing of it outlives the call."""
 
     def __init__(self, capture: str, call: Any) -> None:
         self.capture = capture
@@ -455,8 +500,12 @@ class TransactionGraphBinding:
         self._cells_capture: str | None = None
         self._graphs: list[Any] = []
         self._serving_attempted = False
-        self._bindings: Any = None
-        self._layer: str | None = None
+        #: The plain-value layout of the state layer's component pools that
+        #: the serving capture read (address, shape, strides and dtype per
+        #: component, in the layer's order): what a later binding of the
+        #: layer's views and post-warmup verification compare with
+        #: (TXG-LIFE-009, TXG-VER-001). Plain values only (TXG-CAP-008).
+        self._serving_layout: dict[str, tuple[Any, ...]] | None = None
         self._margin: Any = None
         self._device: torch.device | None = None
         self._reserved_at_start: int | None = None
@@ -559,23 +608,45 @@ class TransactionGraphBinding:
         return f"{KEY}={list(self.populations)!r}, N = {self.n}"
 
     def _budget_setting(self, requirement: Any) -> tuple[str, bool]:
-        """The budget setting as the messages name it, and whether it is a
-        fixed budget."""
+        """The budget setting as the messages name it (TXG-MEM-010): a
+        budget fixed at the given ``kv_cache_memory_bytes``, or a block count
+        fixed at the given ``num_gpu_blocks_override`` with core's estimate
+        enabled or disabled; and whether it is a fixed budget."""
         budget = requirement.kv_cache_memory_bytes
         if budget:
             plan = (
-                "set by a persisted startup plan after the model was built"
+                "by a persisted startup plan after the model was built"
                 if not self._constructed_budget
-                else "set by configuration, not by a startup plan"
+                else "by configuration, not by a startup plan"
             )
             return (
-                f"fixed at kv_cache_memory_bytes="
-                f"{graph_memory.format_bytes(int(budget))} ({plan})",
+                "a budget fixed at --kv-cache-memory-bytes "
+                f"{graph_memory.format_bytes(int(budget))}, fixed {plan}",
                 True,
             )
-        if requirement.estimate:
-            return "profiled with the estimate", False
-        return "profiled with the estimate disabled", False
+        estimate = "enabled" if requirement.estimate else "disabled"
+        override = self._block_override()
+        if override is not None:
+            return (
+                f"a block count fixed at --num-gpu-blocks-override {override}, "
+                f"with core's graph-memory estimate {estimate}",
+                False,
+            )
+        return f"a profiled budget, with core's graph-memory estimate {estimate}", False
+
+    def _block_override(self) -> int | None:
+        cache = getattr(self._vllm_config, "cache_config", None)
+        override = getattr(cache, "num_gpu_blocks_override", None)
+        return None if override is None else int(override)
+
+    def _admission_limit(self) -> tuple[int, str]:
+        """The admission limit and the setting it came from:
+        ``max_num_active_seqs`` when set, otherwise ``max_num_seqs``."""
+        scheduler = self._vllm_config.scheduler_config
+        active = getattr(scheduler, "max_num_active_seqs", None)
+        if active is not None:
+            return int(active), "--max-num-active-seqs"
+        return int(scheduler.max_num_seqs), "--max-num-seqs"
 
     # -- counters -------------------------------------------------------------
 
@@ -624,29 +695,30 @@ class TransactionGraphBinding:
 
     # -- bindings -------------------------------------------------------------
 
-    # @spec TXG-LIFE-009
-    def check_bindings(self, bindings: Any, layer: str) -> None:
-        """Before ``initialize_state_slots`` takes new bindings: once serving
-        cells exist, a pool layout other than the one the serving capture
-        recorded is worker-fatal, because the cells bake in the captured
-        addresses. Profiling bindings take no part."""
-        if self._cells_capture != SERVING or self._verify is None:
+    # @spec TXG-LIFE-009, TXG-LIFE-003
+    def check_bindings(self, layer: Any) -> None:
+        """The state layer reports views core just bound (``bind_kv_cache``).
+        Before a serving capture was attempted (the profiling KV cache's
+        bindings included) this takes no part and records nothing. After it,
+        views with the plain-value layout the serving capture read change
+        nothing; any other layout latches the binding and raises, because
+        the cells bake in the captured addresses."""
+        if not self._serving_attempted or self._serving_layout is None:
             return
-        live = dict(bindings.pool_layout(layer))
-        if live != self._verify["layout"]:
+        live = _views_layout(layer.component_pools)
+        if live != self._serving_layout:
             self.failed = True
+            changed = [
+                name
+                for name in (*self._serving_layout, *live)
+                if live.get(name) != self._serving_layout.get(name)
+            ]
             raise RuntimeError(
-                f"{KEY}: initialize_state_slots received serving state pools "
-                "whose layout differs from the layout the serving capture "
-                "recorded; the captured cells bake in those addresses. " + LATCHED
+                f"{KEY}: core bound the state layer's views over pools whose "
+                "layout differs from the layout the serving capture read "
+                f"(components {sorted(set(changed))[:4]}); the captured cells "
+                "bake in those addresses. " + LATCHED
             )
-
-    # @spec TXG-LIFE-003
-    def record_bindings(self, bindings: Any, layer: str) -> None:
-        """Record the bindings ``initialize_state_slots`` received: the
-        profiling bindings, then the serving bindings."""
-        self._bindings = bindings
-        self._layer = layer
 
     # -- capture entry ----------------------------------------------------------
 
@@ -744,6 +816,18 @@ class TransactionGraphBinding:
         self._all_false: torch.Tensor | None = None
         self._row_index: torch.Tensor | None = None
         self._buffer_layout = ()
+
+    # @spec TXG-EXEC-007
+    @property
+    def static_inputs(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The step static inputs ``(ids_static[P_max], embeds_static[P_max,
+        H])``: a covered step's two device copies write their first ``P``
+        rows, and each cell gathers its rows from them by the arena's step
+        positions. ``None`` before a capture allocates them and after their
+        release."""
+        if self._ids_static is None or self._embeds_static is None:
+            return None
+        return self._ids_static, self._embeds_static
 
     def _owned_buffers(self) -> list[tuple[str, torch.Tensor]]:
         named = [
@@ -1062,34 +1146,93 @@ class TransactionGraphBinding:
         with torch.cuda.stream(stream):
             yield
 
-    # @spec TXG-CAP-008
-    def _startup_pools(self, work: _CaptureWork) -> None:
-        """Reach the state pools through core's startup access, valid only
-        inside this capture call; no access object is kept."""
+    # @spec TXG-CAP-008, TXG-LIFE-003, TXG-MEM-017
+    def _pool_access(self, work: _CaptureWork) -> None:
+        """Reach the state pools through the state-group layout core's
+        ``ModelState.state_group_layouts`` returns during this call, after
+        checking core's layout contract (exactly one layout, holding exactly
+        the state layer, each component tensor the layer's bound view of
+        that name and position) and that the pools hold at least the
+        admission limit plus one blocks. Only the call's work holds the
+        tensors; the binding keeps plain values (TXG-LIFE-003)."""
         from vllm_nemotron_asr_streaming.nemotron_asr.state_profile import (
             project_nemotron_state_pools,
         )
 
-        if self._bindings is None or self._layer is None:
-            raise RuntimeError(
-                "no state-slot bindings were recorded before the capture "
-                "(initialize_state_slots did not run)"
-            )
+        self._phase, self._phase_cell = PHASE_POOL_ACCESS, None
         model = self._model
-        components = dict(
-            self._bindings.startup_pool_access(self._layer).component_pools
-        )
-        roles = project_nemotron_state_pools(
-            components, model._state_spec, n_layers=int(model.config.n_layers)
-        )
-        work.components = components
-        work.roles = roles
-        work.capacity = int(roles.replay_queue.shape[0])
-        if work.capacity < self.n + 1:
-            raise RuntimeError(
-                f"the state pool holds {work.capacity - 1} non-null pages, fewer "
-                f"than the {self.n} capture rows of the largest cell"
+        read = work.call.state_group_layouts
+        layouts = tuple(read()) if read is not None else ()
+        received = _describe_layouts(layouts)
+        layer = model._persistent_state_layer
+        if len(layouts) != 1:
+            raise _PoolAccessError(
+                "core's state-group layout accessor "
+                f"(ModelState.state_group_layouts) returned {len(layouts)} "
+                "layouts, not exactly one for the model's one state group; "
+                f"received {received}",
+                contract=True,
             )
+        layers = dict(layouts[0].layers)
+        if list(layers) != [layer.prefix]:
+            others = [name for name in layers if name != layer.prefix]
+            raise _PoolAccessError(
+                f"the state-group layout holds the layers {list(layers)}, not "
+                f"exactly the state layer {layer.prefix!r}"
+                + (f" (other layers {others})" if others else "")
+                + f"; received {received}",
+                contract=True,
+            )
+        components = tuple(layers[layer.prefix])
+        names = tuple(layer.layout.names)
+        if len(components) != len(names):
+            raise _PoolAccessError(
+                f"the state-group layout holds {len(components)} components "
+                f"of the state layer {layer.prefix!r}, which has "
+                f"{len(names)}; received {received}",
+                contract=True,
+            )
+        views = layer.component_pools
+        pools: dict[str, torch.Tensor] = {}
+        for position, (name, component) in enumerate(
+            zip(names, components, strict=True)
+        ):
+            tensor, view = component.tensor, views[name]
+            if _layout(tensor) != _layout(view) or (
+                tensor.untyped_storage().data_ptr() != view.untyped_storage().data_ptr()
+            ):
+                raise _PoolAccessError(
+                    f"component {position} of the state-group layout is not "
+                    f"the state layer's bound view {name!r} (layout "
+                    f"{_layout(tensor)[1:]} at {tensor.data_ptr():#x}, view "
+                    f"{_layout(view)[1:]} at {view.data_ptr():#x}); received "
+                    f"{received}",
+                    contract=True,
+                )
+            pools[name] = tensor
+        del views
+        blocks = int(components[0].tensor.shape[0])
+        limit, setting = self._admission_limit()
+        required = max(limit, self.n) + 1
+        if blocks < required:
+            raise _PoolAccessError(
+                f"the state pools hold {blocks} blocks, fewer than the "
+                f"admission limit {limit} (from {setting}) plus one, "
+                f"{required} blocks, which core's scheduler requires (the "
+                "null page and one page for each request the admission limit "
+                f"lets be active); received {received}",
+                contract=False,
+            )
+        roles = project_nemotron_state_pools(
+            pools, model._state_spec, n_layers=int(model.config.n_layers)
+        )
+        work.components = pools
+        work.roles = roles
+        work.capacity = blocks
+        if not work.call.profile_only:
+            # Plain values only: what a later binding and post-warmup
+            # verification compare with (TXG-LIFE-009, TXG-VER-001).
+            self._serving_layout = _views_layout(pools)
         work.pool_kwargs = {
             "channel_pools": list(roles.channel),
             "time_pools": list(roles.convolution),
@@ -1111,7 +1254,7 @@ class TransactionGraphBinding:
         # the state pages and the KV cache.
         work.snapshot = {
             name: pool[: self.n + 1].to("cpu", copy=True)
-            for name, pool in components.items()
+            for name, pool in pools.items()
         }
 
     # @spec TXG-CAP-006, TXG-CAP-013
@@ -1315,10 +1458,11 @@ class TransactionGraphBinding:
     # @spec TXG-MEM-008, TXG-MEM-010, TXG-OBS-004
     def capture(self, call: Any) -> None:
         """The transaction-graph part of one ``capture_cudagraphs`` call,
-        after its segment graphs: the binding-owned buffers, the scatter
-        warm-up, the ``2N`` cells largest first (chunk cells, then echo
-        cells), then the charged margin (profiling call) or the memory
-        comparison (serving call). ``call`` is ``graph_memory.CaptureCall``.
+        after its segment graphs: pool access through core's state-group
+        layout (TXG-CAP-008), the binding-owned buffers, the scatter warm-up,
+        the ``2N`` cells largest first (chunk cells, then echo cells), then
+        the charged margin (profiling call) or the memory comparison (serving
+        call). ``call`` is ``graph_memory.CaptureCall``.
 
         A failure here raises an error chained from the original that names
         the phase and the figures; the caller discards what the call created
@@ -1328,14 +1472,15 @@ class TransactionGraphBinding:
         capture = PROFILING if call.profile_only else SERVING
         work = _CaptureWork(capture, call)
         self._work = work
-        self._phase, self._phase_cell = PHASE_BUFFERS, None
+        self._phase, self._phase_cell = PHASE_POOL_ACCESS, None
         self._cells_capture = capture
         self.verified = False
         self._encoder_modules = tuple(self._model.core.encoder.modules())
         try:
             with self._on_stream(call.stream):
+                self._pool_access(work)
+                self._phase = PHASE_BUFFERS
                 self._allocate_buffers(call.device)
-                self._startup_pools(work)
                 work.transaction_before = self._reading(work)
                 self._phase = PHASE_WARMUP
                 self._scatter_warmup(work)
@@ -1486,12 +1631,16 @@ class TransactionGraphBinding:
         self._constants = process_constants(self._model.core)
         self._verify = self._verification_values()
 
-    # @spec TXG-MEM-010, TXG-MEM-011, TXG-MEM-012, TXG-MEM-013
+    # @spec TXG-MEM-010, TXG-MEM-011, TXG-MEM-012, TXG-MEM-013, TXG-MEM-017
     def _failure_message(self, work: _CaptureWork, error: BaseException) -> str:
         """The message of a failure in a capture call's transaction-graph
         part: the option, the capture, the phase, the failing cell when the
         phase is a cell's, what was retained so far, the transient peak, the
-        budget setting, the allocator settings and the remedies."""
+        budget setting, the allocator settings and the remedies for its case.
+        A pool-access failure that breaks core's state-group layout contract
+        names the broken condition (in the original error) and gives no
+        configuration remedy; one that finds too few blocks gives
+        TXG-MEM-017's."""
         call = work.call
         try:
             now = graph_memory.free_memory(call.device, call.stream)
@@ -1513,49 +1662,10 @@ class TransactionGraphBinding:
         if phase in CELL_PHASES and self._phase_cell is not None:
             _geometry, kind, count = self._phase_cell
             cell = f" of the {kind} cell at count {count} ({self.label})"
-        smaller = (
-            f"a smaller largest population in {KEY}; a smaller --max-num-seqs; "
-            f"or transaction graphs off (remove {KEY})"
-        )
-        if call.profile_only:
-            remedies = smaller
-        elif fixed:
-            parts, total, unavailable = [], 0, []
-            for kind in KINDS:
-                growths = [
-                    item["growth"]
-                    for item in work.cells
-                    if item["kind"] == kind and item["growth"] is not None
-                ]
-                if not growths:
-                    unavailable.append(kind)
-                    continue
-                left = self.n - len(growths)
-                estimate = int(sum(growths) / len(growths)) * left
-                total += estimate
-                parts.append(
-                    f"{kind} cells: {left} not yet captured at a mean growth of "
-                    f"{graph_memory.format_bytes(int(sum(growths) / len(growths)))}"
-                )
-            projected = (
-                f"a --kv-cache-memory-bytes smaller by at least the projected "
-                f"remainder, an estimate of {graph_memory.format_bytes(total)}"
-                + (f" ({'; '.join(parts)})" if parts else "")
-            )
-            if unavailable:
-                projected += (
-                    "; the estimate is unavailable for the "
-                    f"{' and '.join(unavailable)} cells, none of which was "
-                    "captured in this call"
-                )
-            remedies = f"{projected}; or {smaller}"
+        if phase == PHASE_POOL_ACCESS:
+            remedies = self._pool_access_remedies(error)
         else:
-            remedies = (
-                f"{smaller}; or a lower --gpu-memory-utilization, which helps "
-                "only when the allocated state pages and KV cache fill the "
-                "budget and leave too little device memory for the capture's "
-                "transient peak"
-            )
+            remedies = "Remedies: " + self._capture_remedies(work, fixed) + "."
         call_so_far = graph_memory.format_bytes(
             graph_memory.retained(call.call_free_before, now)
         )
@@ -1569,9 +1679,79 @@ class TransactionGraphBinding:
             f"{call_so_far}, transaction graphs {cells_so_far}"
             f" in {len(work.cells)} captured cells; transient peak "
             f"{graph_memory.format_bytes(peak)}. Budget setting: {setting}. "
-            f"Allocator settings: {self._allocator_settings()}. "
-            f"Remedies: {remedies}."
+            f"Allocator settings: {self._allocator_settings()}. {remedies}"
         )
+
+    def _pool_access_remedies(self, error: BaseException) -> str:
+        """TXG-MEM-017's remedies for too few blocks; none for a break of
+        core's state-group layout contract (TXG-CAP-008, TXG-MEM-010)."""
+        if isinstance(error, _PoolAccessError) and not error.contract:
+            limit, _setting = self._admission_limit()
+            required = max(limit, self.n) + 1
+            return (
+                "Remedies: a larger --kv-cache-memory-bytes, or a larger "
+                f"--num-gpu-blocks-override, that holds at least {required} "
+                "state pages (the admission limit plus one); or a lower "
+                "admission limit (--max-num-active-seqs, or --max-num-seqs) "
+                f"with the largest population in {KEY} at most it."
+            )
+        return (
+            "This breaks core's state-group layout contract, which no "
+            "configuration repairs: the running core does not provide the "
+            "layout the plugin requires."
+        )
+
+    def _capture_remedies(self, work: _CaptureWork, fixed: bool) -> str:
+        """The remedies of a failure after pool access: TXG-MEM-011 for the
+        profiling capture; for the serving capture, TXG-MEM-013's projected
+        remainder under a fixed budget, otherwise TXG-MEM-012's under a fixed
+        block count."""
+        smaller = (
+            f"a smaller largest population in {KEY}; a smaller --max-num-seqs; "
+            f"or transaction graphs off (remove {KEY})"
+        )
+        if work.call.profile_only:
+            return smaller
+        if fixed:
+            parts, total, unavailable = [], 0, []
+            for kind in KINDS:
+                growths = [
+                    item["growth"]
+                    for item in work.cells
+                    if item["kind"] == kind and item["growth"] is not None
+                ]
+                if not growths:
+                    unavailable.append(kind)
+                    continue
+                mean = int(sum(growths) / len(growths))
+                left = self.n - len(growths)
+                total += mean * left
+                parts.append(
+                    f"{kind} cells: {left} not yet captured at a mean growth of "
+                    f"{graph_memory.format_bytes(mean)}"
+                )
+            projected = (
+                "a --kv-cache-memory-bytes smaller by at least the projected "
+                f"remainder, an estimate of {graph_memory.format_bytes(total)}"
+                + (f" ({'; '.join(parts)})" if parts else "")
+            )
+            if unavailable:
+                projected += (
+                    "; the estimate is unavailable for the "
+                    f"{' and '.join(unavailable)} cells, none of which was "
+                    "captured in this call"
+                )
+            return f"{projected}; or {smaller}"
+        if self._block_override() is not None:
+            limit, _setting = self._admission_limit()
+            return (
+                f"{smaller}; or a smaller --num-gpu-blocks-override that still "
+                f"holds at least {max(limit, self.n) + 1} blocks (the "
+                "admission limit plus one; core's scheduler refuses fewer), "
+                "which helps only when the allocated state pages leave too "
+                "little device memory for the capture's transient peak"
+            )
+        return smaller
 
     # -- release --------------------------------------------------------------
 
@@ -1687,11 +1867,11 @@ class TransactionGraphBinding:
     def _verification_values(self) -> dict[str, Any]:
         """The plain values post-warmup verification compares, recorded at
         the serving capture."""
-        assert self._bindings is not None and self._layer is not None
+        assert self._serving_layout is not None
         assert self._capture_layout is not None
         device, roles = self._capture_layout
         return {
-            "layout": dict(self._bindings.pool_layout(self._layer)),
+            "layout": dict(self._serving_layout),
             "device": device,
             "roles": roles,
             "identities": self._callable_identities(),
@@ -1745,9 +1925,15 @@ class TransactionGraphBinding:
         recorded = self._verify
         if self._cells_capture != SERVING or recorded is None:
             return "no serving capture recorded its cells in this worker"
-        assert self._bindings is not None and self._layer is not None
-        # 1. the live pool layout, addresses included, and the pools' device
-        live = dict(self._bindings.pool_layout(self._layer))
+        # 1. the plain-value layout of the state layer's currently bound
+        # views, addresses included, and the pools' device
+        try:
+            views = self._model._persistent_state_layer.component_pools
+        except RuntimeError as error:
+            return f"the state layer's views are not bound ({error})"
+        live = _views_layout(views)
+        devices = {view.device for view in views.values()}
+        del views
         if live != recorded["layout"]:
             changed = sorted(
                 name
@@ -1759,10 +1945,10 @@ class TransactionGraphBinding:
                 f"capture recorded (pools {changed[:4]})"
             )
         parameter = next(self._model.core.encoder.parameters(), None)
-        if parameter is not None and parameter.device != recorded["device"]:
+        if parameter is not None and devices != {parameter.device}:
             return (
-                f"the state pool layout is on {recorded['device']}, the encoder "
-                f"parameters on {parameter.device}"
+                f"the state pools are on {sorted(map(str, devices))}, the "
+                f"encoder parameters on {parameter.device}"
             )
         # 2. the projected resident layout per transaction role
         shadow = self._shadow_role_table()

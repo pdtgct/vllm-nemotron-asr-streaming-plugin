@@ -71,6 +71,46 @@ def test_a_current_setting_is_a_fact_not_a_remedy():
     ) == ["--num-gpu-blocks-override"]
 
 
+def test_an_option_named_with_another_value_is_a_remedy():
+    """An option named with a value other than its current one suggests that
+    value, whatever the phrasing (a comparison, a wish, no imperative), so it
+    is a configuration remedy; named with its current value, in any byte
+    unit that renders it, it states the configuration. An option the
+    settings leave unset differs from every value. Without the settings no
+    value can be told from the current one."""
+    from support import txg_conditions as c
+
+    settings = {"--kv-cache-memory-bytes": 1 << 30, "--max-num-seqs": 3}
+    changes = {
+        "--num-gpu-blocks-override >= 5": ["--num-gpu-blocks-override"],
+        "you may need --num-gpu-blocks-override 9": ["--num-gpu-blocks-override"],
+        "num_gpu_blocks_override=9 would hold them": ["--num-gpu-blocks-override"],
+        "--max-num-seqs 2 fits": ["--max-num-seqs"],
+        "--max-num-active-seqs: 2": ["--max-num-active-seqs"],
+        "kv_cache_memory_bytes = 2 GiB": ["--kv-cache-memory-bytes"],
+        "--kv-cache-memory-bytes 1073741825": ["--kv-cache-memory-bytes"],
+    }
+    for message, remedies in changes.items():
+        assert c.configuration_remedies(message, settings) == remedies, message
+        assert c.changed_settings(message, settings) == remedies, message
+        # Not a suggested change in words: only the settings tell it apart.
+        assert c.configuration_remedies(message) == [], message
+    facts = (
+        "--kv-cache-memory-bytes 1073741824 bytes (1024.00 MiB)",
+        "kv_cache_memory_bytes=1.00 GiB",
+        "kv_cache_memory_bytes = 1024 MiB",
+        "--max-num-seqs (3) rows",
+        "max_num_seqs is 3",
+        "the state pools hold 3 blocks",
+    )
+    for fact in facts:
+        assert c.changed_settings(fact, settings) == [], fact
+        assert c.configuration_remedies(fact, settings) == [], fact
+    # A stated setting beside a changed one: only the changed one is a remedy.
+    mixed = "budget --kv-cache-memory-bytes 1073741824; needs --max-num-seqs 2"
+    assert c.configuration_remedies(mixed, settings) == ["--max-num-seqs"]
+
+
 def test_state_layer_refusals_are_the_clauses_refusing_the_option_for_it():
     from support import txg_conditions as c
 
@@ -206,6 +246,58 @@ def test_plugin_holds_finds_what_the_plugin_keeps_and_skips_cores(monkeypatch):
     monkeypatch.setattr(advance, "_batch_stats_slot", [("rows", component[1:])])
     held = t.plugin_holds(env, targets)
     assert len(held) == 1 and held[0].startswith(f"module {advance.__name__} -> "), held
+
+
+def test_plugin_holds_walks_the_state_layer_permitting_only_its_views(monkeypatch):
+    """The walk covers the state layer: there only its bound ``kv_cache`` and
+    the objects its ``pages`` and ``component_pools`` return (its view cache,
+    REG-STATE-018) are the layer's. A pool slice, or a container of one,
+    stored on the layer is found; a copy on the layer is not. The same view
+    objects held by a plugin object off the layer are found."""
+    from types import SimpleNamespace
+
+    import pytest
+
+    pytest.importorskip("vllm.v1.worker.utils")
+    pytest.importorskip("vllm.model_executor.layers.mamba.abstract")
+    from support import txgcap_harness as t
+
+    layer, raw = _core_bound_layer((2,), (3,))
+    # The layer's view cache: its own view objects over the bound storage.
+    layer.component_pools = {
+        name: state.view(state.shape)
+        for name, state in zip(("first", "second"), layer.kv_cache, strict=True)
+    }
+    layer.pages = raw.view(raw.shape[0], -1)
+    env, binding = _holds_env(layer)
+    targets = t.accessor_objects(env.state)
+    permitted = {id(obj) for obj in t.layer_permitted(layer)}
+    own = (layer.kv_cache, layer.pages, layer.component_pools)
+    assert {id(obj) for obj in (*own, *layer.component_pools.values())} == permitted
+    assert t.plugin_holds(env, targets) == []
+    view = layer.component_pools["first"]
+    for kept in (view[1:3], view.detach(), {"pools": [view[2:]]}, [layer.pages[1]]):
+        layer.txg_kept = kept
+        held = t.plugin_holds(env, targets)
+        assert len(held) == 1 and held[0].startswith("model -> "), (kept, held)
+        assert "shares storage" in held[0], held
+    layer.txg_kept = view.clone()  # a copy holds none of the pool
+    assert t.plugin_holds(env, targets) == []
+    del layer.txg_kept
+    # The layer's own objects, held by a plugin object off the layer.
+    for kept in (view, layer.component_pools, layer.pages, layer.kv_cache):
+        binding.kept = kept
+        held = t.plugin_holds(env, targets)
+        assert held and all(line.startswith("model -> ") for line in held), (
+            kept,
+            held,
+        )
+    binding.kept = None
+    assert t.plugin_holds(env, targets) == []
+    # An unbound layer permits only its (empty) kv_cache, not a view it
+    # might still hold.
+    unbound = SimpleNamespace(kv_cache=[], component_pools={"first": view})
+    assert [id(obj) for obj in t.layer_permitted(unbound)] == [id(unbound.kv_cache)]
 
 
 def test_plugin_holds_finds_a_flattened_view_of_a_component(monkeypatch):

@@ -64,8 +64,9 @@ def assert_option_recognized(env):
 def assert_capture_creates_cells(env, core):
     """Positive control: the same fake counters a guard reads as zero become
     nonzero once the profiling capture runs."""
-    if core.runner.bindings is None:
-        core.bind_profiling()
+    # Bind the profiling pool again: after a clear, core's layout is empty, and
+    # TXG-CAP-008 refuses a capture without one.
+    core.bind_profiling()
     core.profiling_capture()
     assert env.fake.capture_attempts == 2 * env.n, env.fake.capture_attempts
     assert env.fake.replay_count >= 2 * env.n, env.fake.replay_count
