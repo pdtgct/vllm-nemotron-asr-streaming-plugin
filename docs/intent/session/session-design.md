@@ -334,9 +334,9 @@ per session); exceeding it fails the lease with `output_capacity`.
 ## Endpointing
 
 The model's endpoint detector runs only when a request carries an endpoint policy, which the model
-reads from a request field that core does not populate. This plugin defines no binding for the
-policy on core, and neither the session nor `buffer_realtime_audio` nor the file prompt sets one (core's generic channels, such as sampling `extra_args`, could carry one), so every
-stream and file runs with endpointing disabled and no EOU token is emitted. Binding a policy is
+reads from the request's sampling `extra_args` (`registration`, REG-STATE-020). Neither the session
+nor `buffer_realtime_audio` nor the file prompt sets one, so every stream and file they serve runs
+with endpointing disabled and no EOU token is emitted; only a direct engine client sets a policy. Binding a policy is
 deferred until per-utterance finals are designed with the frontend, since a policy without a way to
 report segments to the frontend changes nothing it can use. Segment boundaries from EOU tokens are
 part of that later design.
@@ -375,8 +375,8 @@ part of that later design.
 ## Open Questions & Future Decisions
 
 ### Deferred
-1. **Utterance finals.** This plugin defines neither a binding for the endpoint policy on core nor
-   a way for the lease to report segment completions. Both are settled together with the frontend,
+1. **Utterance finals.** The session sets no endpoint policy and defines no way for the lease to
+   report segment completions. Both are settled together with the frontend,
    since either alone gives the frontend nothing it can use for per-utterance finals.
 
 ## References

@@ -771,8 +771,10 @@ which only a client that bypasses the plugin's packer and processor can send.
   293 s file in flight, the p95 final latency of eight concurrent streams rose from 0.55 s to
   3.64 s. Tier 4 (mixed load) has not been run on the target core. Serve file traffic from a
   separate server, or keep files short.
-- The plugin binds no endpoint policy. Every stream and file runs with endpointing disabled, and the
-  model emits no end-of-utterance token.
+- The plugin's routes set no endpoint policy, so every stream and file they serve runs with
+  endpointing disabled and the model emits no end-of-utterance token. A direct engine client may set
+  one in the request's sampling parameters: `extra_args={"endpoint_policy": {"mode": "greedy_blank",
+  "threshold_frames": <n>, "residue_frames": <n>}}`; a malformed policy fails that request.
 - Native burst (`experimental_native_burst`) is refused on the target core.
 - The plugin was measured only on one NVIDIA A40 at FP32 with CUDA, on the earlier state-pool
   build. On a device without static graphs, the graphed arms run eagerly and log one INFO line.

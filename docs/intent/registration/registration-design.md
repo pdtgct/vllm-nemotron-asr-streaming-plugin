@@ -969,6 +969,18 @@ its cells captured (TXG-LIFE-009).
   header from the `NewRequestData` and host data only (the `transcription` design, Request-owned
   host buffer). Every other request is a *stream request*.
 
+### Endpoint policy
+
+A request carries an endpoint policy in its sampling parameters: `extra_args["endpoint_policy"]`, a
+mapping with `mode` (`"disabled"` or `"greedy_blank"`), `threshold_frames` and `residue_frames`
+(non-negative integers). Core passes a request's sampling parameters to the model state with the
+request (`NewRequestData.sampling_params`), so the model reads the policy when core delivers the
+request and again at each stream turn core delivers as a new request. A request without the key
+runs with endpointing disabled. A malformed policy (an unknown mode, or a count that is not a
+non-negative integer) is the request's own fault: it fails that request alone (REG-STATE-015). The
+plugin's own paths set no policy (the session factory, `buffer_realtime_audio` and the file prompt;
+SESS-EP-001), so only a direct engine client sets one.
+
 ## Supported tasks
 
 The model class declares `supports_realtime`, `SupportsTranscription` with
@@ -1063,6 +1075,7 @@ adding it here and to the import-time check.
 
 | Decision | Chosen | Alternatives Considered | Rationale |
 |----------|--------|------------------------|-----------|
+| Where a request carries its endpoint policy | `SamplingParams.extra_args["endpoint_policy"]` | A request field core does not carry to the model state (`additional_information`); a plugin-owned side channel | Core's `NewRequestData` carries the sampling parameters to the model state, and `extra_args` is the sampling parameters' generic channel for model-specific options; a field core does not populate cannot reach the model |
 | How the card becomes a served config | A registered config parser selected by `--config-format nemotron_asr_streaming` | `AutoConfig` registration for `nemotron3_5_asr`; `--hf-overrides` alone | Registering the card's `model_type` would claim the offline plugin's configuration; overrides apply after the configuration is built, too late for translation |
 | Where launch options are resolved | Post-override validation of the final configuration; the parser reads only the checkpoint | Reading `hf_overrides` inside the parser; a plugin-specific environment variable | Core gives the parser only flat overrides, applies dictionary overrides after it, and also calls it with none when deriving a generation configuration |
 | Control tokens in the tokenizer | A registered tokenizer mode that appends them as special tokens, with park as the tokenizer's EOS | Publishing a modified tokenizer; leaving them unknown | Core detokenizes every token; unknown IDs break detokenization and unmarked ones appear in text; the card must stay usable unmodified |

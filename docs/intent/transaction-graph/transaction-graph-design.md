@@ -223,7 +223,7 @@ runs with `endpoint_enabled` true, as in `B_hook`. Every cell is captured that w
 endpoint-book `armed` and `has_output` flags follow its observed output, and each fresh row's
 endpoint pages are initialized and stored, whether or not the row carries an endpoint policy.
 Two row classes stay outside the cells and fall back with reason `signature`:
-- **Endpoint-policy rows.** A row whose request sets an endpoint policy (field `endpoint_policy`);
+- **Endpoint-policy rows.** A row whose request sets an endpoint policy (`extra_args["endpoint_policy"]`, REG-STATE-020);
   a row plan has *endpointing* on when one of its rows does. Policy evaluation is elementwise in
   the body, but no plugin path sets a policy (`session`, Endpointing; `transcription`,
   FILE-ENG-002), so no qualification run exercises it.
