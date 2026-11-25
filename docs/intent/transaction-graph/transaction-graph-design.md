@@ -1329,15 +1329,16 @@ change. It models one worker with a small `N` and bounded steps:
   eventually serves or fails with a reported error. Core gives no shutdown-hook guarantee for a
   killed worker or a failed construction, and the model claims none.
 
-The checked models must carry the target core's lifecycle above. `CaptureLifecycle.tla` models
-binding through a state-pool hook (`InitializeStateSlotsProfiling`, `InitializeStateSlotsServing`
-and a repeated call with an equal or a changed layout) and an extensible KV cache disabled after
-construction (`DisableExtensibleCache`); `SplitStep.tla` models a dummy step as one without `bind_rows`
-authorization and a repeated `initialize_state_slots` with a changed layout. Each must become the
-corresponding action above: core's binding with the layout set and cleared, the pool-access check,
-a rebinding after the serving capture, dummy steps classified by `prepare_inputs`, and the fixed
-block count or budget in place of the extensible KV cache. Until the models carry them and check
-without violations, TXG-MODEL-005 is unmet.
+The checked models carry the target core's lifecycle above. `CaptureLifecycle.tla` models core's
+binding of the profiling and serving KV caches with the state-group layout set and cleared, the
+profiling cache released after `clear_cudagraphs` on both the success and the failure path, the
+pool-access check of the capture call (a layout contract break, and too few blocks under a fixed
+budget), and a rebinding after the serving capture (an equal layout changes nothing; a changed layout
+latches), with the startup's fixed block count or fixed budget in place of the extensible KV cache.
+Its invariants include that the layout is read only inside a capture call, for that call's own KV
+cache, and held by no object between calls. `SplitStep.tla` classifies dummy steps as
+`prepare_inputs` does and latches a rebinding with a changed layout. Per-request failure delivery
+through `take_failed_requests` is outside both models.
 
 ## User documents
 

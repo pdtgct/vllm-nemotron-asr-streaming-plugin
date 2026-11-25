@@ -16,8 +16,9 @@
 \* WHAT IS MODELLED (TXG-MODEL-002)
 \*  The worker starts after a successful serving capture holding all 2N
 \*  serving cells, before post_warmup, which passes or latches. Each step is
-\*  a dummy step (no bind_rows authorization), a cleanup-only step (no row
-\*  scheduled), or a real step that schedules rows with K CHUNK rows and E
+\*  a dummy step (as the model state's prepare_inputs classifies it,
+\*  REG-MEM-001), a cleanup-only step (no row scheduled), or a real step
+\*  that schedules rows with K CHUNK rows and E
 \*  other rows. A real step enters the model state's step entry, which
 \*  checks the failed latch first (TXG-FAIL-010): latched, it raises;
 \*  otherwise an all-failed step (every row failed at planning) takes the
@@ -51,8 +52,10 @@
 \*  the worker fails, with its binding's latch unchanged (the option-off
 \*  transaction holds no binding to latch), and runs no later step. A
 \*  request may be aborted after the first launch.
-\*  Between steps: a repeated initialize_state_slots with a changed layout
-\*  latches; a delayed device fault surfaces at the sink's collection,
+\*  Between steps: core's binding of the state layer's views (bind_kv_cache)
+\*  with a changed state-group layout latches (TXG-LIFE-009; an equal one
+\*  changes nothing, see CaptureLifecycle.tla); a delayed device fault
+\*  surfaces at the sink's collection,
 \*  which neither latches nor cancels the staged reservation
 \*  (TXG-FAIL-004); the engine dies, while serving or after a step raised
 \*  before post_warmup (whether the engine survives a propagated error is
@@ -63,7 +66,8 @@
 \*  CUDA semantics, row contents, page contents, signatures, exact fallback
 \*  reasons beyond their class, counters other than the per-step fallback
 \*  increments and histogram entries, the option-off transaction's resident
-\*  pages after a failed scatter, the sink's own refusal of a second
+\*  pages after a failed scatter, each request's failure delivery through
+\*  take_failed_requests (TXG-FAIL-008), the sink's own refusal of a second
 \*  reservation (the model stops later steps by the latch or by the failed
 \*  worker, never by that refusal), concurrency between steps (synchronous
 \*  scheduling serializes them), and the capture lifecycle
@@ -286,8 +290,8 @@ Entry(t, af) == NewRec(t, af, latched, verified)
 Keep == UNCHANGED <<phase, verified, latched, error, fault>>
 KeepButLatch == UNCHANGED <<phase, verified, error, fault>>
 
-\* TXG-EXEC-012: a dummy step carries no bind_rows authorization; it never
-\* calls execute and replays nothing.
+\* TXG-EXEC-012: a dummy step, as the model state's prepare_inputs classifies
+\* it (REG-MEM-001), never calls execute and replays nothing.
 DummyStep ==
     /\ CanStart
     /\ Finish([Entry("dummy", FALSE) EXCEPT !.outcome = "completed"])
@@ -313,7 +317,8 @@ LatchedStepRaises ==
 \* all-failed bypass runs no transaction, whether or not post-warmup
 \* verification has passed (before post_warmup only a step that arrives too
 \* early produces it), returns the rejected-row output and adds one (0, P)
-\* histogram entry.
+\* histogram entry; postprocess_state fails its requests through
+\* take_failed_requests (TXG-FAIL-008, not modelled).
 AllFailedBypass ==
     /\ CanStart /\ ~latched
     /\ Finish([Entry("rows", TRUE) EXCEPT !.bypass = TRUE, !.histogram = 1,
@@ -594,9 +599,11 @@ PostWarmupMismatch ==
     /\ error' = FirstError("verification")
     /\ UNCHANGED <<verified, fault, stepVars>>
 
-\* TXG-LIFE-009: a repeated initialize_state_slots with a changed layout is
-\* worker-fatal; later steps see the latch until the worker is torn down.
-ReinitializeChangedLatches ==
+\* TXG-LIFE-009: core binds the state layer's views (bind_kv_cache) after the
+\* serving capture with a state-group layout whose plain values differ from
+\* the recorded one: worker-fatal; later steps see the latch until the
+\* worker is torn down.
+BindKvCacheChangedLayout ==
     /\ phase \in {"captured", "serving"} /\ Between
     /\ latched' = TRUE
     /\ error' = FirstError("layout-changed")
@@ -648,7 +655,7 @@ FailedTeardown == (latched \/ phase = "failed") /\ Shutdown
 
 Next ==
     \/ StartStep \/ StepProgress \/ PostWarmup
-    \/ ReinitializeChangedLatches \/ DelayedFaultAtCollection \/ EngineDies
+    \/ BindKvCacheChangedLayout \/ DelayedFaultAtCollection \/ EngineDies
     \/ Shutdown \/ Kill \/ Done
 
 Spec ==

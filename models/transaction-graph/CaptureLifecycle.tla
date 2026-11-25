@@ -14,14 +14,19 @@
 \* part of each hook call. SplitStep.tla refines the scheduled step.
 \*
 \* WHAT IS MODELLED (TXG-MODEL-001, TXG-MODEL-002)
-\*  Every hook call in core's startup order: construction (or a failed
-\*  construction), needs_cudagraph_capture, prepare_execution_memory (after
-\*  an optional startup plan that fixes the budget), the profiling forward
-\*  pass (a dummy step), then core's estimate: skipped, its temporary
-\*  profiling pool failing, or initialize_state_slots with profiling
-\*  bindings followed by capture_cudagraphs(profile_only=True) (or a core
-\*  failure before that call is reached) and clear_cudagraphs, also after a
-\*  failed or skipped capture; initialize_state_slots with serving bindings;
+\*  Every hook call in core's startup order, under the restricted startup
+\*  (TXG-CFG-019), whose fixed block count or fixed budget is a
+\*  nondeterministic choice (the extensible KV cache stays off):
+\*  construction (or a failed construction), needs_cudagraph_capture,
+\*  prepare_execution_memory (after an optional startup plan that fixes the
+\*  budget), the profiling forward pass (a dummy step), then core's
+\*  estimate: skipped, its temporary profiling pool failing, or core's
+\*  binding of the profiling KV cache's views (bind_kv_cache), which sets
+\*  the state-group layout, followed by capture_cudagraphs(profile_only=True)
+\*  (or a core failure before that call is reached), clear_cudagraphs, also
+\*  after a failed or skipped capture, and the release of the profiling KV
+\*  cache, which clears the state-group layout; core's binding of the
+\*  serving KV cache's views, which sets the layout again;
 \*  capture_cudagraphs(profile_only=False); post_warmup; serving with
 \*  scheduled steps, dummy steps and cleanup-only steps; a scheduled step
 \*  before post-warmup verification, after whose propagated error the
@@ -29,24 +34,27 @@
 \*  all-failed bypass steps after the serving capture on an unlatched
 \*  worker, before and after verification, behind the latch check
 \*  (TXG-FAIL-010; here a latch fails the worker at once, so SplitStep.tla
-\*  checks the latched refusal); a repeated initialize_state_slots with an
-\*  equal or a changed layout; a later serving capture call after a
+\*  checks the latched refusal); a binding by core after the serving
+\*  capture with an equal or a changed layout (TXG-LIFE-009); a later
+\*  serving capture call after a
 \*  successful serving capture (an elastic reconfiguration) and after a
 \*  failed or refused one (ServingCaptureRetry), which core never makes but
 \*  the model does, so that TXG-MODEL-009 holds by the entry refusal and not
 \*  by core's order; shutdown from any state between hook calls; and a
 \*  killed worker. Each capture call runs its entry checks, then the
-\*  segment graphs, the binding buffers, the scatter warm-up, the 2N cells
+\*  segment graphs, the pool-access check (TXG-CAP-008: it reads the
+\*  state-group layout and records its plain values; it fails on a broken
+\*  layout contract, or on too few blocks, which only a fixed budget can
+\*  give), the binding buffers, the scatter warm-up, the 2N cells
 \*  (chunk N..1 then echo N..1, each with its validation replay on rejected
 \*  capture rows), then the margin (profiling) or the aggregate memory
 \*  comparison (serving), then synchronizes and returns; every phase can
 \*  fail, and a failure runs the whole-call cleanup (transaction-graph part,
 \*  then segment graphs, then synchronize) before it propagates. Whether a
-\*  profiling capture is required (effective budget fixed, possibly by a
-\*  startup plan after construction; estimate setting; extensible KV cache,
-\*  possibly disabled after construction) and whether one runs are
-\*  independent nondeterministic choices. Call totals are abstract units in
-\*  0..MaxMem chosen nondeterministically.
+\*  profiling capture is required (effective budget fixed, by the startup
+\*  setting or by a startup plan after construction; estimate setting) and
+\*  whether one runs are independent nondeterministic choices. Call totals
+\*  are abstract units in 0..MaxMem chosen nondeterministically.
 \*
 \* ENTRY CHECKS (TXG-LIFE-006, TXG-LIFE-007, TXG-LIFE-008, REG-MEM-024,
 \* TXG-MEM-009)
@@ -75,8 +83,12 @@
 \*  capture, which core's order never makes (its entry check is modelled);
 \*  references the propagated error holds (TXG-LIFE-012's last clause);
 \*  the step's execute order, reservations and latch interplay, which
-\*  SplitStep.tla models. A capture call and a hook's two release halves are
-\*  atomic with respect to other hook calls; only a kill interrupts them.
+\*  SplitStep.tla models; the layout's contents (a state-group layout here
+\*  is the KV cache it describes, and the failed pool-access check stands
+\*  for every broken condition); core's own teardown of the views after a
+\*  failed startup. A capture call, a hook's two release halves and core's
+\*  release of the profiling KV cache after clear_cudagraphs are atomic with
+\*  respect to other hook calls; only a kill interrupts them.
 \*
 \* INVARIANTS (CaptureLifecycle.cfg)
 \*  TypeOK: every variable stays in its domain.
@@ -89,7 +101,22 @@
 \*    capture's validation replays are not step replays.
 \*  NothingProfilingAfterClear (TXG-MODEL-008, TXG-LIFE-005, REG-MEM-021):
 \*    once clear_cudagraphs has returned, no object the profiling capture
-\*    created (segment graph, cell, binding buffer or margin) is retained.
+\*    created (segment graph, cell, binding buffer, recorded layout or
+\*    margin) is retained; core releases the profiling KV cache, clearing
+\*    its state-group layout, only after clear_cudagraphs has returned.
+\*  LayoutReadOnlyInCapture (TXG-MODEL-008, TXG-CAP-008, TXG-LIFE-003): the
+\*    transaction-graph part reads the state-group layout only inside a
+\*    capture call, in its pool-access phase, and core's order makes it
+\*    the layout of that call's own KV cache (the profiling KV cache's in
+\*    the profiling capture, the serving KV cache's in the serving
+\*    capture); no layout object read from the accessor is held once the
+\*    call has returned or raised; and a call's buffers, cells and margin
+\*    exist only once its pool-access check passed and recorded the
+\*    layout's plain values.
+\*  PoolAccessBlockCountUnderBudget (TXG-CAP-008, TXG-CFG-019,
+\*    TXG-MEM-017): the pool-access check fails for too few blocks only
+\*    under a startup with a fixed budget; a fixed block count below the
+\*    admission limit plus one is refused before any capture.
 \*  AtMostOneServingCapture (TXG-MODEL-009, TXG-LIFE-008, REG-MEM-024): at
 \*    most one serving capture call passes its entry checks and captures
 \*    graphs in the worker; every later serving call, after a successful or
@@ -109,8 +136,9 @@
 \*    capture whose call total exceeds the profiling call total never
 \*    succeeds, and startup fails once its call has returned.
 \*  NothingLeftByFailedCall (TXG-MODEL-015, TXG-LIFE-012, REG-MEM-017):
-\*    after a capture call raised (at its entry or after it), no segment
-\*    graph, cell, binding buffer or margin that call created remains.
+\*    after a capture call raised (at its entry, in pool access or after
+\*    it), no segment graph, cell, binding buffer, recorded layout or
+\*    margin that call created remains.
 \*  NothingAfterShutdown (TXG-MODEL-016, TXG-LIFE-010, REG-MEM-026): after
 \*    shutdown nothing remains captured.
 \*  FailureIsReported (TXG-MODEL-004, TXG-MEM-010): a failed worker or a
@@ -125,8 +153,9 @@
 \*    prepare_execution_memory, the profiling forward pass and dummy steps
 \*    create nothing.
 \*  ServingInventoryComplete (TXG-CAP-011, TXG-LIFE-006, TXG-VER-001): a
-\*    successful serving capture holds its segment graphs, its buffers and
-\*    exactly the 2N serving cells, and only a profiling call has a margin.
+\*    successful serving capture holds its segment graphs, its recorded
+\*    layout (for post_warmup and TXG-LIFE-009), its buffers and exactly the
+\*    2N serving cells, and only a profiling call has a margin.
 \*  VerifiedBeforeServing (TXG-VER-002, TXG-EXEC-015): the worker serves
 \*    only after post_warmup verification passed.
 \*
@@ -176,13 +205,15 @@ ServingCalls == {"serv", "serv2"}
 Seg(c) == <<c, "seg", NoKey>>        \* the call's segment graphs (registration)
 Buf(c) == <<c, "buf", NoKey>>        \* binding-owned buffers (arena, statics, outputs)
 Margin(c) == <<c, "margin", NoKey>>  \* the charged margin (TXG-MEM-004)
+Lay(c) == <<c, "layout", NoKey>>     \* the call's recorded plain-value pool layout (TXG-CAP-008)
 Cell(c, k) == <<c, "cell", k>>       \* one cell, keyed (kind, count)
 
 Objects ==
     {Seg(c) : c \in CallKinds} \cup {Buf(c) : c \in CallKinds}
-    \cup {Margin(c) : c \in CallKinds} \cup {Cell(c, k) : c \in CallKinds, k \in CellKeys}
+    \cup {Margin(c) : c \in CallKinds} \cup {Lay(c) : c \in CallKinds}
+    \cup {Cell(c, k) : c \in CallKinds, k \in CellKeys}
 
-TxgParts == {"buf", "margin", "cell"}
+TxgParts == {"buf", "margin", "layout", "cell"}
 OfCall(S, c) == {o \in S : o[1] = c}
 TxgOf(S, c) == {o \in S : o[1] = c /\ o[2] \in TxgParts}
 ServingCells == {Cell("serv", k) : k \in CellKeys}
@@ -197,8 +228,21 @@ ReplayRecs ==
     [ctx : {"step", "validation"}, pool : CallKinds, verified : BOOLEAN,
      inCall : BOOLEAN, rejected : BOOLEAN]
 
+\* The state-group layout core sets at each binding of the state layer's views
+\* (bind_kv_cache): none, the profiling KV cache's, the serving KV cache's, or
+\* a serving layout changed by a binding after the serving capture.
+Layouts == {"none", "prof", "serv", "serv-changed"}
+
+\* A read of the layout through ModelState.state_group_layouts: by which
+\* call, what it returned, and whether inside that capture call.
+LayoutReadRecs == [call : CallKinds, layout : Layouts, inCall : BOOLEAN]
+
+\* The restricted startup's setting (TXG-CFG-019): a fixed block count
+\* (num_gpu_blocks_override) or a fixed budget (kv_cache_memory_bytes).
+Startups == {"blockCount", "budget"}
+
 NoCall == [kind |-> "none", pc |-> "none", i |-> 0]
-CallPCs == {"none", "seg", "buf", "scatter", "cell", "margin", "compare", "sync",
+CallPCs == {"none", "seg", "pool", "buf", "scatter", "cell", "margin", "compare", "sync",
             "cleanup-txg", "cleanup-seg", "cleanup-sync"}
 
 \* Step shapes for the coarse scheduled step: K CHUNK rows, E other rows.
@@ -211,19 +255,18 @@ Needed(s) ==
 
 Phases == {
     "constructing", "construction-failed", "constructed", "asked", "prepared",
-    "forwarded", "prof-bound", "clearing", "clearing-seg", "estimated",
+    "forwarded", "prof-bound", "clearing", "clearing-seg", "releasing", "estimated",
     "serv-bound", "captured", "serving", "failed", "shutting-down",
     "shutdown", "killed"}
 Terminal == {"construction-failed", "shutdown", "killed"}
-PreServing == {"constructed", "asked", "prepared", "forwarded", "prof-bound",
-               "clearing", "estimated", "serv-bound"}
 \* Between hook calls a cooperative shutdown can start in any of these.
-Shutdownable == Phases \ (Terminal \cup {"constructing", "clearing-seg", "shutting-down"})
+Shutdownable ==
+    Phases \ (Terminal \cup {"constructing", "clearing-seg", "releasing", "shutting-down"})
 
 Errors == {
     "none", "profiling-pool", "core-capture", "profiling-after-serving",
     "profiling-cells-exist", "recapture-over-live-pools",
-    "profiling-segment-graphs-exist",
+    "profiling-segment-graphs-exist", "pool-access-contract", "pool-access-block-count",
     "profiling-capture-required", "segment-capture", "buffer-allocation",
     "scatter-warmup", "cell-capture", "margin", "serving-overrun",
     "verification", "layout-changed", "execute-before-verification",
@@ -234,9 +277,12 @@ VARIABLES
     call,           \* the capture call in progress, or NoCall
     captured,       \* objects currently captured or allocated
     replays,        \* replay records seen so far
-    bindings,       \* state-slot bindings recorded: "none", "prof", "serv"
+    stateGroupLayout, \* the layout core set at its last binding: "none", "prof", "serv", "serv-changed"
+    heldLayout,     \* the capture call holds the layout object it read from the accessor
+    layoutReads,    \* the transaction-graph part's reads of the state-group layout
+    profReleased,   \* core released the profiling KV cache, clearing the layout
     budgetFixed,    \* effective kv_cache_memory_bytes set
-    extensible,     \* effective extensible KV cache on
+    startup,        \* the restricted startup's setting (TXG-CFG-019): "blockCount", "budget"
     estimateOn,     \* VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS not 0
     profAttempted,  \* capture_cudagraphs(profile_only=True) was called
     profRan,        \* a profiling capture completed in the worker
@@ -261,13 +307,15 @@ VARIABLES
     dummySeen,      \* a dummy or cleanup-only step ran
     bypassUnverified \* an all-failed bypass ran before verification passed
 
-vars == <<phase, call, captured, replays, bindings, budgetFixed, extensible,
+cfgVars == <<budgetFixed, startup, estimateOn>>
+layoutVars == <<stateGroupLayout, heldLayout, layoutReads, profReleased>>
+
+vars == <<phase, call, captured, replays, layoutVars, budgetFixed, startup,
           estimateOn, profAttempted, profRan, servAttempted, servCapturing, servOk,
           requiredAtServ, profTotal, servTotal, servMeasured, uncharged,
           failedCalls, refusedCalls, cleared, pendingFailure, verified, latched,
           devicePending, outcome, error, steps, dummySeen, bypassUnverified>>
 
-cfgVars == <<budgetFixed, extensible, estimateOn>>
 memVars == <<profAttempted, profRan, servAttempted, servCapturing, servOk,
              requiredAtServ, profTotal, servTotal, servMeasured, uncharged>>
 histVars == <<failedCalls, refusedCalls, cleared, pendingFailure>>
@@ -277,8 +325,9 @@ TypeOK ==
     /\ call.kind \in CallKinds \cup {"none"} /\ call.pc \in CallPCs /\ call.i \in 0..2 * N
     /\ captured \subseteq Objects
     /\ replays \subseteq ReplayRecs
-    /\ bindings \in {"none", "prof", "serv"}
-    /\ budgetFixed \in BOOLEAN /\ extensible \in BOOLEAN /\ estimateOn \in BOOLEAN
+    /\ stateGroupLayout \in Layouts /\ heldLayout \in BOOLEAN
+    /\ layoutReads \subseteq LayoutReadRecs /\ profReleased \in BOOLEAN
+    /\ budgetFixed \in BOOLEAN /\ startup \in Startups /\ estimateOn \in BOOLEAN
     /\ profAttempted \in BOOLEAN /\ profRan \in BOOLEAN /\ servAttempted \in BOOLEAN
     /\ servCapturing \in 0..2 /\ servOk \in BOOLEAN
     /\ requiredAtServ \in {"undecided", "yes", "no"}
@@ -298,9 +347,10 @@ Init ==
     /\ call = NoCall
     /\ captured = {}
     /\ replays = {}
-    /\ bindings = "none"
-    /\ budgetFixed \in BOOLEAN
-    /\ extensible \in BOOLEAN
+    /\ stateGroupLayout = "none" /\ heldLayout = FALSE /\ layoutReads = {}
+    /\ profReleased = FALSE
+    /\ startup \in Startups
+    /\ budgetFixed = (startup = "budget")
     /\ estimateOn \in BOOLEAN
     /\ profAttempted = FALSE /\ profRan = FALSE /\ servAttempted = FALSE
     /\ servCapturing = 0 /\ servOk = FALSE /\ requiredAtServ = "undecided"
@@ -310,8 +360,9 @@ Init ==
     /\ outcome = "pending" /\ error = "none" /\ steps = 0 /\ dummySeen = FALSE
     /\ bypassUnverified = FALSE
 
-\* The required-capture predicate of REG-MEM-027 on the effective values.
-Required == ~budgetFixed /\ estimateOn /\ ~extensible
+\* The required-capture predicate of REG-MEM-027 on the effective values;
+\* the extensible KV cache is off under the restricted startup (TXG-CFG-019).
+Required == ~budgetFixed /\ estimateOn
 
 \* The serving inventory a scheduled step classifies against (TXG-COV-002).
 Inventory == {o \in captured : o[2] = "cell" /\ o[1] \in ReplayablePools}
@@ -325,7 +376,7 @@ StartupFails == IF outcome = "pending" THEN "failed" ELSE outcome
 Construct ==
     /\ phase = "constructing"
     /\ phase' = "constructed"
-    /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -333,7 +384,7 @@ Construct ==
 ConstructionFails ==
     /\ phase = "constructing"
     /\ phase' = "construction-failed"
-    /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -342,7 +393,7 @@ ConstructionFails ==
 NeedsCudagraphCapture ==
     /\ phase = "constructed"
     /\ phase' = "asked"
-    /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -353,7 +404,7 @@ PrepareExecutionMemory ==
     /\ phase = "asked"
     /\ \E plan \in BOOLEAN : budgetFixed' = (budgetFixed \/ plan)
     /\ phase' = "prepared"
-    /\ UNCHANGED <<call, captured, replays, bindings, extensible, estimateOn,
+    /\ UNCHANGED <<call, captured, replays, layoutVars, startup, estimateOn,
                    memVars, histVars, verified, latched, devicePending, outcome,
                    error, steps, dummySeen,
                    bypassUnverified>>
@@ -364,7 +415,7 @@ ProfilingForwardPass ==
     /\ phase = "prepared"
     /\ phase' = "forwarded"
     /\ dummySeen' = TRUE
-    /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, devicePending, outcome, error, steps,
                    bypassUnverified>>
 
@@ -372,7 +423,7 @@ ProfilingForwardPass ==
 EstimateSkipped ==
     /\ phase = "forwarded"
     /\ phase' = "estimated"
-    /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -382,15 +433,18 @@ ProfilingPoolFails ==
     /\ phase' = "failed"
     /\ error' = FirstError("profiling-pool")
     /\ outcome' = StartupFails
-    /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, devicePending, steps, dummySeen,
                    bypassUnverified>>
 
-\* initialize_state_slots with the profiling bindings (TXG-LIFE-003).
-InitializeStateSlotsProfiling ==
+\* Core's estimate allocates its profiling KV cache, binds the state layer's
+\* views (bind_kv_cache) and sets the state-group layout to the profiling
+\* KV cache's. The transaction-graph part records nothing (TXG-LIFE-003).
+BindKvCacheProfiling ==
     /\ phase = "forwarded"
-    /\ bindings' = "prof"
+    /\ stateGroupLayout' = "prof"
     /\ phase' = "prof-bound"
+    /\ UNCHANGED <<heldLayout, layoutReads, profReleased>>
     /\ UNCHANGED <<call, captured, replays, cfgVars, memVars, histVars,
                    verified, latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
@@ -403,18 +457,9 @@ ProfilingCaptureNotReached ==
     /\ pendingFailure' = TRUE
     /\ error' = FirstError("core-capture")
     /\ outcome' = StartupFails
-    /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars,
+    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars,
                    failedCalls, refusedCalls, cleared, verified, latched,
                    devicePending, steps, dummySeen,
-                   bypassUnverified>>
-
-\* The engine disables the extensible KV cache after construction.
-DisableExtensibleCache ==
-    /\ phase \in PreServing /\ call.kind = "none" /\ extensible
-    /\ extensible' = FALSE
-    /\ UNCHANGED <<phase, call, captured, replays, bindings, budgetFixed, estimateOn,
-                   memVars, histVars, verified, latched, devicePending, outcome,
-                   error, steps, dummySeen,
                    bypassUnverified>>
 
 -------------------------------------------------------------------------------
@@ -429,7 +474,7 @@ ProfEntryRefusal ==
     ELSE "none"
 
 CaptureCudagraphsProfiling ==
-    /\ phase = "prof-bound" /\ call.kind = "none" /\ bindings = "prof"
+    /\ phase = "prof-bound" /\ call.kind = "none" /\ stateGroupLayout = "prof"
     /\ profAttempted' = TRUE
     /\ IF ProfEntryRefusal = "none"
        THEN /\ call' = [kind |-> "prof", pc |-> "seg", i |-> 0]
@@ -440,7 +485,7 @@ CaptureCudagraphsProfiling ==
             /\ error' = FirstError(ProfEntryRefusal)
             /\ outcome' = StartupFails
             /\ UNCHANGED call
-    /\ UNCHANGED <<captured, replays, bindings, cfgVars, profRan, servAttempted,
+    /\ UNCHANGED <<captured, replays, layoutVars, cfgVars, profRan, servAttempted,
                    servCapturing, servOk, requiredAtServ, profTotal, servTotal,
                    servMeasured, uncharged, failedCalls, cleared, verified, latched,
                    devicePending, steps, dummySeen,
@@ -466,7 +511,7 @@ OrderingRefusal ==
 \* passed every entry check. A refusal is worker-fatal and leaves the latch
 \* and every captured object unchanged (TXG-LIFE-008).
 ServingEntry(c) ==
-    /\ call.kind = "none" /\ bindings = "serv"
+    /\ call.kind = "none" /\ stateGroupLayout \in {"serv", "serv-changed"}
     /\ servAttempted' = (servAttempted \/ ServEntryRefusal = "none")
     /\ requiredAtServ' =
            IF OrderingRefusal THEN requiredAtServ
@@ -480,7 +525,7 @@ ServingEntry(c) ==
             /\ error' = FirstError(ServEntryRefusal)
             /\ outcome' = StartupFails
             /\ UNCHANGED <<call, servCapturing>>
-    /\ UNCHANGED <<captured, replays, bindings, cfgVars, profAttempted, profRan,
+    /\ UNCHANGED <<captured, replays, layoutVars, cfgVars, profAttempted, profRan,
                    servOk, profTotal, servTotal, servMeasured, uncharged,
                    failedCalls, cleared, pendingFailure, verified, latched,
                    devicePending, steps, dummySeen,
@@ -530,8 +575,8 @@ SegmentGraphsCaptured ==
     /\ InCall("seg")
     /\ captured' = captured \cup {Seg(C)}
     /\ devicePending' = TRUE
-    /\ GoTo("buf")
-    /\ UNCHANGED <<phase, replays, bindings, cfgVars, memVars, histVars,
+    /\ GoTo("pool")
+    /\ UNCHANGED <<phase, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -541,16 +586,50 @@ SegmentGraphCaptureFails ==
     /\ captured' = captured \cup {Seg(C)}
     /\ devicePending' = TRUE
     /\ FailTo("segment-capture")
-    /\ UNCHANGED <<phase, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<phase, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, outcome, steps, dummySeen,
                    bypassUnverified>>
+
+\* TXG-CAP-008: the transaction-graph part starts with the pool-access check.
+\* It reads the state-group layout through the accessor, inside this call,
+\* and keeps only its plain values (the recorded layout) once the check
+\* passes; the layout object it read is dropped when the call returns or
+\* raises.
+LayoutRead == [call |-> C, layout |-> stateGroupLayout, inCall |-> TRUE]
+
+PoolAccess ==
+    /\ InCall("pool")
+    /\ captured' = captured \cup {Lay(C)}
+    /\ heldLayout' = TRUE
+    /\ layoutReads' = layoutReads \cup {LayoutRead}
+    /\ GoTo("buf")
+    /\ UNCHANGED <<phase, replays, stateGroupLayout, profReleased, cfgVars, memVars,
+                   histVars, verified, latched, devicePending, outcome, error, steps,
+                   dummySeen, bypassUnverified>>
+
+\* The check fails: a break of core's layout contract (not exactly one
+\* layout, a layout that does not hold exactly the state layer, or a
+\* component tensor that is not the layer's bound view), or fewer blocks than
+\* the admission limit plus one, which under the restricted startup only a
+\* fixed budget can give (a fixed block count below it is refused by the
+\* configuration checks, TXG-CFG-019).
+PoolAccessFails ==
+    /\ InCall("pool")
+    /\ heldLayout' = TRUE
+    /\ layoutReads' = layoutReads \cup {LayoutRead}
+    /\ \E e \in {"pool-access-contract"}
+                \cup (IF startup = "budget" THEN {"pool-access-block-count"} ELSE {}) :
+         FailTo(e)
+    /\ UNCHANGED <<phase, captured, replays, stateGroupLayout, profReleased, cfgVars,
+                   memVars, histVars, verified, latched, devicePending, outcome, steps,
+                   dummySeen, bypassUnverified>>
 
 BindingBuffersAllocated ==
     /\ InCall("buf")
     /\ captured' = captured \cup {Buf(C)}
     /\ devicePending' = TRUE
     /\ GoTo("scatter")
-    /\ UNCHANGED <<phase, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<phase, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -559,7 +638,7 @@ BindingBufferAllocationFails ==
     /\ captured' = captured \cup {Buf(C)}
     /\ devicePending' = TRUE
     /\ FailTo("buffer-allocation")
-    /\ UNCHANGED <<phase, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<phase, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, outcome, steps, dummySeen,
                    bypassUnverified>>
 
@@ -568,7 +647,7 @@ ScatterWarmup ==
     /\ InCall("scatter")
     /\ devicePending' = TRUE
     /\ call' = [call EXCEPT !.pc = "cell", !.i = 1]
-    /\ UNCHANGED <<phase, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<phase, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -576,7 +655,7 @@ ScatterWarmupFails ==
     /\ InCall("scatter")
     /\ devicePending' = TRUE
     /\ FailTo("scatter-warmup")
-    /\ UNCHANGED <<phase, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<phase, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, outcome, steps, dummySeen,
                    bypassUnverified>>
 
@@ -591,7 +670,7 @@ CellCaptured ==
     /\ call' = IF call.i < 2 * N
                THEN [call EXCEPT !.i = @ + 1]
                ELSE [call EXCEPT !.pc = IF C = "prof" THEN "margin" ELSE "compare", !.i = 0]
-    /\ UNCHANGED <<phase, bindings, cfgVars, memVars, histVars, verified, latched,
+    /\ UNCHANGED <<phase, layoutVars, cfgVars, memVars, histVars, verified, latched,
                    outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -603,7 +682,7 @@ CellCaptureFails ==
     /\ replays' = replays \cup {ValidationReplay}
     /\ devicePending' = TRUE
     /\ FailTo("cell-capture")
-    /\ UNCHANGED <<phase, bindings, cfgVars, memVars, histVars, verified, latched,
+    /\ UNCHANGED <<phase, layoutVars, cfgVars, memVars, histVars, verified, latched,
                    outcome, steps, dummySeen,
                    bypassUnverified>>
 
@@ -615,7 +694,7 @@ MarginAllocated ==
     /\ \E t \in 0..MaxMem : profTotal' = t
     /\ devicePending' = TRUE
     /\ GoTo("sync")
-    /\ UNCHANGED <<phase, replays, bindings, cfgVars, profAttempted, profRan,
+    /\ UNCHANGED <<phase, replays, layoutVars, cfgVars, profAttempted, profRan,
                    servAttempted, servCapturing, servOk, requiredAtServ, servTotal,
                    servMeasured, uncharged, histVars, verified, latched, outcome,
                    error, steps, dummySeen,
@@ -625,7 +704,7 @@ MarginAllocationFails ==
     /\ InCall("margin")
     /\ devicePending' = TRUE
     /\ FailTo("margin")
-    /\ UNCHANGED <<phase, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<phase, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, outcome, steps, dummySeen,
                    bypassUnverified>>
 
@@ -644,7 +723,7 @@ MemoryComparison ==
             ELSE /\ GoTo("sync")
                  /\ uncharged' = ~profRan
                  /\ UNCHANGED error
-    /\ UNCHANGED <<phase, captured, replays, bindings, cfgVars, profAttempted,
+    /\ UNCHANGED <<phase, captured, replays, layoutVars, cfgVars, profAttempted,
                    profRan, servAttempted, servCapturing, servOk, requiredAtServ,
                    profTotal, histVars, verified, latched, devicePending, outcome,
                    steps, dummySeen,
@@ -655,13 +734,15 @@ MemoryComparison ==
 CaptureCallReturns ==
     /\ InCall("sync")
     /\ devicePending' = FALSE
+    /\ heldLayout' = FALSE
     /\ call' = NoCall
     /\ phase' = CASE C = "prof" -> "clearing"
                   [] C = "serv" -> "captured"
                   [] OTHER -> phase
     /\ profRan' = (profRan \/ C = "prof")
     /\ servOk' = (servOk \/ C = "serv")
-    /\ UNCHANGED <<captured, replays, bindings, cfgVars, profAttempted,
+    /\ UNCHANGED <<stateGroupLayout, layoutReads, profReleased>>
+    /\ UNCHANGED <<captured, replays, cfgVars, profAttempted,
                    servAttempted, servCapturing, requiredAtServ, profTotal,
                    servTotal, servMeasured, uncharged, histVars, verified, latched,
                    outcome, error, steps, dummySeen,
@@ -672,8 +753,10 @@ CaptureCallReturns ==
 FailureCleanupTxg ==
     /\ InCall("cleanup-txg")
     /\ captured' = captured \ TxgOf(captured, C)
+    /\ heldLayout' = FALSE
     /\ GoTo("cleanup-seg")
-    /\ UNCHANGED <<phase, replays, bindings, cfgVars, memVars, histVars, verified,
+    /\ UNCHANGED <<stateGroupLayout, layoutReads, profReleased>>
+    /\ UNCHANGED <<phase, replays, cfgVars, memVars, histVars, verified,
                    latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -682,7 +765,7 @@ FailureCleanupSegment ==
     /\ InCall("cleanup-seg")
     /\ captured' = captured \ {Seg(C)}
     /\ GoTo("cleanup-sync")
-    /\ UNCHANGED <<phase, replays, bindings, cfgVars, memVars, histVars, verified,
+    /\ UNCHANGED <<phase, replays, layoutVars, cfgVars, memVars, histVars, verified,
                    latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -697,12 +780,13 @@ FailureCleanupRaises ==
        THEN /\ phase' = "clearing" /\ pendingFailure' = TRUE
        ELSE /\ phase' = "failed" /\ UNCHANGED pendingFailure
     /\ outcome' = StartupFails
-    /\ UNCHANGED <<captured, replays, bindings, cfgVars, memVars, refusedCalls,
+    /\ UNCHANGED <<captured, replays, layoutVars, cfgVars, memVars, refusedCalls,
                    cleared, verified, latched, error, steps, dummySeen,
                    bypassUnverified>>
 
 CallProgress ==
     \/ SegmentGraphsCaptured \/ SegmentGraphCaptureFails
+    \/ PoolAccess \/ PoolAccessFails
     \/ BindingBuffersAllocated \/ BindingBufferAllocationFails
     \/ ScatterWarmup \/ ScatterWarmupFails
     \/ CellCaptured \/ CellCaptureFails
@@ -711,7 +795,7 @@ CallProgress ==
     \/ FailureCleanupTxg \/ FailureCleanupSegment \/ FailureCleanupRaises
 
 -------------------------------------------------------------------------------
-(* clear_cudagraphs, serving bindings and post_warmup                      *)
+(* clear_cudagraphs, core's bindings and post_warmup                       *)
 
 \* TXG-LIFE-005: release the profiling cells, buffers and margin, keeping the
 \* profiling figures as host integers; tolerates nothing captured.
@@ -719,27 +803,42 @@ ClearCudagraphsTxg ==
     /\ phase = "clearing" /\ call.kind = "none"
     /\ captured' = captured \ TxgOf(captured, "prof")
     /\ phase' = "clearing-seg"
-    /\ UNCHANGED <<call, replays, bindings, cfgVars, memVars, histVars, verified,
+    /\ UNCHANGED <<call, replays, layoutVars, cfgVars, memVars, histVars, verified,
                    latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
-\* REG-MEM-021: then the profiling segment graphs. A pending estimate failure
-\* propagates now and startup fails.
+\* REG-MEM-021: then the profiling segment graphs; clear_cudagraphs returns.
 ClearCudagraphsSegment ==
     /\ phase = "clearing-seg"
     /\ captured' = captured \ {Seg("prof")}
     /\ cleared' = TRUE
-    /\ phase' = IF pendingFailure THEN "failed" ELSE "estimated"
-    /\ UNCHANGED <<call, replays, bindings, cfgVars, memVars, failedCalls,
+    /\ phase' = "releasing"
+    /\ UNCHANGED <<call, replays, layoutVars, cfgVars, memVars, failedCalls,
                    refusedCalls, pendingFailure, verified, latched, devicePending,
                    outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
-\* initialize_state_slots with the serving bindings (TXG-LIFE-003).
-InitializeStateSlotsServing ==
+\* After clear_cudagraphs, on success and on failure alike, core releases
+\* the profiling KV cache and clears the state-group layout. A pending
+\* estimate failure then propagates and startup fails.
+ReleaseProfilingKvCache ==
+    /\ phase = "releasing"
+    /\ stateGroupLayout' = "none"
+    /\ profReleased' = TRUE
+    /\ phase' = IF pendingFailure THEN "failed" ELSE "estimated"
+    /\ UNCHANGED <<heldLayout, layoutReads>>
+    /\ UNCHANGED <<call, captured, replays, cfgVars, memVars, histVars, verified,
+                   latched, devicePending, outcome, error, steps, dummySeen,
+                   bypassUnverified>>
+
+\* Core allocates the serving KV cache, binds the state layer's views and
+\* sets the state-group layout to the serving KV cache's; the
+\* transaction-graph part records nothing (TXG-LIFE-003).
+BindKvCacheServing ==
     /\ phase = "estimated"
-    /\ bindings' = "serv"
+    /\ stateGroupLayout' = "serv"
     /\ phase' = "serv-bound"
+    /\ UNCHANGED <<heldLayout, layoutReads, profReleased>>
     /\ UNCHANGED <<call, captured, replays, cfgVars, memVars, histVars, verified,
                    latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
@@ -753,7 +852,7 @@ PostWarmupPasses ==
     /\ verified' = TRUE
     /\ phase' = "serving"
     /\ outcome' = IF outcome = "pending" THEN "served" ELSE outcome
-    /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    latched, devicePending, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -764,24 +863,30 @@ PostWarmupMismatch ==
     /\ phase' = "failed"
     /\ error' = FirstError("verification")
     /\ outcome' = StartupFails
-    /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, devicePending, steps, dummySeen,
                    bypassUnverified>>
 
-\* TXG-LIFE-009: a repeated initialize_state_slots after the serving
-\* capture; an equal layout changes nothing ...
-ReinitializeStateSlotsSame ==
+\* TXG-LIFE-009: core binds the state layer's views again after the serving
+\* capture; the state layer reports them to the binding, which compares
+\* their plain-value layout with the one the serving capture recorded. An
+\* equal layout changes nothing ...
+BindKvCacheAfterServingSameLayout ==
     /\ phase \in {"captured", "serving"} /\ call.kind = "none"
+    /\ Lay("serv") \in captured /\ stateGroupLayout = "serv"
     /\ UNCHANGED vars
 
-\* ... a different layout latches and raises (worker-fatal).
-ReinitializeStateSlotsChanged ==
+\* ... a changed layout latches and raises (worker-fatal).
+BindKvCacheAfterServingChangedLayout ==
     /\ phase \in {"captured", "serving"} /\ call.kind = "none"
+    /\ Lay("serv") \in captured
+    /\ stateGroupLayout' = "serv-changed"
     /\ latched' = TRUE
     /\ phase' = "failed"
     /\ error' = FirstError("layout-changed")
     /\ outcome' = StartupFails
-    /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<heldLayout, layoutReads, profReleased>>
+    /\ UNCHANGED <<call, captured, replays, cfgVars, memVars, histVars,
                    verified, devicePending, steps, dummySeen,
                    bypassUnverified>>
 
@@ -812,7 +917,7 @@ ScheduledStep ==
                       /\ error' = FirstError("step-after-launch")
                  ELSE UNCHANGED <<latched, phase, error>>
          ELSE UNCHANGED <<replays, latched, phase, error>>
-    /\ UNCHANGED <<call, captured, bindings, cfgVars, memVars, histVars, verified,
+    /\ UNCHANGED <<call, captured, layoutVars, cfgVars, memVars, histVars, verified,
                    devicePending, outcome, dummySeen,
                    bypassUnverified>>
 
@@ -829,7 +934,7 @@ PrematureScheduledStep ==
               /\ error' = FirstError("execute-before-verification")
               /\ outcome' = StartupFails
          ELSE UNCHANGED <<phase, error, outcome>>
-    /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, devicePending, steps, dummySeen,
                    bypassUnverified>>
 
@@ -844,7 +949,7 @@ AllFailedStep ==
     /\ IF latched
        THEN UNCHANGED vars
        ELSE /\ bypassUnverified' = (bypassUnverified \/ ~verified)
-            /\ UNCHANGED <<phase, call, captured, replays, bindings, cfgVars,
+            /\ UNCHANGED <<phase, call, captured, replays, layoutVars, cfgVars,
                            memVars, histVars, verified, latched, devicePending,
                            outcome, error, steps, dummySeen>>
 
@@ -852,7 +957,7 @@ AllFailedStep ==
 DummyStep ==
     /\ phase \in {"serv-bound", "captured", "serving"} /\ call.kind = "none"
     /\ dummySeen' = TRUE
-    /\ UNCHANGED <<phase, call, captured, replays, bindings, cfgVars, memVars,
+    /\ UNCHANGED <<phase, call, captured, replays, layoutVars, cfgVars, memVars,
                    histVars, verified, latched, devicePending, outcome, error, steps,
                    bypassUnverified>>
 
@@ -860,7 +965,7 @@ DummyStep ==
 CleanupOnlyStep ==
     /\ phase = "serving" /\ call.kind = "none"
     /\ dummySeen' = TRUE
-    /\ UNCHANGED <<phase, call, captured, replays, bindings, cfgVars, memVars,
+    /\ UNCHANGED <<phase, call, captured, replays, layoutVars, cfgVars, memVars,
                    histVars, verified, latched, devicePending, outcome, error, steps,
                    bypassUnverified>>
 
@@ -873,7 +978,7 @@ ShutdownTxg ==
     /\ phase \in Shutdownable /\ call.kind = "none"
     /\ captured' = {o \in captured : o[2] \notin TxgParts}
     /\ phase' = "shutting-down"
-    /\ UNCHANGED <<call, replays, bindings, cfgVars, memVars, histVars, verified,
+    /\ UNCHANGED <<call, replays, layoutVars, cfgVars, memVars, histVars, verified,
                    latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -882,7 +987,7 @@ ShutdownSegment ==
     /\ phase = "shutting-down"
     /\ captured' = {}
     /\ phase' = "shutdown"
-    /\ UNCHANGED <<call, replays, bindings, cfgVars, memVars, histVars, verified,
+    /\ UNCHANGED <<call, replays, layoutVars, cfgVars, memVars, histVars, verified,
                    latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -891,7 +996,7 @@ ShutdownSegment ==
 Kill ==
     /\ phase \notin Terminal
     /\ phase' = "killed"
-    /\ UNCHANGED <<call, captured, replays, bindings, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars, histVars,
                    verified, latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -902,10 +1007,10 @@ Done == phase \in Terminal /\ UNCHANGED vars
 StartupProgress ==
     \/ Construct \/ ConstructionFails \/ NeedsCudagraphCapture
     \/ PrepareExecutionMemory \/ ProfilingForwardPass
-    \/ EstimateSkipped \/ ProfilingPoolFails \/ InitializeStateSlotsProfiling
+    \/ EstimateSkipped \/ ProfilingPoolFails \/ BindKvCacheProfiling
     \/ ProfilingCaptureNotReached \/ CaptureCudagraphsProfiling
     \/ CallProgress \/ ClearCudagraphsTxg \/ ClearCudagraphsSegment
-    \/ InitializeStateSlotsServing \/ CaptureCudagraphsServing
+    \/ ReleaseProfilingKvCache \/ BindKvCacheServing \/ CaptureCudagraphsServing
     \/ PostWarmupPasses \/ PostWarmupMismatch \/ ShutdownSegment
 
 \* Cooperative teardown: a failed or latched worker's runner shuts down.
@@ -913,9 +1018,8 @@ FailedTeardown == (phase = "failed" \/ latched) /\ ShutdownTxg
 
 Next ==
     \/ StartupProgress
-    \/ DisableExtensibleCache
     \/ SecondServingCapture \/ ServingCaptureRetry
-    \/ ReinitializeStateSlotsSame \/ ReinitializeStateSlotsChanged
+    \/ BindKvCacheAfterServingSameLayout \/ BindKvCacheAfterServingChangedLayout
     \/ ScheduledStep \/ PrematureScheduledStep \/ AllFailedStep
     \/ DummyStep \/ CleanupOnlyStep
     \/ ShutdownTxg \/ Kill \/ Done
@@ -933,7 +1037,18 @@ NoReplayOutsideStep ==
 NoStepReplayOverProfilingPools ==
     \A r \in replays : r.ctx = "step" => r.pool /= "prof"
 
-NothingProfilingAfterClear == cleared => OfCall(captured, "prof") = {}
+NothingProfilingAfterClear ==
+    /\ cleared => OfCall(captured, "prof") = {}
+    /\ profReleased => (cleared /\ stateGroupLayout /= "prof")
+
+LayoutReadOnlyInCapture ==
+    /\ \A r \in layoutReads :
+         r.inCall /\ r.layout = (IF r.call = "prof" THEN "prof" ELSE "serv")
+    /\ call.kind = "none" => ~heldLayout
+    /\ \A o \in captured : o[2] \in {"buf", "margin", "cell"} => Lay(o[1]) \in captured
+
+PoolAccessBlockCountUnderBudget ==
+    error = "pool-access-block-count" => startup = "budget"
 
 AtMostOneServingCapture == servCapturing <= 1
 
@@ -978,7 +1093,8 @@ NothingOutsideCaptures ==
 
 ServingInventoryComplete ==
     /\ (servOk /\ phase \in {"captured", "serving"})
-           => OfCall(captured, "serv") = ServingCells \cup {Seg("serv"), Buf("serv")}
+           => OfCall(captured, "serv") =
+                  ServingCells \cup {Seg("serv"), Lay("serv"), Buf("serv")}
     /\ \A c \in ServingCalls : Margin(c) \notin captured
 
 VerifiedBeforeServing == phase = "serving" => verified
