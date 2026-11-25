@@ -215,7 +215,7 @@ class NativeBurstSampler:
         )
 
 
-# @spec REG-ENG-008
+# @spec REG-ENG-008, REG-LA-007, REG-LA-009
 def validate_native_burst_config(
     config: Any,
     *,
@@ -224,9 +224,13 @@ def validate_native_burst_config(
 ) -> None:
     """Reject native selection outside a single-device synchronous engine.
 
-    With ``hf_config``, the server's lookahead (``served_lookahead``) must be
-    valid, and the 160 ms profile (lookahead 1) is required when
-    ``require_160ms_profile`` is set.
+    A parallel setting the running build does not define counts as 1, and an
+    undefined expert-parallel setting as off. With ``hf_config``, the
+    server's lookahead (``served_lookahead``) must be valid, and the 160 ms
+    profile (lookahead 1) is required when ``require_160ms_profile`` is set.
+    These rules apply only on a core that runs native burst; on the state
+    layer native burst is refused outright
+    (``engine_flags.native_burst_refusal``).
     """
     parallel = config.parallel_config
     if (

@@ -25,8 +25,7 @@ from typing import Any
 import numpy as np
 from vllm.engine.protocol import StreamingInput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.v1.engine import StreamAdmissionError
-from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.exceptions import EngineDeadError, StreamAdmissionError
 
 from vllm_nemotron_asr_streaming.identity import ARCHITECTURE
 from vllm_nemotron_asr_streaming.locales import default_locale

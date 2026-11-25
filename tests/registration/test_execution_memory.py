@@ -1588,7 +1588,9 @@ def test_an_unlisted_fault_a_request_can_cause_fails_that_request_alone(
     admission stamp is not a number, and a direct engine client can send one,
     so its row fails alone (here with the step's clean stream row, and with a
     file row whose planning reads every stream row's header)."""
-    env = build()
+    # Three rows (bad, s1 and, with a file row, f1): core never schedules more
+    # rows than max_num_seqs.
+    env = build(max_num_seqs=3)
     env.runner.profile_run(core_embeds=False)
     pool(env)
     envelope = h.stream_envelope(geometry=env.max_geometry)

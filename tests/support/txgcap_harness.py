@@ -470,7 +470,7 @@ def _harness_object(obj: Any) -> bool:
     import types
 
     owner = obj if isinstance(obj, (type, types.FunctionType)) else type(obj)
-    return getattr(owner, "__module__", "").startswith(_HARNESS_MODULES)
+    return (getattr(owner, "__module__", None) or "").startswith(_HARNESS_MODULES)
 
 
 def _plugin_name(name: str) -> bool:

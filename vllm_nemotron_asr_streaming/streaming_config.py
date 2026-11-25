@@ -21,11 +21,7 @@ from .card_parser import SCHEMA_FIELDS, schema_errors
 from .engine_flags import check_engine_config
 from .identity import ARCHITECTURE
 from .locales import locale_language, unmapped_languages
-from .lookahead import (
-    NATIVE_BURST_LOOKAHEAD,
-    cadence_label,
-    served_lookahead,
-)
+from .lookahead import cadence_label, served_lookahead
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +56,9 @@ def _lookahead_errors(hf_config: Any) -> list[str]:
                 cadence_label(lookahead),
                 sorted(card),
             )
-    native_burst = getattr(hf_config, "experimental_native_burst", False)
-    if native_burst and lookahead != NATIVE_BURST_LOOKAHEAD:
-        shown = "not resolved" if lookahead is None else f"{lookahead}"
-        errors.append(
-            "experimental_native_burst requires the server's lookahead to be "
-            f"{NATIVE_BURST_LOOKAHEAD} (160ms); the server's lookahead is {shown}"
-        )
+    # Native burst's lookahead rule (REG-LA-007) holds only on a core that
+    # runs native burst; on the state layer native burst itself is refused
+    # once, in the engine hook (REG-ENG-019), so no lookahead advice is given.
     return errors
 
 
@@ -123,9 +115,9 @@ class Nemotron3_5AsrStreamingConfig(VerifyAndUpdateConfig):
     """Refuse a served configuration or engine the streaming model cannot run."""
 
     @staticmethod
-    # @spec REG-LA-002, REG-LA-003, REG-LA-004, REG-LA-006, REG-LA-007
-    # @spec REG-LA-008, REG-VAL-001, REG-VAL-002, REG-VAL-003, REG-VAL-004
-    # @spec REG-VAL-005, REG-VAL-006, REG-VAL-007
+    # @spec REG-LA-002, REG-LA-003, REG-LA-004, REG-LA-006, REG-LA-008
+    # @spec REG-VAL-001, REG-VAL-002, REG-VAL-003, REG-VAL-004, REG-VAL-005
+    # @spec REG-VAL-006, REG-VAL-007
     def verify_and_update_model_config(model_config: Any) -> None:
         from .nemotron_asr.manifests import REALTIME_MAX_TOKENS
 
@@ -170,9 +162,14 @@ class Nemotron3_5AsrStreamingConfig(VerifyAndUpdateConfig):
             )
 
     @staticmethod
-    # @spec REG-VAL-008
+    # @spec REG-VAL-003, REG-VAL-008, REG-ENG-005, REG-ENG-027
     def verify_and_update_config(vllm_config: Any) -> None:
-        # The engine checks include the transaction-graph conditions
+        # One ValueError lists every failed engine check: the engine settings,
+        # the hook configuration's conditions at the hook stage
+        # (``engine_flags.runner_mode_refusals``), native burst on the state
+        # layer and the transaction-graph conditions
         # (``transaction_graph_config_errors``), evaluated on the geometry
-        # ``verify_and_update_model_config`` resolved.
+        # ``verify_and_update_model_config`` resolved. Settings core's own
+        # persistent-state check refuses first reach this hook only when it is
+        # called directly.
         check_engine_config(vllm_config, ARCHITECTURE)

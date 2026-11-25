@@ -27,7 +27,10 @@ from torch import nn
 from vllm.logger import init_logger
 from vllm_nemotron_asr_streaming import engine_flags
 from vllm_nemotron_asr_streaming.engine_flags import graphed_execution_configured
-from vllm.model_executor.models.interfaces import SupportsTranscription
+from vllm.model_executor.models.interfaces import (
+    SupportsPersistentState,
+    SupportsTranscription,
+)
 from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
     ENVELOPE_HEADER_SLOTS,
     DecodeRequest,
@@ -77,11 +80,10 @@ from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
 )
 from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
     ObservedRow,
-    file_envelope_header,
     PlanContextSlot,
+    RequestRowFault,
     SessionRegistry,
     prepare_plan_context,
-    reject_unsupported_outer_graph_mode,
     resolve_row_envelope_header,
 )
 from vllm_nemotron_asr_streaming.nemotron_asr.precision import (
@@ -343,7 +345,7 @@ __all__ = [
     dummy_inputs=NemotronASRDummyInputsBuilder,
 )
 # @spec REG-TASK-001, FILE-IF-001
-class NemotronASRForRNNT(nn.Module, SupportsTranscription):
+class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentState):
     """Engine-facing cache-aware RNN-T over one aggregate state page."""
 
     supports_multimodal = True
@@ -353,6 +355,13 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
     supports_segment_timestamp = False
     supports_diarized_transcription = False
     supports_persistent_state = True
+    # @spec REG-TASK-003: the forward reads no value of ``positions``.
+    persistent_state_reads_positions = False
+    # @spec REG-TASK-004
+    persistent_state_accepts_synthetic_warmup = False
+    # @spec REG-TASK-005: a stop-free EOS (the park) is the only resumable
+    # stop.
+    persistent_state_resumable_stops = frozenset({"eos"})
     is_attention_free = True
     # @spec FILE-IF-002
     supported_languages = _supported_languages()
@@ -376,6 +385,14 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 f"({min_history} tokens)"
             )
         hf_config = vllm_config.model_config.hf_config
+        # @spec REG-ENG-006, REG-ENG-027: the final engine configuration may
+        # differ from what the configuration hook saw; check it again, the
+        # hook configuration's conditions through
+        # ``engine_flags.runner_mode_refusals`` (stage ``"constructor"``),
+        # before any arm is built or weights load.
+        engine_flags.check_engine_config(
+            vllm_config, "the Nemotron streaming model", resolved=True
+        )
         # @spec REG-014, REG-018: the graph-runtime dependencies are needed
         # only when graphed execution is configured, the transaction-graph
         # members only while transaction graphs are on; name every missing one
@@ -431,9 +448,6 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         # Pool sizing is resolved after vLLM's real memory profile in the
         # common worker. The model constructor deliberately does not invent
         # physical capacity or mutate ``num_gpu_blocks_override``.
-        reject_unsupported_outer_graph_mode(
-            getattr(vllm_config, "compilation_config", None)
-        )
         self.config = hf_config
         self.num_logits = int(hf_config.vocab_size)
         self.core = NemotronASRCore(
@@ -598,7 +612,10 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             transaction_graph_config_errors,
         )
 
-        if transaction_graph_config_errors(vllm_config):
+        if transaction_graph_config_errors(
+            vllm_config,
+            has_state_group_layouts=engine_flags.model_state_has_state_group_layouts(),
+        ):
             return None
         return TransactionGraphBinding(self, vllm_config)
 
@@ -842,62 +859,73 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
         policy = information.get("endpoint_policy")
         if not isinstance(policy, dict):
             return 0, 0, 0
+        # A policy is the request's own: its faults fail the request alone
+        # (REG-STATE-015).
         mode_name = policy.get("mode")
         if mode_name not in ("disabled", "greedy_blank"):
-            raise ValueError("request carries an unknown endpoint mode")
+            raise RequestRowFault("request carries an unknown endpoint mode")
         mode = 1 if mode_name == "greedy_blank" else 0
-        threshold = int(policy.get("threshold_frames", 0))
-        residue = int(policy.get("residue_frames", 0))
+        try:
+            threshold = int(policy.get("threshold_frames", 0))
+            residue = int(policy.get("residue_frames", 0))
+        except (TypeError, ValueError, OverflowError) as error:
+            raise RequestRowFault(
+                "request carries an invalid endpoint policy"
+            ) from error
         if threshold < 0 or residue < 0:
-            raise ValueError("request carries an invalid endpoint policy")
+            raise RequestRowFault("request carries an invalid endpoint policy")
         return mode, threshold, residue
 
+    # @spec REG-STATE-014, REG-STATE-015, TXG-COV-010
     def _stage_v2_projection(self, projection: Any) -> Any:
         input_batch = projection.input_batch
         metadata = projection.request_metadata
         if metadata is None:
             raise RuntimeError("MRv2 projection omitted request metadata")
+        # The rows the model state failed at planning, and each clean stream
+        # CHUNK row's screened header (resolved here when the projection
+        # carries none).
+        planning_failed = getattr(projection, "planning_failed", None) or ()
+        stream_headers = getattr(projection, "stream_headers", None)
         rows: list[ObservedRow] = []
         for index, (request_id, binding) in enumerate(
             zip(projection.req_ids, projection.bindings)
         ):
-            if int(input_batch.num_scheduled_tokens[index]) != 1:
-                raise ValueError("every streaming row must be single-token")
             request = metadata[request_id]
             computed = int(input_batch.num_computed_tokens_np[index])
             token = projection.token_ids[index]
+            file_row = projection.file_rows.get(request_id)
+            if request_id in planning_failed or (
+                file_row is not None and file_row.failed
+            ):
+                # Failed at planning: the row stays at its position, bound
+                # non-CHUNK with its planned-rejection bit, which the
+                # transaction rejects; its tokens are not classified.
+                rows.append(
+                    ObservedRow(
+                        request_id=request_id,
+                        block_id=int(binding.slot_id),
+                        scheduled_token_id=token,
+                        has_prior_state=not bool(binding.fresh),
+                        envelope_header=None,
+                        is_file=file_row is not None,
+                        reject=True,
+                    )
+                )
+                continue
+            if int(input_batch.num_scheduled_tokens[index]) != 1:
+                raise ValueError(
+                    f"row {request_id!r} schedules more than one token but did "
+                    "not fail at planning"
+                )
             endpoint_mode, endpoint_threshold, endpoint_residue = (
                 self._endpoint_controls(request)
             )
-            file_row = projection.file_rows.get(request_id)
             if file_row is not None:
                 # FILE-ROW-001: a FILE row's role and header come from the
                 # step plan, not from the request's multimodal feature.
                 plan = file_row.file_plan
                 assert plan is not None
-                if file_row.failed:
-                    # A malformed file item fails this row alone: a CHUNK
-                    # bound as non-CHUNK, which the transaction masks.
-                    rows.append(
-                        ObservedRow(
-                            request_id=request_id,
-                            block_id=int(binding.slot_id),
-                            scheduled_token_id=token,
-                            has_prior_state=not bool(binding.fresh),
-                            envelope_header=file_envelope_header(
-                                valid_samples=0,
-                                geometry_id=0,
-                                final_tail=False,
-                                prompt_index=0,
-                                chunk_sequence=0,
-                                now_ms=int(time.time() * 1000),
-                            ),
-                            is_file=True,
-                            file_advances=True,
-                            reject=True,
-                        )
-                    )
-                    continue
                 rows.append(
                     ObservedRow(
                         request_id=request_id,
@@ -910,21 +938,25 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                     )
                 )
                 continue
+            if stream_headers is not None:
+                header = stream_headers.get(request_id)
+            else:
+                header = resolve_row_envelope_header(
+                    scheduled_token_id=token,
+                    placeholder_id=int(self.config.audio_chunk_token_id),
+                    num_computed_tokens=computed,
+                    mm_features=request.mm_features,
+                    scheduled_encoder_input_ids=projection.scheduled_encoder_inputs.get(
+                        request_id, ()
+                    ),
+                )
             rows.append(
                 ObservedRow(
                     request_id=request_id,
                     block_id=int(binding.slot_id),
                     scheduled_token_id=token,
                     has_prior_state=not bool(binding.fresh),
-                    envelope_header=resolve_row_envelope_header(
-                        scheduled_token_id=token,
-                        placeholder_id=int(self.config.audio_chunk_token_id),
-                        num_computed_tokens=computed,
-                        mm_features=request.mm_features,
-                        scheduled_encoder_input_ids=projection.scheduled_encoder_inputs.get(
-                            request_id, ()
-                        ),
-                    ),
+                    envelope_header=header,
                     endpoint_mode=endpoint_mode,
                     endpoint_threshold_frames=endpoint_threshold,
                     endpoint_residue_frames=endpoint_residue,
@@ -1814,20 +1846,29 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
                 )
         context = self._stage_v2_projection(persistent_state_projection)
         planning_failed = self._record_planning(persistent_state_projection, context)
+        state_batch = persistent_state_projection.state_batch
+        if state_batch is None:
+            raise RuntimeError("MRv2 projection omitted bounded state views")
+        # @spec REG-STATE-010: a fresh row's page may hold a previous owner's
+        # bytes (core does not clear a reused block): initialize it on the
+        # current stream before the transaction reads it, whether or not the
+        # row failed at planning, an all-failed step included.
+        state_batch.initialize_fresh_pages()
+        row_ids, row_embeds, last_positions = self._rows_by_position(
+            input_ids, inputs_embeds, persistent_state_projection.input_batch
+        )
         if (
             planning_failed
             and len(planning_failed) == len(context.request_ids)
             and self._native_burst_handoff is None
         ):
-            return self._all_failed_bypass(context, inputs_embeds)
-        state_batch = persistent_state_projection.state_batch
-        if state_batch is None:
-            raise RuntimeError("MRv2 projection omitted bounded state views")
-        # A fresh row's page may hold a previous owner's bytes (core does not
-        # clear a reused block): initialize it before the transaction.
-        state_batch.initialize_fresh_pages()
+            return self._runner_output(
+                self._all_failed_bypass(context, row_embeds),
+                last_positions,
+                inputs_embeds,
+            )
         pools = self._state_pools(persistent_state_projection)
-        self._write_file_envelopes(inputs_embeds, persistent_state_projection)
+        self._write_file_envelopes(row_embeds, persistent_state_projection)
         commit_sink = state_batch.commit_sink(
             self._ensure_commit_sink(inputs_embeds.device)
         )
@@ -1887,29 +1928,71 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription):
             geometry_order=persistent_state_projection.geometry_order,
         )
         try:
-            row_ids = input_ids.long()
             if binding is not None:
                 # @spec TXG-COV-003, TXG-EXEC-012: a scheduled step replays
                 # its cells; a step ``execute`` declines (already counted)
                 # runs wholly as the option-off transaction below. ``execute``
                 # is looked up on the binding at call time.
                 result = binding.execute(
-                    self.core, row_ids, inputs_embeds, plan, **transaction
+                    self.core, row_ids, row_embeds, plan, **transaction
                 )
                 if result is not None:
-                    return result
+                    return self._runner_output(result, last_positions, inputs_embeds)
             result = advance_model_rows(
                 self.core,
                 row_ids,
-                inputs_embeds,
+                row_embeds,
                 plan,
                 **transaction,
             )
-            return result
+            return self._runner_output(result, last_positions, inputs_embeds)
         except BaseException:
             if native_handoff is not None:
                 native_handoff.clear()
             raise
+
+    # @spec REG-STATE-014, TXG-TXN-010
+    @staticmethod
+    def _rows_by_position(
+        input_ids: torch.Tensor, inputs_embeds: torch.Tensor, input_batch: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Each row's runner inputs at its last token position, the position
+        core samples. In a one-token step row ``i`` is position ``i`` and the
+        runner's tensors pass through; otherwise (a row that failed at
+        planning for scheduling several tokens) each row's ``input_ids`` and
+        ``inputs_embeds`` are gathered from ``query_start_loc[i + 1] - 1``,
+        whose index is returned for the output."""
+        counts = getattr(input_batch, "num_scheduled_tokens", None)
+        if counts is None or all(int(c) == 1 for c in counts):
+            return input_ids.long(), inputs_embeds, None
+        ends = torch.as_tensor(counts, dtype=torch.int64).cumsum(0) - 1
+        last = ends.to(inputs_embeds.device)
+        return input_ids.long()[last], inputs_embeds[last], last
+
+    def _runner_output(
+        self,
+        rows: torch.Tensor,
+        last_positions: torch.Tensor | None,
+        inputs_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        """The runner-facing output: one row per scheduled token, each row's
+        output at its last token position and the rejected-row output at
+        every other position (TXG-TXN-010)."""
+        if last_positions is None:
+            return rows
+        from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
+            rejected_row_output,
+        )
+
+        out = rejected_row_output(
+            int(inputs_embeds.shape[0]),
+            int(rows.shape[-1]),
+            park_id=int(self.config.eos_token_id),
+            dtype=rows.dtype,
+            device=rows.device,
+        )
+        out[last_positions] = rows[: int(last_positions.shape[0])]
+        return out
 
     # @spec TXG-FAIL-008
     @staticmethod

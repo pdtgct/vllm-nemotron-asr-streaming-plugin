@@ -40,7 +40,7 @@ macOS loader chain and is differentially tested locally.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field, fields
 
 import torch
@@ -106,9 +106,7 @@ def file_envelope_header(
     return tuple(header)
 
 
-def stream_order_key(
-    header: Sequence[float], *, now_ns: int
-) -> tuple[int, int]:
+def stream_order_key(header: Sequence[float], *, now_ns: int) -> tuple[int, int]:
     """``(geometry index, ready deadline in ns)`` of a stream CHUNK header,
     for ordering the step's chunk groups."""
     geometry = int(header[ENV_GEOMETRY_ID])
@@ -117,6 +115,15 @@ def stream_order_key(
     )
 
 
+class RequestRowFault(ValueError):
+    """A planning fault that the row's request causes through its own prompt
+    or multimodal items, as a direct engine client can send them
+    (REG-STATE-015): the model state fails that row alone at planning and
+    never raises it out of a step. Any other planning ``ValueError`` is a
+    violation of core's model-state contract and is raised."""
+
+
+# @spec REG-STATE-015
 def resolve_row_envelope_header(
     *,
     scheduled_token_id: int,
@@ -132,9 +139,25 @@ def resolve_row_envelope_header(
     token and the request feature overlapping that one-token window are the
     row authorities; a present encoder-input id only cross-checks them
     (PORT-ADV-003 / PORT-INT-003).
+
+    Its faults fall in two classes (REG-STATE-015). Those the request's
+    prompt and items cause raise :class:`RequestRowFault`: a non-CHUNK row
+    that a feature overlaps; a CHUNK row that no feature, or more than one,
+    overlaps; an overlapping feature that is not audio, carries no kwargs
+    payload or no envelope payload; an envelope smaller than its header.
+    Those only core's scheduling or multimodal delivery can produce raise a
+    plain ``ValueError``: a feature without position metadata or of
+    non-positive length; a non-CHUNK row with a scheduled encoder input; a
+    CHUNK row with more than one scheduled encoder input, or one naming a
+    feature other than the overlapping one; an envelope payload that is not
+    host-resident. A row with faults of both classes raises
+    :class:`RequestRowFault`: the request caused it. A feature without
+    usable position metadata raises at once: no overlap can be judged
+    without it.
     """
     start = int(num_computed_tokens)
     end = start + 1
+    contract: list[str] = []
     overlapping: list[tuple[int, object]] = []
     for index, feature in enumerate(mm_features):
         position = getattr(feature, "mm_position", None)
@@ -151,43 +174,121 @@ def resolve_row_envelope_header(
 
     scheduled = tuple(int(index) for index in scheduled_encoder_input_ids)
     is_chunk = int(scheduled_token_id) == int(placeholder_id)
+    request: str | None = None
+    envelope: torch.Tensor | None = None
     if not is_chunk:
         if overlapping:
-            raise ValueError("non-CHUNK row has an overlapping multimodal feature")
-        if scheduled:
-            raise ValueError("non-CHUNK row has a scheduled encoder input")
-        return None
-
-    if len(overlapping) != 1:
-        raise ValueError(
+            request = "non-CHUNK row has an overlapping multimodal feature"
+        elif scheduled:
+            contract.append("non-CHUNK row has a scheduled encoder input")
+    elif len(overlapping) != 1:
+        request = (
             "CHUNK row requires exactly one overlapping multimodal feature, found "
             f"{len(overlapping)}"
         )
-    feature_index, feature = overlapping[0]
-    if len(scheduled) > 1:
-        raise ValueError("CHUNK row may have at most one encoder input scheduled")
-    if scheduled and scheduled[0] != feature_index:
-        raise ValueError(
-            "scheduled encoder input must name the same overlapping feature"
-        )
+    else:
+        feature_index, feature = overlapping[0]
+        if len(scheduled) > 1:
+            contract.append("CHUNK row may have at most one encoder input scheduled")
+        elif scheduled and scheduled[0] != feature_index:
+            contract.append(
+                "scheduled encoder input must name the same overlapping feature"
+            )
+        request, envelope = _envelope_payload(feature)
+        if request is None and envelope is not None and envelope.device.type != "cpu":
+            contract.append("envelope payload must be host-resident at the hook")
+    if request is not None:
+        raise RequestRowFault(request)
+    if contract:
+        raise ValueError("; ".join(contract))
+    if envelope is None:
+        return None
+    return tuple(float(value) for value in envelope[:ENVELOPE_HEADER_SLOTS].tolist())
+
+
+def _envelope_payload(feature: object) -> tuple[str | None, torch.Tensor | None]:
+    """The overlapping feature's flat envelope, or the request-caused fault
+    that leaves it without one (REG-STATE-015)."""
     modality = getattr(feature, "modality", None)
     if modality != "audio":
-        raise ValueError(f"CHUNK row feature must be audio, got {modality!r}")
+        return f"CHUNK row feature must be audio, got {modality!r}", None
     item = getattr(feature, "data", None)
     if item is None:
-        raise ValueError("CHUNK row envelope has no kwargs payload")
+        return "CHUNK row envelope has no kwargs payload", None
     try:
-        field = item["audio"]
-        payload = field.data
-    except (KeyError, TypeError, AttributeError) as exc:
-        raise ValueError("CHUNK row audio feature has no envelope payload") from exc
-    env = payload if isinstance(payload, torch.Tensor) else torch.as_tensor(payload)
-    if env.device.type != "cpu":
-        raise ValueError("envelope payload must be host-resident at the hook")
-    env = env.reshape(-1)
-    if int(env.shape[0]) < ENVELOPE_HEADER_SLOTS:
-        raise ValueError("CHUNK row envelope is smaller than its header")
-    return tuple(float(value) for value in env[:ENVELOPE_HEADER_SLOTS].tolist())
+        payload = item["audio"].data
+    except (KeyError, TypeError, AttributeError):
+        return "CHUNK row audio feature has no envelope payload", None
+    try:
+        envelope = (
+            payload if isinstance(payload, torch.Tensor) else torch.as_tensor(payload)
+        ).reshape(-1)
+    except (TypeError, ValueError, RuntimeError):
+        return "CHUNK row audio feature has no envelope payload", None
+    if int(envelope.shape[0]) < ENVELOPE_HEADER_SLOTS:
+        return "CHUNK row envelope is smaller than its header", None
+    return None, envelope
+
+
+# @spec REG-STATE-015
+def check_envelope_header(
+    header: Sequence[float] | None,
+    request_id: str,
+    *,
+    num_prompts: int,
+    num_geometries: int,
+) -> tuple[int, int, int]:
+    """Validate a stream CHUNK row's envelope header; return its geometry,
+    prompt index and admission stamp. Every fault is the request's
+    (:class:`RequestRowFault`): the header is the client's envelope."""
+    if header is None:
+        raise RequestRowFault(
+            f"CHUNK row {request_id!r} has no overlapping envelope header"
+        )
+    if len(header) != ENVELOPE_HEADER_SLOTS:
+        raise RequestRowFault(
+            f"envelope header for {request_id!r} has {len(header)} slots, "
+            f"expected {ENVELOPE_HEADER_SLOTS}"
+        )
+    if _header_int(header, ENV_VERSION, "version") != ENVELOPE_VERSION:
+        raise RequestRowFault(
+            f"envelope header for {request_id!r} carries version "
+            f"{header[ENV_VERSION]!r}, expected {ENVELOPE_VERSION}"
+        )
+    if _header_int(header, ENV_VALID_SAMPLES, "valid_samples") < 0:
+        raise RequestRowFault(
+            f"envelope header for {request_id!r} carries a negative valid-sample count"
+        )
+    final = _header_int(header, ENV_FINAL_TAIL, "final_tail")
+    if final not in (0, 1):
+        raise RequestRowFault(
+            f"envelope header for {request_id!r} carries a non-boolean final "
+            f"flag {final}"
+        )
+    _header_int(header, ENV_CHUNK_SEQUENCE, "chunk_sequence")
+    geometry = _header_int(header, ENV_GEOMETRY_ID, "geometry_id")
+    if not 0 <= geometry < num_geometries:
+        raise RequestRowFault(
+            f"envelope header for {request_id!r} carries geometry {geometry} "
+            "outside the admitted set"
+        )
+    prompt = _header_int(header, ENV_PROMPT_INDEX, "prompt_index")
+    if not 0 <= prompt < num_prompts:
+        raise RequestRowFault(
+            f"envelope header for {request_id!r} carries prompt {prompt} "
+            "outside the prompt dictionary"
+        )
+    # Host-side mirror of the device-side range check (design
+    # §Ingress-deadline plumbing) — the same dual-validation pattern used
+    # for geometry/prompt.
+    admission_ms_mod = _header_int(header, ENV_ADMISSION_MS_MOD, "admission_ms_mod")
+    if not 0 <= admission_ms_mod < ADMISSION_EPOCH_MODULUS_MS:
+        raise RequestRowFault(
+            f"envelope header for {request_id!r} carries "
+            f"admission_ms_mod {admission_ms_mod} outside "
+            f"[0, {ADMISSION_EPOCH_MODULUS_MS})"
+        )
+    return geometry, prompt, admission_ms_mod
 
 
 def _reconstruct_deadline_ns(
@@ -302,34 +403,11 @@ class _Session:
     progress_flushed: bool = False
 
 
-def reject_unsupported_outer_graph_mode(compilation_config: object) -> None:
-    """Fail startup when the outer runner would capture full decode.
-
-    Phase 6c owns an eager transaction whose row plan and commit sink are
-    host-step state. Piecewise graphs may cover lower operators, but the
-    runner must not capture/replay the whole model ``forward`` until an
-    exact padded-plan and replay-safe handoff exist (PORT-ADV-003).
-    """
-    mode = getattr(compilation_config, "cudagraph_mode", None)
-    if mode is None:
-        return
-    decode_mode = getattr(mode, "decode_mode", None)
-    runtime = decode_mode() if callable(decode_mode) else mode
-    name = getattr(runtime, "name", str(runtime)).upper()
-    if name == "FULL":
-        raise ValueError(
-            "Nemotron ASR rejects full CUDA graph decode until the runner "
-            "provides exact padded RowPlan and commit-handoff replay semantics; "
-            "use cudagraph_mode=NONE or PIECEWISE"
-        )
-
-
-def _header_int(header: tuple[float, ...], slot: int, name: str) -> int:
+def _header_int(header: Sequence[float], slot: int, name: str) -> int:
     value = header[slot]
     if not math.isfinite(value) or value != math.trunc(value):
-        raise ValueError(
-            f"envelope header {name} is not an exact integer: {value!r} "
-            "— the serving tier mints headers, so this is a port defect"
+        raise RequestRowFault(
+            f"envelope header {name} is not an exact integer: {value!r}"
         )
     return int(value)
 
@@ -462,64 +540,19 @@ class SessionRegistry:
         session.pending_prompt_index = None
         return True
 
+    @staticmethod
     def _parse_chunk_header(
-        self,
         row: ObservedRow,
         *,
         num_prompts: int,
         num_geometries: int,
     ) -> tuple[int, int, int]:
-        header = row.envelope_header
-        if header is None:
-            raise ValueError(
-                f"CHUNK row {row.request_id!r} has no overlapping envelope "
-                "header — the serving tier mints one per CHUNK"
-            )
-        if len(header) != ENVELOPE_HEADER_SLOTS:
-            raise ValueError(
-                f"envelope header for {row.request_id!r} has {len(header)} slots, "
-                f"expected {ENVELOPE_HEADER_SLOTS}"
-            )
-        if _header_int(header, ENV_VERSION, "version") != ENVELOPE_VERSION:
-            raise ValueError(
-                f"envelope header for {row.request_id!r} carries version "
-                f"{header[ENV_VERSION]!r}, expected {ENVELOPE_VERSION}"
-            )
-        if _header_int(header, ENV_VALID_SAMPLES, "valid_samples") < 0:
-            raise ValueError(
-                f"envelope header for {row.request_id!r} carries a negative "
-                "valid-sample count"
-            )
-        final = _header_int(header, ENV_FINAL_TAIL, "final_tail")
-        if final not in (0, 1):
-            raise ValueError(
-                f"envelope header for {row.request_id!r} carries a non-boolean final "
-                f"flag {final}"
-            )
-        _header_int(header, ENV_CHUNK_SEQUENCE, "chunk_sequence")
-        geometry = _header_int(header, ENV_GEOMETRY_ID, "geometry_id")
-        if not 0 <= geometry < num_geometries:
-            raise ValueError(
-                f"envelope header for {row.request_id!r} carries geometry {geometry} "
-                "outside the admitted set"
-            )
-        prompt = _header_int(header, ENV_PROMPT_INDEX, "prompt_index")
-        if not 0 <= prompt < num_prompts:
-            raise ValueError(
-                f"envelope header for {row.request_id!r} carries prompt {prompt} "
-                "outside the prompt dictionary"
-            )
-        # Host-side mirror of the device-side range check (design
-        # §Ingress-deadline plumbing) — the same dual-validation
-        # pattern already used for geometry/prompt.
-        admission_ms_mod = _header_int(header, ENV_ADMISSION_MS_MOD, "admission_ms_mod")
-        if not 0 <= admission_ms_mod < ADMISSION_EPOCH_MODULUS_MS:
-            raise ValueError(
-                f"envelope header for {row.request_id!r} carries "
-                f"admission_ms_mod {admission_ms_mod} outside "
-                f"[0, {ADMISSION_EPOCH_MODULUS_MS})"
-            )
-        return geometry, prompt, admission_ms_mod
+        return check_envelope_header(
+            row.envelope_header,
+            row.request_id,
+            num_prompts=num_prompts,
+            num_geometries=num_geometries,
+        )
 
     # @spec SESS-MODEL-001, SESS-MODEL-002
     def bind_rows(
@@ -599,6 +632,47 @@ class SessionRegistry:
                     f"request {row.request_id!r} appears twice in one step's row plan"
                 )
             seen.add(row.request_id)
+            if row.reject:
+                # TXG-COV-010, REG-STATE-015: a row the model state failed at
+                # planning stays at its position, bound non-CHUNK. Its request
+                # is registered when it is new, so the step's lease holds.
+                session = visible_session(row.request_id)
+                if session is None:
+                    owner = visible_block_owner(row.block_id)
+                    if owner is not None:
+                        raise ValueError(
+                            f"block {row.block_id} is already owned by {owner!r} — "
+                            "duplicate ownership"
+                        )
+                    staged_generation += 1
+                    session = _Session(
+                        block_id=row.block_id,
+                        generation=staged_generation,
+                        geometry_id=0 if server_geometry is None else server_geometry,
+                        prompt_index=0,
+                    )
+                    new_sessions[row.request_id] = session
+                    new_blocks[row.block_id] = row.request_id
+                elif session.block_id != row.block_id:
+                    raise ValueError(
+                        f"request {row.request_id!r} block remapped from "
+                        f"{session.block_id} to {row.block_id} — resident "
+                        "state never migrates outside park serialization"
+                    )
+                bindings.append(
+                    PreparedRowBinding(
+                        request_id=row.request_id,
+                        block_id=row.block_id,
+                        admission_generation=session.generation,
+                        geometry_id=session.geometry_id,
+                        prompt_index=session.prompt_index,
+                        prior_prompt_index=session.prompt_index,
+                        allow_prompt_transition=False,
+                        is_chunk=False,
+                        ready_deadline_ns=0,
+                    )
+                )
+                continue
             is_chunk = row.advances_chunk(placeholder_id)
             if not is_chunk and row.envelope_header is not None:
                 raise ValueError(
@@ -634,9 +708,7 @@ class SessionRegistry:
                 new_blocks[row.block_id] = row.request_id
                 # SESS-MODEL-002: the first unit fixes the stream's geometry;
                 # one other than the server's fails the row.
-                unserved = row.reject or (
-                    server_geometry is not None and geometry != server_geometry
-                )
+                unserved = server_geometry is not None and geometry != server_geometry
                 bindings.append(
                     PreparedRowBinding(
                         request_id=row.request_id,
@@ -677,10 +749,8 @@ class SessionRegistry:
                     num_prompts=num_prompts,
                     num_geometries=num_geometries,
                 )
-                if (
-                    row.reject
-                    or header_geometry != session.geometry_id
-                    or (server_geometry is not None and header_geometry != server_geometry)
+                if header_geometry != session.geometry_id or (
+                    server_geometry is not None and header_geometry != server_geometry
                 ):
                     # SESS-MODEL-001: a stream's geometry is fixed by its
                     # first unit; a later unit for another geometry fails the
@@ -826,9 +896,7 @@ def prepare_plan_context(
             dtype=torch.int64,
         ),
         is_file=torch.tensor([row.is_file for row in rows], dtype=torch.bool),
-        planned_rejection=torch.tensor(
-            failed if any(failed) else [], dtype=torch.bool
-        ),
+        planned_rejection=torch.tensor(failed if any(failed) else [], dtype=torch.bool),
         forced_eou_candidate=torch.tensor(
             candidates if any(candidates) else [], dtype=torch.bool
         ),

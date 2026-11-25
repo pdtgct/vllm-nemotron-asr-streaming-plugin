@@ -1,45 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 """``vllm.general_plugins`` entry point.
 
-``register`` checks that the vLLM build carries the core changes the plugin
-needs (``_require_client_path``), then registers the
-streaming architecture, its model-configuration hook, the card parser and the
-tokenizer mode. It does not import the model module, initialize a device or
-load weights, so a process that has not initialized CUDA can still load the
-plugin. The model adapter's own dependencies are checked when the model class
-module is imported (``engine_flags.check_adapter_dependencies``).
+``register`` checks that the vLLM build carries the state-layer surface the
+model uses (``_require_core``), then registers the streaming architecture, its
+model-configuration hook, the card parser and the tokenizer mode. It does not
+import a model class module, initialize a device or load weights, so a
+process that has not initialized CUDA can still load the plugin. The model
+adapter's own dependencies are checked when the model class module is
+imported (``engine_flags.check_adapter_dependencies``).
 """
 
 from __future__ import annotations
 
-import inspect
 
+# @spec REG-002
+def _require_core() -> None:
+    """Refuse a vLLM build without RFC 1's state layer and vllm#67583's
+    model-state hooks, naming every missing item, before any registry
+    changes (``engine_flags.CORE_CHECK_DEPENDENCIES``). No client call is checked:
+    on the target core ``AsyncLLM.generate`` admits a persistent-state
+    stream without an admission argument, and the session factory checks its
+    own calls."""
+    from vllm_nemotron_asr_streaming.engine_flags import missing_core_items
 
-def _require_client_path() -> None:
-    """Fail plugin load on a vLLM build the PR 6 proof of concept cannot run
-    on: one without vllm#67583's model-state hooks or without pdtgct/vllm#6's
-    non-recomputable state layer (``MambaManager.layer_config(...,
-    recomputable=...)``). Stream admission is not required: PR 6 has none,
-    and the session factory that uses it is not supported on this build."""
-    from vllm_nemotron_asr_streaming.engine_flags import missing_graph_hooks
-
-    missing = [f"ModelState.{hook}" for hook in missing_graph_hooks()]
-    try:
-        from vllm.v1.core.single_type_kv_cache_manager import MambaManager
-
-        layer_config = getattr(MambaManager, "layer_config", None)
-        has_flag = layer_config is not None and (
-            "recomputable" in inspect.signature(layer_config).parameters
-        )
-    except (ImportError, TypeError, ValueError):
-        has_flag = False
-    if not has_flag:
-        missing.append("MambaManager.layer_config(recomputable=...)")
+    missing = missing_core_items()
     if missing:
         raise RuntimeError(
-            "vllm-nemotron-asr-streaming (PR 6 proof of concept) requires a "
-            "vLLM build with pdtgct/vllm#6's state layer and vllm#67583's "
-            "model-state hooks; this build lacks " + ", ".join(missing)
+            "vllm-nemotron-asr-streaming requires a vLLM build with RFC 1's "
+            "state layer and vllm#67583's model-state hooks; this build lacks "
+            + ", ".join(missing)
         )
 
 
@@ -50,7 +39,7 @@ def register() -> None:
     Safe to call more than once in one process. Never writes the offline
     architecture key or its configuration hook.
     """
-    _require_client_path()
+    _require_core()
 
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP

@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Engine settings a persistent-state serve refuses, and the model adapter's
-dependency checks.
+"""Engine settings a persistent-state serve refuses, the runner
+configurations, and the model adapter's dependency checks.
 
 ``persistent_state_config_errors`` reports the refused settings of a
-``VllmConfig``, the transaction-graph conditions
-(``transaction_graph_config.transaction_graph_config_errors``) included; it
-does not turn anything off. The model-configuration hook
-(``streaming_config``) and the model state's construction both raise from that
-report, so a setting that core resolves only after the hook ran is still
-caught.
+``VllmConfig``: the engine settings, the hook configuration's conditions
+(``runner_mode_refusals``), the missing model-state hooks, native burst on
+the state layer and the transaction-graph conditions
+(``transaction_graph_config.transaction_graph_config_errors``); it does not
+turn anything off. The model-configuration hook (``streaming_config``), model
+construction and the model state's construction all raise from that report,
+so a setting that core resolves only after the hook ran is still caught.
 
 Serve with the settings explicit (see the README), for example::
 
@@ -16,9 +17,9 @@ Serve with the settings explicit (see the README), for example::
         --dtype float32 \\
         --enforce-eager
 
-``enforce_eager`` off is accepted only in the hook configuration, where core
-captures the model's graphs through its model-state hooks
-(``hook_capture_refusals``).
+Without ``--enforce-eager`` the hook configuration applies: core captures
+the model's graphs through its model-state hooks and no runner graph over the
+model's forward (``runner_mode_refusals``).
 
 Importing this module imports no vLLM.
 """
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 from typing import Any
 
 # The transaction-graph checks and predicate are looked up on their module at
@@ -46,11 +48,14 @@ PARALLEL_SIZES_MUST_BE_ONE: tuple[str, ...] = (
 
 #: The model adapter's unconditional internal vLLM dependencies, beyond the
 #: public client surface: module name -> names the adapter uses from it. A
-#: dotted name is a member of the name before the dot: a ``ModelState`` hook,
-#: or a constructor argument (``MambaManager.layer_config``'s
-#: ``recomputable``).
+#: dotted name is a member of the name before the dot: a ``ModelState``
+#: hook or method, an enum member
+#: (``MambaAttentionBackendEnum.PERSISTENT_STATE``), or a call argument
+#: (``MambaManager.layer_config``'s ``recomputable``).
 ADAPTER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
-    "vllm.config.compilation": ("CUDAGraphMode",),
+    "vllm.config.compilation": ("CUDAGraphMode", "CompilationMode"),
+    "vllm.compilation.breakable_cudagraph": ("is_breakable_cudagraph_enabled",),
+    "vllm.v1.attention.backend": ("AttentionCGSupport",),
     "vllm.v1.core.sched.output": ("NewRequestData", "SchedulerOutput"),
     "vllm.v1.kv_cache_interface": (
         "KVCacheConfig",
@@ -62,7 +67,11 @@ ADAPTER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "MambaManager",
         "MambaManager.layer_config.recomputable",
     ),
-    "vllm.v1.attention.backends.registry": ("MambaAttentionBackendEnum",),
+    "vllm.v1.attention.backends.registry": (
+        "MambaAttentionBackendEnum",
+        "MambaAttentionBackendEnum.PERSISTENT_STATE",
+    ),
+    "vllm.model_executor.models.interfaces": ("SupportsPersistentState",),
     "vllm.v1.worker.gpu.input_batch": ("InputBatch",),
     "vllm.v1.worker.gpu.model_states.interface": (
         "ModelState",
@@ -72,6 +81,8 @@ ADAPTER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "ModelState.clear_cudagraphs",
         "ModelState.post_warmup",
         "ModelState.shutdown",
+        "ModelState.get_additional_cg_support",
+        "ModelState.take_failed_requests",
     ),
     "vllm.v1.worker.gpu.states": ("RequestState",),
     "vllm.v1.worker.utils": ("AttentionGroup",),
@@ -92,15 +103,12 @@ GRAPH_RUNTIME_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "vllm.envs": ("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",),
 }
 
-#: The transaction-graph dependencies, needed only while transaction graphs
-#: are on (``transaction_graph_config.transaction_graphs_on``). The PR 6
-#: proof of concept refuses transaction graphs (``pr6_poc_refusals``); no
-#: build it runs on has these members.
+#: The transaction-graph dependency, needed only while transaction graphs
+#: are on (``transaction_graph_config.transaction_graphs_on``): core's
+#: state-group layout accessor, a property. The attributes of the layouts it
+#: returns are read without importing their classes, at capture.
 TRANSACTION_GRAPH_DEPENDENCIES: dict[str, tuple[str, ...]] = {
-    "vllm.v1.worker.gpu.state_slots": (
-        "StateSlotBindings.startup_pool_access",
-        "StateSlotBindings.pool_layout",
-    ),
+    "vllm.v1.worker.gpu.model_states.interface": ("ModelState.state_group_layouts",),
 }
 
 #: The model-state hooks vllm#67583 adds; the plugin needs every one in every
@@ -113,6 +121,45 @@ MODEL_STATE_GRAPH_HOOKS: tuple[str, ...] = (
     "post_warmup",
     "shutdown",
 )
+
+#: The state-layer surface ``register()`` checks before it changes any
+#: registry (REG-002): module name -> dotted names, written as in
+#: ``ADAPTER_DEPENDENCIES``.
+CORE_CHECK_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "vllm.v1.worker.gpu.model_states.interface": (
+        "ModelState.prepare_execution_memory",
+        "ModelState.needs_cudagraph_capture",
+        "ModelState.capture_cudagraphs",
+        "ModelState.clear_cudagraphs",
+        "ModelState.post_warmup",
+        "ModelState.shutdown",
+        "ModelState.take_failed_requests",
+    ),
+    "vllm.v1.core.single_type_kv_cache_manager": (
+        "MambaManager.layer_config.recomputable",
+    ),
+    "vllm.v1.attention.backends.registry": (
+        "MambaAttentionBackendEnum.PERSISTENT_STATE",
+    ),
+    "vllm.model_executor.models.interfaces": ("SupportsPersistentState",),
+}
+
+#: The environment variables core's configuration build reads for breakable
+#: graphs and for turning compilation off (``VllmConfig.__post_init__``).
+BREAKABLE_CUDAGRAPH_ENV = "VLLM_USE_BREAKABLE_CUDAGRAPH"
+TORCH_COMPILE_DISABLE_ENV = "TORCH_COMPILE_DISABLE"
+
+#: The runner stages ``runner_mode_refusals`` judges (REG-ENG-027).
+RUNNER_STAGES: tuple[str, ...] = ("hook", "constructor")
+
+#: Mode names by value, for a configuration that carries a plain integer.
+_GRAPH_MODE_NAMES = {0: "NONE", 1: "PIECEWISE", 2: "FULL"}
+_COMPILATION_MODE_NAMES = {
+    0: "NONE",
+    1: "STOCK_TORCH_COMPILE",
+    2: "DYNAMO_TRACE_ONCE",
+    3: "VLLM_COMPILE",
+}
 
 
 def graphed_execution_configured(hf_config: Any) -> bool:
@@ -127,22 +174,17 @@ def graphed_execution_configured(hf_config: Any) -> bool:
     )
 
 
-# @spec REG-ENG-005, REG-MEM-019
+# @spec REG-ENG-025, REG-MEM-019
 def selects_hook_captured_graph(hf_config: Any) -> bool:
     """Whether the configuration selects a graph core's capture hook
     captures: the ``eager-graphed`` encoder, the ``dense-graphed`` decoder,
     or transaction graphs on. The one predicate of hook-captured graphs, for
-    the engine check and the model state's ``needs_cudagraph_capture``."""
+    the runner check and the model state's ``needs_cudagraph_capture``."""
     return (
         getattr(hf_config, "encoder_execution_arm", None) == "eager-graphed"
         or getattr(hf_config, "decode_dispatch_arm", None) == "dense-graphed"
         or _txg.transaction_graphs_on(hf_config)
     )
-
-
-#: Earlier name of :func:`selects_hook_captured_graph`, kept for the model
-#: state's import.
-hook_captured_arm = selects_hook_captured_graph
 
 
 def missing_graph_hooks() -> list[str]:
@@ -159,11 +201,23 @@ def missing_graph_hooks() -> list[str]:
     ]
 
 
-def _cuda_platform(vllm_config: Any) -> bool:
-    """Whether the engine runs on a CUDA platform: vLLM's current platform is
-    CUDA. vLLM derives the device configuration's type from that platform, so
-    the platform alone decides (REG-ENG-005, REG-MEM-019)."""
-    del vllm_config
+# @spec TXG-CFG-016, REG-018
+def model_state_has_state_group_layouts() -> bool:
+    """Whether the running core's ``ModelState`` defines
+    ``state_group_layouts`` (a property counts). Both callers of
+    ``transaction_graph_config_errors`` pass this as
+    ``has_state_group_layouts``."""
+    try:
+        from vllm.v1.worker.gpu.model_states.interface import ModelState
+    except ImportError:
+        return False
+    return hasattr(ModelState, "state_group_layouts")
+
+
+def _cuda_platform() -> bool:
+    """Whether vLLM's current platform is CUDA. vLLM derives the device
+    configuration's type from that platform, so the platform alone decides
+    (REG-ENG-024, REG-MEM-019)."""
     try:
         from vllm.platforms import current_platform
     except ImportError:
@@ -171,127 +225,165 @@ def _cuda_platform(vllm_config: Any) -> bool:
     return bool(current_platform.is_cuda())
 
 
-# @spec REG-ENG-001
-def pr6_poc_refusals(hf_config: Any) -> list[str]:
-    """The features the PR 6 proof of concept does not support: transaction
-    graphs (they need a state pool with fixed addresses and its layout) and
-    native burst (its history check refuses every turn after a session's
-    first, since PR 6 sends each turn with its cumulative prompt)."""
-    errors: list[str] = []
-    if _txg.transaction_graphs_on(hf_config):
-        errors.append(
-            f"{TRANSACTION_GRAPH_KEY} (transaction graphs) is not supported on "
-            "the PR 6 state layer in this proof of concept; remove it"
-        )
-    if getattr(hf_config, "experimental_native_burst", False):
-        errors.append(
-            "experimental_native_burst is not supported on the PR 6 state "
-            "layer in this proof of concept; remove it"
-        )
-    return errors
-
-
-def _mode_value(mode: Any) -> Any:
-    return getattr(mode, "value", mode)
+def _mode_name(mode: Any, names: dict[int, str]) -> str | None:
+    """A ``cudagraph_mode`` or compilation mode by its name (``None`` while
+    unset): an enum member's name, or the name of a plain integer value."""
+    if mode is None:
+        return None
+    name = getattr(mode, "name", None)
+    if isinstance(name, str):
+        return name
+    if isinstance(mode, int) and not isinstance(mode, bool):
+        return names.get(mode, str(mode))
+    return str(mode).upper()
 
 
 def _enforce_eager_remedy(hf_config: Any) -> str:
+    """The ``--enforce-eager`` remedy; while transaction graphs are on it
+    also names removing their option, which is refused under
+    ``--enforce-eager`` (REG-ENG-005)."""
     if _txg.transaction_graphs_on(hf_config):
         return (
-            f"--enforce-eager, with {TRANSACTION_GRAPH_KEY} removed (transaction "
-            "graphs are refused under --enforce-eager)"
+            f"--enforce-eager with {TRANSACTION_GRAPH_KEY} removed, since "
+            "transaction graphs are refused under --enforce-eager"
         )
     return "--enforce-eager"
 
 
-# @spec REG-ENG-005
-def hook_capture_refusals(vllm_config: Any, *, resolved: bool = False) -> list[str]:
+# @spec REG-ENG-005, REG-ENG-006, REG-ENG-011, REG-ENG-021, REG-ENG-022
+# @spec REG-ENG-023, REG-ENG-024, REG-ENG-025, REG-ENG-026, REG-ENG-027
+def runner_mode_refusals(vllm_config: Any, *, stage: str) -> list[str]:
     """The conditions of the hook configuration that ``vllm_config`` misses,
-    each with its remedy (empty when every one holds).
+    each with its remedy (empty under ``--enforce-eager`` or when every one
+    holds). The one function of the runner configurations: the
+    configuration hook calls it with ``stage="hook"``, model and model-state
+    construction with ``stage="constructor"``.
 
-    ``enforce_eager`` off lets core capture the model's graphs through the
-    model-state hooks. It requires core's own CUDA graphs off
-    (``cudagraph_mode`` NONE; unset is accepted before core resolves it.
-    Stale on PR 6: its core no longer sets NONE for persistent state, so an
-    unset mode is refused only once resolved; pass ``-cc.cudagraph_mode
-    none``); torch.compile off
-    (compilation mode NONE: ``-cc.mode none``, or ``-O0`` before core
-    resolves the mode); a CUDA platform; at least one graph the hook
-    captures; and no graph it does not (the compiled ``dense-graphed``
-    encoder, CHUNK-bucket graphs).
+    At ``"hook"`` the modes are the requested ones and an unset mode passes;
+    breakable graphs are predicted from ``VLLM_USE_BREAKABLE_CUDAGRAPH``, and
+    a requested ``STOCK_TORCH_COMPILE`` passes when core will set the mode to
+    NONE (breakable graphs on, or ``TORCH_COMPILE_DISABLE=1``). At
+    ``"constructor"`` both modes are as core's configuration build left
+    them: an unset mode is refused, breakable graphs are the resolved
+    ``compilation_config.use_breakable_cudagraph``, and a surviving
+    ``STOCK_TORCH_COMPILE`` is refused.
+
+    While transaction graphs are on, the remedies of the mode conditions are
+    the explicit NONE alone, the only value their own runner-mode condition
+    accepts (TXG-CFG-018), and every ``--enforce-eager`` remedy names
+    removing their option.
     """
-    missing: list[str] = []
+    if stage not in RUNNER_STAGES:
+        raise ValueError(f"stage must be one of {RUNNER_STAGES}, not {stage!r}")
     model = getattr(vllm_config, "model_config", None)
+    if getattr(model, "enforce_eager", False):
+        return []
     hf_config = getattr(model, "hf_config", None)
-    eager_remedy = _enforce_eager_remedy(hf_config)
+    transaction_graphs = _txg.transaction_graphs_on(hf_config)
+    eager = _enforce_eager_remedy(hf_config)
     compilation = getattr(vllm_config, "compilation_config", None)
-    cudagraph_mode = getattr(compilation, "cudagraph_mode", None)
-    graph_mode = _mode_value(cudagraph_mode)
-    if compilation is None or not (
-        graph_mode == 0 or (graph_mode is None and not resolved)
-    ):
-        missing.append("cudagraph_mode must be NONE (pass -cc.cudagraph_mode none)")
-    mode = _mode_value(getattr(compilation, "mode", None))
-    if mode is None and not resolved:
-        level = _mode_value(getattr(vllm_config, "optimization_level", None))
-        mode = 0 if level == 0 else None
-    if compilation is None or mode != 0:
-        missing.append("torch.compile must be off (pass -cc.mode none)")
-    if not _cuda_platform(vllm_config):
-        missing.append(
-            f"the hook configuration needs a CUDA platform (pass {eager_remedy})"
+    graph = _mode_name(getattr(compilation, "cudagraph_mode", None), _GRAPH_MODE_NAMES)
+    mode = _mode_name(getattr(compilation, "mode", None), _COMPILATION_MODE_NAMES)
+    constructor = stage == "constructor"
+    if constructor:
+        breakable = bool(getattr(compilation, "use_breakable_cudagraph", False))
+        compile_disabled = False
+    else:
+        breakable = os.environ.get(BREAKABLE_CUDAGRAPH_ENV) == "1"
+        compile_disabled = os.environ.get(TORCH_COMPILE_DISABLE_ENV) == "1"
+
+    refusals: list[str] = []
+    if constructor and graph is None:
+        refusals.append(
+            "cudagraph_mode is unset after core's configuration build "
+            "(pass -cc.cudagraph_mode none)"
         )
+    if constructor and mode is None:
+        refusals.append(
+            "the compilation mode is unset after core's configuration build "
+            "(pass -cc.mode none)"
+        )
+    if graph == "FULL":
+        remedy = "-cc.cudagraph_mode none"
+        if not transaction_graphs:
+            remedy += ", or leave cudagraph_mode unset"
+        refusals.append(
+            "cudagraph_mode FULL is not supported: core cannot reduce its "
+            f"full graphs for a model that captures its own (pass {remedy})"
+        )
+    if graph == "PIECEWISE" and breakable:
+        remedy = "-cc.cudagraph_mode none"
+        if not transaction_graphs:
+            remedy = f"{BREAKABLE_CUDAGRAPH_ENV}=0, or {remedy}"
+        refusals.append(
+            "cudagraph_mode PIECEWISE is not supported while breakable CUDA "
+            "graphs are on: core would capture the forward as one breakable "
+            f"graph (pass {remedy})"
+        )
+    if mode == "STOCK_TORCH_COMPILE" and (
+        constructor or not (breakable or compile_disabled)
+    ):
+        remedy = "-cc.mode none"
+        if not transaction_graphs:
+            remedy += ", or leave the compilation mode unset"
+        refusals.append(
+            "compilation mode STOCK_TORCH_COMPILE is not supported: it would "
+            "compile the whole model, whose forward plans each step on the "
+            f"host (pass {remedy})"
+        )
+    if not _cuda_platform():
+        refusals.append(f"the hook configuration needs a CUDA platform (pass {eager})")
     if not selects_hook_captured_graph(hf_config):
-        missing.append(
-            "no graph core's capture hook captures is selected: select "
-            "encoder_execution_arm eager-graphed, decode_dispatch_arm "
-            f"dense-graphed or {TRANSACTION_GRAPH_KEY} in --hf-overrides, or "
-            "pass --enforce-eager"
+        refusals.append(
+            "no graph that core's capture hook captures is selected (select "
+            "encoder_execution_arm eager-graphed or decode_dispatch_arm "
+            f"dense-graphed in --hf-overrides, or pass {eager})"
         )
     if getattr(hf_config, "encoder_execution_arm", None) == "dense-graphed":
-        missing.append(
-            "encoder_execution_arm dense-graphed (compiled) is not captured "
-            f"through core's capture hook (pass {eager_remedy})"
+        refusals.append(
+            "encoder_execution_arm dense-graphed (the compiled encoder) is not "
+            f"captured through core's capture hook (pass {eager})"
         )
     chunk_populations = getattr(hf_config, "chunk_bucket_graph_populations", ())
     if chunk_populations:
-        missing.append(
+        refusals.append(
             f"chunk_bucket_graph_populations {chunk_populations!r} are not "
-            f"captured through core's capture hook (pass {eager_remedy})"
+            f"captured through core's capture hook (pass {eager})"
         )
-    return missing
+    return refusals
+
+
+# @spec REG-ENG-019
+def native_burst_refusal(hf_config: Any) -> str | None:
+    """The state layer's refusal of native burst, or ``None``."""
+    if not getattr(hf_config, "experimental_native_burst", False):
+        return None
+    return (
+        "experimental_native_burst (native burst) is not supported on the "
+        "state layer: remove experimental_native_burst"
+    )
 
 
 # @spec REG-ENG-001, REG-ENG-002, REG-ENG-003, REG-ENG-004, REG-ENG-005
-# @spec REG-ENG-009, REG-VAL-008
+# @spec REG-ENG-006, REG-ENG-009, REG-ENG-019, REG-VAL-008
 def persistent_state_config_errors(
     vllm_config: Any, *, resolved: bool = False
 ) -> list[str]:
     """Return human-readable refusals for a persistent-state engine.
 
-    ``async_scheduling`` of ``True`` is refused. An unset value (``None``) is
-    accepted before core resolves the option (``resolved=False``: it resolves
-    to ``False`` for a model that declares persistent state; stale on PR 6,
-    whose core resolves an unset value to ``True``, so the refusal then
-    fires only at model-state construction: pass ``--no-async-scheduling``);
-    once the engine configuration is final (``resolved=True``) only
-    ``False`` is accepted. The result also lists every model-state hook the
-    core lacks, the features the PR 6 proof of concept refuses
-    (``pr6_poc_refusals``) and every condition
-    ``transaction_graph_config_errors`` returns.
+    ``resolved=False`` is the configuration hook (``runner_mode_refusals``
+    stage ``"hook"``); ``resolved=True`` is model and model-state
+    construction against the final engine configuration (stage
+    ``"constructor"``). ``async_scheduling`` is refused only while
+    transaction graphs are on (their scheduling condition). The result also
+    lists every model-state hook the core lacks, native burst on the state
+    layer and every condition ``transaction_graph_config_errors`` returns.
     """
     errors: list[str] = []
-    scheduler = vllm_config.scheduler_config
     cache = vllm_config.cache_config
     parallel = vllm_config.parallel_config
     model = vllm_config.model_config
     attention = getattr(vllm_config, "attention_config", None)
-    async_scheduling = getattr(scheduler, "async_scheduling", None)
-    if async_scheduling is True or (resolved and async_scheduling is not False):
-        errors.append(
-            "async scheduling must be False "
-            "(pass async_scheduling=False or --no-async-scheduling)"
-        )
     if getattr(cache, "enable_prefix_caching", None):
         errors.append(
             "prefix caching must be False "
@@ -310,38 +402,41 @@ def persistent_state_config_errors(
     if getattr(attention, "hisparse_config", None) is not None:
         errors.append("HiSparse (hierarchical sparse attention) must be off")
     if getattr(parallel, "enable_fault_tolerance", False):
-        # Core's kernel warm-up then runs synthetic real steps that carry no
-        # state-slot handles (pass neither --enable-fault-tolerance nor
-        # --fault-tolerance-config).
+        # Core's kernel warm-up then runs synthetic real steps through the
+        # model state, which the model declines.
         errors.append(
             "fault tolerance must be off "
             "(remove --enable-fault-tolerance and --fault-tolerance-config)"
         )
     if getattr(parallel, "enable_elastic_ep", False):
         # Its reconfiguration reruns the worker's warmup, which would call the
-        # serving capture again over live state pools.
+        # serving capture again over live state pages.
         errors.append(
             "elastic expert parallelism must be off (remove --enable-elastic-ep)"
         )
     for name in PARALLEL_SIZES_MUST_BE_ONE:
         if getattr(parallel, name, 1) != 1:
             errors.append(f"{name} must be 1")
-    if not getattr(model, "enforce_eager", False):
-        missing = hook_capture_refusals(vllm_config, resolved=resolved)
-        if missing:
-            errors.append(
-                "enforce_eager is off, so the hook configuration is required; "
-                "unmet: " + "; ".join(missing)
-            )
+    errors.extend(
+        runner_mode_refusals(vllm_config, stage="constructor" if resolved else "hook")
+    )
     hooks = missing_graph_hooks()
     if hooks:
         errors.append(
             "the installed vLLM's ModelState lacks the model-state hooks "
             + ", ".join(hooks)
-            + "; the plugin requires vllm#67583's model-state hooks"
+            + " (the plugin requires vllm#67583's model-state hooks)"
         )
-    errors.extend(pr6_poc_refusals(getattr(model, "hf_config", None)))
-    errors.extend(_txg.transaction_graph_config_errors(vllm_config))
+    hf_config = getattr(model, "hf_config", None)
+    native_burst = native_burst_refusal(hf_config)
+    if native_burst is not None:
+        errors.append(native_burst)
+    errors.extend(
+        _txg.transaction_graph_config_errors(
+            vllm_config,
+            has_state_group_layouts=model_state_has_state_group_layouts(),
+        )
+    )
     return errors
 
 
@@ -359,7 +454,11 @@ def engine_config_refusal(
 def check_engine_config(
     vllm_config: Any, subject: str, *, resolved: bool = False
 ) -> None:
-    """Raise one ``ValueError`` listing every refused engine setting."""
+    """Raise one ``ValueError`` listing every refused engine setting.
+
+    The configuration hook calls this with ``resolved=False``; model and
+    model-state construction with ``resolved=True``, so each applies
+    ``runner_mode_refusals`` once, at its stage."""
     message = engine_config_refusal(vllm_config, subject, resolved=resolved)
     if message is not None:
         raise ValueError(message)
@@ -367,8 +466,8 @@ def check_engine_config(
 
 def _absent(module: Any, name: str) -> bool:
     """Whether ``module`` lacks ``name``. A dotted name is a member of the
-    name before the last dot: a callable attribute (a hook) or a constructor
-    or call argument."""
+    name before the last dot: any attribute (a hook, a property, an enum
+    member) or a parameter of a callable owner."""
     *owners, member = name.split(".")
     if not owners:
         return not hasattr(module, member)
@@ -383,7 +482,29 @@ def _absent(module: Any, name: str) -> bool:
             return False
     except (TypeError, ValueError):
         pass
-    return not callable(getattr(owner, member, None))
+    return not hasattr(owner, member)
+
+
+def _missing_in(
+    module_name: str, names: tuple[str, ...], note: str = "not defined"
+) -> list[str]:
+    """The ``names`` of the dependency table row ``module_name`` that cannot
+    be imported or are not defined, each named with its module."""
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        return [f"{module_name}.{name} ({exc})" for name in names]
+    return [f"{module_name}.{name} ({note})" for name in names if _absent(module, name)]
+
+
+# @spec REG-002
+def missing_core_items() -> list[str]:
+    """The items of ``register()``'s core check (``CORE_CHECK_DEPENDENCIES``)
+    that the installed vLLM lacks, each named with its module."""
+    missing: list[str] = []
+    for module_name, names in CORE_CHECK_DEPENDENCIES.items():
+        missing += _missing_in(module_name, names)
+    return missing
 
 
 def _dependency_error(missing: list[str], purpose: str) -> ImportError:
@@ -404,21 +525,11 @@ def check_adapter_dependencies() -> None:
     """
     missing: list[str] = []
     for module_name, names in ADAPTER_DEPENDENCIES.items():
-        try:
-            module = importlib.import_module(module_name)
-        except ImportError as exc:
-            missing.extend(f"{module_name}.{name} ({exc})" for name in names)
-            continue
-        missing.extend(
-            f"{module_name}.{name} (not defined)"
-            for name in names
-            if _absent(module, name)
-        )
+        missing += _missing_in(module_name, names)
     if missing:
         raise _dependency_error(
             missing,
-            "adapter dependencies (a vLLM build with pdtgct/vllm#6's state "
-            "layer, MambaManager.layer_config(recomputable=...), and "
+            "adapter dependencies (a vLLM build with RFC 1's state layer and "
             "vllm#67583's model-state hooks is required)",
         )
 
@@ -427,32 +538,18 @@ def check_adapter_dependencies() -> None:
 def check_conditional_dependencies(hf_config: Any) -> None:
     """Raise naming every missing conditional dependency the configuration
     needs: the graph-runtime rows when graphed execution is configured, the
-    transaction-graph rows while transaction graphs are on. Model
+    state-group layout accessor while transaction graphs are on. Model
     construction calls this before any weights load."""
     missing: list[str] = []
     if graphed_execution_configured(hf_config):
         for module_name, names in GRAPH_RUNTIME_DEPENDENCIES.items():
-            try:
-                module = importlib.import_module(module_name)
-            except ImportError as exc:
-                missing.extend(f"{module_name}.{name} ({exc})" for name in names)
-                continue
-            missing.extend(
-                f"{module_name}.{name} (not defined; graphed execution is configured)"
-                for name in names
-                if _absent(module, name)
+            missing += _missing_in(
+                module_name, names, "not defined; graphed execution is configured"
             )
     if _txg.transaction_graphs_on(hf_config):
         for module_name, names in TRANSACTION_GRAPH_DEPENDENCIES.items():
-            try:
-                module = importlib.import_module(module_name)
-            except ImportError as exc:
-                missing.extend(f"{module_name}.{name} ({exc})" for name in names)
-                continue
-            missing.extend(
-                f"{module_name}.{name} (not defined; {TRANSACTION_GRAPH_KEY} is set)"
-                for name in names
-                if _absent(module, name)
+            missing += _missing_in(
+                module_name, names, f"not defined; {TRANSACTION_GRAPH_KEY} is set"
             )
     if missing:
         raise _dependency_error(missing, "dependencies the configuration needs")
