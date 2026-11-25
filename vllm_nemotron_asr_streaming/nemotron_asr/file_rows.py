@@ -140,7 +140,6 @@ class ChunkGroup:
         return self.deadlines
 
 
-# @spec FILE-ENG-004
 def order_chunk_groups(groups: Iterable[Any]) -> list[Any]:
     """Order chunk groups by urgency.
 
@@ -158,7 +157,7 @@ def order_chunk_groups(groups: Iterable[Any]) -> list[Any]:
     return sorted(groups, key=key)
 
 
-# @spec FILE-ENG-001, FILE-ENG-003, FILE-ENG-004
+# @spec FILE-ENG-001, FILE-ENG-003
 def plan_chunk_groups(rows: Sequence[StepRow]) -> list[ChunkGroup]:
     """Group the step's chunk rows by geometry, in running order.
 
