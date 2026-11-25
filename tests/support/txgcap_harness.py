@@ -223,17 +223,17 @@ def foreign_geometry(env: Any) -> int:
 
 
 def with_endpoint_policy(request: Any, *, threshold_frames: int = 2) -> Any:
-    """``request`` carrying an endpoint policy, as only a direct engine stream
-    client sets one (SESS-EP-001): its row then carries endpoint mode 1 in the
-    row plan (TXG-COV-012)."""
-    request.additional_information = {
-        "endpoint_policy": {
-            "mode": "greedy_blank",
-            "threshold_frames": threshold_frames,
-            "residue_frames": 0,
-        }
+    """``request`` carrying an endpoint policy in its sampling parameters'
+    ``extra_args`` (REG-STATE-020), as only a direct engine stream client sets
+    one (SESS-EP-001): its row then carries endpoint mode 1 in the row plan
+    (TXG-COV-012)."""
+    extra_args = dict(request.sampling_params.extra_args or {})
+    extra_args["endpoint_policy"] = {
+        "mode": "greedy_blank",
+        "threshold_frames": threshold_frames,
+        "residue_frames": 0,
     }
-    return request
+    return h.with_extra_args(request, extra_args)
 
 
 def eou_request(env: Any, req_id: str) -> Any:

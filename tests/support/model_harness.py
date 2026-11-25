@@ -766,6 +766,18 @@ def new_request(
     )
 
 
+def with_extra_args(request: Any, extra_args: dict[str, Any] | None) -> Any:
+    """``request`` whose sampling parameters (a copy) carry ``extra_args``,
+    as a direct engine client sets them; the endpoint policy is read from
+    ``extra_args["endpoint_policy"]`` (REG-STATE-020)."""
+    from vllm.sampling_params import SamplingParams
+
+    params = request.sampling_params
+    params = SamplingParams(max_tokens=100) if params is None else params.clone()
+    params.extra_args = extra_args
+    return dataclasses.replace(request, sampling_params=params)
+
+
 def scheduler_output(
     *,
     new: tuple = (),

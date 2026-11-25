@@ -820,13 +820,20 @@ def run_fallbacks(ctx: Any, n: int) -> dict[str, Any]:
     step(cached=ids, computed={r: 1 for r in ids}, label="E=N+1")
     _, clip = ctx.corpus.take()
     policy = requests.unit("fb-policy", requests.units(clip)[0], "0")
-    policy.additional_information = {
-        "endpoint_policy": {
-            "mode": "greedy_blank",
-            "threshold_frames": 2,
-            "residue_frames": 0,
-        }
-    }
+    # The policy rides in the sampling parameters' extra_args (REG-STATE-020).
+    from support import model_harness as h
+
+    policy = h.with_extra_args(
+        policy,
+        {
+            **(policy.sampling_params.extra_args or {}),
+            "endpoint_policy": {
+                "mode": "greedy_blank",
+                "threshold_frames": 2,
+                "residue_frames": 0,
+            },
+        },
+    )
     step(new=[policy], label="endpoint policy")
     # A forced-EOU candidate: the EOU token for a stream the worker serves,
     # parked or not (the planner refuses a non-CHUNK row of an unseen stream).

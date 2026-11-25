@@ -155,7 +155,8 @@ def file_model_state(tmp_path):
 
     The state class comes from the model's ``get_model_state_cls``; the model is
     the real class without weights (``nn.Module.__init__`` only), with the few
-    attributes ``prepare_step`` reads set to inert values. Layout addition used
+    attributes the model state's request and planning calls read set to inert
+    values. Layout addition used
     by the tests: ``state.file_buffers`` is the state's ``FileHostBuffers``.
     """
 

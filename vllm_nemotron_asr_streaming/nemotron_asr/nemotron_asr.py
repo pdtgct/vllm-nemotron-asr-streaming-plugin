@@ -19,6 +19,7 @@ by the replay-echo guard (PORT-DEC-005/007).
 import dataclasses
 import json
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,6 @@ from vllm.model_executor.models.interfaces import (
     SupportsTranscription,
 )
 from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
-    ENVELOPE_HEADER_SLOTS,
     DecodeRequest,
     DecodeResolver,
     EmissionAdapter,
@@ -84,6 +84,7 @@ from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
     PlanContextSlot,
     RequestRowFault,
     SessionRegistry,
+    envelope_width_fault,
     prepare_plan_context,
     resolve_row_envelope_header,
 )
@@ -116,6 +117,14 @@ from vllm_nemotron_asr_streaming.transaction_graph_config import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 logger = init_logger(__name__)
+
+#: The sampling ``extra_args`` key that carries a request's endpoint policy
+#: (REG-STATE-020), and the policy's modes by name, as the row plan's
+#: ``endpoint_mode`` column holds them.
+ENDPOINT_POLICY_KEY = "endpoint_policy"
+ENDPOINT_MODES = {"disabled": 0, "greedy_blank": 1}
+#: The largest count the row plan's ``int64`` endpoint columns hold.
+_MAX_INT64 = torch.iinfo(torch.int64).max
 
 #: The captures that create segment graphs (REG-MEM-015): the first profiling
 #: dummy step under ``--enforce-eager``, and core's capture hook's profiling
@@ -822,6 +831,7 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
                         scheduled_encoder_input_ids=scheduled_encoder_inputs.get(
                             request_id, ()
                         ),
+                        carrier_width=int(self.config.hidden_size),
                     ),
                     endpoint_mode=endpoint_mode,
                     endpoint_threshold_frames=endpoint_threshold,
@@ -862,50 +872,64 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
         self._plan_slot.stage(context)
         return context
 
+    # @spec REG-STATE-020
     @staticmethod
     def _endpoint_controls(request: Any) -> tuple[int, int, int]:
-        information = getattr(request, "additional_information", None)
-        if not isinstance(information, dict):
-            information = getattr(information, "entries", None)
-        if not isinstance(information, dict):
+        """The request's endpoint policy as ``(mode, threshold_frames,
+        residue_frames)``, from its sampling parameters'
+        ``extra_args["endpoint_policy"]`` (core delivers the sampling
+        parameters with the request): ``(0, 0, 0)``, endpointing disabled,
+        without ``extra_args`` or without the key. A count the policy omits
+        is 0. A malformed policy (not a mapping, an unknown mode, or a count
+        that is not a non-negative integer the plan's ``int64`` columns hold)
+        is the request's own fault (:class:`RequestRowFault`, REG-STATE-015).
+        """
+        params = getattr(request, "sampling_params", None)
+        extra_args = getattr(params, "extra_args", None)
+        if extra_args is None:
             return 0, 0, 0
-        policy = information.get("endpoint_policy")
-        if not isinstance(policy, dict):
+        if not isinstance(extra_args, Mapping):
+            raise RequestRowFault("request's sampling extra_args is not a mapping")
+        if ENDPOINT_POLICY_KEY not in extra_args:
             return 0, 0, 0
-        # A policy is the request's own: its faults fail the request alone
-        # (REG-STATE-015).
+        policy = extra_args[ENDPOINT_POLICY_KEY]
+        if not isinstance(policy, Mapping):
+            raise RequestRowFault("request's endpoint policy is not a mapping")
         mode_name = policy.get("mode")
-        if mode_name not in ("disabled", "greedy_blank"):
-            raise RequestRowFault("request carries an unknown endpoint mode")
-        mode = 1 if mode_name == "greedy_blank" else 0
-        try:
-            threshold = int(policy.get("threshold_frames", 0))
-            residue = int(policy.get("residue_frames", 0))
-        except (TypeError, ValueError, OverflowError) as error:
+        if not isinstance(mode_name, str) or mode_name not in ENDPOINT_MODES:
             raise RequestRowFault(
-                "request carries an invalid endpoint policy"
-            ) from error
-        if threshold < 0 or residue < 0:
-            raise RequestRowFault("request carries an invalid endpoint policy")
-        return mode, threshold, residue
+                f"request carries an unknown endpoint mode {mode_name!r}"
+            )
+        counts = []
+        for name in ("threshold_frames", "residue_frames"):
+            value = policy.get(name, 0)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= _MAX_INT64
+            ):
+                raise RequestRowFault(
+                    f"request's endpoint policy {name} {value!r} is not a "
+                    "non-negative integer"
+                )
+            counts.append(value)
+        return ENDPOINT_MODES[mode_name], counts[0], counts[1]
 
-    # @spec REG-STATE-014, REG-STATE-015, TXG-COV-010
+    # @spec REG-STATE-014, REG-STATE-015, TXG-COV-010, FILE-ENG-002
     def _stage_v2_projection(self, projection: Any) -> Any:
         input_batch = projection.input_batch
         metadata = projection.request_metadata
         if metadata is None:
             raise RuntimeError("MRv2 projection omitted request metadata")
         # The rows the model state failed at planning, and each clean stream
-        # CHUNK row's screened header (resolved here when the projection
-        # carries none).
+        # CHUNK row's screened header.
         planning_failed = getattr(projection, "planning_failed", None) or ()
-        stream_headers = getattr(projection, "stream_headers", None)
+        stream_headers = projection.stream_headers
         rows: list[ObservedRow] = []
         for index, (request_id, binding) in enumerate(
             zip(projection.req_ids, projection.bindings)
         ):
             request = metadata[request_id]
-            computed = int(input_batch.num_computed_tokens_np[index])
             token = projection.token_ids[index]
             file_row = projection.file_rows.get(request_id)
             if request_id in planning_failed or (
@@ -931,12 +955,11 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
                     f"row {request_id!r} schedules more than one token but did "
                     "not fail at planning"
                 )
-            endpoint_mode, endpoint_threshold, endpoint_residue = (
-                self._endpoint_controls(request)
-            )
             if file_row is not None:
                 # FILE-ROW-001: a FILE row's role and header come from the
-                # step plan, not from the request's multimodal feature.
+                # step plan, not from the request's multimodal feature; it runs
+                # with endpointing disabled (FILE-ENG-002), and screening has
+                # already failed it for a malformed policy.
                 plan = file_row.file_plan
                 assert plan is not None
                 rows.append(
@@ -951,25 +974,16 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
                     )
                 )
                 continue
-            if stream_headers is not None:
-                header = stream_headers.get(request_id)
-            else:
-                header = resolve_row_envelope_header(
-                    scheduled_token_id=token,
-                    placeholder_id=int(self.config.audio_chunk_token_id),
-                    num_computed_tokens=computed,
-                    mm_features=request.mm_features,
-                    scheduled_encoder_input_ids=projection.scheduled_encoder_inputs.get(
-                        request_id, ()
-                    ),
-                )
+            endpoint_mode, endpoint_threshold, endpoint_residue = (
+                self._endpoint_controls(request)
+            )
             rows.append(
                 ObservedRow(
                     request_id=request_id,
                     block_id=int(binding.slot_id),
                     scheduled_token_id=token,
                     has_prior_state=not bool(binding.fresh),
-                    envelope_header=header,
+                    envelope_header=stream_headers.get(request_id),
                     endpoint_mode=endpoint_mode,
                     endpoint_threshold_frames=endpoint_threshold,
                     endpoint_residue_frames=endpoint_residue,
@@ -1707,13 +1721,18 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
             self._host_staging = HostStaging(self._max_num_seqs)
         return self._host_staging
 
-    # @spec FILE-QC-005
+    # @spec FILE-QC-005, REG-ENG-020
     def collect_commit_status(self) -> CommitCollection:
         """Consume the staged step once: the resolved statuses, the requests
         to fail and one ``QueueCount`` per report resolved to status 0 that
-        carries a count; all three empty without a staged commit."""
+        carries a count; all three empty without a staged commit, after
+        waiting for the completion event of a step that recorded one without
+        staging (an all-failed step)."""
         sink = self._commit_sink
-        if sink is None or not sink.has_staged:
+        if sink is None:
+            return CommitCollection()
+        if not sink.has_staged:
+            sink.wait_fence()
             return CommitCollection()
         reports, _records, lease_ok = sink.collect()
         statuses, failed = resolve_status_reports(
@@ -1780,10 +1799,11 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
                 .reshape(-1)
                 .to(dtype=torch.float32)
             )
-            if envelope.shape[0] < ENVELOPE_HEADER_SLOTS:
-                raise ValueError("audio envelope is smaller than its header")
-            if envelope.shape[0] > hidden:
-                raise ValueError("audio envelope exceeds carrier width")
+            # Screening fails a request whose envelope breaks this rule
+            # before core's encoder path runs (REG-STATE-015).
+            fault = envelope_width_fault(int(envelope.shape[0]), carrier_width=hidden)
+            if fault is not None:
+                raise ValueError(f"audio {fault}")
             row = torch.zeros(hidden, dtype=torch.float32)
             row[: envelope.shape[0]] = envelope
             rows.append(row.to(device).unsqueeze(0))
@@ -1892,11 +1912,17 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
             and len(planning_failed) == len(context.request_ids)
             and self._native_burst_handoff is None
         ):
-            return self._runner_output(
+            output = self._runner_output(
                 self._all_failed_bypass(context, row_embeds),
                 last_positions,
                 inputs_embeds,
             )
+            # @spec REG-ENG-020: the step stages no commit, but its device
+            # work read the step's state and inputs (the fresh pages and the
+            # row gather above); its commit event follows that work, and
+            # ``postprocess_state`` waits for it.
+            self._ensure_commit_sink(inputs_embeds.device).record_fence()
+            return output
         pools = self._state_pools(persistent_state_projection)
         self._write_file_envelopes(row_embeds, persistent_state_projection)
         commit_sink = state_batch.commit_sink(
@@ -2062,21 +2088,16 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
         rejected-row output in the runner's order. ``postprocess_state`` fails
         the requests from the planning-failed set (TXG-FAIL-008).
 
-        Where transaction graphs are on, the binding's failed latch is checked
-        first, so a latched worker refuses this step as it refuses every
-        other (TXG-FAIL-003); the binding also counts the step as a bypass,
-        not a fallback (TXG-COV-013)."""
+        The forward refuses a real step on a latched worker before it plans
+        one (TXG-FAIL-003, TXG-FAIL-010), so a latched worker never gets
+        here. Where transaction graphs are on, the binding counts the step as
+        a bypass, not a fallback (TXG-COV-013)."""
         from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
             rejected_row_output,
         )
 
         binding = getattr(self, "_transaction_graph_binding", None)
         if binding is not None:
-            if getattr(binding, "failed", False):
-                raise RuntimeError(
-                    "transaction graphs failed on this worker; a fresh engine "
-                    "is required"
-                )
             record_bypass = getattr(binding, "record_all_failed_step", None)
             if record_bypass is not None:
                 record_bypass(len(context.request_ids))

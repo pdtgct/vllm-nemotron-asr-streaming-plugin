@@ -116,6 +116,7 @@ class NemotronStateLayer(MambaBase, nn.Module):
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         return self.layout.dtypes
 
+    # @spec REG-STATE-001
     def get_kv_cache_config(self, vllm_config: Any) -> KVCacheLayerConfig:
         spec = state_spec(
             self.layout, block_size=int(vllm_config.model_config.max_model_len)

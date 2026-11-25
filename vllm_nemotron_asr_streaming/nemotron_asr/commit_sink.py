@@ -179,6 +179,9 @@ class BoundedCommitSink:
         self._staged: CommitPlan | None = None
         self._staged_records: tuple[CaptureRecord, ...] = ()
         self._staged_lease_ok = False
+        #: A step that staged no commit recorded the completion event
+        #: (``record_fence``) and its collection has not waited for it yet.
+        self._fenced = False
 
     def reserve(self, plan: CommitPlan) -> CommitTicket:
         """Pre-commit composite admission (fallible by design)."""
@@ -302,6 +305,26 @@ class BoundedCommitSink:
     def has_staged(self) -> bool:
         return self._staged is not None
 
+    # @spec REG-ENG-020
+    def record_fence(self) -> None:
+        """Record the completion event for a step that stages no commit (a
+        step whose every row failed at planning) after its last device read
+        of the step's inputs or state; ``wait_fence`` waits for it."""
+        if self._event is not None:
+            self._event.record()
+        self._fenced = True
+
+    # @spec REG-ENG-020
+    def wait_fence(self) -> None:
+        """Wait for the event ``record_fence`` recorded, once; nothing to wait
+        for without one. The step's collection calls this when the step
+        staged no commit."""
+        if not self._fenced:
+            return
+        self._fenced = False
+        if self._event is not None:
+            self._event.synchronize()
+
     def collect(
         self,
     ) -> tuple[list[SessionStatusReport], list[CaptureRecord], bool]:
@@ -318,6 +341,8 @@ class BoundedCommitSink:
             raise ValueError("no staged commit to collect")
         if self._event is not None:
             self._event.synchronize()
+        # The event recorded at this stage is later than any earlier fence.
+        self._fenced = False
         rows = len(plan.bindings)
         status = self._status_host[:rows].tolist()
         progress = (

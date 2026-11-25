@@ -814,6 +814,7 @@ fall in both classes (REG-STATE-015):
 | an overlapping feature whose modality is not audio | fail the request | the request sent another modality |
 | an overlapping feature with no kwargs payload or no envelope payload | fail the request | the request's item carries no envelope |
 | an envelope smaller than its header | fail the request | the request's item is truncated |
+| an envelope wider than the carrier row (`hidden_size`) | fail the request | the request's item is oversized; no list names it, so the default class applies |
 | a feature without position metadata | raise | core's multimodal processing places every feature it delivers |
 | a feature of non-positive length | raise | core never delivers an empty placeholder range |
 | a non-CHUNK row with a scheduled encoder input | raise | core schedules encoder input only for a token that a feature covers |
@@ -823,6 +824,16 @@ fall in both classes (REG-STATE-015):
 
 A row that matches both a fail-the-request fault and a raise fault fails its request: the client
 caused it.
+
+The model state screens a step's rows in `prepare_inputs_embeds`, before it runs core's encoder
+(`execute_mm_encoder`) and gather (`gather_mm_embeddings`), so core never meets a request's fault:
+a row that fails at planning, a file whose item `add_request` could not take included, is left
+out of the gather. An encoder input is dropped only when its own item is one the model's encoder
+refuses (its modality, its payload, or an envelope smaller than its header or wider than the
+carrier row); every other input runs, a failed row's included. Core's scheduler encodes an item
+once and treats its identifier as cached for every request whose feature shares it, in the same
+step or a later one, so a row failed for its prompt's structure must still run its valid items; an
+item the encoder refuses fails every request that carries it.
 
 **Exceptions.** Core ends the engine when a model-state method or the forward raises, so every
 raise is worker-fatal and no later step of the worker runs. `postprocess_state` records a step's
@@ -1228,3 +1239,20 @@ Each item names what is deferred, the trigger that reopens it and the shape of t
     each unit keeps its own header checks and partial-failure semantics inside the row; and the
     transaction graphs address units (TXG-TXN-010, TXG-EXEC-007 per unit) or keep falling back
     with `multi-token` (the `transaction-graph` design, Future roadmap).
+15. **Native-burst configuration checks.** REG-LA-007 (native burst requires lookahead 1),
+    REG-ENG-008 (the native-burst check's undefined parallel settings) and the native-burst clause
+    of TXG-QUAL-023 apply only on a core that runs native burst; on the target core REG-ENG-019
+    refuses native burst, so they are deferred and the native-burst code stays in the package,
+    unreached. Trigger: native burst is ported to the state layer (item 9). Shape: the specs return
+    to the active list with their IDs, REG-ENG-019 narrows to the configurations the port does not
+    qualify, and their tests run against the ported path.
+
+
+16. **Distinct items under one client UUID.** Core's encoder cache keys an item by its multimodal
+    identifier, which a direct engine client may supply. When a row fails for a prompt-structure
+    fault, the model still runs every encoder input whose own item is valid, so a request that shares
+    an identifier with identical content still gets its output; two items with different content
+    under one client-supplied identifier can still make core report an encoder-cache miss. Trigger:
+    core validates client-supplied identifiers against content, or a client is seen reusing them.
+    Shape: the model screens a scheduled encoder input whose identifier another live request uses
+    with different content.

@@ -123,6 +123,21 @@ class RequestRowFault(ValueError):
     violation of core's model-state contract and is raised."""
 
 
+def envelope_width_fault(width: int, *, carrier_width: int) -> str | None:
+    """Why a flat stream envelope of ``width`` values does not fit the
+    carrier row of ``carrier_width`` values (the model's ``hidden_size``), or
+    ``None``: an envelope holds at least its header and at most the carrier.
+    The one width rule of screening (REG-STATE-015) and ``embed_multimodal``."""
+    if width < ENVELOPE_HEADER_SLOTS:
+        return "envelope is smaller than its header"
+    if width > carrier_width:
+        return (
+            f"envelope of {width} values is wider than the carrier row of "
+            f"{carrier_width}"
+        )
+    return None
+
+
 # @spec REG-STATE-015
 def resolve_row_envelope_header(
     *,
@@ -131,6 +146,7 @@ def resolve_row_envelope_header(
     num_computed_tokens: int,
     mm_features: Sequence[object],
     scheduled_encoder_input_ids: Sequence[int],
+    carrier_width: int,
 ) -> tuple[float, ...] | None:
     """Resolve one row's host CHUNK header independently of cache state.
 
@@ -144,11 +160,12 @@ def resolve_row_envelope_header(
     prompt and items cause raise :class:`RequestRowFault`: a non-CHUNK row
     that a feature overlaps; a CHUNK row that no feature, or more than one,
     overlaps; an overlapping feature that is not audio, carries no kwargs
-    payload or no envelope payload; an envelope smaller than its header.
-    Those only core's scheduling or multimodal delivery can produce raise a
-    plain ``ValueError``: a feature without position metadata or of
-    non-positive length; a non-CHUNK row with a scheduled encoder input; a
-    CHUNK row with more than one scheduled encoder input, or one naming a
+    payload or no envelope payload; an envelope smaller than its header or
+    wider than the carrier row (``carrier_width``, the model's
+    ``hidden_size``). Those only core's scheduling or multimodal delivery can
+    produce raise a plain ``ValueError``: a feature without position metadata
+    or of non-positive length; a non-CHUNK row with a scheduled encoder input;
+    a CHUNK row with more than one scheduled encoder input, or one naming a
     feature other than the overlapping one; an envelope payload that is not
     host-resident. A row with faults of both classes raises
     :class:`RequestRowFault`: the request caused it. A feature without
@@ -194,7 +211,7 @@ def resolve_row_envelope_header(
             contract.append(
                 "scheduled encoder input must name the same overlapping feature"
             )
-        request, envelope = _envelope_payload(feature)
+        request, envelope = _envelope_payload(feature, carrier_width=carrier_width)
         if request is None and envelope is not None and envelope.device.type != "cpu":
             contract.append("envelope payload must be host-resident at the hook")
     if request is not None:
@@ -206,7 +223,9 @@ def resolve_row_envelope_header(
     return tuple(float(value) for value in envelope[:ENVELOPE_HEADER_SLOTS].tolist())
 
 
-def _envelope_payload(feature: object) -> tuple[str | None, torch.Tensor | None]:
+def _envelope_payload(
+    feature: object, *, carrier_width: int
+) -> tuple[str | None, torch.Tensor | None]:
     """The overlapping feature's flat envelope, or the request-caused fault
     that leaves it without one (REG-STATE-015)."""
     modality = getattr(feature, "modality", None)
@@ -225,9 +244,35 @@ def _envelope_payload(feature: object) -> tuple[str | None, torch.Tensor | None]
         ).reshape(-1)
     except (TypeError, ValueError, RuntimeError):
         return "CHUNK row audio feature has no envelope payload", None
-    if int(envelope.shape[0]) < ENVELOPE_HEADER_SLOTS:
-        return "CHUNK row envelope is smaller than its header", None
+    width = envelope_width_fault(int(envelope.shape[0]), carrier_width=carrier_width)
+    if width is not None:
+        return f"CHUNK row {width}", None
     return None, envelope
+
+
+#: The fields of a complete-file item (``samples`` and ``file_header``): the
+#: model's encoder takes an item that carries either as a file placeholder.
+FILE_ITEM_FIELDS = ("samples", "file_header")
+
+
+# @spec REG-STATE-015
+def encoder_item_fault(feature: object, *, carrier_width: int) -> str | None:
+    """Why the model's encoder (``embed_multimodal``) would refuse this
+    feature's own item, or ``None`` when it takes it: a complete-file item
+    (a field of :data:`FILE_ITEM_FIELDS`), or a stream envelope whose
+    modality is audio and whose width fits the carrier row. The faults are
+    the item's content (its modality, its payload, its envelope's width), so
+    every request whose feature has the same encoder-cache identifier has
+    them too; a fault of a row's prompt structure is not one of them."""
+    item = getattr(feature, "data", None)
+    if getattr(feature, "modality", None) == "audio" and item is not None:
+        try:
+            if any(name in item for name in FILE_ITEM_FIELDS):
+                return None
+        except TypeError:
+            return "audio feature has no kwargs payload"
+    fault, _ = _envelope_payload(feature, carrier_width=carrier_width)
+    return fault
 
 
 # @spec REG-STATE-015

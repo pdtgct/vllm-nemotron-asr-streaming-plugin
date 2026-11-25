@@ -20,10 +20,11 @@ other call retires the request first. A file request's ``remove_request``
 retires it within the call.
 
 A row whose request causes a planning fault (more than one scheduled token, a
-window past its recorded prompt, a malformed envelope, a malformed file item)
-fails alone at planning; ``postprocess_state`` records it with the step's
-other failed rows, and core ends those requests through
-``take_failed_requests``. A violation of core's model-state contract raises.
+window past its recorded prompt, a malformed envelope, a malformed file item,
+a malformed endpoint policy) fails alone at planning, before core's encoder
+path reads it; ``postprocess_state`` records it with the step's other failed
+rows, and core ends those requests through ``take_failed_requests``. A
+violation of core's model-state contract raises.
 
 The model owns every graph it runs: core's runner captures no graph over its
 forward (``get_additional_cg_support``, ``initialize_kv_cache``,
@@ -64,6 +65,7 @@ from vllm_nemotron_asr_streaming.nemotron_asr.manifests import (
 from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
     RequestRowFault,
     check_envelope_header,
+    encoder_item_fault,
     file_envelope_header,
     resolve_row_envelope_header,
     stream_order_key,
@@ -134,13 +136,15 @@ class _Screen:
     """One real step's rows as planning screens them, before core's encoder
     path reads them: each row's scheduled host tokens, the rows failed at
     planning for a fault their request caused (REG-STATE-008, REG-STATE-014,
-    REG-STATE-015), and each clean stream CHUNK row's validated envelope
-    header."""
+    REG-STATE-015), each clean stream CHUNK row's validated envelope header,
+    and the scheduled encoder inputs core's encoder may run (every input
+    whose own item the model's encoder takes)."""
 
     input_batch: Any
     token_rows: tuple[tuple[int, ...], ...]
     failed: frozenset[str]
     headers: dict[str, tuple[float, ...]]
+    encoder_inputs: dict[str, list[int]]
 
 
 @dataclass(frozen=True)
@@ -239,9 +243,8 @@ class StateBatch:
         layout: StateLayout,
         n_layers: int,
     ):
+        # The bound views; the state layer raises when core bound none.
         views = layer.component_pools
-        if views is None:
-            raise RuntimeError("the state pool is not bound")
         num_blocks = layer.num_blocks
         self.layer = layer
         self.request_ids = tuple(b.request_id for b in bindings)
@@ -787,19 +790,19 @@ class NemotronASRModelState(ModelState):
         self._scheduled_encoder_inputs = scheduled_encoder_inputs
         self._features = None
         # A row whose request caused a planning fault leaves core's encoder
-        # path: its encoder inputs are not run and its features not gathered,
-        # so core never meets the fault (it would raise for the whole step).
+        # path, so core never meets the fault (it would raise for the whole
+        # step): its features are not gathered, and an encoder input whose
+        # own item the model's encoder refuses is not run. Every other input
+        # runs, a failed row's included: core's scheduler encodes an item
+        # once and treats it as cached for each request that shares it.
         screen = self._screen_rows(input_batch, scheduled_encoder_inputs)
         self._screen = screen
-        failed = screen.failed if screen is not None else frozenset()
+        if screen is None:
+            failed, encoder_inputs = frozenset(), scheduled_encoder_inputs
+        else:
+            failed, encoder_inputs = screen.failed, screen.encoder_inputs
         if self.supports_mm_inputs:
-            self.execute_mm_encoder(
-                {
-                    req_id: inputs
-                    for req_id, inputs in scheduled_encoder_inputs.items()
-                    if req_id not in failed
-                }
-            )
+            self.execute_mm_encoder(encoder_inputs)
             mm_embeds, is_mm_embed = self._gather_mm_embeddings(input_batch, failed)
             self._features = self.encoder_runner.get_inputs_embeds(
                 input_batch.input_ids[: input_batch.num_tokens], mm_embeds, is_mm_embed
@@ -823,7 +826,8 @@ class NemotronASRModelState(ModelState):
             input_batch.num_computed_tokens_np[keep],
         )
 
-    # @spec REG-STATE-008, REG-STATE-014, REG-STATE-015, FILE-PROMPT-007
+    # @spec REG-STATE-008, REG-STATE-014, REG-STATE-015, REG-STATE-020
+    # @spec FILE-PROMPT-007, FILE-BUF-001
     def _screen_rows(
         self,
         input_batch: Any,
@@ -831,9 +835,12 @@ class NemotronASRModelState(ModelState):
     ) -> _Screen | None:
         """Classify a real step's rows before any of them is read: each row's
         scheduled host tokens, the rows that fail at planning for a fault
-        their request caused, and each clean stream CHUNK row's validated
-        envelope header. ``None`` for a dummy step (a row the model state
-        does not hold). A fault of core's contract raises.
+        their request caused (a stream row's envelope, a file whose item
+        ``add_request`` could not take, any row's endpoint policy), each clean
+        stream CHUNK row's validated envelope header and the encoder inputs
+        core's encoder may run (``_runnable_encoder_inputs``). ``None`` for a
+        dummy step (a row the model state does not hold). A fault of core's
+        contract raises.
 
         Core sends no token slices for cached requests unless pipeline
         parallelism is on, which this model refuses, so a row's host tokens
@@ -845,8 +852,11 @@ class NemotronASRModelState(ModelState):
         req_ids = tuple(input_batch.req_ids)
         if any(r not in self._requests for r in req_ids):
             return None
-        config = getattr(self.model, "config", None)
+        config = self.model.config
         placeholder = getattr(config, "audio_chunk_token_id", None)
+        # The carrier row's width: a stream envelope fits it (REG-STATE-015).
+        carrier_width = int(config.hidden_size)
+        endpoint_controls = getattr(self.model, "_endpoint_controls", None)
         token_rows: list[tuple[int, ...]] = []
         failed: set[str] = set()
         headers: dict[str, tuple[float, ...]] = {}
@@ -867,13 +877,19 @@ class NemotronASRModelState(ModelState):
                 continue
             token = int(window[0])
             token_rows.append((token,))
-            if record.is_file or placeholder is None:
-                continue
             try:
-                endpoint_controls = getattr(self.model, "_endpoint_controls", None)
                 if endpoint_controls is not None:
-                    # The request's endpoint policy is the client's.
+                    # Every request's endpoint policy is the client's, a
+                    # file's too, though a file runs with endpointing
+                    # disabled (REG-STATE-020, FILE-ENG-002).
                     endpoint_controls(record.metadata)
+                if record.is_file:
+                    # A file whose item add_request could not take.
+                    if req_id in self._failed_files:
+                        failed.add(req_id)
+                    continue
+                if placeholder is None:
+                    continue
                 header = resolve_row_envelope_header(
                     scheduled_token_id=token,
                     placeholder_id=int(placeholder),
@@ -882,6 +898,7 @@ class NemotronASRModelState(ModelState):
                     scheduled_encoder_input_ids=scheduled_encoder_inputs.get(
                         req_id, ()
                     ),
+                    carrier_width=carrier_width,
                 )
                 if header is not None:
                     check_envelope_header(
@@ -893,7 +910,49 @@ class NemotronASRModelState(ModelState):
                     headers[req_id] = header
             except RequestRowFault:
                 failed.add(req_id)
-        return _Screen(input_batch, tuple(token_rows), frozenset(failed), headers)
+        return _Screen(
+            input_batch,
+            tuple(token_rows),
+            frozenset(failed),
+            headers,
+            self._runnable_encoder_inputs(
+                scheduled_encoder_inputs, carrier_width=carrier_width
+            ),
+        )
+
+    # @spec REG-STATE-015
+    def _runnable_encoder_inputs(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        *,
+        carrier_width: int,
+    ) -> dict[str, list[int]]:
+        """The scheduled encoder inputs core's encoder may run: each input
+        whose own item the model's encoder takes (``encoder_item_fault``).
+        An input whose item it refuses (its modality, its payload, an
+        envelope smaller than its header or wider than the carrier) is
+        dropped; its row fails at planning, and a request whose feature has
+        the same identifier has the same item and fails too. A row that fails
+        for its prompt's structure keeps its valid inputs, which another
+        request sharing their identifier gathers, in this step or a later one.
+        An input that names no feature of its request is core's to refuse."""
+        runnable: dict[str, list[int]] = {}
+        for req_id, inputs in scheduled_encoder_inputs.items():
+            record = self._requests.get(req_id)
+            if record is None:
+                runnable[req_id] = list(inputs)
+                continue
+            features = record.metadata.mm_features
+            kept = [
+                index
+                for index in inputs
+                if not 0 <= int(index) < len(features)
+                or encoder_item_fault(features[int(index)], carrier_width=carrier_width)
+                is None
+            ]
+            if kept:
+                runnable[req_id] = kept
+        return runnable
 
     # @spec REG-STATE-008
     def _row_window(self, req_id: str, start: int, count: int) -> tuple[int, ...]:
@@ -1043,16 +1102,16 @@ class NemotronASRModelState(ModelState):
         input_batch: InputBatch,
         plan_order: tuple[str, ...] | None = None,
         *,
-        headers: dict[str, tuple[float, ...]] | None = None,
+        headers: dict[str, tuple[float, ...]],
         failed: frozenset[str] = frozenset(),
     ) -> StepPlan:
-        """Make the step's plan once: resolve stream rows' geometry and
-        deadline, then plan the rows in ``plan_order`` (default: the batch
-        order). FILE rows plan from their file's queue count; no label book is
-        read (FILE-QC-011). ``headers`` holds the step's screened stream
-        headers (without them each stream CHUNK row's header is resolved
-        here); a row in ``failed`` takes no part in ordering."""
-        del bindings, batch
+        """Make the step's plan once: order the stream rows by the geometry
+        and deadline of their screened headers (``headers``, from
+        ``_screen_rows``), then plan the rows in ``plan_order`` (default: the
+        batch order). FILE rows plan from their file's queue count; no label
+        book is read (FILE-QC-011). A row in ``failed`` takes no part in
+        ordering."""
+        del bindings, batch, input_batch
         if plan_order is None:
             plan_order = req_ids
         if not any(
@@ -1071,18 +1130,7 @@ class NemotronASRModelState(ModelState):
                 or token != int(config.audio_chunk_token_id)
             ):
                 continue
-            if headers is not None:
-                header = headers.get(req_id)
-            else:
-                header = resolve_row_envelope_header(
-                    scheduled_token_id=token,
-                    placeholder_id=int(config.audio_chunk_token_id),
-                    num_computed_tokens=int(input_batch.num_computed_tokens_np[index]),
-                    mm_features=self._requests[req_id].metadata.mm_features,
-                    scheduled_encoder_input_ids=self._scheduled_encoder_inputs.get(
-                        req_id, ()
-                    ),
-                )
+            header = headers.get(req_id)
             if header is None:
                 continue
             stream_rows[req_id] = stream_order_key(header, now_ns=now_ns)

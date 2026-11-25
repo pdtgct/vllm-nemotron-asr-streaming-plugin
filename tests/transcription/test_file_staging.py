@@ -101,7 +101,12 @@ def test_production_planning_uses_the_file_count_and_never_reads_the_book(
         before = (entry.queue_count, entry.queue_count_unknown)
         binding = RowBinding("f1", handle["nemotron.state"], fresh)
         plan = state._plan_production_step(
-            ("f1",), (binding,), batch, [state._scheduled_tokens["f1"]], input_batch
+            ("f1",),
+            (binding,),
+            batch,
+            [state._scheduled_tokens["f1"]],
+            input_batch,
+            headers={},
         )
         assert (entry.queue_count, entry.queue_count_unknown) == before
         (row,) = plan.rows

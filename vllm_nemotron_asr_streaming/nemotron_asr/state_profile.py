@@ -143,11 +143,10 @@ def manifest_page_bytes(config: Any) -> int:
 
 def memory_contributors(config: Any) -> tuple[str, ...]:
     """The configured options that enlarge the model's execution memory or
-    graphs (diagnostic only; no core in the PR 6 proof of concept reads
-    them): ``max_num_seqs`` and the two segment arms
-    when graphed execution is configured, ``chunk_bucket_graph_populations``
-    when it is non-empty, and ``transaction_graph_populations`` while
-    transaction graphs are on."""
+    graphs (diagnostic only; core reads none of them): ``max_num_seqs`` and
+    the two segment arms when graphed execution is configured,
+    ``chunk_bucket_graph_populations`` when it is non-empty, and
+    ``transaction_graph_populations`` while transaction graphs are on."""
     from vllm_nemotron_asr_streaming.engine_flags import (
         graphed_execution_configured,
     )

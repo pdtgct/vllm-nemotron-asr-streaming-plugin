@@ -1405,7 +1405,7 @@ def _step_with_a_clean_row(env, bad, encoder_inputs):
     step; returns the error it raised, or ``None``."""
     output = h.scheduler_output(
         new=(bad, stream(env, "s1")),
-        handles={"bad": 3, "s1": 1},
+        handles={bad.req_id: 3, "s1": 1},
         encoder_inputs={**encoder_inputs, "s1": [0]},
     )
     return h.call_with(env.runner.real_step, output)
@@ -1605,6 +1605,267 @@ def test_an_unlisted_fault_a_request_can_cause_fails_that_request_alone(
     error = h.call_with(
         env.runner.real_step, h.scheduler_output(new=tuple(new), handles=handles)
     )
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [{"bad"}]
+    statuses, _ = env.runner.commit_log[-1]
+    assert statuses.get("s1") == 0
+
+
+def _audio_payload(envelope: torch.Tensor):
+    """A kwargs payload whose one field is the envelope ``envelope``."""
+    from vllm.multimodal.inputs import (
+        MultiModalBatchedField,
+        MultiModalFieldElem,
+        MultiModalKwargsItem,
+    )
+
+    field = MultiModalBatchedField(keep_on_cpu=True)
+    return MultiModalKwargsItem({"audio": MultiModalFieldElem(envelope, field)})
+
+
+def _wider_than_the_carrier(env) -> torch.Tensor:
+    """A stream envelope with a valid header and a full chunk, padded to one
+    value more than the carrier row holds (``hidden_size``)."""
+    valid = h.stream_envelope(geometry=env.max_geometry)
+    envelope = torch.zeros(int(env.config.hidden_size) + 1)
+    envelope[: valid.shape[0]] = valid
+    return envelope
+
+
+# @spec REG-STATE-015
+def test_an_envelope_wider_than_the_carrier_fails_that_request_alone(build):
+    """REG-STATE-015's default class: a direct engine client can send a stream
+    envelope whose header is valid and whose payload is wider than the
+    carrier row. Screening checks the whole envelope, not only its header, so
+    the row fails at planning before core's encoder path meets it, and the
+    step's clean row commits."""
+    env = build()
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    bad = _carrier_request(
+        env,
+        "bad",
+        features=[_envelope_feature(env, "bad", envelope=_wider_than_the_carrier(env))],
+    )
+    error = _step_with_a_clean_row(env, bad, {"bad": [0]})
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [{"bad"}]
+    statuses, _ = env.runner.commit_log[-1]
+    assert statuses.get("s1") == 0
+
+
+def _file_carrier_request(env, req_id: str, data):
+    """A file-carrier request whose one feature carries the kwargs payload
+    ``data`` instead of a file's samples and header."""
+    template = file(env, req_id)
+    (feature,) = template.mm_features
+    return dataclasses.replace(
+        template, mm_features=[dataclasses.replace(feature, data=data)]
+    )
+
+
+#: Malformed items of a file request (FILE-BUF-001) that core's encoder path
+#: would raise for if it ran them: name -> payload builder.
+_MALFORMED_FILE_ITEMS = {
+    "item with neither samples nor a file header": (
+        lambda env: _payload_without_an_envelope()
+    ),
+    "item carrying an envelope wider than the carrier": (
+        lambda env: _audio_payload(_wider_than_the_carrier(env))
+    ),
+}
+
+
+@pytest.mark.parametrize("item", list(_MALFORMED_FILE_ITEMS))
+# @spec REG-STATE-015, FILE-BUF-001
+def test_a_malformed_file_request_fails_alone_before_cores_encoder_path(build, item):
+    """A file request whose item the model state could not take at
+    ``add_request`` is a known failure before the step's encoder path runs:
+    screening drops its item from core's encoder and its row from core's
+    gather, so beside a clean stream row the step does not raise, the file
+    request alone fails and the stream row commits."""
+    env = build()
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    bad = _file_carrier_request(env, "bad", _MALFORMED_FILE_ITEMS[item](env))
+    error = _step_with_a_clean_row(env, bad, {"bad": [0]})
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [{"bad"}]
+    statuses, _ = env.runner.commit_log[-1]
+    assert statuses.get("s1") == 0
+
+
+#: Prompt-structure faults of a row whose own item is valid (REG-STATE-015):
+#: name -> (request builder over the shared feature, the row's scheduled
+#: encoder inputs).
+_STRUCTURE_FAULTS = {
+    "non-CHUNK row a feature overlaps": (
+        lambda env, shared: _carrier_request(env, "bad", token=7, features=[shared]),
+        [0],
+    ),
+    "CHUNK row two features overlap": (
+        lambda env, shared: _carrier_request(
+            env, "bad", features=[shared, _second_feature(env, "bad")]
+        ),
+        [0, 1],
+    ),
+}
+
+
+@pytest.mark.parametrize("when", ["same step", "later step"])
+@pytest.mark.parametrize("fault", list(_STRUCTURE_FAULTS))
+# @spec REG-STATE-015
+def test_a_structure_fault_keeps_the_encoder_output_a_shared_item_needs(
+    build, fault, when
+):
+    """Core's scheduler encodes an identifier once, for the first request it
+    schedules, and treats it as cached for every other request whose feature
+    has that identifier, in the same step or a later one. A row that fails
+    for a prompt-structure fault still runs the encoder inputs whose own item
+    is valid, so another request with the same item gathers its encoder
+    output: the faulty request alone fails and the other one commits."""
+    env = build()
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    shared = _envelope_feature(env, "good", identifier="uuid-shared")
+    make, inputs = _STRUCTURE_FAULTS[fault]
+    bad = make(env, shared)
+    good = _carrier_request(env, "good", features=[shared])
+    if when == "same step":
+        steps = [
+            h.scheduler_output(
+                new=(bad, good),
+                handles={"bad": 3, "good": 1},
+                encoder_inputs={"bad": inputs},
+            )
+        ]
+    else:
+        steps = [
+            h.scheduler_output(
+                new=(bad,), handles={"bad": 3}, encoder_inputs={"bad": inputs}
+            ),
+            h.scheduler_output(
+                new=(good,),
+                finished=("bad",),
+                handles={"good": 1},
+                encoder_inputs={},
+            ),
+        ]
+    for output in steps:
+        error = h.call_with(env.runner.real_step, output)
+        assert error is None, repr(error)
+    assert env.runner.failed_log == [{"bad"}] + [None] * (len(steps) - 1)
+    statuses, _ = env.runner.commit_log[-1]
+    assert statuses.get("good") == 0
+
+
+# ---------------------------------------------------------------------------
+# REG-STATE-020: the endpoint policy, from the sampling parameters' extra_args
+
+#: A well-formed endpoint policy with distinct counts.
+_POLICY = {"mode": "greedy_blank", "threshold_frames": 2, "residue_frames": 1}
+
+
+def _endpoint_row(env, req_id: str) -> tuple[int, int, int]:
+    """The endpoint mode, threshold and residue of ``req_id``'s row in the
+    step's row plan (the row transaction's plan)."""
+    plan = env.advance.calls[-1]
+    row = plan.request_ids.index(req_id)
+    return (
+        int(plan.endpoint_mode[row]),
+        int(plan.endpoint_threshold_frames[row]),
+        int(plan.endpoint_residue_frames[row]),
+    )
+
+
+# @spec REG-STATE-020
+def test_the_endpoint_policy_is_read_from_the_sampling_extra_args(build):
+    env = build()
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    policy = h.with_extra_args(stream(env, "p"), {"endpoint_policy": dict(_POLICY)})
+    error = _step_with_a_clean_row(env, policy, {"p": [0]})
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [None]
+    assert _endpoint_row(env, "p") == (1, 2, 1)
+    assert _endpoint_row(env, "s1") == (0, 0, 0)
+
+
+def _without_the_key(env, carrier: str):
+    request = stream(env, "p")
+    if carrier == "extra_args without the key":
+        return h.with_extra_args(request, {"other_option": 1})
+    if carrier == "a policy only in additional_information":
+        # The request field an earlier design read; core carries no such field
+        # to the model state, so a policy there is never read.
+        request.additional_information = {"endpoint_policy": dict(_POLICY)}
+    return request
+
+
+@pytest.mark.parametrize(
+    "carrier",
+    [
+        "no extra_args",
+        "extra_args without the key",
+        "a policy only in additional_information",
+    ],
+)
+# @spec REG-STATE-020
+def test_a_request_without_the_policy_key_runs_with_endpointing_disabled(
+    build, carrier
+):
+    env = build()
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    error = _step_with_a_clean_row(env, _without_the_key(env, carrier), {"p": [0]})
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [None]
+    assert _endpoint_row(env, "p") == (0, 0, 0)
+
+
+#: Endpoint policies a direct engine client can send that are not a mapping
+#: of a known mode and non-negative integer counts.
+_MALFORMED_POLICIES = {
+    "unknown mode": {"mode": "eager", "threshold_frames": 2, "residue_frames": 0},
+    "no mode": {"threshold_frames": 2, "residue_frames": 0},
+    "negative threshold": {
+        "mode": "greedy_blank",
+        "threshold_frames": -1,
+        "residue_frames": 0,
+    },
+    "fractional residue": {
+        "mode": "greedy_blank",
+        "threshold_frames": 2,
+        "residue_frames": 0.5,
+    },
+    "string threshold": {
+        "mode": "greedy_blank",
+        "threshold_frames": "2",
+        "residue_frames": 0,
+    },
+    "boolean threshold": {
+        "mode": "greedy_blank",
+        "threshold_frames": True,
+        "residue_frames": 0,
+    },
+    "not a mapping": "greedy_blank",
+}
+
+
+@pytest.mark.parametrize("row", ["stream", "file"])
+@pytest.mark.parametrize("policy", list(_MALFORMED_POLICIES))
+# @spec REG-STATE-020, REG-STATE-015
+def test_a_malformed_endpoint_policy_fails_that_request_alone(build, policy, row):
+    """On a stream row and on a file row (which runs with endpointing
+    disabled, FILE-ENG-002, but whose policy is still the request's): the
+    row fails at planning, the step does not raise, and the step's clean
+    stream row commits."""
+    env = build()
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    bad = stream(env, "bad") if row == "stream" else file(env, "bad")
+    bad = h.with_extra_args(bad, {"endpoint_policy": _MALFORMED_POLICIES[policy]})
+    error = _step_with_a_clean_row(env, bad, {"bad": [0]})
     assert error is None, repr(error)
     assert env.runner.failed_log == [{"bad"}]
     statuses, _ = env.runner.commit_log[-1]

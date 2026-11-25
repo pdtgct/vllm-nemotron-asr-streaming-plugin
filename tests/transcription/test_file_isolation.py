@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """A malformed file request fails its own row and nothing else (CPU).
 
-Drives core's request hooks (``add_request``), the production planning and
-the registry binding of ``_stage_v2_projection`` with a malformed file request
-next to a valid file request and a valid stream request.
+Drives core's request hooks (``add_request``), the model state's screening
+(``_screen_rows``), the production planning and the registry binding of
+``_stage_v2_projection`` with a malformed file request next to a valid file
+request and a valid stream request.
 """
 
 from __future__ import annotations
@@ -109,12 +110,23 @@ def test_malformed_file_request_fails_only_its_row(file_model_state, make_step, 
 
     bindings = tuple(RowBinding(i, handles[i][LAYER], True) for i in ids)
     input_batch = SimpleNamespace(
+        req_ids=list(ids),
         num_computed_tokens_np=np.zeros(3, np.int64),
         num_scheduled_tokens=np.ones(3, np.int64),
     )
-    token_rows = [state._scheduled_tokens[i] for i in ids]
+    screen = state._screen_rows(input_batch, {})
+    # The file the model state could not take fails at screening, before
+    # core's encoder path (REG-STATE-015); the others are clean.
+    assert screen.failed == {"bad"}, screen.failed
+    token_rows = list(screen.token_rows)
     plan = state._plan_production_step(
-        ids, bindings, SimpleNamespace(pools=None), token_rows, input_batch
+        ids,
+        bindings,
+        SimpleNamespace(pools=None),
+        token_rows,
+        input_batch,
+        headers=screen.headers,
+        failed=screen.failed,
     )
     by_id = {r.request_id: r for r in plan.rows}
     assert by_id["bad"].failed
@@ -131,6 +143,8 @@ def test_malformed_file_request_fails_only_its_row(file_model_state, make_step, 
         token_ids=tuple(t[0] for t in token_rows),
         scheduled_encoder_inputs={},
         file_rows={r.request_id: r for r in plan.rows if r.is_file},
+        planning_failed=set(screen.failed),
+        stream_headers=dict(screen.headers),
         req_states=SimpleNamespace(req_id_to_index={i: n for n, i in enumerate(ids)}),
     )
     context = type(model)._stage_v2_projection(model, projection)

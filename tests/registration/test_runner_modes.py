@@ -1118,8 +1118,13 @@ def _read_log(order: list[str], watched: dict[int, str]):
     return ReadLog()
 
 
-# @spec REG-ENG-020
-def test_the_commit_event_follows_the_steps_last_read_and_is_waited_on(stages):
+def _watched_step(stages, make_request):
+    """One real step of the request ``make_request(chunk_token_id)`` builds
+    (slot 1) on a fresh eager model, under the read log: returns the runner
+    and the ordered log of reads
+    (``read:state``, ``read:staged``), the commit event's ``record`` and
+    ``synchronize``, the status buffer's reads and ``postprocess_state``'s
+    entry and return."""
     config = stages.config(eager=True)
     model = stages.model(config)
     state = stages.state(config, model)
@@ -1152,14 +1157,25 @@ def test_the_commit_event_follows_the_steps_last_read_and_is_waited_on(stages):
         order.append("postprocess.return")
 
     state.postprocess_state = recording_postprocess
-    unit = h.new_request(
-        "s1",
-        int(model.config.audio_chunk_token_id),
-        audio=h.stream_envelope(model.config, geometry=2),
-        identifier="uuid-s1-0",
-    )
+    request = make_request(int(model.config.audio_chunk_token_id))
     with _read_log(order, watched):
-        runner.real_step(h.scheduler_output(new=(unit,), handles={"s1": 1}))
+        runner.real_step(
+            h.scheduler_output(new=(request,), handles={request.req_id: 1})
+        )
+    return runner, order
+
+
+# @spec REG-ENG-020
+def test_the_commit_event_follows_the_steps_last_read_and_is_waited_on(stages):
+    runner, order = _watched_step(
+        stages,
+        lambda chunk: h.new_request(
+            "s1",
+            chunk,
+            audio=h.stream_envelope(geometry=2),
+            identifier="uuid-s1-0",
+        ),
+    )
 
     assert runner.commit_log and not runner.commit_log[-1][1], runner.commit_log
     reads = [i for i, e in enumerate(order) if e.startswith("read:")]
@@ -1172,6 +1188,29 @@ def test_the_commit_event_follows_the_steps_last_read_and_is_waited_on(stages):
     assert (
         order.index("postprocess") < wait < status < order.index("postprocess.return")
     ), order
+    assert record < wait, order
+
+
+# @spec REG-ENG-020, TXG-FAIL-009
+def test_an_all_failed_step_records_its_commit_event_and_waits_on_it(stages):
+    """A step whose every row fails at planning stages no commit, yet its
+    device work reads the step's state and inputs (the fresh row's page
+    initialization, REG-STATE-010, and the rows' inputs): the commit event is
+    recorded once, after the step's last such read, and ``postprocess_state``
+    waits for it before it returns."""
+    # A CHUNK row with no multimodal feature: its request's own fault
+    # (REG-STATE-015), so the step's one row fails at planning.
+    runner, order = _watched_step(stages, lambda chunk: h.new_request("bad", chunk))
+
+    assert runner.failed_log == [{"bad"}], runner.failed_log
+    reads = [i for i, e in enumerate(order) if e.startswith("read:")]
+    assert "read:state" in {order[i] for i in reads}, order
+    assert order.count("event.record") == 1, order
+    record = order.index("event.record")
+    assert reads[-1] < record, ("a read after the commit event", order[record:])
+    assert order.count("event.synchronize") == 1, order
+    wait = order.index("event.synchronize")
+    assert order.index("postprocess") < wait < order.index("postprocess.return"), order
     assert record < wait, order
 
 
