@@ -271,9 +271,11 @@ tolerated rate. A direct engine stream client that sets an endpoint policy or sc
 token causes an expected `signature` fallback. The first `signature`
 fallback per `(kind, field)` logs one WARNING naming the field.
 
-With `N = P_max` every reachable split of a one-token step that reaches transaction execution
-(not an all-failed step) and whose signatures match is covered, which on plugin-packed input is
-every split; a step with a multi-token row still falls back with `multi-token`. A smaller `N`
+With `N = min(P_max, admission limit)`, the largest `N` the configuration checks accept, every
+reachable split of a one-token step that reaches transaction execution (not an all-failed step)
+and whose signatures match is covered, because no step holds more rows than that `N`. On
+plugin-packed input that is every split; a step with a multi-token row still falls back with
+`multi-token`. A smaller `N`
 trades coverage of large steps for graph memory (Fit analysis).
 
 ### Step arena, static inputs and step outputs
@@ -460,7 +462,9 @@ for a real row, the row plan's CUDA-graph padding entries never enter the body, 
 scatter stores only rows with a zero status and only to their own pages, capture rows use pages
 `1 … k`, and the scatter warm-up's rows are rejected. No transaction, cell replay or capture
 therefore stores to it (TXG-MASK-007), which makes it the zero initial state fresh rows gather.
-A cell bakes the null block ID into its gather, so the ID is part of the cell's signature.
+That read-only gather is the one access outside the rows' own pages that `registration`'s state
+access rule permits (REG-STATE-003). A cell bakes the null block ID into its gather, so the ID is
+part of the cell's signature.
 
 ### Whole-file rows
 
@@ -875,7 +879,12 @@ and the transient peak; the budget setting (a block count fixed at the given
   the admission limit plus one state pages (a larger `--kv-cache-memory-bytes`, or a larger
   `--num-gpu-blocks-override`), or a lower admission limit with the largest population at most
   it; never a smaller budget, which would hold fewer pages still;
-- profiling capture: a smaller largest population, a smaller `max_num_seqs`, or the option off;
+- pool access that finds core's state-group layout contract broken (a layout count other than
+  one, a layout that does not hold exactly the state layer, or a component tensor that is not the
+  layer's bound view): no remedy, since no configuration repairs core's contract; the error names
+  the broken condition;
+- profiling capture, in a later phase: a smaller largest population, a smaller `max_num_seqs`,
+  or the option off;
 - serving capture, fixed block count, in a later phase: a profiling-capture remedy; or a smaller
   `--num-gpu-blocks-override` that still holds at least the admission limit plus one blocks, which
   helps only when the allocated state pages leave too little device memory for the capture's
@@ -1055,7 +1064,8 @@ against `VLLM_ENGINE_READY_TIMEOUT_S` (600 s by default).
 transaction and per-kind totals, the transient peak, `m`, `r`, the absorbed rounding and the
 capture time, for `N` = 16, 32 and 64 at `max_num_seqs` 64.
 
-**Choosing `N`.** Run the served `Q` workload of Qualification with `N = P_max` when it
+**Choosing `N`.** Run the served `Q` workload of Qualification with
+`N = min(P_max, admission limit)`, the largest `N` the configuration checks accept, when it
 fits, otherwise the largest `N` that fits, and read the `(K, E)` histogram from the counters.
 For tier 5, declare as `N` the smallest count of at least 63 that fits and for which steps with
 `K ≤ N` and `E ≤ N` make up at least 99 % of served steps; if none fits, tier 5 is not claimed. A
@@ -1112,16 +1122,19 @@ use a fixed `--num-gpu-blocks-override` with the estimate enabled.
   progress, remaining counts and every page. The driver runs on the worker of a hook-captured
   process through a test-only adapter over the serving pools, which drives the model state's step
   lifecycle as core's runner does: per step it calls `remove_request` for each request that
-  finished, in ascending request-ID order; then, for each new or continuing request in the step's
-  scheduled order, `remove_request` for that request immediately followed by its `add_request`
-  with the request's `NewRequestData`; then `prepare_inputs`. Removal and addition interleave
-  per request, as in core's runner: in the order "remove A, remove B, add A" the model state
-  would retire A at B's removal (REG-STATE-011) and then refuse A's continuing turn
-  (REG-STATE-012). It executes on the runner stream, then calls
-  `postprocess_state`, which waits for the step's commit event, and `take_failed_requests`
+  finished, in ascending request-ID order; then, for each request the step delivers as
+  `NewRequestData` in `scheduled_new_reqs` (a new request, or a stream's next turn), in that
+  list's order, `remove_request` for that request immediately followed by its `add_request` with
+  that `NewRequestData`; then `prepare_inputs`. Removal and addition interleave per request, as in
+  core's runner: in the order "remove A, remove B, add A" the model state would retire A at B's
+  removal (REG-STATE-011) and then refuse A's continuing turn (REG-STATE-012). A cached request
+  (a file's later step, or a label drain within a stream's turn) gets neither call: core updates
+  it with no model-state call, and a removal would retire a running file at once (REG-STATE-016),
+  after which its addition would raise (REG-STATE-012). It executes on the runner stream, then
+  calls `postprocess_state`, which waits for the step's commit event, and `take_failed_requests`
   before the next step. The adapter assigns each request one block at its first step, keeps it
   until the request's terminal finish and reuses it only after that, as core's allocator does, and
-  delivers a continuing turn as core does (its compacted prompt, `num_computed_tokens` 1). No
+  delivers a stream's next turn as core does (its compacted prompt, `num_computed_tokens` 1). No
   replay, restore or store runs outside a step run this way. The lifecycle calls, the pool copy
   and the sink's collection run outside any timer.
 - **Mixed workload `M`.** `N` in-flight requests at the transaction level: `max(1, ⌊N/4⌋)` file
@@ -1458,9 +1471,9 @@ not set; and a frontend release that opens streams by locale only.
 | Steps with a multi-token row | The step falls back with reason `multi-token`; the option-off transaction places every row by its token positions | Cells and static inputs addressed by token position; failing every request of the step | Planning fails the multi-token row, and only a direct engine client produces one. Token-position addressing in the cells would size the static inputs by `max_num_batched_tokens` and change the arena and every cell for a step that plugin-packed input never produces. Failing the whole step would fail requests that did nothing wrong |
 | Populations above the admission limit | Refused (TXG-CFG-020) | Accepted; `N` clamped to the limit | Core schedules at most the admission limit's rows per step, so cells above it are captured, charged and never replayed. Clamping would capture an inventory other than the one declared, without telling the operator |
 | Block count under the restricted startup | At least the admission limit plus one: refused in the configuration hook under `num_gpu_blocks_override` (TXG-CFG-005), and checked at pool access under a fixed `kv_cache_memory_bytes` (TXG-CAP-008) | At least `N + 1`, the capture's own need; leave the check to core's scheduler | Core builds its scheduler, which refuses fewer state pages than requests that can be active, only after both captures, so a count between `N + 1` and the admission limit would capture `2N` cells twice and then fail with core's message. Checking the capture's need alone passes a configuration that cannot serve |
-| Pool-access remedy | A larger block count or budget, or a lower admission limit (TXG-MEM-017) | TXG-MEM-013's smaller `--kv-cache-memory-bytes` | A pool-access failure means the budget holds too few state pages, and a smaller budget holds fewer still. TXG-MEM-013 answers a serving capture that ran out of device memory after pool access |
+| Pool-access remedy | For too few blocks, a larger block count or budget, or a lower admission limit (TXG-MEM-017); for a break of core's state-group layout contract, no configuration remedy (TXG-CAP-008) | TXG-MEM-013's smaller `--kv-cache-memory-bytes`; the remedies of TXG-MEM-011 to TXG-MEM-013 for every pool-access failure | A block-count failure means the budget holds too few state pages, and a smaller budget holds fewer still. TXG-MEM-013 answers a serving capture that ran out of device memory after pool access. A layout count other than one, or a component tensor that is not the layer's bound view, is a break of core's contract that no setting changes, so a configuration remedy would direct the operator to the wrong cause |
 | Pages of rejected fresh rows | Initialized before the transaction whether or not the row is rejected; preservation starts after initialization (Fresh rows) | Initialize only the rows that commit; preserve a rejected fresh row's recycled contents | The body finds a per-row rejection on the device, after the initialization has run, so initializing only committed rows would need every rejection on the host before the step. Preserving recycled contents would leave an earlier request's state in a page that the rejected request holds |
-| Qualification adapter's call order | Core's runner order: finished requests removed first, then each new or continuing request removed and at once added (TXG-QUAL-026) | All removals, then all additions | With all removals first, the next request's removal retires a continuing request's pending removal (REG-STATE-011), and the model state then refuses that request's continuing turn (REG-STATE-012), so the adapter would not drive the model state as core does |
+| Qualification adapter's call order | Core's runner order: finished requests removed first, then each request delivered as `NewRequestData` in `scheduled_new_reqs` (a new request or a stream's next turn) removed and at once added; a cached request gets neither call (TXG-QUAL-026) | All removals, then all additions; a removal and an addition for every scheduled request | With all removals first, the next request's removal retires a continuing request's pending removal (REG-STATE-011), and the model state then refuses that request's continuing turn (REG-STATE-012), so the adapter would not drive the model state as core does. Core makes no model-state call for a cached request; a removal there would retire a running file at once (REG-STATE-016), and the addition after it would raise (REG-STATE-012), failing every file at its second step |
 | Option-off baseline | `B_hook`: the default segment arms under the hook configuration, no CHUNK-bucket graphs | The eager encoder; the `--enforce-eager` graphed configuration | `B_hook` is the default at the same geometry, so the option is the only difference; the eager encoder would credit the option with the encoder graphs' gain |
 | CHUNK-bucket graphs | Refused under the option | Accept the binding inside or beside the cells | The binding graphs an already-gathered bucket, which a chunk cell captures in full; it is experimental, covers three counts at 160 ms, and would only change fallback steps |
 | Endpoint arguments | The forward passes the endpoint pools and EOU token on every step, option on or off; cells run with `endpoint_enabled` true and the policy-free endpoint bookkeeping; a step with an endpoint-policy row or a forced-EOU candidate, marked conservatively on the host, falls back by `signature` | Cells with `endpoint_enabled` false and the endpoint arguments passed only for a step with a policy row; forcing EOU only for a row that carries a policy; cells that also cover policy rows and forced EOU | Passing the arguments only for policy steps makes the option change the transaction: policy-free rows' endpoint pages would differ from `B_hook`'s, and a policy-free row that schedules the EOU token would be rejected instead of forced, against TXG-EQ-001. Forcing EOU only for policy rows changes `B_hook` itself, a session-protocol decision outside this component. Policy evaluation and forced EOU arise only from a direct engine client and have no qualification evidence, so they wait for cells of their own (Deferred 6) |

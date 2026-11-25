@@ -461,8 +461,9 @@ events (the finish event, optional usage, and `[DONE]`) are sent as for any mode
 ## Completion
 
 A file's transcript is complete only when its request finishes with EOS after the final tail. Core's
-serving returns the text for any ending, so an `error` or `abort` ending (for example a preempted
-slot, whose queued labels are lost) returns partial text on a core without vllm#67144, and a
+serving returns the text for any ending, so an `error` or `abort` ending (for example a file the
+model fails, or an abort, either of which loses the file's queued labels) returns partial text on
+a core without vllm#67144, and a
 server-caused `length` on a core without vllm#67151 (Input length). Beam search and every client completion limit are refused by the model before
 submission (Request guards), so neither can truncate a transcript.
 

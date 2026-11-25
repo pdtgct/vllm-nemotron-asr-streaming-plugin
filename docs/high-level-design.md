@@ -362,8 +362,11 @@ the leaf designs cite them where they depend on them.
   `--num-gpu-blocks-override` block count when that is set, then
   releases that capture through `clear_cudagraphs` and plans the state pages, then binds the
   serving state pages and captures again. The model's profiling capture therefore captures the same graphs as
-  its serving capture, or graphs with at least their memory, and the model keeps nothing derived
-  from the profiling state pages once `clear_cudagraphs` returns. Core locks the workspace after the
+  its serving capture, or graphs with at least their memory. When `clear_cudagraphs` returns, the
+  plugin's objects hold the profiling state pages only through the references that core installed and
+  clears in its teardown of the profiling KV cache (the state layer's `kv_cache` and the model
+  state's `_state_group_layouts`), so after that teardown no object of the plugin keeps those pages
+  allocated (the `registration` design, REG-STATE-018). Core locks the workspace after the
   serving capture, so all workspace-backed memory is sized by the time that capture returns.
 - **Graph memory is charged before capacity is fixed when core estimates it.** The default
   segment graphs retain about 2.3 GiB at 64 rows and 17.4 GiB at 128 at the 320 ms geometry
