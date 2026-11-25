@@ -235,10 +235,11 @@ Validation never changes `encoder_execution_arm` or `decode_dispatch_arm`: a val
 
 ## Engine settings
 
-The persistent-state model needs one copy of each session's state and a single device. It
-accepts asynchronous scheduling in every setting (`async_scheduling` `True`, `False` or unset):
-core's per-request barrier for state models schedules no state request while the output of its
-previous step is still in flight, so each stream still advances one step at a time. The worker
+The persistent-state model needs one copy of each session's state and a single device. With
+transaction graphs off it accepts asynchronous scheduling in every setting (`async_scheduling`
+`True`, `False` or unset): core's per-request barrier for state models schedules no state request
+while the output of its previous step is still in flight, so each stream still advances one step
+at a time. With transaction graphs on it accepts only `False` (the restricted startup, below). The worker
 also stays one step at a time for the model under either setting: it runs a step's
 `postprocess_state` before it executes the next step, and there the model waits for the step's
 commit event, which follows every device read of the step's staged inputs and state, then reads
@@ -252,8 +253,15 @@ that still reads the request's buffers. Native burst, whose sampler reads ahead 
 specified (Future roadmap 9), so it meets asynchronous scheduling nowhere yet. The plugin
 refuses:
 - on this core, native burst (`experimental_native_burst`), at model construction and in the
-  configuration hook, naming the state layer and the remedy of removing it; transaction graphs are
-  refused here too, by the transaction-graph component's configuration checks (Future roadmap 8);
+  configuration hook, naming the state layer and the remedy of removing it;
+- while transaction graphs are on, every startup outside the **restricted startup** of the
+  `transaction-graph` design's configuration checks: an `async_scheduling` other than `False`
+  (TXG-CFG-017), a `cudagraph_mode` or compilation mode other than an explicit NONE
+  (TXG-CFG-018), and neither `--num-gpu-blocks-override` nor a positive `--kv-cache-memory-bytes`
+  (TXG-CFG-019), each named with its remedy; and a core whose `ModelState` lacks
+  `state_group_layouts` (TXG-CFG-016). The restriction holds until core's profiling and extensible
+  KV caches support a model-state capture over state pages and the qualification covers the other
+  settings (Future roadmap 8);
 - prefix caching: `enable_prefix_caching = True` in the resolved configuration. An unset command-line
   option arrives already `False`: `EngineArgs` resolves it from the model, which reports prefix
   caching as unsupported when it declares persistent state. A configuration built directly with
@@ -360,8 +368,7 @@ Two runner configurations are accepted:
   - **platform**: CUDA (remedy `--enforce-eager`).
   - **hook-captured graphs**: at least one graph the hook captures, the `eager-graphed` encoder,
     the `dense-graphed` decoder, or transaction graphs (remedy: select the `eager-graphed` encoder
-    or the `dense-graphed` decoder, or `--enforce-eager`; transaction graphs are refused on this
-    core); and no graph it does not capture: the compiled `dense-graphed` encoder
+    or the `dense-graphed` decoder, or `--enforce-eager`); and no graph it does not capture: the compiled `dense-graphed` encoder
     arm and CHUNK-bucket graphs (`chunk_bucket_graph_populations`) are refused with the remedy
     `--enforce-eager`. The eager arms alone capture nothing, so they need `--enforce-eager`.
 
@@ -369,6 +376,12 @@ Two runner configurations are accepted:
 command without runner options selects. A refusal names each unmet condition with its remedy;
 every remedy that names `--enforce-eager` also names removing `transaction_graph_populations`
 when it is set (the option is refused under `--enforce-eager`).
+
+While transaction graphs are on, the hook configuration narrows to explicit
+`-cc.cudagraph_mode none -cc.mode none` (TXG-CFG-018): every other accepted mode, an unset one
+included, is refused, and the remedies of the graph-mode, breakable-piecewise and
+compilation-mode conditions name only `-cc.cudagraph_mode none` and `-cc.mode none`. The
+`transaction-graph` design owns that condition; this design's conditions still apply beside it.
 
 One function in `engine_flags` holds these conditions. Three stages apply it, each to what core
 has settled by then:
@@ -399,9 +412,13 @@ core therefore reduces only when it initializes the KV cache, is not identical t
 engine configuration sizes core's graph capture sizes from the requested mode, and core's
 profiling KV-cache initialization, with it the state group of the profiling capture,
 holds `min(max_num_seqs, the largest capture size) or 1` pages, where an explicit NONE, or a
-mode reduced while the configuration is built, has no capture sizes and so holds one. The model's
-graphs and its serving state pages do not change; the profiling capture's transient memory does
-(Future roadmap 3).
+mode reduced while the configuration is built, has no capture sizes and so holds one. A set
+`num_gpu_blocks_override` replaces that count, so the profiling KV cache then holds the override's
+block count, the serving page count (`may_override_num_blocks` in
+`vllm/v1/core/kv_cache_planning.py`). The model's graphs and its serving state pages do not
+change; the profiling capture's transient memory does (Future roadmap 3). Transaction-graph cells
+capture over `N` pages beside the null page, which is one reason the restricted startup requires
+an explicit block count or KV budget.
 
 ### Qualification of the runner configurations
 
@@ -448,6 +465,12 @@ The plugin needs #67583's model-state hooks in every configuration: `prepare_exe
 model-adapter dependency check (below) lists them, so a worker on such a core also fails before
 any weights load. Under `--enforce-eager` core still calls `prepare_execution_memory`,
 `post_warmup` and `shutdown`.
+
+While transaction graphs are on, the model also needs core's state-group layout accessor,
+`ModelState.state_group_layouts`, through which their cells reach the state pages (the
+`transaction-graph` design, Rules of the capture call). Model construction checks it as a
+conditional dependency (Model-adapter dependencies), and the configuration checks refuse the
+option on a core without it (TXG-CFG-016).
 
 ### README serve command
 
@@ -559,8 +582,8 @@ workspace, which core locks after the serving capture.
   segment graphs copy state into and out of their own static buffers, and the gather from and
   scatter to the pages run outside any segment graph, so neither preparation, the profile
   transaction nor segment-graph capture reads the state layer's views, a page or its address, in
-  either runner configuration. Transaction-graph cells, which would reach the pages from inside
-  their graphs, are refused on the target core (Engine settings).
+  either runner configuration. Transaction-graph cells reach the pages from inside their graphs,
+  through `state_group_layouts`; the `transaction-graph` design owns that access.
 - **Once per worker.** A failure of preparation marks the worker failed, discards partial execution
   state and raises, so startup fails; the next attempt is a fresh worker.
 - **Readiness on every real step.** The model refuses any real step that runs model execution unless
@@ -699,7 +722,10 @@ capture line's retained figure is the span of the call's segment-graph part.
   `decode_dispatch_arm` `dense-eager` with `chunk_bucket_graph_populations` and
   `transaction_graph_populations` empty, together with `--enforce-eager`; under a fixed budget,
   also a smaller `--kv-cache-memory-bytes`; for a serving capture
-  under a profiled budget, also a lower `--gpu-memory-utilization`. The serving-over-profiling
+  under a profiled budget, also a lower `--gpu-memory-utilization`, or, when
+  `--num-gpu-blocks-override` fixes the block count (and with it the state pages), a smaller block
+  count that still holds a page for every request that can be active and, while transaction graphs
+  are on, for the largest population. The serving-over-profiling
   failure names both call totals, `r` and the excess, with the same remedies. Whatever the
   failure, the propagated error holds no reference to the tensors or graphs the capture created:
   the cleanup clears the local variables of the finished frames in its traceback and in the
@@ -791,7 +817,10 @@ and binds it again when the extensible KV cache grows, so the layer replaces its
 binding. The extensible KV cache keeps every block at a fixed offset in its reservation, and it
 grows once, while the engine initializes, before the worker serves; its only other growth is in
 the synthetic warmup that the model declines. A rebinding therefore rebuilds the views over the
-same addresses, and no page moves while a request holds it.
+same addresses, and no page moves while a request holds it. While transaction graphs are on, the
+restricted startup turns the extensible KV cache off, and the state layer reports any binding
+after the serving capture to the transaction-graph binding, which checks it against the layout
+its cells captured (TXG-LIFE-009).
 
 - **Slot.** A request's slot is its one block, `block_ids[0][0]` of the `NewRequestData` core
   delivers to `add_request`, whose `block_ids` must hold exactly one group of exactly one block;
@@ -905,9 +934,9 @@ is imported:
 | `vllm.v1.attention.backends.registry` | `MambaAttentionBackendEnum`, with its member `PERSISTENT_STATE` |
 | `vllm.model_executor.models.interfaces` | `SupportsPersistentState` |
 | `vllm.v1.worker.gpu.input_batch` | `InputBatch` |
-| `vllm.v1.worker.gpu.model_states.interface` | `ModelState`, with its hooks `prepare_execution_memory`, `needs_cudagraph_capture`, `capture_cudagraphs`, `clear_cudagraphs`, `post_warmup` and `shutdown`, its `get_additional_cg_support` and its `take_failed_requests` |
+| `vllm.v1.worker.gpu.model_states.interface` | `ModelState`, with its hooks `prepare_execution_memory`, `needs_cudagraph_capture`, `capture_cudagraphs`, `clear_cudagraphs`, `post_warmup` and `shutdown`, its `get_additional_cg_support`, its `take_failed_requests` and, conditionally, its property `state_group_layouts` |
 | `vllm.v1.worker.gpu.states` | `RequestState` |
-| `vllm.v1.worker.utils` | `AttentionGroup` |
+| `vllm.v1.worker.utils` | `AttentionGroup`; conditionally, the attributes `StateGroupLayout.layers` and `StateComponentLayout.tensor` of the layouts the state-group layout accessor returns, read without importing either class |
 | `vllm.multimodal` | `MULTIMODAL_REGISTRY` |
 | `vllm.v1.attention.backends.utils` | `NULL_BLOCK_ID` |
 | `vllm.v1.worker.gpu.sample.output` | `SamplerOutput` |
@@ -920,14 +949,15 @@ is imported:
 | `vllm.utils.torch_utils` | `direct_register_custom_op` |
 | `vllm.model_executor.determinism.batch_invariant` | the batch-invariant matmul used by the batch-invariant mode |
 
-Two groups of rows are conditional. The graph-runtime rows (`graph_capture`, `BatchDescriptor`,
+Three groups of names are conditional. The graph-runtime rows (`graph_capture`, `BatchDescriptor`,
 `set_forward_context`, `current_platform`, `resolve_obj_by_qualname`, `capture_pool` and
 `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS`) are imported when graphed execution is configured; the
-batch-invariant row when that mode is. The import-time check covers the rest, the six hooks of
-`ModelState`, its `get_additional_cg_support` and `take_failed_requests`, the `recomputable`
-parameter and the `PERSISTENT_STATE` member included. The table has no transaction-graph row:
-transaction graphs are refused on the target core before any dependency of theirs is needed
-(Engine settings; Future roadmap 8). vLLM's model-registration, config
+batch-invariant row when that mode is; and the transaction-graph names (`state_group_layouts` and
+the two layout attributes) are checked at model construction while transaction graphs are on,
+where a missing one raises naming it (REG-018). The import-time check covers the rest, the six
+hooks of `ModelState`, its `get_additional_cg_support` and `take_failed_requests`, the
+`recomputable` parameter and the `PERSISTENT_STATE` member included. A property such as
+`state_group_layouts` counts as defined; the check does not require it to be callable. vLLM's model-registration, config
 parser, tokenizer and renderer registries, model configuration hooks (`VerifyAndUpdateConfig`,
 `MODELS_CONFIG_MAP`), speech-to-text configuration, multimodal processing, `SupportsTranscription`,
 logging and Hub file helpers, which out-of-tree models use, are outside this table, as is the public
@@ -968,7 +998,7 @@ adding it here and to the import-time check.
 | Graphed arms without static graphs | A stand-in wrapper that runs each entry eagerly, keeping the graphed arms' inventory and serving path | Refusing graphed arms off CUDA; resolving the default arms to the eager arms there | The card's default arms are graphed, so a refusal would fail every non-CUDA run of the default configuration, and silently switching arms would leave the graphed staging and checks untested off CUDA; the stand-in keeps one path whose outputs equal the eager arms' |
 | Core's runner graphs over the forward | None: the model state reports `AttentionCGSupport.NEVER`, core reduces every graphed mode it can to NONE, and the plugin refuses FULL and a piecewise mode under breakable graphs | Refuse every graphed mode; register the stateful segment operations as splitting ops; breakable graphs with host planning inside break operations; core full graphs with the model running eagerly during core's capture | Refusing would make every serve command without runner options name `-cc.cudagraph_mode none` while core can already reduce the mode itself, as it does for encoder-only model states. Splitting ops split a compiled graph, and the forward is not traceable; the code between its stateful segments is index uploads and a projection. Inside a breakable graph the whole forward would be one break operation, so core would capture nothing of value until planning and staging move out of the forward (Future roadmap 5). Core's full graphs replay without calling the forward, so its host planning would not run. The model's own graphs, captured through the hook, already key on its step shapes |
 | Compilation modes | Accept NONE, `DYNAMO_TRACE_ONCE` and `VLLM_COMPILE`, which compile nothing in an undecorated model, and a requested `STOCK_TORCH_COMPILE` that core sets to NONE; refuse `STOCK_TORCH_COMPILE` that would reach the runner | Require compilation off; accept every mode | The model has no `CustomOp` subclass, whose dispatch the compilation mode's `custom_ops` selects, so a compilation mode changes no operator dispatch in the model; `STOCK_TORCH_COMPILE` compiles the whole model with `fullgraph=True`, which a forward with host reads cannot pass |
-| Asynchronous scheduling | Accepted | Refuse it | Core's per-request barrier for state models runs each stream one step at a time, which is the property the model needs; the model reads commit status in `postprocess_state`, before the next step executes |
+| Asynchronous scheduling | Accepted while transaction graphs are off; refused while they are on (TXG-CFG-017) | Refuse it always; accept it with transaction graphs too | Core's per-request barrier for state models runs each stream one step at a time, which is the property the model needs; the model reads commit status in `postprocess_state`, before the next step executes. Transaction graphs' baseline `B_hook` and their qualification run synchronously, and the worker's call order under asynchronous scheduling is unverified with cells |
 | Core hooks | Required in every configuration; a core without them is refused | Detect them and fall back to profiling-step capture | One core API to test (HLD, Key Design Decisions, Core API) |
 | Load-time checks | The state-layer surface in `register()` (the six model-state hooks, `take_failed_requests`, the `recomputable` parameter, `PERSISTENT_STATE` and `SupportsPersistentState`), none of which needs a model class module; every adapter symbol at model import | All checks in `register()`; only the hooks and `recomputable` in `register()`; a check of client calls in `register()` | `register()` and the session factory do not import the model class modules, so loading the plugin stays cheap, and a core that lacks any part of the state layer fails at plugin load, before model configuration; core's speech-to-text serving imports the model class in the API server when it starts, so importing it initializes no device and loads no weights. The target core admits a stream without a client call to check, and the session factory checks its own calls |
 | Whether the forward reads positions | `persistent_state_reads_positions = False`, declared | Core's default, True | The forward discards `positions`. Core compacts this model's history either way, because its only KV-cache group is non-recomputable; with True, compaction adds every dropped token to the request's position offset, which core counts against `max_model_len`, so a long session would end with a length cap for no gain |
@@ -989,7 +1019,11 @@ adding it here and to the import-time check.
 - Supported tasks, model-state hooks and `take_failed_requests`:
   `vllm/v1/worker/gpu/model_states/interface.py` (hooks from vllm#67583); graph-pool routing:
   `vllm/compilation/cudagraph_pool.py`.
-- The target core's state layer (`pdtgct/vllm` at `ac2ef47540`): `SupportsPersistentState` in
+- The target core's state layer (`pdtgct/vllm` at `ddf6db2ab8`): the state-group layout accessor
+  `ModelState.state_group_layouts` in `vllm/v1/worker/gpu/model_states/interface.py`, with
+  `StateGroupLayout` and `StateComponentLayout` in `vllm/v1/worker/utils.py`; the profiling KV
+  cache's size in `vllm/v1/worker/gpu/cudagraph_utils.py` and the block-count override in
+  `vllm/v1/core/kv_cache_planning.py`; `SupportsPersistentState` in
   `vllm/model_executor/models/interfaces.py`; the state-group check
   `verify_persistent_state_groups` in `vllm/v1/core/kv_cache_utils.py`; `MambaSpec` and its
   `initial_values` in `vllm/v1/kv_cache_interface.py`; `StatePageInitializer` in
@@ -1044,14 +1078,21 @@ Each item names what is deferred, the trigger that reopens it and the shape of t
 7. **`STOCK_TORCH_COMPILE`.** Trigger: item 5 leaves a forward that Dynamo can trace whole.
    Shape: accept the mode once the traced forward's transcripts equal `--enforce-eager`'s at every
    configured chunk size.
-8. **Transaction graphs on the state layer.** The model refuses `transaction_graph_populations`
-   on this core, which has no state-group layout accessor to capture its state pages through.
-   Trigger: core provides that accessor with fixed page addresses. Shape: capture through the
-   accessor in the hook configuration at the 80 and 160 ms geometries, accepted only with an
-   explicit `cudagraph_mode` NONE, compilation mode NONE and synchronous scheduling (the cells'
-   baseline `B_hook`) until the transaction-graph qualification covers the reduced modes, whose
-   profiling KV caches hold more state pages, and asynchronous scheduling. The accessor's members
-   join the dependency table as conditional rows, checked while transaction graphs are on (REG-018).
+8. **Transaction graphs beyond the restricted startup.** While transaction graphs are on, the
+   plugin accepts only synchronous scheduling, an explicit `cudagraph_mode` NONE with compilation
+   mode NONE, and an explicit block count (`--num-gpu-blocks-override`) or KV budget
+   (`--kv-cache-memory-bytes`) (Engine settings). The block-count condition exists because core's
+   minimal profiling KV cache holds `min(max_num_seqs, max_cudagraph_capture_size) or 1` blocks,
+   one under an explicit NONE, too few for a capture over `N` state pages, and because the
+   extensible KV cache backs only its first blocks when the serving capture runs and grows without
+   refreshing `state_group_layouts`. Triggers: core sizes its profiling KV cache for a model state
+   that captures over state pages, and backs the state group's pages before the model-state
+   capture or refreshes the layouts when the extensible KV cache grows (the condition on block
+   count or budget then drops); the transaction-graph qualification at the reduced modes, whose
+   profiling KV caches hold more state pages, and with asynchronous scheduling (those conditions
+   then drop). Shape: the `transaction-graph` design's Future roadmap; here, REG-ENG-001,
+   REG-ENG-011 and REG-ENG-026 lose their transaction-graph exceptions and REG-ENG-005 its
+   narrowed remedies as each condition drops.
 9. **Native burst on the state layer, with asynchronous scheduling.** Native burst is refused on
    this core: its history check requires a turn with `num_computed_tokens` 0 whose prompt is its
    whole history, and core delivers each later input compacted, with `num_computed_tokens` 1
