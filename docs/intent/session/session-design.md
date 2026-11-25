@@ -7,6 +7,12 @@ prefix: SESS
 
 ## Context and Design Philosophy
 
+Scope: this design specifies the session factory over vLLM's admitted-stream client path
+(`stream_admission`, `wait_stream_retired`). The target core of the high-level design admits state
+streams itself and offers no such client path, so there the factory refuses and core's routes serve
+the model; porting the factory to core's admission is this design's Future roadmap. The model-side
+obligations below (row status, failure through the model state) apply on the target core.
+
 A session is one live audio stream on one RFC 1 state slot. This component gives protocol
 frontends a session API (open, feed, flush, abort, release) over vLLM's admitted-stream client
 path. It owns the packer that turns 16 kHz audio into the model's input units, and the projection
@@ -272,9 +278,10 @@ device geometry status remains a cross-check behind it.
 
 **Row status in the model.** No row status is recoverable. When a scheduled stream row's
 collected status resolves to any nonzero value, with transaction graphs on or off, the model
-state's `postprocess_state` fails that request alone through `state_slots.fail_requests`, and the
-step and its other rows continue. The request ends with finish reason `error`, which the session
-maps to `abnormal_end` (SESS-ENG-009 for a unit outstanding, SESS-EXP-001 for an idle lease).
+state's `postprocess_state` fails that request alone, recording it for the model state's
+`take_failed_requests` (the `registration` design, Row failure), and the step and its other rows
+continue. The request ends with finish reason `error`, which the session maps to `abnormal_end`
+(SESS-ENG-009 for a unit outstanding, SESS-EXP-001 for an idle lease).
 Admission rejections are a different path: core reports them as rejection outputs, and the
 session handles them by SESS-ENG-003 to SESS-ENG-007.
 
@@ -300,7 +307,9 @@ the factory that `create_session_factory` returns for `Nemotron3_5AsrStreamingFo
 this repository's engine double. Each suite test carries its own `asyncio` mark. The tier 1 record
 names the tag and the command it ran. A run in which either distribution is missing, `seam` is not
 defined, or the suite's tests are skipped does not meet tier 1. The suite's parts that need a real
-engine client on the stage 2 build (the GPU lane) are not tier 1; they belong to tier 2.
+engine client on the stage 2 build (the GPU lane) are not tier 1; they belong to tier 2. The suite
+covers this design's stream-admission client path, which the target core does not run (Future
+roadmap 1); the engine double models that path, so a pass makes no claim for the target core.
 
 ## Core `/v1/realtime`
 

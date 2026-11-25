@@ -33,13 +33,15 @@ entry-point names and must include `nemotron_asr_streaming`; otherwise the parse
 mode below do not exist and core rejects `--config-format nemotron_asr_streaming` as unknown.
 
 `register()` performs the following, and changes no registry until the core check has passed:
-1. **Core check.** The installed vLLM's `ModelState` must define the six model-state hooks of
-   vllm#67583 (Core hooks, below), and `MambaManager.layer_config` must accept `recomputable`,
-   the parameter through which a state layer declares a KV-cache group that its tokens cannot
-   rebuild. A missing one raises, naming each and stating that the plugin needs a vLLM build with
-   RFC 1's state layer and vllm#67583's model-state hooks. The rest of the state-layer surface the
-   model uses (`SupportsPersistentState`, `MambaAttentionBackendEnum.PERSISTENT_STATE`,
-   `ModelState.take_failed_requests`) is checked when the model class is imported
+1. **Core check.** The installed vLLM must carry the state-layer surface the model uses:
+   `ModelState` defines the six model-state hooks of vllm#67583 (Core hooks, below) and
+   `take_failed_requests`; `MambaManager.layer_config` accepts `recomputable`, the parameter
+   through which a state layer declares a KV-cache group that its tokens cannot rebuild;
+   `MambaAttentionBackendEnum` has the member `PERSISTENT_STATE`; and
+   `vllm.model_executor.models.interfaces` defines `SupportsPersistentState`. None of these checks
+   imports a model class module. A missing item raises, naming each and stating that the plugin
+   needs a vLLM build with RFC 1's state layer and vllm#67583's model-state hooks. The whole
+   model-adapter dependency table is checked again when the model class is imported
    (Model-adapter dependencies). `register()` checks no client call: on the target core
    `AsyncLLM.generate` admits a persistent-state stream without an admission argument, and the
    session factory checks its own calls (the `session` design). `register()` initializes no device
@@ -243,9 +245,10 @@ commit event, which follows every device read of the step's staged inputs and st
 the step's commit status. A request that leaves the engine (finish, abort, error; core never
 preempts a request whose state cannot be recomputed) reaches the model state through
 `remove_request`, which core calls when it applies the next step's finished request IDs, also on
-a step with no forward work; the model state retires the request at its next call (State-slot
-access), so cleanup never races a step that still reads the request's buffers. Native burst,
-whose sampler reads ahead of the scheduler, is refused on the state layer until its port there is
+a step with no forward work. The model state retires a file request in that call and a stream
+request at its next model-state call (State-slot access, Retirement and turn continuation). By
+then the worker has run the previous step's `postprocess_state`, so retirement never races a step
+that still reads the request's buffers. Native burst, whose sampler reads ahead of the scheduler, is refused on the state layer until its port there is
 specified (Future roadmap 9), so it meets asynchronous scheduling nowhere yet. The plugin
 refuses:
 - on this core, native burst (`experimental_native_burst`), at model construction and in the
@@ -254,18 +257,16 @@ refuses:
 - prefix caching: `enable_prefix_caching = True` in the resolved configuration. An unset command-line
   option arrives already `False`: `EngineArgs` resolves it from the model, which reports prefix
   caching as unsupported when it declares persistent state. A configuration built directly with
-  `True` is refused here (and by core's state validation);
+  `True` is refused by core's own check before this rule runs (Core's checks first, below);
 - speculative decoding, KV transfer, dual-batch overlap, sleep mode, the cumem allocator,
   hierarchical sparse attention, fault tolerance (`parallel_config.enable_fault_tolerance`;
   `--fault-tolerance-config` turns it on, and the refusal names that cause) and elastic expert
   parallelism (`parallel_config.enable_elastic_ep`, whose reconfiguration reruns the worker's
   warmup and so would call the serving capture again over live state pages; A second serving
-  capture, below). Core itself refuses fault tolerance and elastic expert parallelism for a model
-  that declines synthetic warmup (Synthetic warmup, below), and refuses prefix caching for every
-  persistent-state model, in its own configuration check, which runs before the configuration
-  hook; the plugin's refusals repeat those rules in the configuration hook and at construction.
-  Moving execution preparation into core's profiling step does not make sleep mode or the cumem
-  allocator usable: both stay refused, so there is no wake-up re-preparation;
+  capture, below). Core refuses several of these settings itself, before the configuration hook
+  (Core's checks first, below). Moving execution preparation into core's profiling step does not
+  make sleep mode or the cumem allocator usable: both stay refused, so there is no wake-up
+  re-preparation;
 - any tensor, pipeline, data, decode-context or prefill-context parallel size other than 1 (a
   setting the build does not have counts as 1);
 - a runner configuration other than the two of Runner configurations, below.
@@ -276,6 +277,21 @@ an unset `cudagraph_mode` or compilation mode is not accepted.
 On a core that runs native burst, its own configuration check, run at model construction, applies
 the same rule for a setting the build does not define: a parallel size counts as 1 and expert
 parallelism as off.
+
+**Core's checks first.** While core builds the engine configuration (`VllmConfig.__post_init__`),
+its persistent-state check (`_verify_persistent_state_config`) runs before the configuration hook
+(`try_verify_and_update_config`) and raises `ValueError` with the message `<option> is not
+supported for this model` for the first setting it finds of: `enable_prefix_caching`; a KV
+connector (`kv_transfer_config`); an EC connector (`ec_transfer_config`); speculative decoding
+(`speculative_config`); a pipeline, data or tensor parallel size above 1; multi-dimensional rotary
+positions (M-RoPE), which this model does not use; fault tolerance's `request_failure_policy`
+`recompute`; and, because the model declines synthetic warmup (below), `enable_fault_tolerance`
+and `enable_elastic_ep`. For these settings the operator sees core's message, which names one
+setting; the configuration hook does not run. The plugin keeps its own rules for them (REG-ENG-002
+to REG-ENG-004), which list every failed check when the hook is called directly on such a
+configuration. Core's check does not cover decode-context and
+prefill-context parallelism, dual-batch overlap, sleep mode, the cumem allocator or hierarchical
+sparse attention; for them the configuration hook's refusal is the operator's message.
 
 ### Synthetic warmup
 
@@ -383,8 +399,9 @@ core therefore reduces only when it initializes the KV cache, is not identical t
 engine configuration sizes core's graph capture sizes from the requested mode, and core's
 profiling KV-cache initialization, with it the state group of the profiling capture,
 holds `min(max_num_seqs, the largest capture size) or 1` pages, where an explicit NONE, or a
-mode reduced while the configuration is built, has no capture sizes and so holds one. The model's graphs and its serving pools do
-not change; the profiling capture's transient memory does (Future roadmap 3).
+mode reduced while the configuration is built, has no capture sizes and so holds one. The model's
+graphs and its serving state pages do not change; the profiling capture's transient memory does
+(Future roadmap 3).
 
 ### Qualification of the runner configurations
 
@@ -511,9 +528,11 @@ configured CHUNK-bucket graph population; transaction graphs add no shape to it.
 workspace, which core locks after the serving capture.
 
 - **Step classification.** Core gives the model state no record of why it runs a step, so the
-  model state's `prepare_inputs` classifies each step from what it has seen: a step with a row
-  whose request ID `add_request` never recorded is a *dummy step* (core's dummy batches carry
-  fresh request IDs), every other step is a *real step*, and a dummy step for which core called
+  model state's `prepare_inputs` classifies each step by the requests it holds at that moment,
+  after deciding any pending removal (State-slot access): a step with a row whose request the
+  model state does not hold, because it never recorded the request or has retired it, is a
+  *dummy step* (core's dummy batches carry fresh request IDs), every other step is a *real step*,
+  and a dummy step for which core called
   no `prepare_attn` since the previous `prepare_inputs` is a *profiling dummy step* (core's
   profiling run builds no attention metadata). A dummy step's projection reads no page
   (`no_page_io`).
@@ -534,7 +553,7 @@ workspace, which core locks after the serving capture.
   accepted as pending).
 - **Other dummy steps.** On a dummy step the model reads no page, no recorded request and nothing
   left from an earlier real step. Core's dummy batches carry only fresh request IDs, so no row of
-  a dummy step names a request the model state recorded.
+  a dummy step names a request the model state holds.
 - **No state page needed.** Preparation, capture and profiling use model-owned scratch state built
   from the model's state layout (`StateLayout`, built from the checkpoint's state manifest):
   segment graphs copy state into and out of their own static buffers, and the gather from and
@@ -620,7 +639,7 @@ and raises at the call's entry, before capturing; while transaction graphs are o
 
 **A second serving capture.** A serving capture after a serving capture was attempted, whether or
 not the attempt succeeded, raises at the call's entry, stating that recapture over live state
-pools is not supported and that the recovery is an engine restart, and naming
+pages is not supported and that the recovery is an engine restart, and naming
 `transaction_graph_populations` while transaction graphs are on. The refusal is keyed on the
 attempt, not on segment graphs existing, because a failed attempt discards the graphs it captured.
 Core reaches it only through an elastic expert-parallel reconfiguration, which the plugin refuses.
@@ -703,10 +722,10 @@ these overrides, which the runner calls on the worker:
 | Method | What the model state does |
 | --- | --- |
 | `add_request(req_index, new_req_data)` | Decides a pending removal, records the request (its prompt, slot, admission generation and `NewRequestData`) and takes a file request's samples (State-slot access; the `transcription` design). |
-| `remove_request(req_id)` | Records one pending removal, which the model state's next call decides (State-slot access). |
+| `remove_request(req_id)` | Decides a pending removal, then retires a file request at once or records a stream request as the one pending removal, which the model state's next call decides (State-slot access). |
 | `initialize_kv_cache(kv_cache_config, block_tables)` | Checks that the one KV-cache group holds exactly the state layer and that core bound its pages, then the resolved runner mode (REG-ENG-017). |
-| `prepare_inputs(input_batch, req_states)` | Classifies the step (Execution memory), refuses a real row that schedules more than one token, binds the step's rows to their slots and plans the step once. |
-| `prepare_attn(...)` | Builds no attention metadata and returns `{}`; refuses a capture, a FULL step and a micro-batch (REG-ENG-029). |
+| `prepare_inputs(input_batch, req_states)` | Decides a pending removal, classifies the step (Execution memory), fails at planning a real row that schedules more than one token (Error boundary, below), binds the step's rows to their slots and plans the step once. |
+| `prepare_attn(...)` | Decides a pending removal, builds no attention metadata and returns `{}`; refuses a capture, a FULL step and a micro-batch (REG-ENG-029). |
 | `postprocess_state(...)` | Waits for the step's commit event, collects the step's commit status, applies file queue counts, and records the step's failed requests (Row failure, below). |
 | `take_failed_requests()` | Returns the requests `postprocess_state` recorded as failed and clears the record. |
 
@@ -717,17 +736,42 @@ Supported tasks.
 **Row failure.** A step can fail some of its rows and complete the others. A row fails when its
 collected commit status resolves to a nonzero value (the `session` design, Row status in the
 model), when the model state failed it at planning (the `transaction-graph` design, TXG-FAIL-008,
-with transaction graphs on or off), and when it is a file row with no accepted queue count (the
-`transcription` design, Queue counts). `postprocess_state` records each such request and raises
-no error for it. The runner asks once per step, after `postprocess_state`, through
+with transaction graphs on or off; Error boundary, below), and when it is a file row with no
+accepted queue count (the `transcription` design, Queue counts). `postprocess_state` records each
+such request and raises no error for it. The runner asks once per step, after `postprocess_state`, through
 `take_failed_requests`, which returns the recorded request IDs and clears the record; it returns
 `None` when none is recorded, and a dummy step records none. The IDs are the worker's request
 IDs, which are the IDs core's scheduler holds. Core's scheduler discards those rows' sampled
 tokens and finishes each such request alone with finish reason `error`, publishing a terminal
 output for a state stream, and ignores an ID it no longer holds. The failed request's record,
-file buffer and progress are retired like those of any finished request, after core's
-`remove_request`. The channel adds no host synchronization: `postprocess_state` already waits for
-the step's commit event before it reads the commit status (Engine settings).
+file buffer and progress are retired like those of any finished request, from core's
+`remove_request` (State-slot access). The channel adds no host synchronization:
+`postprocess_state` already waits for the step's commit event before it reads the commit status
+(Engine settings). The plugin's unit tests check the return-and-clear contract; the `gpu` test
+tier checks that a returned request ends with finish reason `error` while the step's other
+requests continue.
+
+**Error boundary.** The model state fails a request alone for every fault that the request's own
+prompt or multimodal items can cause, because a direct engine client can send any of them and a
+raise would end every stream on the server: a row that schedules more than one token, a scheduled
+window that crosses the end of the recorded prompt (State-slot access, Recorded prompt), a unit
+at another geometry (the `session` design, Geometry check in the model), and a malformed or
+foreign-geometry file item (the `transcription` design). Each such row fails at planning through
+the planning-failed set: it stays in the row plan at its scheduled position as a non-CHUNK row
+that the transaction rejects (the `transaction-graph` design, Option and configuration), and its
+request ends through `take_failed_requests`. A multi-token row's tokens are not classified. The
+model state raises for a violation of core's contract with the model state, which means that core
+and the model disagree about a request's state, so that no outcome confined to one request is
+safe: a `NewRequestData` that does not carry exactly one block, a slot outside the bound pages,
+and an `add_request` that neither starts nor continues a request (State-slot access). It also
+raises for the configuration and lifecycle refusals of Engine settings and Execution memory.
+
+**Exceptions.** Core ends the engine when a model-state method or the forward raises, so every
+raise is worker-fatal and no later step of the worker runs. `postprocess_state` records a step's
+failed requests only after the step's collection completes; if it raises, it first drops the
+step's plan and records no failed request for that step, so `take_failed_requests` never returns
+a partial set. Execution preparation and capture discard their partial state before they raise
+(Execution memory; Segment-graph memory, Capture failure).
 
 ## State-slot access
 
@@ -744,12 +788,16 @@ allocates the request's block when it first schedules the request, keeps it whil
 for its next input, frees it when the request finishes, and never preempts the request. It binds
 the group's memory through `MambaBase.bind_kv_cache`, one view per state with one row per block,
 and binds it again when the extensible KV cache grows, so the layer replaces its views on every
-binding.
+binding. The extensible KV cache keeps every block at a fixed offset in its reservation, and it
+grows once, while the engine initializes, before the worker serves; its only other growth is in
+the synthetic warmup that the model declines. A rebinding therefore rebuilds the views over the
+same addresses, and no page moves while a request holds it.
 
 - **Slot.** A request's slot is its one block, `block_ids[0][0]` of the `NewRequestData` core
-  delivers to `add_request`; block 0 is core's null block, so a valid slot lies between 1 and the
-  bound block count minus 1. The model state pairs the slot with an admission generation from its
-  own counter, new for every request that does not continue a live one (`SlotHandle`). The
+  delivers to `add_request`, whose `block_ids` must hold exactly one group of exactly one block;
+  block 0 is core's null block, so a valid slot lies between 1 and the bound block count minus 1.
+  The model state pairs the slot with an admission generation from its own counter, new for every
+  `add_request` that does not continue its request (`SlotHandle`). The
   `transcription` design records a file's host buffer with that pair.
 - **Fresh page.** A row is fresh when its `num_computed_tokens` is 0; core delivers that count
   exactly on the request's first step, the step on which its page is new. Core initializes a new
@@ -760,23 +808,38 @@ binding.
   writes run on the current stream before any read of the page. The layout has no bytes outside
   its states, so core's zeroing and the layer's agree on every byte except the blank labels
   (Future roadmap 11).
-- **Turn continuation.** For each input after a stream's first, core calls `remove_request` and
-  then `add_request` for the same request, with the compacted prompt and `num_computed_tokens` 1
-  (Recorded prompt, below); for a finished request it calls `remove_request` alone, and before it
-  adds any request it calls `remove_request` for that request's ID, which for an ID the model state
-  does not hold only decides an earlier pending removal. The model state therefore records one
-  pending removal and decides it at its next call. An `add_request` of the same request, with
-  `num_computed_tokens` above 0 and the same slot, continues the request: it keeps the request's
-  admission generation, file buffer and progress and replaces its recorded prompt. Every other call
-  retires the pending request first, dropping its record, its file buffer and progress, and its
-  failed-file mark. An `add_request` with `num_computed_tokens` above 0 that continues no live
-  request on its slot raises, naming the request, as does an `add_request` for a live request that
-  no removal preceded.
+- **Retirement and turn continuation.** For each input after a stream's first, core calls
+  `remove_request` and then `add_request` for the same request, with the compacted prompt and
+  `num_computed_tokens` 1 (Recorded prompt, below). For a finished request it calls
+  `remove_request` alone, also on a step with no forward work, and before it adds any request it
+  calls `remove_request` for that request's ID. A file request (File requests, below) is one
+  request that core never continues, so `remove_request` retires it within the call, dropping its
+  record, admission generation, file buffer, progress and failed-file mark; an idle engine keeps
+  none of them. A stream request's `remove_request` may precede its next turn, so the model state
+  holds that request as its one pending removal and decides the removal at its next model-state
+  call: the next call of `add_request`, `remove_request`, `prepare_attn` or `prepare_inputs`. An
+  `add_request` of the same request, with `num_computed_tokens` above 0 and the same slot,
+  continues the request: it keeps the request's admission generation and replaces its recorded
+  prompt and `NewRequestData`. Every other such call retires the pending request first, dropping
+  its record and admission generation. A finished stream's record therefore stays until the next
+  model-state call; it holds no host buffer, and core has already freed its page. A
+  `remove_request` for an ID the model state does not hold only decides an earlier pending
+  removal. An `add_request` for a live request (one held with no removal since its latest
+  `add_request`) raises, naming the request, whatever its `num_computed_tokens`, 0 included; so
+  does an `add_request` with `num_computed_tokens` above 0 that continues no request.
 - **Views per step.** During a real step, the model reads state only through the layer's views
   as bound at that step (`component_pools`, read when the step's `StateBatch` is built), for the
   slots of the step's rows, and refuses a slot outside the bound pages before it reads any.
 - **Commit check.** Before committing a step's state, the model checks that the commit's row order
-  and slots equal the step's bindings, and writes no state if they differ.
+  and slots equal the step's bindings, and writes no state if they differ. The check compares no
+  admission generation, because steps are serial for the model: core calls `add_request` and
+  `remove_request` only at the start of a step, and the worker runs a step's `postprocess_state`
+  before it starts the next (Engine settings), so no request is retired or admitted between a
+  step's planning and its commit, and the rows a step commits are the incarnations it planned.
+  Admission generations guard the host records that outlive a step: a file's buffer and queue
+  count (the `transcription` design) and the model's session registry, which resolves a status
+  report whose admission generation is not its request's current one as a failure, accepting no
+  queue count and publishing no progress from it.
 - **Projection.** The model's projection of the views into named state tensors
   (`project_nemotron_state_pools`) takes the views and the model's `StateLayout` and reads nothing
   else.
@@ -791,12 +854,14 @@ binding.
   and the row reads the new input from position 1. A position past the recorded prompt holds a
   token the sampler produced on the device; the host does not read it (that would synchronize
   with the device), and no sampled token is a CHUNK carrier, so the row is planned as a non-CHUNK
-  row. The record is dropped when the request is retired. For a file request this classifies only
-  the scheduled token's origin: the file step rule (`transcription`, FILE-ROW-002) decides whether
+  row. A scheduled window that crosses the end of the recorded prompt fails the row at planning
+  (Model-state interface, Error boundary). The record is dropped when the request is retired.
+  For a file request this classifies only the scheduled token's origin: the file step rule (`transcription`, FILE-ROW-002) decides whether
   the row executes as CHUNK, before transaction classification.
 - **File requests.** When `add_request` delivers a request whose scheduled token is the file
-  carrier, the model state takes the file's samples and header from the `NewRequestData` and host
-  data only (the `transcription` design, Request-owned host buffer).
+  carrier, the request is a *file request*, and the model state takes the file's samples and
+  header from the `NewRequestData` and host data only (the `transcription` design, Request-owned
+  host buffer). Every other request is a *stream request*.
 
 ## Supported tasks
 
@@ -905,12 +970,15 @@ adding it here and to the import-time check.
 | Compilation modes | Accept NONE, `DYNAMO_TRACE_ONCE` and `VLLM_COMPILE`, which compile nothing in an undecorated model, and a requested `STOCK_TORCH_COMPILE` that core sets to NONE; refuse `STOCK_TORCH_COMPILE` that would reach the runner | Require compilation off; accept every mode | The model has no `CustomOp` subclass, whose dispatch the compilation mode's `custom_ops` selects, so a compilation mode changes no operator dispatch in the model; `STOCK_TORCH_COMPILE` compiles the whole model with `fullgraph=True`, which a forward with host reads cannot pass |
 | Asynchronous scheduling | Accepted | Refuse it | Core's per-request barrier for state models runs each stream one step at a time, which is the property the model needs; the model reads commit status in `postprocess_state`, before the next step executes |
 | Core hooks | Required in every configuration; a core without them is refused | Detect them and fall back to profiling-step capture | One core API to test (HLD, Key Design Decisions, Core API) |
-| Load-time checks | The model-state hooks and the `recomputable` parameter in `register()`; every adapter symbol at model import | All checks in `register()`; a check of client calls in `register()` | `register()` and the session factory do not import the model class modules, so loading the plugin stays cheap; core's speech-to-text serving imports the model class in the API server when it starts, so importing it initializes no device and loads no weights. The target core admits a stream without a client call to check, and the session factory checks its own calls |
+| Load-time checks | The state-layer surface in `register()` (the six model-state hooks, `take_failed_requests`, the `recomputable` parameter, `PERSISTENT_STATE` and `SupportsPersistentState`), none of which needs a model class module; every adapter symbol at model import | All checks in `register()`; only the hooks and `recomputable` in `register()`; a check of client calls in `register()` | `register()` and the session factory do not import the model class modules, so loading the plugin stays cheap, and a core that lacks any part of the state layer fails at plugin load, before model configuration; core's speech-to-text serving imports the model class in the API server when it starts, so importing it initializes no device and loads no weights. The target core admits a stream without a client call to check, and the session factory checks its own calls |
 | Whether the forward reads positions | `persistent_state_reads_positions = False`, declared | Core's default, True | The forward discards `positions`. Core compacts this model's history either way, because its only KV-cache group is non-recomputable; with True, compaction adds every dropped token to the request's position offset, which core counts against `max_model_len`, so a long session would end with a length cap for no gain |
 | Core's synthetic warmup | Declined: `persistent_state_accepts_synthetic_warmup = False` | Core's default, True; recognizing warmup requests in the model state and serving them | Warmup requests schedule two tokens with non-greedy sampling, which the model state refuses, and they run by default on CUDA, where the extensible KV cache defaults on, even under `--enforce-eager`. No contract names a warmup request, so the model state could recognize one only by guessing. The cost is JIT compilation on the first serving steps |
 | Resumable stops | `persistent_state_resumable_stops = frozenset({"eos"})`, declared | `{"eos", "max_tokens"}`; `{"max_tokens"}` alone or an empty set | The park token is the only EOS and ends every unit. A resumable `max_tokens` stop would hide a unit that never parked and leave the session waiting for a park; without `"eos"`, every park would end the stream after one unit |
 | State group type | `MambaSpec` with `mamba_type` `PERSISTENT_STATE` | `SHORT_CONV`, the short-convolution type with the same KV-cache shape handling; another Mamba type | Core refuses a group its tokens cannot rebuild unless its spec is a `MambaSpec` of `mamba_type` `PERSISTENT_STATE`. The model builds no attention metadata, so the backend the type selects changes nothing else for it |
 | Per-request failure | `postprocess_state` records the step's failed rows and `take_failed_requests` returns them, so core finishes each failed request alone with finish reason `error` | Raise from `postprocess_state`; retry or roll back the row in the model | A raise ends the engine, and with it every stream on the server, for one row's failure. A retry or rollback cannot recover a row: a stream row's status is final, and a file row's position has already advanced (the `transcription` design). Core's channel needs no host synchronization beyond the wait `postprocess_state` already makes |
+| Faults a request's inputs cause | Fail the request alone at planning, through the planning-failed set and `take_failed_requests`; raise only for a violation of core's contract with the model state | Raise for every fault; fail a contract violation per request too | A direct engine client can send a multi-token prompt, a unit at another geometry or a malformed file item, and a raise would end every stream on the server for one client's input. A contract violation means core and the model disagree about a request's state, so no outcome confined to that request is safe |
+| Retirement of a finished request | A file request within `remove_request`; a stream request at the next model-state call | Every request at the next model-state call; every request within `remove_request` | A file is one request that core never continues, so nothing after its removal reads its buffer, and a deferred retirement would keep the last file's buffer (64,000 bytes per second of audio) on an idle engine. A stream's `remove_request` may precede its next turn's `add_request`, which keeps the admission generation, so retiring it at once would lose the generation a continuing turn needs; the deferred stream record holds no host buffer |
+| Settings core refuses before the configuration hook | Core's message, which names one setting (Engine settings, Core's checks first); the plugin keeps its own rules for them | Ask core to defer its check to the hook; drop the plugin's rules for those settings | Core's check runs while it builds the engine configuration, before the hook, and its message names the setting to remove, which is the remedy. The plugin's rules still list every failed check when the hook is called directly, and keep the plugin's refusals independent of core's list |
 | `generate` task | Not advertised (model-state override) | Advertise for compatibility | The model emits transcript labels, not text generation |
 
 ## References
@@ -926,7 +994,11 @@ adding it here and to the import-time check.
   `verify_persistent_state_groups` in `vllm/v1/core/kv_cache_utils.py`; `MambaSpec` and its
   `initial_values` in `vllm/v1/kv_cache_interface.py`; `StatePageInitializer` in
   `vllm/v1/worker/utils.py`; the synthetic-warmup decision in `vllm/v1/worker/gpu_worker.py`;
-  compaction and the failed-request path in `vllm/v1/core/sched/scheduler.py`.
+  compaction and the failed-request path in `vllm/v1/core/sched/scheduler.py`; the
+  persistent-state configuration check `_verify_persistent_state_config` in
+  `vllm/config/vllm.py`; the request add and remove order and `take_failed_requests` call in
+  `vllm/v1/worker/gpu/model_runner.py`; fixed block offsets and the one growth of the extensible
+  KV cache in `vllm/v1/worker/extensible_kv_cache.py` and `vllm/v1/engine/core.py`.
 - Plugin loading: `vllm/plugins/__init__.py`.
 - Card translation: `nemotron_asr/configuration_nemotron_asr.py`; geometries:
   `nemotron_asr/manifests.py` and `lookahead.py`.
@@ -950,9 +1022,9 @@ Each item names what is deferred, the trigger that reopens it and the shape of t
    that configuration.
 4. **Hook capture of the other graphed arms.** The compiled `dense-graphed` encoder and
    CHUNK-bucket graphs. Trigger: their exactness, fit and serving benefit are measured. Shape:
-   compilation and warm-up in `prepare_execution_memory`, profiling capture over core's profiling
-   pools, release in `clear_cudagraphs`, serving capture into core's graph pool, the same memory
-   accounting and serving-over-profiling check; the hook-configuration refusal and the arm table
+   compilation and warm-up in `prepare_execution_memory`, profiling capture over core's minimal
+   profiling KV cache, release in `clear_cudagraphs`, serving capture into core's graph pool, the
+   same memory accounting and serving-over-profiling check; the hook-configuration refusal and the arm table
    change, and their capture specs join REG-MEM-016 to REG-MEM-022.
 5. **Runner piecewise graphs through breakable CUDA graphs.** Core capturing the dense work
    between the model's stateful operations, with the model's graphs replayed inside core's eager
@@ -978,8 +1050,8 @@ Each item names what is deferred, the trigger that reopens it and the shape of t
    accessor in the hook configuration at the 80 and 160 ms geometries, accepted only with an
    explicit `cudagraph_mode` NONE, compilation mode NONE and synchronous scheduling (the cells'
    baseline `B_hook`) until the transaction-graph qualification covers the reduced modes, whose
-   profiling state pools hold more pages, and asynchronous scheduling. The accessor's members join
-   the dependency table as conditional rows, checked while transaction graphs are on (REG-018).
+   profiling KV caches hold more state pages, and asynchronous scheduling. The accessor's members
+   join the dependency table as conditional rows, checked while transaction graphs are on (REG-018).
 9. **Native burst on the state layer, with asynchronous scheduling.** Native burst is refused on
    this core: its history check requires a turn with `num_computed_tokens` 0 whose prompt is its
    whole history, and core delivers each later input compacted, with `num_computed_tokens` 1

@@ -327,7 +327,7 @@ the leaf designs cite them where they depend on them.
   releases that capture through `clear_cudagraphs` and plans the state pages, then binds the
   serving state pages and captures again. The model's profiling capture therefore captures the same graphs as
   its serving capture, or graphs with at least their memory, and the model keeps nothing derived
-  from the profiling pools once `clear_cudagraphs` returns. Core locks the workspace after the
+  from the profiling state pages once `clear_cudagraphs` returns. Core locks the workspace after the
   serving capture, so all workspace-backed memory is sized by the time that capture returns.
 - **Graph memory is charged before capacity is fixed when core estimates it.** The default
   segment graphs retain about 2.3 GiB at 64 rows and 17.4 GiB at 128 at the 320 ms geometry
@@ -349,8 +349,8 @@ the leaf designs cite them where they depend on them.
   that its graphs were not charged and the graph memory the serving capture retained, and a
   serving capture that cannot allocate fails startup with a message naming the option or segment
   arm, the graph whose capture failed (its cell, or its geometry, count or tier), the graph memory
-  captured so far, and the budget setting. The CuMem allocator and sleep mode are already refused
-  for every persistent-state model (core, and `registration`'s REG-ENG-003).
+  captured so far, and the budget setting. The plugin refuses the CuMem allocator and sleep mode
+  (`registration`'s REG-ENG-003).
 - **Engine surface.** Session operations use only `AsyncLLM` / `EngineClient` public and
   RFC-proposed calls, never `engine_core` or scheduler internals. The model adapter's own
   dependencies (model-state interface, the state layer's `MambaSpec` and manager configuration,
@@ -449,17 +449,20 @@ implementations differ:
 
 Acceptance is tiered; a claim names the tier it has met and the build (stage 1 or stage 2) it was
 met on. Stage 1 can meet every tier on core's routes. The CPU seam conformance suite needs only the frontend and
-its `vllm-riva-frontend-dev` test distribution installed at the pinned release tag. Only legs served through a
-frontend (`Recognize`, a frontend's streaming endpoint) need stage 2. The session factory runs
-on neither build until its port (Future roadmap); until then the legs that drive it through a
-real engine are not claimed.
+its `vllm-riva-frontend-dev` test distribution installed at the pinned release tag; it runs the
+factory's stream-admission design, deferred on the target core, against an engine double. Only
+legs served through a frontend (`Recognize`, a frontend's streaming endpoint) need stage 2, and
+stage 2 makes no acceptance claim until the session factory's port (Future roadmap): the factory
+runs on neither build until then, so no leg that drives it through a real engine is claimed.
 
 1. **CPU conformance.** Unit and contract tests, including the frontend's seam conformance suite run
    against this plugin's real factory, pass without a GPU.
 2. **Installed-engine cycle.** On the target build with the plugin installed: plugin load →
    stream started → audio → final transcript → state page freed, for one and for concurrent
-   sessions. On stage 1 the stream is a `/v1/realtime` session; on stage 2 it is also a frontend
-   session through the factory, once the factory runs on the target core. In the default configuration the startup log reports the
+   sessions. The state pages are freed when core's `vllm:kv_cache_usage_perc` gauge, read from
+   the server's `/metrics` endpoint after every session of the run has ended, is 0, as it is
+   before the first session. On stage 1 the stream is a `/v1/realtime` session; on stage 2 it is
+   also a frontend session through the factory, once the factory runs on the target core. In the default configuration the startup log reports the
    segment graphs' retained memory and capture time; both are measured at each geometry before
    that geometry is claimed.
 3. **Equivalence.** On public clips from 20 s to over 400 s, whole-file transcripts (core

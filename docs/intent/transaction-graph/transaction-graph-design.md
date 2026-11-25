@@ -22,6 +22,15 @@ capture stream, while core's runner captures no graph over the forward (its reso
 `cudagraph_mode` is NONE). The model keeps
 no graph pool and no memory admission of its own.
 
+**Interface.** The option-on rules of this design name the state-pool interface they were
+designed against: `prepare_step`, `bind_rows`, `initialize_state_slots`, `StateSlotBindings` and
+its `component_pools`, and `PersistentStateSpec` with its `memory_contributors`. The plugin's
+target core, RFC 1's state layer, has none of them (the `registration` design, State-slot
+access). The rules that hold with the option off or whether it is on or off apply on the target
+core as written, except that a part of a state-pool hook (`initialize_state_slots`) applies only
+on a core that calls the hook, and the row-failure channel is the model state's
+`take_failed_requests`.
+
 **Evidence.** The quantitative figures in this design are unpublished project measurements; the
 tier 2 and tier 5 results published with the plugin replace them. A whole-transaction prototype
 on an earlier in-tree copy of this model, on an A40 at 80 ms, FP32 with TF32 off, with the
@@ -79,9 +88,10 @@ A step's **row plan** is every row the runner scheduled for model execution, at 
 position, with its binding and host-produced vectors; row `i` reads only the runner's input `i`
 and writes only output `i`, and the runner-facing output has one row per scheduled row in the
 runner's order. The **row-failure path** fails a row at planning: a foreign-geometry row
-(`session`, SESS-MODEL-001 and SESS-MODEL-002; `transcription`, FILE-PROMPT-007) or a continuing
-file row whose queue count is not known (FILE-QC-010). Such a **planning-failed row** stays in
-the row plan at its position, bound as a non-CHUNK row with a planned-rejection bit that the body
+(`session`, SESS-MODEL-001 and SESS-MODEL-002; `transcription`, FILE-PROMPT-007), a continuing
+file row whose queue count is not known (FILE-QC-010), or a row with another fault that its
+request's own inputs cause (`registration`, REG-STATE-008, REG-STATE-014 and REG-STATE-015).
+Such a **planning-failed row** stays in the row plan at its position, bound as a non-CHUNK row with a planned-rejection bit that the body
 turns into a nonzero status whatever the row's kind, freshness or token; it counts in `P` and `E`,
 never in `K`. Its output row is the rejected-row output (the projection row the transaction
 writes for any rejected row), its masked scatter leaves its pages untouched, and the model state
@@ -857,9 +867,9 @@ workspace. Its one allocation is a bounded host shadow page of the state layout,
 **Per-row rejections are not step failures.** A rejected row has a nonzero status, its pages stay
 as core's slot initialization left them at the start of the step, and the other rows commit. Under
 replay as under the option-off transaction, its status flows through the sink's collection, and
-`postprocess_state` then fails its request alone (`state_slots.fail_requests`), as the owning
-design states: `session` for stream rows (SESS-MODEL-003), `transcription` for file rows
-(FILE-QC-012). No row status is recoverable. Such a step neither raises nor latches. A
+`postprocess_state` then fails its request alone, returning it through the model state's
+`take_failed_requests` (the `registration` design, Row failure), as the owning design states:
+`session` for stream rows (SESS-MODEL-003), `transcription` for file rows (FILE-QC-012). No row status is recoverable. Such a step neither raises nor latches. A
 planning-failed row (Option and configuration) is not such a rejection: its request fails from
 the planning-failed set, independently of collection.
 
@@ -1247,17 +1257,19 @@ graph memory, transient peaks and capture time with the build, device, geometry 
 ## Permitted dependencies
 
 The option uses these internal dependencies of the model adapter. `registration`'s table and
-import-time check own them: `ModelState.post_warmup` and the `memory_contributors` argument are
-unconditional rows (REG-010), and `capture_pool` and `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS`
+import-time check own the ones the option-off model also uses: `ModelState.post_warmup` is an
+unconditional row (REG-010), and `capture_pool` and `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS`
 are conditional on graphed execution (REG-014), because the default segment arms use them with the
-option off. The option adds only the `StateSlotBindings` methods, conditional on the option (REG-018):
+option off. The `StateSlotBindings` methods and the `memory_contributors` argument belong to the
+state-pool interface (Context, Interface): `registration`'s table has no row for them, and model
+import and construction check no transaction-graph dependency (REG-018).
 
 | Module | Names | Use by this component |
 | --- | --- | --- |
-| `vllm.v1.worker.gpu.state_slots` | `StateSlotBindings.startup_pool_access`, `StateSlotBindings.pool_layout` (methods of a permitted class) | capture rows and post-warmup verification (REG-018) |
+| `vllm.v1.worker.gpu.state_slots` | `StateSlotBindings.startup_pool_access`, `StateSlotBindings.pool_layout` (state-pool interface) | capture rows and post-warmup verification; not in `registration`'s table (REG-018) |
 | `vllm.compilation.cudagraph_pool` | `capture_pool` | captures into the pool core passes (REG-014) |
 | `vllm.v1.worker.gpu.model_states.interface` | `ModelState.post_warmup` (a method of a permitted class) | post-warmup verification (REG-010) |
-| `vllm.v1.kv_cache_interface` | `PersistentStateSpec(memory_contributors=...)` (an argument of a permitted class) | names the option in core's memory notes (REG-010) |
+| `vllm.v1.kv_cache_interface` | `PersistentStateSpec(memory_contributors=...)` (state-pool interface) | names the option in core's memory notes; not in `registration`'s table (REG-018) |
 | `vllm.envs` | `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` | whether a profiling capture is required (REG-014) |
 
 `torch.cuda.CUDAGraph`, `torch.cuda.graph` and `torch.cuda.mem_get_info` are PyTorch, not vLLM.
