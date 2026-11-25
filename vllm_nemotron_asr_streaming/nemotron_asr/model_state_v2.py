@@ -498,6 +498,7 @@ class NemotronASRModelState(ModelState):
         )
 
     # @spec FILE-BUF-001, FILE-BUF-004, FILE-BUF-005, FILE-ROW-001
+    # @spec REG-STATE-015
     def _take_file(self, request: NewRequestData) -> None:
         """Take a file request's samples and header into a request-owned
         host buffer at its first schedule and mark it a FILE request.
@@ -505,7 +506,9 @@ class NemotronASRModelState(ModelState):
         A malformed item (the processor refuses these at input processing,
         so only a direct engine client can send one) fails that row alone
         through the transaction's row-failure path; it never raises out of
-        the step.
+        the step. An item the model's encoder refuses (``encoder_item_fault``,
+        the rule screening drops encoder inputs by) is malformed, so a file
+        row whose input screening drops also leaves core's gather.
         """
         req_id = request.req_id
         try:
@@ -520,9 +523,15 @@ class NemotronASRModelState(ModelState):
         req_id = request.req_id
         if len(request.mm_features) != 1:
             raise ValueError(f"file request {req_id!r} needs exactly one audio item")
-        item = request.mm_features[0].data
+        (feature,) = request.mm_features
+        item = feature.data
         if item is None:
             raise ValueError(f"file request {req_id!r} arrived without its samples")
+        fault = encoder_item_fault(
+            feature, carrier_width=int(self.model.config.hidden_size)
+        )
+        if fault is not None:
+            raise ValueError(f"file request {req_id!r} item is refused: {fault}")
         record = self._requests.get(req_id)
         if record is None:
             raise ValueError(f"file request {req_id!r} has no state slot")

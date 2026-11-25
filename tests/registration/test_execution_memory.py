@@ -1634,11 +1634,11 @@ def _wider_than_the_carrier(env) -> torch.Tensor:
 
 # @spec REG-STATE-015
 def test_an_envelope_wider_than_the_carrier_fails_that_request_alone(build):
-    """REG-STATE-015's default class: a direct engine client can send a stream
-    envelope whose header is valid and whose payload is wider than the
-    carrier row. Screening checks the whole envelope, not only its header, so
-    the row fails at planning before core's encoder path meets it, and the
-    step's clean row commits."""
+    """REG-STATE-015 lists an envelope wider than the carrier: a direct engine
+    client can send a stream envelope whose header is valid and whose payload
+    is wider than the carrier row. Screening checks the whole envelope, not
+    only its header, so the row fails at planning before core's encoder path
+    meets it, and the step's clean row commits."""
     env = build()
     env.runner.profile_run(core_embeds=False)
     pool(env)
@@ -1693,6 +1693,38 @@ def test_a_malformed_file_request_fails_alone_before_cores_encoder_path(build, i
     assert env.runner.failed_log == [{"bad"}]
     statuses, _ = env.runner.commit_log[-1]
     assert statuses.get("s1") == 0
+
+
+@pytest.mark.parametrize("beside", ["stream row", "file row"])
+# @spec REG-STATE-015, FILE-BUF-001
+def test_a_file_item_the_encoder_refuses_fails_that_file_request_alone(build, beside):
+    """A direct engine client can send a file-carrier request whose item
+    carries valid samples and a valid header under another modality. The
+    model's encoder refuses that item (``encoder_item_fault``), so screening
+    drops its encoder input; ``add_request`` refuses it by the same rule, so
+    its row also leaves core's gather. Beside a healthy stream or file
+    request (each with its own identifier) the step does not raise, the bad
+    file request alone fails and the other request commits."""
+    env = build()
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    template = file(env, "bad")
+    (feature,) = template.mm_features
+    bad = dataclasses.replace(
+        template, mm_features=[dataclasses.replace(feature, modality="image")]
+    )
+    good = stream(env, "s1") if beside == "stream row" else file(env, "f1")
+    assert feature.identifier != good.mm_features[0].identifier
+    output = h.scheduler_output(
+        new=(bad, good),
+        handles={"bad": 3, good.req_id: 1},
+        encoder_inputs={"bad": [0], good.req_id: [0]},
+    )
+    error = h.call_with(env.runner.real_step, output)
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [{"bad"}]
+    statuses, _ = env.runner.commit_log[-1]
+    assert statuses.get(good.req_id) == 0
 
 
 #: Prompt-structure faults of a row whose own item is valid (REG-STATE-015):
