@@ -1118,8 +1118,11 @@ use a fixed `--num-gpu-blocks-override` with the estimate enabled.
   by each step's measured option-on duration and, when no stream has a schedulable unit, jumps to
   the next arrival. Each step holds every stream with a schedulable unit (a chunk, a label drain,
   an echo, a FLUSH), so mixed steps arise from the pacing. The driver runs every step replayed and
-  as the option-off transaction on a copy of the pools, and compares outputs, statuses,
-  progress, remaining counts and every page. The driver runs on the worker of a hook-captured
+  as the option-off transaction on a detached copy of the pools taken before the step, and
+  compares outputs, statuses, progress, remaining counts and every page. The replayed step runs on
+  the serving pools, whose addresses its graphs hold; the copy is test-only storage that the serving
+  rules (REG-STATE-003, TXG-CAP-013) do not govern, and the reference never touches the serving
+  pools. The driver runs on the worker of a hook-captured
   process through a test-only adapter over the serving pools, which drives the model state's step
   lifecycle as core's runner does: per step it calls `remove_request` for each request that
   finished, in ascending request-ID order; then, for each request the step delivers as
