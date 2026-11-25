@@ -114,10 +114,10 @@ Tier 5 is not met at either lookahead.
   fallbacks (TXG-QUAL-007); the revised served comparison (TXG-QUAL-008) at both lookaheads; the
   capture figures (TXG-QUAL-019).
 - Failed: the step rule (TXG-QUAL-010 to -014), both groups at both lookaheads; `U_api`
-  (TXG-QUAL-016, -017) at both lookaheads; the body check (TXG-QUAL-015) at population 1, one block
-  per lookahead. The first served `M` run at 80 ms (plugin `8166d85`) failed its original file
-  criterion, equality with one `B_hook` run (123 of 124 files); TXG-QUAL-008 as revised replaced that
-  criterion (see the note after the served-run table).
+  (TXG-QUAL-016, -017) at both lookaheads; the body check (TXG-QUAL-015, since retired; historical)
+  at population 1, one block per lookahead. The first served `M` run at 80 ms (plugin `8166d85`)
+  failed its original file criterion, equality with one `B_hook` run (123 of 124 files);
+  TXG-QUAL-008 as revised replaced that criterion (see the note after the served-run table).
 - Not run: tier 4 with the option on, on any build.
 
 `N` = 63 and `--max-num-seqs 64` are the values the tier 5 run verified to fit at 80 ms and at
@@ -147,10 +147,11 @@ block 1 median (TXG-CAL-001): 15.06 ms on and 21.97 ms off at 80 ms, 17.46 ms on
 
 #### Body check
 
-Body check (TXG-QUAL-015): the option-off step time of this release (`adfb24b`) against plugin
-`4cc1381`, both under `--enforce-eager` with transaction graphs off, in two blocks of legs OLD1, NEW,
-OLD2 per population. Medians of 21 counted steps (ms); a block passes when NEW − min(OLD1, OLD2) ≤
-max(1 ms, |OLD1 − OLD2|). These are engine step times, not served latencies.
+Body check (TXG-QUAL-015, since retired; this record is historical): the option-off step time of
+this release (`adfb24b`) against plugin `4cc1381`, both under `--enforce-eager` with transaction
+graphs off, in two blocks of legs OLD1, NEW, OLD2 per population. Medians of 21 counted steps (ms);
+a block passes when NEW − min(OLD1, OLD2) ≤ max(1 ms, |OLD1 − OLD2|). These are engine step times,
+not served latencies.
 
 | ms | P | Block 1: OLD1 / NEW / OLD2 | Block 2: OLD1 / NEW / OLD2 | NEW − mean(OLD), block 1 / 2 |
 |---|---|---|---|---|

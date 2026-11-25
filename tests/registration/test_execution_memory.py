@@ -230,14 +230,16 @@ def pool(env, *, spy: bool = True, capacity: int = 8):
 
 
 def trapped_pool(env):
-    """Bind a pool, then let the model reach its state layer only through an
-    armed ``support.state_layer.ViewTrap``: any read of the layer's views or
-    pages fails and is recorded (REG-MEM-005, REG-MEM-009, REG-MEM-012,
-    REG-MEM-013). ``trap._target`` is the bound pool."""
+    """Bind a pool, then let the model reach its state layer, and the model
+    state its state-group layouts (which hold the same views), only through
+    an armed ``support.state_layer.ViewTrap``: any read of the layer's views
+    or pages, or use of the layouts, fails and is recorded (REG-MEM-005,
+    REG-MEM-009, REG-MEM-012, REG-MEM-013). ``trap._target`` is the bound
+    pool."""
     from support import state_layer as sl
 
     bindings = pool(env, spy=False)
-    trap = sl.trap_views(env.model, h.core_bindings(bindings))
+    trap = sl.trap_views(env.model, h.core_bindings(bindings), env.state)
     trap.armed = True
     return trap
 
@@ -1268,8 +1270,12 @@ def _carrier_request(env, req_id: str, *, token=None, features=()):
     return dataclasses.replace(request, mm_features=list(features))
 
 
-def _envelope_feature(env, req_id: str, *, envelope=None, offset: int = 0):
-    """The multimodal feature of a regular unit at ``offset``."""
+def _envelope_feature(
+    env, req_id: str, *, envelope=None, offset: int = 0, identifier=None, **changes
+):
+    """The multimodal feature of a regular unit at ``offset``; ``envelope``
+    replaces its envelope row, ``identifier`` its encoder-cache identity, and
+    ``changes`` any other field (``modality``, ``data``, ``mm_position``)."""
     template = stream(env, req_id)
     (feature,) = template.mm_features
     if envelope is not None:
@@ -1290,19 +1296,83 @@ def _envelope_feature(env, req_id: str, *, envelope=None, offset: int = 0):
         feature = dataclasses.replace(
             feature, mm_position=PlaceholderRange(offset=offset, length=1)
         )
-    return feature
+    if identifier is not None:
+        feature = dataclasses.replace(feature, identifier=identifier)
+    return dataclasses.replace(feature, **changes)
 
 
-#: REG-STATE-015's request-caused envelope-header faults that the CPU harness
-#: delivers as core would: name -> (request builder, scheduled encoder inputs).
+def _second_feature(env, req_id: str):
+    """Another unit's feature over the same token (its own cache identity)."""
+    return _envelope_feature(env, req_id, identifier=f"uuid-{req_id}-second")
+
+
+def _payload_without_an_envelope():
+    """A kwargs payload whose only field is not the envelope (``audio``)."""
+    from vllm.multimodal.inputs import (
+        MultiModalBatchedField,
+        MultiModalFieldElem,
+        MultiModalKwargsItem,
+    )
+
+    field = MultiModalBatchedField(keep_on_cpu=True)
+    return MultiModalKwargsItem(
+        {"features": MultiModalFieldElem(torch.zeros(20), field)}
+    )
+
+
+#: REG-STATE-015's request-caused envelope-header faults, delivered as core
+#: delivers them: name -> (request builder, scheduled encoder inputs). Core's
+#: scheduler schedules every overlapping feature it has not cached, so two
+#: overlapping features arrive with both inputs scheduled, or with one when
+#: the other is cached; both are the request's fault. The model state's
+#: ``prepare_inputs_embeds`` runs core's ``execute_mm_encoder`` and
+#: ``gather_mm_embeddings``, so it screens these rows before it calls them.
 _REQUEST_FAULTS = {
     "CHUNK row without a feature": (
         lambda env: _carrier_request(env, "bad"),
         {},
     ),
+    "CHUNK row two features overlap, both scheduled": (
+        lambda env: _carrier_request(
+            env,
+            "bad",
+            features=[_envelope_feature(env, "bad"), _second_feature(env, "bad")],
+        ),
+        {"bad": [0, 1]},
+    ),
+    "CHUNK row two features overlap, one cached": (
+        lambda env: _carrier_request(
+            env,
+            "bad",
+            features=[_envelope_feature(env, "bad"), _second_feature(env, "bad")],
+        ),
+        {"bad": [0]},
+    ),
     "non-CHUNK row a feature overlaps": (
         lambda env: _carrier_request(
             env, "bad", token=7, features=[_envelope_feature(env, "bad")]
+        ),
+        {"bad": [0]},
+    ),
+    "overlapping feature not audio": (
+        lambda env: _carrier_request(
+            env, "bad", features=[_envelope_feature(env, "bad", modality="image")]
+        ),
+        {"bad": [0]},
+    ),
+    "overlapping feature without a kwargs payload": (
+        lambda env: _carrier_request(
+            env, "bad", features=[_envelope_feature(env, "bad", data=None)]
+        ),
+        {"bad": [0]},
+    ),
+    "overlapping feature without an envelope payload": (
+        lambda env: _carrier_request(
+            env,
+            "bad",
+            features=[
+                _envelope_feature(env, "bad", data=_payload_without_an_envelope())
+            ],
         ),
         {"bad": [0]},
     ),
@@ -1317,44 +1387,212 @@ _REQUEST_FAULTS = {
 }
 
 
+def _step_with_a_clean_row(env, bad, encoder_inputs):
+    """``bad`` (slot 3) and a clean stream unit ``s1`` (slot 1) in one real
+    step; returns the error it raised, or ``None``."""
+    output = h.scheduler_output(
+        new=(bad, stream(env, "s1")),
+        handles={"bad": 3, "s1": 1},
+        encoder_inputs={**encoder_inputs, "s1": [0]},
+    )
+    return h.call_with(env.runner.real_step, output)
+
+
 @pytest.mark.parametrize("fault", list(_REQUEST_FAULTS))
 # @spec REG-STATE-015
 def test_a_request_caused_envelope_fault_fails_that_request_alone(build, fault):
     """A direct engine client can send each of these: the row fails at
-    planning, its request alone ends through ``take_failed_requests``, and
-    the step's other row commits."""
+    planning, before core's encoder path sees it, its request alone ends
+    through ``take_failed_requests``, and the step's other row commits."""
     make, encoder_inputs = _REQUEST_FAULTS[fault]
     env = build()
     env.runner.profile_run(core_embeds=False)
     pool(env)
-    good = stream(env, "s1")
-    output = h.scheduler_output(
-        new=(make(env), good),
-        handles={"bad": 3, "s1": 1},
-        encoder_inputs={**encoder_inputs, "s1": [0]},
-    )
-    error = h.call_with(env.runner.real_step, output)
+    error = _step_with_a_clean_row(env, make(env), encoder_inputs)
     assert error is None, repr(error)
     assert env.runner.failed_log == [{"bad"}]
     statuses, _ = env.runner.commit_log[-1]
     assert statuses.get("s1") == 0
 
 
+def _raised_in(error: BaseException) -> str:
+    """``"plugin"`` or ``"core"``: whose code raised ``error``, by the
+    innermost frame of its traceback in either package (frames of torch or
+    another library are skipped); ``"other"`` for neither."""
+    for frame in reversed(traceback.extract_tb(error.__traceback__)):
+        path = frame.filename.replace("\\", "/")
+        if "/vllm_nemotron_asr_streaming/" in path:
+            return "plugin"
+        if "/vllm/" in path:
+            return "core"
+    return "other"
+
+
+#: The plugin's error for each contract fault of a stream row's envelope
+#: header: the class it raises for these (``ValueError``) and what the message
+#: names.
+_PLUGIN_CONTRACT_ERRORS = {
+    "feature without position metadata": r"(?i)position",
+    "feature of non-positive length": r"(?i)non-positive length",
+    "non-CHUNK row with a scheduled encoder input": (
+        r"(?i)non-CHUNK row[^.]*scheduled encoder input"
+    ),
+    "CHUNK row with more than one scheduled encoder input": (
+        r"(?i)(more than one|at most one)[^.]*encoder input"
+    ),
+    "scheduled encoder input naming another feature": (
+        r"(?i)encoder input[^.]*(same overlapping|other) feature"
+    ),
+    "envelope payload not host-resident": r"(?i)host",
+}
+
+#: Where core's own multimodal plumbing meets a contract fault before the
+#: model state's planning can (the CPU harness runs core's encoder cache,
+#: ``execute_mm_encoder`` and ``gather_mm_embeddings``): core's error class
+#: and message, raised in core's code. A meta tensor stands for a device
+#: payload on CPU; core's batching of the step's encoder inputs, or its
+#: host-to-device copy, cannot read it.
+_CORE_CONTRACT_ERRORS = {
+    "feature without position metadata": (
+        (AttributeError, r"'NoneType' object has no attribute 'offset'"),
+    ),
+    "scheduled encoder input naming another feature": (
+        (RuntimeError, r"Encoder cache miss for uuid-bad"),
+    ),
+    "envelope payload not host-resident": (
+        (RuntimeError, r"not on the expected device meta"),
+        (NotImplementedError, r"Cannot copy out of meta tensor"),
+    ),
+}
+
+
+def _far_feature(env, req_id: str):
+    """A feature that does not overlap the row's token (position 5)."""
+    return _envelope_feature(env, req_id, offset=5, identifier=f"uuid-{req_id}-far")
+
+
+#: Faults of a stream row's envelope header that core's scheduling or
+#: multimodal plumbing produces and no request input can (REG-STATE-015):
+#: name -> (request builder, scheduled encoder inputs).
+_CONTRACT_FAULTS = {
+    "feature without position metadata": (
+        lambda env: _carrier_request(
+            env, "bad", features=[_envelope_feature(env, "bad", mm_position=None)]
+        ),
+        [0],
+    ),
+    "feature of non-positive length": (
+        lambda env: _carrier_request(
+            env,
+            "bad",
+            features=[
+                _envelope_feature(
+                    env, "bad", mm_position=_placeholder(offset=0, length=0)
+                )
+            ],
+        ),
+        [0],
+    ),
+    "non-CHUNK row with a scheduled encoder input": (
+        lambda env: _carrier_request(
+            env, "bad", token=7, features=[_far_feature(env, "bad")]
+        ),
+        [0],
+    ),
+    "CHUNK row with more than one scheduled encoder input": (
+        lambda env: _carrier_request(
+            env, "bad", features=[_envelope_feature(env, "bad")]
+        ),
+        [0, 0],
+    ),
+    "scheduled encoder input naming another feature": (
+        lambda env: _carrier_request(
+            env,
+            "bad",
+            features=[_envelope_feature(env, "bad"), _far_feature(env, "bad")],
+        ),
+        [1],
+    ),
+    "envelope payload not host-resident": (
+        lambda env: _carrier_request(
+            env,
+            "bad",
+            features=[
+                _envelope_feature(
+                    env,
+                    "bad",
+                    envelope=torch.zeros(h.stream_envelope().shape, device="meta"),
+                )
+            ],
+        ),
+        [0],
+    ),
+}
+
+
+def _placeholder(*, offset: int, length: int):
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    return PlaceholderRange(offset=offset, length=length)
+
+
+@pytest.mark.parametrize("fault", list(_CONTRACT_FAULTS))
 # @spec REG-STATE-015
-def test_a_scheduled_encoder_input_on_an_uncovered_non_chunk_row_raises(build):
-    """Core schedules an encoder input only for a token a feature covers, so
-    a non-CHUNK row with one and no overlapping feature is a violation of
-    core's contract: the step raises."""
+def test_a_contract_fault_of_the_envelope_header_raises(build, fault):
+    """No request input can cause these, so core and the model disagree
+    about the step: the step raises, naming the fault, and records no failed
+    request. The raise is the plugin's ``ValueError`` naming the fault, or,
+    where core's own multimodal plumbing meets the fault first, core's error
+    raised in core's code."""
+    make, encoder_inputs = _CONTRACT_FAULTS[fault]
     env = build()
     env.runner.profile_run(core_embeds=False)
     pool(env)
+    error = _step_with_a_clean_row(env, make(env), {"bad": encoder_inputs})
+    assert error is not None, f"the step accepted a {fault}"
+    message = str(error)
+    if _raised_in(error) == "core" and fault in _CORE_CONTRACT_ERRORS:
+        expected = _CORE_CONTRACT_ERRORS[fault]
+    else:
+        assert _raised_in(error) == "plugin", (fault, _raised_in(error), repr(error))
+        expected = ((ValueError, _PLUGIN_CONTRACT_ERRORS[fault]),)
+    assert any(
+        type(error) is cls and re.search(pattern, message) for cls, pattern in expected
+    ), (fault, repr(error))
+    assert env.runner.failed_log == [], "a contract fault was recorded as a row failure"
+
+
+@pytest.mark.parametrize("step", ["stream-step", "with-a-file-row"])
+@pytest.mark.parametrize(
+    "stamp", [float("nan"), float("inf")], ids=["nan-stamp", "inf-stamp"]
+)
+# @spec REG-STATE-015
+def test_an_unlisted_fault_a_request_can_cause_fails_that_request_alone(
+    build, stamp, step
+):
+    """REG-STATE-015's default class: no list names an envelope header whose
+    admission stamp is not a number, and a direct engine client can send one,
+    so its row fails alone (here with the step's clean stream row, and with a
+    file row whose planning reads every stream row's header)."""
+    env = build()
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    envelope = h.stream_envelope(geometry=env.max_geometry)
+    envelope[6] = stamp  # admission_ms_mod, the header's last slot
     bad = _carrier_request(
-        env, "bad", token=7, features=[_envelope_feature(env, "bad", offset=5)]
+        env, "bad", features=[_envelope_feature(env, "bad", envelope=envelope)]
     )
-    output = h.scheduler_output(
-        new=(bad,), handles={"bad": 3}, encoder_inputs={"bad": [0]}
+    new, handles = [bad, stream(env, "s1")], {"bad": 3, "s1": 1}
+    if step == "with-a-file-row":
+        new.append(file(env, "f1"))
+        handles["f1"] = 2
+    error = h.call_with(
+        env.runner.real_step, h.scheduler_output(new=tuple(new), handles=handles)
     )
-    assert h.call_with(env.runner.real_step, output) is not None
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [{"bad"}]
+    statuses, _ = env.runner.commit_log[-1]
+    assert statuses.get("s1") == 0
 
 
 # ===========================================================================

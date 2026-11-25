@@ -237,7 +237,9 @@ def build_covered(monkeypatch: Any, run: Any, *, lookahead: int = 0) -> CoveredS
             capacity=core.capacity,
             monkeypatch=patch,
         )
-    return CoveredSteps(tenv, EagerCells(env.model).install(monkeypatch))
+    covered = CoveredSteps(tenv, EagerCells(env.model).install(monkeypatch))
+    covered.run_env = env  # the option-on environment (its ``vllm_config``)
+    return covered
 
 
 def pools_of(transaction: dict[str, Any]) -> dict[str, Any]:

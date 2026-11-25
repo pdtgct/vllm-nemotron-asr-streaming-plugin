@@ -210,9 +210,9 @@ def test_a_read_after_a_drop_with_nothing_bound_raises(layout):
     layer = sl.layer(layout)
     assert layer.component_pools
     clear_layer_kv_caches([layer])
-    with pytest.raises(Exception):  # noqa: B017 - any refusal, no stale view
+    with pytest.raises(RuntimeError, match=sl.NOT_BOUND):
         layer.component_pools  # noqa: B018
-    with pytest.raises(Exception):  # noqa: B017
+    with pytest.raises(RuntimeError, match=sl.NOT_BOUND):
         layer.pages  # noqa: B018
 
 
@@ -390,8 +390,10 @@ def test_add_request_takes_the_slot_from_block_ids(state):
 )
 # @spec REG-STATE-002, REG-STATE-015
 def test_a_request_without_exactly_one_block_in_one_group_raises(state, block_ids):
-    with pytest.raises(Exception, match="'a'|a\\b"):
-        state.add_request(0, sl.request("a", None, block_ids=block_ids))
+    """A violation of core's contract: the plugin's ``ValueError`` names the
+    request."""
+    with pytest.raises(ValueError, match=sl.names_request("req-blocks")):
+        state.add_request(0, sl.request("req-blocks", None, block_ids=block_ids))
 
 
 # @spec REG-STATE-002
@@ -410,7 +412,7 @@ def test_a_slot_outside_the_bound_pages_raises_before_any_page_is_touched(state,
     before = layer.pages.clone()
     state.add_request(0, sl.request("a", slot))
     sl.attn(state)
-    with pytest.raises(Exception, match=str(slot)):
+    with pytest.raises(ValueError, match=rf"(?i)slot[^.]*(?<![\d.]){slot}(?![\d.])"):
         sl.inputs(state, ("a",), (0,))
     assert torch.equal(layer.pages, before)
 
@@ -603,7 +605,7 @@ def test_a_zero_token_step_defers_retirement_to_the_next_steps_first_call(state)
 # @spec REG-STATE-012, REG-STATE-015
 def test_add_request_for_a_live_request_raises_naming_it(state, computed):
     state.add_request(0, sl.request("live", 3))
-    with pytest.raises(Exception, match="live"):
+    with pytest.raises(RuntimeError, match=sl.names_request("live")):
         state.add_request(0, sl.request("live", 3, computed=computed))
 
 
@@ -616,7 +618,7 @@ def test_add_request_with_prior_state_that_continues_nothing_raises(state, pendi
         bad = _compacted("x", 4, 9)
     else:
         bad = _compacted("x", 3, 9)
-    with pytest.raises(Exception, match="x"):
+    with pytest.raises(RuntimeError, match=sl.names_request("x")):
         state.add_request(0, bad)
 
 
@@ -725,7 +727,7 @@ def _kv_config(*groups):
 )
 # @spec REG-STATE-013
 def test_initialize_kv_cache_refuses_any_other_grouping_naming_it(state, groups):
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(ValueError) as excinfo:
         state.initialize_kv_cache(_kv_config(*groups), None)
     for group in groups:
         for name in group:
@@ -735,7 +737,7 @@ def test_initialize_kv_cache_refuses_any_other_grouping_naming_it(state, groups)
 # @spec REG-STATE-013
 def test_initialize_kv_cache_refuses_unbound_views_naming_the_groups(served, layout):
     state = sl.weightless_state(served, layout, bound=False)
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(RuntimeError, match=sl.NOT_BOUND) as excinfo:
         state.initialize_kv_cache(_kv_config((sl.LAYER,)), None)
     assert sl.LAYER in str(excinfo.value), str(excinfo.value)
 
@@ -836,7 +838,7 @@ def test_a_real_step_refuses_a_layer_core_has_not_bound(served, layout):
     state = sl.weightless_state(served, layout, bound=False)
     state.add_request(0, sl.request("a", 1))
     sl.attn(state)
-    with pytest.raises(Exception):  # noqa: B017 - no view to read
+    with pytest.raises(RuntimeError, match=sl.NOT_BOUND):
         sl.inputs(state, ("a",), (0,))
 
 

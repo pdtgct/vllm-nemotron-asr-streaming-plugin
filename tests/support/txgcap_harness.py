@@ -377,9 +377,11 @@ class AccessorSpy:
     """Records every read of ``ModelState.state_group_layouts`` on ``state``
     (the property, shadowed on the model state's class for the test): whether
     it happened inside a ``capture_cudagraphs`` call, whether the
-    transaction-graph module (``transaction_graph.py``) made it, and weak
-    references to each layout object and component tensor it returned
-    (TXG-CAP-008, TXG-LIFE-003)."""
+    transaction-graph module (``transaction_graph.py``) made it, how many
+    layouts it returned and weak references to each component tensor
+    (TXG-CAP-008, TXG-LIFE-003). Core's layout types take no weak reference
+    (slotted dataclasses), so what holds a layout object is checked by
+    reachability instead (:func:`plugin_holds`)."""
 
     def __init__(self, monkeypatch: Any, state: Any) -> None:
         import weakref
@@ -394,7 +396,7 @@ class AccessorSpy:
                 {
                     "inside": spy.inside,
                     "txg": _called_from(TRANSACTION_GRAPH_SOURCE),
-                    "layouts": [weakref.ref(layout) for layout in layouts],
+                    "layouts": len(layouts),
                     "tensors": [
                         weakref.ref(component.tensor)
                         for layout in layouts
@@ -423,6 +425,129 @@ class AccessorSpy:
         """The transaction-graph module's reads inside (or outside) a
         capture call."""
         return [r for r in self.reads if r["txg"] and r["inside"] is inside]
+
+
+def accessor_objects(state: Any) -> list[tuple[str, Any]]:
+    """What ``ModelState.state_group_layouts`` returns now, object by
+    object: each layout, each component layout and each component tensor,
+    labelled. Core installs these (``_state_group_layouts``) and keeps them
+    until it binds or releases the KV cache again, so right after a capture
+    call they are the objects the call's reads returned."""
+    layouts = state._state_group_layouts
+    # ``()`` is shared by every empty tuple, so only a nonempty one is a target.
+    objects: list[tuple[str, Any]] = [("layout tuple", layouts)] if layouts else []
+    for index, layout in enumerate(layouts):
+        objects.append((f"layout {index}", layout))
+        for name, components in layout.layers.items():
+            for position, component in enumerate(components):
+                label = f"layout {index} {name}[{position}]"
+                objects.append((f"{label} component", component))
+                objects.append((f"{label} tensor", component.tensor))
+    return objects
+
+
+#: The model state's attribute that core installs the layouts in.
+CORE_ATTRIBUTE = "_state_group_layouts"
+
+#: Modules whose objects are the harness's or pytest's, never the plugin's.
+_HARNESS_MODULES = ("support.", "test_", "tests.", "_pytest", "pytest", "pluggy")
+
+
+def _harness_object(obj: Any) -> bool:
+    import types
+
+    owner = obj if isinstance(obj, types.FunctionType) else type(obj)
+    return getattr(owner, "__module__", "").startswith(_HARNESS_MODULES)
+
+
+def _referents(obj: Any) -> list[Any]:
+    """What ``obj`` holds, for :func:`plugin_holds`: a function's closure
+    cells and defaults (not its module globals), a bound method's object
+    and function, and otherwise the garbage collector's referents."""
+    import types
+
+    if isinstance(obj, (type, types.ModuleType)):
+        return []
+    if isinstance(obj, types.FunctionType):
+        held = [c.cell_contents for c in obj.__closure__ or () if _filled(c)]
+        held += list(obj.__defaults__ or ())
+        held += list((obj.__kwdefaults__ or {}).values())
+        return held
+    if isinstance(obj, types.MethodType):
+        return [obj.__self__, obj.__func__]
+    return list(gc.get_referents(obj))
+
+
+def _filled(cell: Any) -> bool:
+    try:
+        cell.cell_contents  # noqa: B018
+    except ValueError:
+        return False
+    return True
+
+
+def plugin_holds(
+    env: Any, targets: list[tuple[str, Any]], *, limit: int = 3_000_000
+) -> list[str]:
+    """Every path through which the plugin's objects hold one of
+    ``targets`` (``[(label, object)]``) or a view of a target tensor: a walk
+    of every object the model and its model state reach, except core's
+    attribute on the model state (``_state_group_layouts``; another
+    reference to the same objects counts), the state layer (its bound
+    ``kv_cache`` and its view cache are the layer's, REG-STATE-018), module
+    namespaces, and the harness's and pytest's objects (spies, fakes, the
+    runner). Empty when the plugin holds none (TXG-CAP-008)."""
+    import sys
+    from collections import deque
+
+    wanted = {id(obj): label for label, obj in targets}
+    state = env.state
+    layer = h.state_layer_of(env.model)
+    seen = {id(layer)}
+    seen |= {id(vars(m)) for m in list(sys.modules.values()) if hasattr(m, "__dict__")}
+    parent: dict[int, tuple[int | None, str]] = {}
+    queue: deque[Any] = deque()
+    for name, root in (("model", env.model), ("model state", state)):
+        seen.add(id(root))
+        parent[id(root)] = (None, name)
+        queue.append(root)
+
+    def path(node: int) -> str:
+        names = []
+        current: int | None = node
+        while current is not None:
+            current, name = parent[current]
+            names.append(name)
+        return " -> ".join(reversed(names))
+
+    found: list[str] = []
+    while queue:
+        obj = queue.popleft()
+        if obj is state:
+            # Core's attribute, not the plugin's: skip that one edge only.
+            children = [v for k, v in vars(state).items() if k != CORE_ATTRIBUTE]
+        else:
+            children = _referents(obj)
+        for child in children:
+            key = id(child)
+            if key in seen:
+                continue
+            seen.add(key)
+            parent[key] = (id(obj), type(child).__name__)
+            if key in wanted:
+                found.append(f"{path(key)}: {wanted[key]}")
+                continue
+            if isinstance(child, torch.Tensor):
+                base = child._base
+                if base is not None and id(base) in wanted:
+                    found.append(f"{path(key)}: a view of {wanted[id(base)]}")
+                continue
+            if _harness_object(child):
+                continue
+            queue.append(child)
+            if len(seen) > limit:
+                raise AssertionError(f"plugin_holds walked more than {limit} objects")
+    return found
 
 
 def make_layouts(*groups: dict[str, tuple[Any, ...]]) -> tuple[Any, ...]:

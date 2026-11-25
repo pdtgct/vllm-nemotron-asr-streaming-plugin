@@ -20,6 +20,22 @@ import numpy as np
 import torch
 
 LAYER = "nemotron.state"
+#: What the model state's refusal of a layer core has not bound (or has
+#: unbound) states (REG-STATE-003, REG-STATE-013, REG-STATE-018). The
+#: plugin raises ``RuntimeError`` for it; the specs name no class.
+NOT_BOUND = (
+    r"(?i)\bnot bound\b|\bunbound\b|did not bind|bound none|no bound kv[_ ]cache"
+)
+
+
+def names_request(req_id: str) -> str:
+    """A pattern for an error message that names the request ``req_id``
+    quoted (the plugin writes request IDs with ``repr``)."""
+    import re
+
+    return rf"""['"`]{re.escape(req_id)}['"`]"""
+
+
 #: A stream token that is neither a carrier nor a control token.
 STREAM_TOKEN = 7
 BLOCKS = 6
@@ -205,7 +221,12 @@ class ViewTrap:
     views or pages (``component_pools``, ``pages``, ``kv_cache``,
     ``num_blocks``, ``initialize_pages``); once ``armed`` such a read fails.
     Every other attribute (the layout, the prefix) passes through. ``pool``
-    is the bound pool the layer's views are views of."""
+    is the bound pool the layer's views are views of.
+
+    Core's state-group layout holds the same views, so :func:`trap_views`
+    also traps the model state's ``state_group_layouts``: any use of what
+    the accessor returns (its length, an item, iteration, truth) is recorded
+    as ``"state_group_layouts"`` and fails once armed."""
 
     VIEWS = frozenset(
         {"component_pools", "pages", "kv_cache", "num_blocks", "initialize_pages"}
@@ -217,11 +238,15 @@ class ViewTrap:
         object.__setattr__(self, "armed", False)
         object.__setattr__(self, "reads", [])
 
+    def read(self, attr: str) -> None:
+        """Record a read of ``attr``; fail it while armed."""
+        self.reads.append(attr)
+        if self.armed:
+            raise AssertionError(f"the state layer's {attr} was read")
+
     def __getattr__(self, attr: str) -> Any:
         if attr in ViewTrap.VIEWS:
-            self.reads.append(attr)
-            if self.armed:
-                raise AssertionError(f"the state layer's {attr} was read")
+            self.read(attr)
         return getattr(self._layer, attr)
 
     def __setattr__(self, attr: str, value: Any) -> None:
@@ -231,11 +256,49 @@ class ViewTrap:
             setattr(self._layer, attr, value)
 
 
-def trap_views(model: Any, pool: Any = None) -> ViewTrap:
+class TrappedLayouts(tuple):
+    """Core's state-group layouts, as the model state's
+    ``_state_group_layouts`` holds them, reporting every use to a
+    :class:`ViewTrap` (which fails it while armed)."""
+
+    def __new__(cls, layouts: Any, trap: ViewTrap) -> TrappedLayouts:
+        trapped = super().__new__(cls, tuple(layouts))
+        trapped._trap = trap
+        return trapped
+
+    def _use(self) -> None:
+        self._trap.read("state_group_layouts")
+
+    def __iter__(self) -> Any:
+        self._use()
+        return super().__iter__()
+
+    def __len__(self) -> int:
+        self._use()
+        return super().__len__()
+
+    def __getitem__(self, key: Any) -> Any:
+        self._use()
+        return super().__getitem__(key)
+
+    def __bool__(self) -> bool:
+        self._use()
+        return super().__len__() > 0
+
+    def __contains__(self, item: Any) -> bool:
+        self._use()
+        return super().__contains__(item)
+
+
+def trap_views(model: Any, pool: Any = None, state: Any = None) -> ViewTrap:
     """Make the model (and so its model state) reach its state layer only
-    through a :class:`ViewTrap`; returns the trap, unarmed."""
+    through a :class:`ViewTrap`, and, given the model ``state``, its
+    state-group layouts only through a :class:`TrappedLayouts`; returns the
+    trap, unarmed."""
     trap = ViewTrap(model._persistent_state_layer, pool)
     # The layer is a registered submodule; the instance attribute takes
     # precedence over ``nn.Module``'s submodule lookup.
     object.__setattr__(model, "_persistent_state_layer", trap)
+    if state is not None:
+        state._state_group_layouts = TrappedLayouts(state._state_group_layouts, trap)
     return trap

@@ -34,15 +34,28 @@ The child reads a JSON request and writes a JSON reply:
   state layer takes a ``StorageWeakRef`` of the storage of the first KV cache
   core binds to it (the profiling KV cache under core's graph-memory
   estimate), and the reply's ``reads["profiling_kv_cache_expired"]`` records,
-  at each later ``bind_kv_cache``, whether that reference had expired; both
-  patches need mode ``"llm"``, where the worker runs in the child);
-  ``reads`` (names in :data:`READS`, each run on the worker through
-  ``collective_rpc``); ``env`` (environment variables the
-  child sets before it imports vLLM).
+  at each later ``bind_kv_cache``, whether that reference had expired; or
+  ``"inject-failed-requests"``: the model state records the worker's request
+  IDs as ``reads["added"]``, those core retired through ``remove_request``
+  as ``reads["retired"]`` and each real step's rows as
+  ``reads["step_rows"]``, and its ``take_failed_requests`` adds, on every
+  real step after a request retired, the first retired ID, and, once, on the
+  first real step that holds a request whose ID starts with
+  ``inject["live"]`` beside another, that request's ID; ``reads["injected"]``
+  records both; the patches need mode ``"llm"``, where the worker runs in
+  the child); ``reads`` (names in :data:`READS`, each run on the worker
+  through ``collective_rpc``); ``phases`` (mode ``"llm"``: after the reads,
+  complete-file requests run phase by phase, each phase's requests added
+  together and stepped until none is unfinished; a request is ``{"id",
+  "seconds", "seed"}``, seeded noise at 16 kHz through the model's file
+  prompt; ``reads["finished"]`` lists ``[request ID, finish reason]`` per
+  terminal output); ``inject`` (see the patch); ``env`` (environment
+  variables the child sets before it imports vLLM).
 * reply: ``ok``; ``error`` (every message in the failure's chain, its types
-  and its formatted traceback) when the engine did not start; ``reads``;
-  ``records`` (every record the ``vllm_nemotron_asr_streaming`` loggers
-  emitted at WARNING or above in the child, as ``[levelname, message]``).
+  and its formatted traceback) when the engine did not start or a phase
+  raised; ``reads``; ``records`` (every record the
+  ``vllm_nemotron_asr_streaming`` loggers emitted at WARNING or above in the
+  child, as ``[levelname, message]``).
 """
 
 from __future__ import annotations
@@ -137,7 +150,69 @@ def _start_llm(request: dict[str, Any], reply: dict[str, Any]) -> Any:
     reply["ok"] = True
     for name in request.get("reads", ()):
         reply["reads"][name] = engine.collective_rpc(_reader(name))[0]
+    _run_phases(engine, request.get("phases") or (), reply)
     return engine.engine_core.shutdown
+
+
+def _file_prompt(model_config: Any, spec: dict[str, Any]) -> Any:
+    """The model's prompt for a complete file of ``spec["seconds"]`` of
+    seeded noise at 16 kHz (``build_file_prompt``, as the transcription
+    route builds it)."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm_nemotron_asr_streaming.transcription import build_file_prompt
+
+    rng = np.random.default_rng(int(spec.get("seed", 0)))
+    samples = rng.standard_normal(int(float(spec["seconds"]) * 16000)) * 0.01
+    return build_file_prompt(
+        SimpleNamespace(
+            task_type="transcribe",
+            request_prompt="",
+            hotwords=None,
+            to_language=None,
+            model_config=model_config,
+            extra_args=None,
+            language=None,
+            audio=samples.astype(np.float32),
+        )
+    )
+
+
+def _run_phases(engine: Any, phases: Any, reply: dict[str, Any]) -> None:
+    """See ``phases`` in the module docstring."""
+    if not phases:
+        return
+    from vllm.sampling_params import SamplingParams
+
+    model_config = engine.vllm_config.model_config
+    # core's transcription route: max_model_len minus the one-token prompt
+    params = SamplingParams(temperature=0.0, max_tokens=model_config.max_model_len - 1)
+    finished: list[list[Any]] = []
+    reply["reads"]["finished"] = finished
+    names: dict[str, str] = {}
+
+    def name_of(request_id: str) -> str:
+        # The output's ID is the one given, or the engine's (which starts
+        # with it); either way the request's own name is recorded.
+        if request_id in names:
+            return names[request_id]
+        given = [n for n in names.values() if request_id.startswith(n)]
+        return given[0] if given else request_id
+
+    for phase in phases:
+        for spec in phase:
+            used = engine.add_request(
+                spec["id"], _file_prompt(model_config, spec), params
+            )
+            names[str(used or spec["id"])] = spec["id"]
+            names[spec["id"]] = spec["id"]
+        while engine.has_unfinished_requests():
+            for output in engine.step():
+                if output.finished:
+                    reason = output.outputs[0].finish_reason
+                    finished.append([name_of(str(output.request_id)), reason])
 
 
 def _start_async(request: dict[str, Any], reply: dict[str, Any]) -> Any:
@@ -202,6 +277,65 @@ def _profiling_kv_cache_ref(reply: dict[str, Any]) -> None:
     NemotronStateLayer.bind_kv_cache = bind_kv_cache
 
 
+def _inject_failed_requests(reply: dict[str, Any], request: dict[str, Any]) -> None:
+    """See ``"inject-failed-requests"`` in the module docstring
+    (REG-MS-005)."""
+    from vllm_nemotron_asr_streaming.nemotron_asr.model_state_v2 import (
+        NemotronASRModelState,
+    )
+
+    live = (request.get("inject") or {}).get("live")
+    added: list[str] = []
+    retired: list[str] = []
+    steps: list[list[str]] = []
+    injected: dict[str, list[Any]] = {"retired": [], "live": []}
+    reply["reads"].update(
+        added=added, retired=retired, step_rows=steps, injected=injected
+    )
+    current: dict[str, Any] = {"rows": None}
+    cls = NemotronASRModelState
+    add, remove = cls.add_request, cls.remove_request
+    prepare, take = cls.prepare_inputs, cls.take_failed_requests
+
+    def add_request(self: Any, req_index: int, new_req_data: Any) -> None:
+        added.append(str(new_req_data.req_id))
+        add(self, req_index, new_req_data)
+
+    def remove_request(self: Any, req_id: str) -> None:
+        # core also removes a new request before it adds it: not a retirement
+        if req_id in added and req_id not in retired:
+            retired.append(req_id)
+        remove(self, req_id)
+
+    def prepare_inputs(self: Any, input_batch: Any, req_states: Any) -> Any:
+        rows = [str(r) for r in input_batch.req_ids]
+        real = bool(rows) and all(r in added and r not in retired for r in rows)
+        current["rows"] = rows if real else None
+        if real:
+            steps.append(rows)
+        return prepare(self, input_batch, req_states)
+
+    def take_failed_requests(self: Any) -> Any:
+        result = take(self)
+        rows, current["rows"] = current["rows"], None
+        if rows is None:
+            return result
+        failed = set(result or ())
+        if retired:
+            failed.add(retired[0])
+            injected["retired"].append(retired[0])
+        victims = [r for r in rows if live and r.startswith(live)]
+        if victims and len(rows) > 1 and not injected["live"]:
+            failed.add(victims[0])
+            injected["live"].append({"id": victims[0], "step": rows})
+        return failed or result
+
+    cls.add_request = add_request
+    cls.remove_request = remove_request
+    cls.prepare_inputs = prepare_inputs
+    cls.take_failed_requests = take_failed_requests
+
+
 def _child(request_path: str, reply_path: str) -> int:
     request = json.loads(Path(request_path).read_text())
     os.environ.update(request.get("env") or {})
@@ -226,6 +360,8 @@ def _child(request_path: str, reply_path: str) -> int:
             _record_add_request(reply)
         if request.get("patch") == "profiling-kv-cache-ref":
             _profiling_kv_cache_ref(reply)
+        if request.get("patch") == "inject-failed-requests":
+            _inject_failed_requests(reply, request)
         start = _start_llm if request.get("mode", "llm") == "llm" else _start_async
         try:
             stop = start(request, reply)

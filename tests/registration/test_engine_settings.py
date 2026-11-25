@@ -604,11 +604,12 @@ def test_the_hook_configuration_is_accepted(engine_config, platform, case, stage
 
 
 def _no_state_layer_refusal(message: str) -> None:
-    """The target core defines ``ModelState.state_group_layouts``: nothing in
-    the refusal says transaction graphs are refused on the state layer or for
-    a missing layout accessor (TXG-CFG-016)."""
-    assert not rc.LAYOUT_ACCESSOR.search(message), message
-    assert rc.state_layer_mentions(message) == 0, message
+    """The target core defines ``ModelState.state_group_layouts``: no clause
+    of the refusal refuses transaction graphs on account of the state layer
+    or core's layout accessor (TXG-CFG-016)."""
+    from support import txg_conditions as c
+
+    assert c.state_layer_refusals(message) == [], message
 
 
 @STAGES

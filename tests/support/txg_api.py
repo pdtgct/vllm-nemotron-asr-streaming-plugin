@@ -75,6 +75,13 @@ Model module
   which takes ``advance_model_rows``'s parameters and returns the escaped row
   tensor of a covered step, or ``None`` when it declines the step (the caller
   then runs the option-off transaction).
+* The binding's ``static_inputs`` (TXG-EXEC-007): the pair ``(ids_static,
+  embeds_static)`` of binding-owned step static inputs, ``ids_static`` of
+  shape ``(P_max,)`` and ``embeds_static`` of shape ``(P_max, H)`` (``H``
+  the carrier width), the tensors whose first ``P`` rows a covered step's
+  two device copies write and from which each cell gathers its rows by the
+  arena's step positions; ``None`` while no capture call has allocated them
+  (and after their release).
 
 Transaction module (``nemotron_asr.advance``)
 ---------------------------------------------
@@ -283,6 +290,21 @@ def binding_of(model: Any) -> Any:
             "(transaction-graph binding not implemented)"
         )
     return getattr(model, BINDING_ATTRIBUTE)
+
+
+#: The binding attribute holding the step static inputs (TXG-EXEC-007).
+STATIC_INPUTS_ATTRIBUTE = "static_inputs"
+
+
+def static_inputs(binding: Any) -> Any:
+    """The binding's ``(ids_static, embeds_static)`` (see the module
+    docstring). Fails, not errors, when the binding has no such attribute."""
+    if not hasattr(binding, STATIC_INPUTS_ATTRIBUTE):
+        raise AssertionError(
+            f"the transaction-graph binding has no {STATIC_INPUTS_ATTRIBUTE!r} "
+            "(TXG-EXEC-007's step static inputs are not observable)"
+        )
+    return getattr(binding, STATIC_INPUTS_ATTRIBUTE)
 
 
 def phase_function(name: str) -> Any:

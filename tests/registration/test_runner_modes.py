@@ -257,11 +257,12 @@ def test_construction_lists_every_failed_condition_in_one_error(stages, stage):
 
 
 def _no_state_layer_refusal(message: str) -> None:
-    """The target core defines ``ModelState.state_group_layouts``: nothing in
-    a refusal says transaction graphs are refused on the state layer or for a
-    missing layout accessor (TXG-CFG-016)."""
-    assert not rc.LAYOUT_ACCESSOR.search(message), message
-    assert rc.state_layer_mentions(message) == 0, message
+    """The target core defines ``ModelState.state_group_layouts``: no clause
+    of the refusal refuses transaction graphs on account of the state layer
+    or core's layout accessor (TXG-CFG-016)."""
+    from support import txg_conditions as c
+
+    assert c.state_layer_refusals(message) == [], message
 
 
 #: TXG-CFG-019's pool condition: an explicit block count or KV budget.
@@ -836,6 +837,12 @@ def _assert_no_runner_graph(message: str) -> None:
     _has(message, "own graphs", NO_RUNNER_GRAPH)
 
 
+#: The class of the model state's refusals of a runner-graph path
+#: (REG-ENG-017, REG-ENG-029): the plugin raises ``RuntimeError`` for them;
+#: the specs name no class.
+RUNNER_GRAPH_REFUSAL = RuntimeError
+
+
 @pytest.mark.parametrize("pool", ["profiling", "serving"])
 @pytest.mark.parametrize(
     "resolved", ["PIECEWISE", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE", "FULL"]
@@ -867,7 +874,7 @@ def test_initialize_kv_cache_refuses_a_resolved_runner_graph_mode_before_capture
     captured = len(graphs.captures)
     config.compilation_config.cudagraph_mode = CUDAGraphMode[resolved]
     bind = core.bind_profiling if pool == "profiling" else core.bind_serving
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(RUNNER_GRAPH_REFUSAL) as excinfo:
         bind()
     message = str(excinfo.value)
     assert rc.whole(resolved).search(message), message
@@ -878,7 +885,7 @@ def test_initialize_kv_cache_refuses_a_resolved_runner_graph_mode_before_capture
 # @spec REG-ENG-029
 def test_prepare_dummy_inputs_refuses_a_runner_capture(eager_config, build_model_state):
     state = build_model_state(eager_config())
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(RUNNER_GRAPH_REFUSAL) as excinfo:
         state.prepare_dummy_inputs(1, 1)
     _assert_no_runner_graph(str(excinfo.value))
 
@@ -894,7 +901,7 @@ def test_prepare_attn_refuses_a_capture_or_a_full_step(
     from vllm.config import CUDAGraphMode
 
     state = build_model_state(eager_config())
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(RUNNER_GRAPH_REFUSAL) as excinfo:
         state.prepare_attn(
             None,
             CUDAGraphMode[cudagraph],
@@ -1174,22 +1181,24 @@ def test_the_commit_event_follows_the_steps_last_read_and_is_waited_on(stages):
 
 
 def _state_layer_conditions(errors):
-    """Every returned condition of TXG-CFG-016's kind: it mentions the state
-    layer or the layout accessor."""
-    return [
-        e for e in errors if rc.state_layer_mentions(e) or rc.LAYOUT_ACCESSOR.search(e)
-    ]
+    """Every returned condition that refuses transaction graphs on account of
+    the state layer or core's layout accessor (``support.txg_conditions``,
+    the one matcher of TXG-CFG-016)."""
+    from support import txg_conditions as c
+
+    return [e for e in errors if c.state_layer_refusals(e)]
 
 
 def _assert_the_state_layer_condition(errors, value) -> str:
     """Exactly one condition of TXG-CFG-016's kind, in full: the option, the
     rejected value (TXG-CFG-003), the missing state-group layout accessor, and
     removing the option."""
+    from support import txg_conditions as c
+
     found = _state_layer_conditions(errors)
     assert len(found) == 1, errors
     (condition,) = found
-    assert rc.is_state_layer_condition(condition), condition
-    assert "state_group_layouts" in condition, condition
+    assert c.is_state_layer_condition(condition), condition
     assert rc.shows_value(condition, value), (value, condition)
     return condition
 

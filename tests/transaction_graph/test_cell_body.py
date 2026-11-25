@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The cell body on CPU: accepted-row equivalence with the option-off
-transaction, and no host read where a capture would run (TXG-EQ-001,
-TXG-EQ-004, TXG-EQ-005, TXG-CELL-001, TXG-EXEC-005, TXG-EXEC-008,
-TXG-EXEC-009, TXG-TXN-002, TXG-CAP-001, TXG-CAP-004).
+transaction, the step static inputs, and no host read where a capture would
+run (TXG-EQ-001, TXG-EQ-004, TXG-EQ-005, TXG-CELL-001, TXG-EXEC-005,
+TXG-EXEC-007, TXG-EXEC-008, TXG-EXEC-009, TXG-TXN-002, TXG-CAP-001,
+TXG-CAP-004).
 
 The fake-capture seam captures cells whose replay runs nothing, and every
 capture row is rejected, so neither says what a cell computes for an accepted
@@ -329,6 +330,135 @@ def test_a_covered_step_stores_its_endpoint_pages(covered):
     off = env.run(step)
     for name in ("endpoint_history_pool", "endpoint_book_pool"):
         assert tx.same_bits(after.pools.tensors[name], off.pools.tensors[name]), name
+
+
+# ---------------------------------------------------------------------------
+# The step static inputs (TXG-EXEC-007)
+
+#: Values no step input holds, written into the static inputs before a step
+#: so that what its copies wrote, and what they did not, shows.
+ID_SENTINEL = -7
+EMBED_SENTINEL = -1234.5
+
+
+def _p_max(steps) -> int:
+    scheduler = steps.run_env.vllm_config.scheduler_config
+    return min(int(scheduler.max_num_seqs), int(scheduler.max_num_batched_tokens))
+
+
+def _split_step(env):
+    """A two-row step, a CHUNK row then a non-CHUNK row: the arena's chunk
+    section is step position 0, its echo section position 1, and the rows'
+    inputs differ (a carrier token and envelope, another token)."""
+    step = env.compose([env.accepted(CC), env.accepted(OC)])
+    assert not torch.equal(step.inputs_embeds[0], step.inputs_embeds[1])
+    assert int(step.input_ids[0]) != int(step.input_ids[1])
+    return step
+
+
+# @spec TXG-EXEC-007
+def test_the_static_inputs_are_binding_owned_p_max_buffers(covered):
+    """After the serving capture the binding owns ``ids_static[P_max]`` and
+    ``embeds_static[P_max, H]`` (``P_max = min(max_num_seqs,
+    max_num_batched_tokens)``, ``H`` the carrier width), with the step
+    inputs' types, outside the serving pools, and at the same addresses on
+    every covered step (the cells bake them in)."""
+    steps = covered(0)
+    env, binding = steps.env, steps.cells.binding
+    statics = api.static_inputs(binding)
+    assert statics is not None, "the serving capture allocated no static inputs"
+    ids, embeds = statics
+    step = _split_step(env)
+    p_max = _p_max(steps)
+    assert tuple(ids.shape) == (p_max,), (tuple(ids.shape), p_max)
+    assert tuple(embeds.shape) == (p_max, int(step.inputs_embeds.shape[1]))
+    assert ids.dtype == step.input_ids.dtype
+    assert embeds.dtype == step.inputs_embeds.dtype
+    pools = {t.untyped_storage().data_ptr() for _, t in env.serving.flat()}
+    for tensor in (ids, embeds):
+        assert tensor.untyped_storage().data_ptr() not in pools
+    addresses = (ids.data_ptr(), embeds.data_ptr())
+    for _ in range(2):
+        assert steps.run(_split_step(env)) is not None, "execute declined the step"
+        after = api.static_inputs(binding)
+        assert after[0] is ids and after[1] is embeds
+        assert (after[0].data_ptr(), after[1].data_ptr()) == addresses
+
+
+# @spec TXG-EXEC-007, TXG-EXEC-009
+def test_the_copies_fill_the_first_p_rows_and_each_cell_gathers_by_position(
+    covered, monkeypatch
+):
+    """A covered split step (``P = 2``, one row of each kind): before the
+    first launch the two copies have written the step's ``input_ids`` and
+    ``inputs_embeds`` into the first ``P`` rows of the static inputs and
+    nothing past them; each cell's body then receives the rows of the static
+    inputs at its arena section's step positions. The static rows are
+    permuted after the copies, so a cell that read the step's inputs, or
+    gathered by another order, would receive other rows."""
+    import contextlib
+
+    steps = covered(0)
+    env, binding = steps.env, steps.cells.binding
+    ids, embeds = api.static_inputs(binding)
+    step = _split_step(env)
+    population = step.population
+    chunk_positions, echo_positions = api.arena_rows(step.plan)
+    positions = {api.CHUNK: chunk_positions, api.ECHO: echo_positions}
+    with torch.inference_mode():  # the capture allocated them in inference mode
+        ids.fill_(ID_SENTINEL)
+        embeds.fill_(EMBED_SENTINEL)
+    seen = {}
+
+    @contextlib.contextmanager
+    def at_launch(key):
+        if not seen:
+            seen["ids"] = ids[:population].clone()
+            seen["embeds"] = embeds[:population].clone()
+            seen["ids past P"] = ids[population:].clone()
+            seen["embeds past P"] = embeds[population:].clone()
+            flipped = torch.arange(population - 1, -1, -1)
+            ids[:population] = ids[:population].index_select(0, flipped)
+            embeds[:population] = embeds[:population].index_select(0, flipped)
+            seen["permuted ids"] = ids[:population].clone()
+            seen["permuted embeds"] = embeds[:population].clone()
+        seen["key"] = key
+        yield
+
+    received = []
+    advance = api.advance_module()
+    body = advance.model_rows_body
+
+    def recording_body(core, input_ids, inputs_embeds, *args, **kwargs):
+        _geometry, kind, _count = seen["key"]
+        index = torch.tensor(positions[kind], dtype=torch.long)
+        received.append((kind, input_ids.clone(), inputs_embeds.clone()))
+        # The body runs on the rows the step really holds at those positions.
+        return body(
+            core,
+            step.input_ids.index_select(0, index),
+            step.inputs_embeds.index_select(0, index),
+            *args,
+            **kwargs,
+        )
+
+    steps.cells.inside = at_launch
+    monkeypatch.setattr(advance, "model_rows_body", recording_body)
+    assert steps.run(step) is not None, "execute declined the step"
+    assert seen, "no cell launched"
+    assert torch.equal(seen["ids"], step.input_ids), "ids_static[:P] != input_ids"
+    assert tx.same_bits(seen["embeds"], step.inputs_embeds), (
+        "embeds_static[:P] != inputs_embeds"
+    )
+    assert bool((seen["ids past P"] == ID_SENTINEL).all()), "a copy wrote past P"
+    assert bool((seen["embeds past P"] == EMBED_SENTINEL).all()), "a copy wrote past P"
+    assert sorted(kind for kind, _, _ in received) == sorted([api.CHUNK, api.ECHO])
+    for kind, input_ids, inputs_embeds in received:
+        index = torch.tensor(positions[kind], dtype=torch.long)
+        assert torch.equal(input_ids, seen["permuted ids"].index_select(0, index)), kind
+        assert tx.same_bits(
+            inputs_embeds, seen["permuted embeds"].index_select(0, index)
+        ), kind
 
 
 # ---------------------------------------------------------------------------

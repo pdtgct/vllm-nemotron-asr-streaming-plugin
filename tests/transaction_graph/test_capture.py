@@ -353,6 +353,14 @@ def _dead(refs) -> bool:
     return all(ref() is None for ref in refs)
 
 
+def _assert_the_plugin_holds_no_accessor_object(env, when):
+    """TXG-CAP-008: the plugin holds no layout object, component or tensor
+    that the accessor returned (core's own references and the state layer's
+    bound views aside), checked at ``when``."""
+    held = t.plugin_holds(env, t.accessor_objects(env.state))
+    assert held == [], (f"{when}, the plugin holds what the accessor returned", held)
+
+
 # @spec TXG-CAP-008, TXG-LIFE-003
 def test_cells_reach_the_pools_only_through_the_state_group_layouts_in_the_call(
     on_cpu, monkeypatch
@@ -360,10 +368,12 @@ def test_cells_reach_the_pools_only_through_the_state_group_layouts_in_the_call(
     """The transaction-graph part reads ``ModelState.state_group_layouts``
     inside each capture call and nowhere else (not at core's binding, not in
     ``post_warmup`` or a step), stores to no page of either pool (the null
-    page included), and keeps no layout object and no tensor the accessor
-    returned: once core releases the profiling KV cache and binds the
-    serving one, and once core releases the serving layout, every object the
-    accessor returned inside a call is gone."""
+    page included), and, as soon as each call returns, holds no layout
+    object, component layout or tensor the accessor returned, nor a view of
+    one: only plain values. Core still holds them then (it installed them),
+    so the check is what the plugin's objects reach, not whether they are
+    dead. Once core releases the profiling KV cache and binds the serving
+    one, the profiling tensors are gone."""
     run = on_cpu(n=2)
     env, core = run.env, run.core
     spy = t.AccessorSpy(monkeypatch, env.state)
@@ -371,6 +381,7 @@ def test_cells_reach_the_pools_only_through_the_state_group_layouts_in_the_call(
     core.bind_profiling()
     before = pool_snapshot(core.profiling_bindings)
     core.profiling_capture()
+    _assert_the_plugin_holds_no_accessor_object(env, "when the profiling call returned")
     assert_pools_equal(before, pool_snapshot(core.profiling_bindings))
     # Inside the call any reader counts: the model state may read the
     # accessor and hand the layouts to the binding (implementation layout,
@@ -382,6 +393,7 @@ def test_cells_reach_the_pools_only_through_the_state_group_layouts_in_the_call(
     before = pool_snapshot(core.serving_bindings)
     mark = len(spy.reads)
     core.serving_capture()
+    _assert_the_plugin_holds_no_accessor_object(env, "when the serving call returned")
     assert_pools_equal(before, pool_snapshot(core.serving_bindings))
     serving = [r for r in spy.reads[mark:] if r["inside"]]
     assert serving, "the serving capture never read the state-group layouts"
@@ -390,14 +402,9 @@ def test_cells_reach_the_pools_only_through_the_state_group_layouts_in_the_call(
     assert spy.txg_reads(inside=False) == [], (
         "the transaction-graph part read the state-group layouts outside a capture call"
     )
-    # The spies' recorded transaction arguments hold pools; drop them.
     h.drop_advance_records()
-    assert _dead(ref for r in profiling for ref in (*r["layouts"], *r["tensors"])), (
-        "a profiling layout or one of its tensors outlived core's release"
-    )
-    env.state._state_group_layouts = ()  # core's release of the serving cache
-    assert _dead(ref for r in serving for ref in r["layouts"]), (
-        "the serving capture retained a layout object"
+    assert _dead(ref for r in profiling for ref in r["tensors"]), (
+        "a profiling component tensor outlived core's release"
     )
 
 
@@ -451,9 +458,12 @@ def test_a_broken_layout_contract_fails_pool_access_with_no_remedy(on_cpu, broke
     assert re.search(needle, message), (broken, message)
     if broken == "two-layouts":
         assert c.shows_number(message, 2), message
-    assert c.configuration_remedies(message) == [], (
+    # The error states the budget setting (TXG-MEM-010), which names
+    # ``--kv-cache-memory-bytes`` with its current value: a fact, not a remedy.
+    settings = c.current_settings(env.vllm_config)
+    assert c.configuration_remedies(message, settings) == [], (
         "a contract break gave a configuration remedy",
-        c.configuration_remedies(message),
+        c.configuration_remedies(message, settings),
         message,
     )
     assert t.fake_graph_count(env) == 0, "a cell was captured past pool access"

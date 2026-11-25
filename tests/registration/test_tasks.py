@@ -30,18 +30,14 @@ def test_model_class_declares_realtime_persistent_state_and_transcription(regist
 
 
 def _set_on_the_class(cls, name: str):
-    """The value of ``name`` as the model class itself sets it: the first
-    class of its MRO that defines it, which must not be the protocol
-    ``SupportsPersistentState`` (whose defaults differ)."""
-    from vllm.model_executor.models.interfaces import SupportsPersistentState
-
-    for owner in cls.__mro__:
-        if name in vars(owner):
-            assert owner is not SupportsPersistentState, (
-                f"{name} is the protocol's default, not set on the model class"
-            )
-            return vars(owner)[name]
-    raise AssertionError(f"{name} is not set")
+    """The value of ``name`` as the model class itself sets it, in its own
+    namespace (``vars(cls)``): a value inherited from a base class, the
+    protocol ``SupportsPersistentState``'s default included, is not set on the
+    class (REG-TASK-001)."""
+    assert name in vars(cls), f"{name} is not set on {cls.__name__} itself" + (
+        f" (it is inherited: {getattr(cls, name)!r})" if hasattr(cls, name) else ""
+    )
+    return vars(cls)[name]
 
 
 @pytest.mark.parametrize(

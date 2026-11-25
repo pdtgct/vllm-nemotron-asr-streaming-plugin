@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Installed-engine startup checks on CUDA with the published card
-(REG-ENG-032, REG-STATE-019), each engine in a fresh child process
-(``support.engine_child``, mode ``"llm"``: the worker runs in the child, so a
-patch there sees the model state and the state layer).
+"""Installed-engine checks on CUDA with the published card (REG-ENG-032,
+REG-STATE-019 at startup; REG-MS-005 while serving), each engine in a fresh
+child process (``support.engine_child``, mode ``"llm"``: the worker runs in
+the child, so a patch there sees the model state and the state layer).
 
 ``gpu`` and ``card`` tier: they collect and skip without CUDA or
 ``NEMOTRON_CARD_DIR``.
@@ -41,10 +41,12 @@ def _settings(**settings):
     }
 
 
-def _run(tmp_path, settings, patch):
+def _run(tmp_path, settings, patch, **request):
     from support.engine_child import run_engine
 
-    reply = run_engine(tmp_path, {"mode": "llm", "settings": settings, "patch": patch})
+    reply = run_engine(
+        tmp_path, {"mode": "llm", "settings": settings, "patch": patch, **request}
+    )
     assert reply["ok"], reply.get("error")
     return reply
 
@@ -89,3 +91,44 @@ def test_no_plugin_object_keeps_the_profiling_kv_cache(tmp_path, arm):
     expired = reply["reads"]["profiling_kv_cache_expired"]
     assert expired, "core bound the state layer only once: no profiling KV cache"
     assert expired[0] is True, "an object kept the profiling KV cache"
+
+
+# @spec REG-MS-005
+def test_a_failed_request_ends_alone_and_a_retired_id_ends_nothing(tmp_path):
+    """Complete files through the engine, in two phases: ``first`` alone,
+    then ``victim`` and ``other`` together. On every real step after
+    ``first`` retired, the model state's ``take_failed_requests`` also
+    returns ``first``'s ID, which core's scheduler no longer holds; once,
+    on the first step that holds ``victim`` beside ``other``, it returns
+    ``victim``. ``victim`` alone ends with finish reason ``error``; ``other``,
+    which shared that step (the recorded rows show it), and ``first`` end
+    normally, each once; no error is raised."""
+    files = [
+        [{"id": "first", "seconds": 1.0, "seed": 0}],
+        [
+            {"id": "victim", "seconds": 3.0, "seed": 1},
+            {"id": "other", "seconds": 3.0, "seed": 2},
+        ],
+    ]
+    reply = _run(
+        tmp_path,
+        _settings(**EAGER),
+        "inject-failed-requests",
+        phases=files,
+        inject={"live": "victim"},
+    )
+    reads = reply["reads"]
+    ends: dict[str, list[str]] = {}
+    for req_id, reason in reads["finished"]:
+        ends.setdefault(req_id, []).append(reason)
+    assert ends == {"first": ["stop"], "victim": ["error"], "other": ["stop"]}, ends
+    (live,) = reads["injected"]["live"]
+    assert live["id"].startswith("victim"), live
+    assert any(r.startswith("other") for r in live["step"]), (
+        "victim was failed on a step without other",
+        live,
+    )
+    retired = reads["retired"][0]
+    assert retired.startswith("first"), reads["retired"]
+    assert reads["injected"]["retired"], "no step returned the retired ID"
+    assert set(reads["injected"]["retired"]) == {retired}

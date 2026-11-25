@@ -345,6 +345,49 @@ def test_a_step_with_a_multi_token_row_falls_back_by_multi_token(on_cpu, chunk_r
 
 
 @pytest.mark.engine
+# @spec TXG-COV-014, TXG-COV-006
+def test_multi_token_takes_precedence_over_an_absent_cell(on_cpu, monkeypatch):
+    """With every serving cell's graph absent, a one-token step of two CHUNK
+    rows falls back by ``uncaptured`` (TXG-COV-006: the absent cell is
+    visible to classification), while the same shape with a multi-token row
+    falls back once, by ``multi-token``, the reason classification assigns
+    before any of TXG-COV-006's, without raising."""
+    from support import txg_steps as steps
+    from support import txgcap_harness as t
+
+    run = on_cpu(n=2, max_num_seqs=4)
+    env, core = run.env, run.core
+    core.startup()
+    for cell in api.binding_of(env.model).cells.values():
+        monkeypatch.setattr(cell, "graph", None)
+    replays = env.fake.replay_count
+    before = dict(t.counter(env, "fallbacks"))
+    steps.token_step(
+        env.runner,
+        t.stream_unit(env, "a"),
+        t.stream_unit(env, "b"),
+        handles={"a": 1, "b": 2},
+    )
+    grown = _fallback_growth(before, dict(t.counter(env, "fallbacks")))
+    assert [key[0] for key in grown] == ["uncaptured"], grown
+    before = dict(t.counter(env, "fallbacks"))
+    wide = steps.with_tokens(
+        t.stream_unit(env, "wide"), int(env.config.audio_chunk_token_id)
+    )
+    steps.token_step(
+        env.runner,
+        t.stream_unit(env, "c"),
+        wide,
+        counts={"wide": 2},
+        handles={"c": 3, "wide": 4},
+    )
+    grown = _fallback_growth(before, dict(t.counter(env, "fallbacks")))
+    assert [key[0] for key in grown] == ["multi-token"], grown
+    assert list(grown.values()) == [1], grown
+    assert env.fake.replay_count == replays, "a step without graphs launched"
+
+
+@pytest.mark.engine
 # @spec TXG-COV-002, TXG-COV-008
 def test_a_one_token_step_within_n_is_covered(on_cpu):
     """The same rows, each scheduling one token, are covered: no fallback,

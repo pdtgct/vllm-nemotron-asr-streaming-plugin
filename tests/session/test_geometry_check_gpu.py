@@ -229,7 +229,10 @@ def test_a_later_unit_at_another_geometry_fails_its_row_alone(served_engine):
     assert parked_units(served_engine, bad) == 1, (
         "the first unit parked before the second failed"
     )
-    # The other stream, in the same steps, is unaffected.
+    # The other stream, sent alongside, is unaffected. Whether the two shared
+    # a step cannot be asserted here: the engine core runs in another
+    # process and no output names its step. test_startup_gpu's REG-MS-005
+    # check records each step's rows in the worker and asserts it.
     assert good[-1].finished and finish_reason(good) == "stop"
     assert parked_units(served_engine, good) == len(clean)
 
@@ -257,7 +260,9 @@ def test_a_row_status_of_another_class_fails_that_request_alone(served_engine):
     """A later unit at the server's geometry whose ``chunk_sequence`` skips
     ahead: the transaction's sequence status (a collected row status of
     another class than geometry) fails that request with ``error``; the
-    step's other row continues to a normal close."""
+    other stream, sent alongside, continues to a normal close. That the two
+    shared a step is not visible to this client (see the note in
+    ``test_a_later_unit_at_another_geometry_fails_its_row_alone``)."""
     faulty = server_prompts(served_engine, 2, seed=5)
     faulty[1] = repacked(
         faulty[1], SERVER_RIGHT_CONTEXT, SERVER_RIGHT_CONTEXT, sequence=7

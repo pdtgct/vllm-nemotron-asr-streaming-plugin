@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """How a refusal names the hook configuration's conditions and remedies
-(REG-ENG-005, REG-ENG-021 to REG-ENG-025) and the state layer's refusals
-(REG-ENG-019, TXG-CFG-016), for the tests that read refusal messages.
+(REG-ENG-005, REG-ENG-021 to REG-ENG-025) and the state layer's refusal of
+native burst (REG-ENG-019), for the tests that read refusal messages. The
+transaction-graph conditions, TXG-CFG-016's among them, are
+``support.txg_conditions``'s.
 
 Each condition is recognized by a phrase no other condition's text or remedy
 contains, so a message that lists several conditions (REG-VAL-003) shows each
@@ -111,41 +113,14 @@ def names_removal_of(text: str, option: str) -> bool:
     return option in text and re.search(r"(?i)\bremov", text) is not None
 
 
-#: TXG-CFG-016's reason: the state layer offers no state-group layout accessor.
-LAYOUT_ACCESSOR = re.compile(r"(?i)layout accessor")
 TRANSACTION_GRAPH_KEY = "transaction_graph_populations"
 
 
 def state_layer_mentions(message: str) -> int:
+    """How often ``message`` mentions the state layer (REG-ENG-019's refusal
+    of native burst names it). TXG-CFG-016's condition is matched by
+    ``support.txg_conditions`` alone."""
     return len(re.findall(r"(?i)state layer", message))
-
-
-def is_state_layer_condition(error: str) -> bool:
-    """TXG-CFG-016's condition: the option, the state layer and its reason
-    (no state-group layout accessor), and removing the option as the
-    remedy."""
-    return (
-        names_removal_of(error, TRANSACTION_GRAPH_KEY)
-        and state_layer_mentions(error) > 0
-        and LAYOUT_ACCESSOR.search(error) is not None
-    )
-
-
-def assert_one_state_layer_condition(message: str, vllm_config) -> str:
-    """``message`` (a refusal of ``vllm_config``, transaction graphs on and
-    native burst off) carries TXG-CFG-016's condition, as
-    ``transaction_graph_config_errors`` returns it, exactly once, and nothing
-    else in it mentions the state layer: a second refusal of transaction
-    graphs on the state layer would be a duplicate (TXG-CFG-011). Returns the
-    condition."""
-    from support import txg_api as api
-
-    found = [e for e in api.config_errors(vllm_config) if is_state_layer_condition(e)]
-    assert len(found) == 1, found
-    (condition,) = found
-    assert message.count(condition) == 1, message
-    assert state_layer_mentions(message.replace(condition, "")) == 0, message
-    return condition
 
 
 def shows_value(error: str, value) -> bool:

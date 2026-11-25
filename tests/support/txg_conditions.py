@@ -78,13 +78,35 @@ def shows_number(message: str, value: int) -> bool:
 def is_state_layer_condition(error: str) -> bool:
     """TXG-CFG-016's condition: transaction graphs need core's state-group
     layout accessor ``ModelState.state_group_layouts``, which the running
-    core lacks; remedy: remove ``transaction_graph_populations``."""
+    core lacks; remedy: remove ``transaction_graph_populations``. This is the
+    one matcher of that condition (the registration tests use it too)."""
     return (
         KEY in error
         and found(ACCESSOR, error)
         and "ModelState" in error
         and found(REMOVAL, error)
     )
+
+
+#: A clause that refuses transaction graphs on account of the state layer in
+#: other words than TXG-CFG-016's (the proof of concept's refusal said
+#: "not supported on the ... state layer").
+_ON_THE_STATE_LAYER = re.compile(r"(?i)state layer")
+
+
+def state_layer_refusals(message: str) -> list[str]:
+    """The clauses of ``message`` (its parts between ``;`` and line breaks)
+    that refuse ``transaction_graph_populations`` on account of the state
+    layer: TXG-CFG-016's condition (it names core's accessor,
+    :data:`ACCESSOR`) or any other clause naming the option with the state
+    layer. On a core whose ``ModelState`` defines ``state_group_layouts``
+    there is none (TXG-CFG-016)."""
+    return [
+        clause
+        for clause in re.split(r"[;\n]", message)
+        if KEY in clause
+        and (found(ACCESSOR, clause) or found(_ON_THE_STATE_LAYER, clause))
+    ]
 
 
 def is_admission_condition(error: str) -> bool:
@@ -124,13 +146,69 @@ CONFIGURATION_REMEDIES: dict[str, re.Pattern[str]] = {
 }
 
 
-def configuration_remedies(message: str) -> list[str]:
+#: The configuration options a capture failure's diagnostic can name with
+#: their current values (TXG-MEM-010's budget setting; ``N`` and the
+#: admission limit): CLI flag -> the option's names.
+OPTION_NAMES: dict[str, tuple[str, ...]] = {
+    "--num-gpu-blocks-override": (
+        "--num-gpu-blocks-override",
+        "num_gpu_blocks_override",
+    ),
+    "--kv-cache-memory-bytes": ("--kv-cache-memory-bytes", "kv_cache_memory_bytes"),
+    "--max-num-active-seqs": ("--max-num-active-seqs", "max_num_active_seqs"),
+    "--max-num-seqs": ("--max-num-seqs", "max_num_seqs"),
+}
+
+
+def current_settings(vllm_config: object) -> dict[str, object]:
+    """The current value of each option of :data:`OPTION_NAMES` that
+    ``vllm_config`` sets (duck-typed; ``None`` values are left out)."""
+    cache = getattr(vllm_config, "cache_config", None)
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    values = {
+        "--num-gpu-blocks-override": getattr(cache, "num_gpu_blocks_override", None),
+        "--kv-cache-memory-bytes": getattr(cache, "kv_cache_memory_bytes", None),
+        "--max-num-active-seqs": getattr(scheduler, "max_num_active_seqs", None),
+        "--max-num-seqs": getattr(scheduler, "max_num_seqs", None),
+    }
+    return {flag: value for flag, value in values.items() if value is not None}
+
+
+def diagnostic_facts(message: str, settings: dict[str, object]) -> list[str]:
+    """The places where ``message`` names an option of ``settings`` together
+    with its current value (``--kv-cache-memory-bytes 1073741824``,
+    ``num_gpu_blocks_override=8``, ``--max-num-seqs (3)``): facts about the
+    configuration, not suggested changes."""
+    facts = []
+    for flag, value in settings.items():
+        names = "|".join(re.escape(name) for name in OPTION_NAMES[flag])
+        pattern = rf"(?:{names})[\s=:(\"'`]*{re.escape(str(value))}(?![\d.])"
+        facts += [m.group(0) for m in re.finditer(pattern, message)]
+    return facts
+
+
+def suggested_changes(message: str, settings: dict[str, object] | None = None) -> str:
+    """``message`` without its diagnostic facts (:func:`diagnostic_facts`):
+    what remains can only suggest changes."""
+    for fact in diagnostic_facts(message, settings or {}):
+        message = message.replace(fact, " ")
+    return message
+
+
+def configuration_remedies(
+    message: str, settings: dict[str, object] | None = None
+) -> list[str]:
     """The configuration remedies ``message`` gives (empty for a break of
-    core's state-group layout contract, TXG-CAP-008, TXG-MEM-010)."""
+    core's state-group layout contract, TXG-CAP-008, TXG-MEM-010): the
+    changes of :data:`CONFIGURATION_REMEDIES` it suggests. A mention of an
+    option with its current value in ``settings`` (:func:`current_settings`)
+    states the configuration, as TXG-MEM-010's budget setting does, and is
+    not a remedy."""
+    changes = suggested_changes(message, settings)
     return [
         name
         for name, pattern in CONFIGURATION_REMEDIES.items()
-        if found(pattern, message)
+        if found(pattern, changes)
     ]
 
 

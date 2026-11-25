@@ -426,9 +426,11 @@ def test_a_retry_after_a_failed_serving_capture_is_refused_with_the_option_off(
 
 # @spec TXG-LIFE-009
 def test_a_rebinding_with_the_captured_layout_changes_nothing(on_cpu):
-    """Core binds the same serving pages again (new view objects over the
-    same storage): the plain-value layout equals the captured one, so the
-    binding changes nothing and the worker still verifies and serves."""
+    """Core binds the same serving pages again through ``bind_kv_cache``
+    alone (new view objects over the same storage; no
+    ``initialize_kv_cache``): the plain-value layout equals the captured
+    one, so the binding changes nothing and the worker still verifies and
+    serves."""
     from support import txg_api
 
     run = on_cpu(n=2)
@@ -436,7 +438,9 @@ def test_a_rebinding_with_the_captured_layout_changes_nothing(on_cpu):
     core.startup(verify=False)
     binding = txg_api.binding_of(env.model)
     mark = len(env.events)
-    core.bind_serving(core.serving_bindings)
+    initialized = _count_calls(env.state, "initialize_kv_cache")
+    assert h.call_with(core.rebind_views, core.serving_bindings) is None
+    assert initialized == [], "the rebinding initialized the KV cache"
     assert t.captures_since(env, mark) == []
     assert t.fake_graph_count(env) == 2 * env.n
     assert binding.failed is False
@@ -444,13 +448,29 @@ def test_a_rebinding_with_the_captured_layout_changes_nothing(on_cpu):
     core.step(t.stream_unit(env, "s1"))
 
 
+def _count_calls(obj, name):
+    """Record each later call of ``obj.name`` (an instance attribute wraps
+    the method); returns the record."""
+    calls = []
+    real = getattr(obj, name)
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    setattr(obj, name, counted)
+    return calls
+
+
 @pytest.mark.parametrize("attempt", ["succeeded", "failed"])
 # @spec TXG-LIFE-009
 def test_a_rebinding_with_another_layout_latches_and_raises(on_cpu, attempt):
     """After a serving capture was attempted, whether or not it succeeded,
-    core binding the state layer's views over other pages (another
-    plain-value layout) latches the binding and raises; every later step
-    then raises the fresh-engine error."""
+    core binding the state layer's views over other pages through
+    ``bind_kv_cache`` alone (another plain-value layout; no
+    ``initialize_kv_cache``) raises from that call and has latched the
+    binding when it returns, before any other lifecycle call; every later
+    step then raises the fresh-engine error."""
     from support import txg_api
 
     run = on_cpu(n=2, kv_cache_memory_bytes=1 << 30)
@@ -465,9 +485,12 @@ def test_a_rebinding_with_another_layout_latches_and_raises(on_cpu, attempt):
         core.serving_capture()
         core.post_warmup()
     binding = txg_api.binding_of(env.model)
-    error = h.call_with(core.bind_serving)  # a fresh pool: other addresses
+    assert binding.failed is False
+    initialized = _count_calls(env.state, "initialize_kv_cache")
+    error = h.call_with(core.rebind_views)  # a fresh pool: other addresses
     assert error is not None, "a different serving layout was accepted"
-    assert binding.failed is True, "the binding did not latch"
+    assert initialized == [], "the rebinding initialized the KV cache"
+    assert binding.failed is True, "bind_kv_cache returned without the latch"
     later = h.call_with(core.step, t.stream_unit(env, "s1"))
     assert later is not None and t.FRESH_ENGINE.search(t.text(later)), later
 

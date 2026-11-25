@@ -112,6 +112,21 @@ class CoreOrder:
         self.serving_bindings = self.runner.bind_pool(bindings or self.bindings())
         return self.serving_bindings
 
+    def rebind_views(self, bindings: Any = None) -> Any:
+        """Core binding the state layer's views again without initializing
+        the KV cache: ``bind_kv_cache`` alone, as core's extensible KV cache
+        rebinds every layer when it grows (``extensible_kv_cache.py``), with
+        no call of the model state's ``initialize_kv_cache`` and no new
+        state-group layout. ``bindings`` defaults to a fresh pool (other
+        addresses); the serving pool's own bindings give new view objects
+        over the same storage. Returns the bindings, now the serving ones."""
+        bindings = bindings or self.bindings()
+        h.state_layer_of(self.runner.model).bind_kv_cache(
+            h.core_bindings(bindings).tensor
+        )
+        self.runner.bindings = self.serving_bindings = bindings
+        return bindings
+
     # -- captures -------------------------------------------------------------
 
     def needs_capture(self) -> bool:
