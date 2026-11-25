@@ -87,8 +87,9 @@ fields on `SpeechToTextParams`, `use_beam_search: bool = False` and
 translation) request. The class docstring already provides for adding fields without changing the
 `get_generation_prompt` signature. The guards activate when the fields are present; against a core
 without them, `getattr` finds neither and the model behaves as before. vllm#67151 adds the fields
-(head `dbae7c72cf`, stacked on #67144) and is part of the stage 1 build (HLD Constraints); on a
-core without it the guards are inactive and the user manual states the limits.
+(head `dbae7c72cf`, stacked on #67144). The stage 1 build, the target core alone, carries neither
+pull request (HLD Constraints), so on stage 1, as on any core without #67151, the guards are
+inactive and the user manual states the limits.
 
 What reaches the model, by core request field:
 - Beam search and a completion limit are text-decoding options. They do not apply to audio
@@ -165,7 +166,7 @@ Five things bound a file or set its cost today:
   would admit only about 1/71 of the file length core's actual-token stop allows. The model
   imposes no input-length limit; the operator sizes `max_model_len`.
 - **How core reports the stop.** On upstream `main` a request that ends with `length`, `error` or
-  `abort` returns HTTP 200 with partial text. Two upstream pull requests, both in the stage 1
+  `abort` returns HTTP 200 with partial text. Two upstream pull requests, neither in the stage 1
   build, change that on the transcription and translation routes, which share core's
   speech-to-text serving:
   - vllm#67144 fails an `error` ending (non-streaming: HTTP 500; streaming: an error event after
@@ -177,8 +178,8 @@ Five things bound a file or set its cost today:
     a client's own `max_completion_tokens` stays HTTP 200 for other models; this plugin refuses
     that field, so every `length` ending of its files is server-caused.
 
-  On a core without these PRs such a file returns partial text with HTTP 200, and the user manual's
-  limits say so (FILE-BUD-004).
+  On a core without these PRs, stage 1 included, such a file returns partial text with HTTP 200,
+  and the user manual's limits say so (FILE-BUD-004, REG-DOC-003).
 - **Upload and decode (core settings).** Core reads the upload into bytes and decodes the whole
   file to float32 under the limits above, then carries every sample in the request's
   `multi_modal_data`.
@@ -530,9 +531,10 @@ submission (Request guards), so neither can truncate a transcript.
 
 ### Open
 1. The core changes are open upstream as vllm#67144 (`error` and `abort` endings) and vllm#67151
-   (the two request fields and server-caused `length` endings), and both are in the stage 1 build.
-   Until they merge, the user manual states the behaviour on a core without them: guards inactive, and
-   partial text with HTTP 200 for these endings.
+   (the two request fields and server-caused `length` endings). Neither is in the stage 1 build,
+   the target core alone. Until a build the plugin targets carries them, the user manual states the
+   behaviour on a core without them: guards inactive, and partial text with HTTP 200 for these
+   endings.
 2. For the user manual's limits: on a core without vllm#67151, beam search can issue up to
    `n × max_model_len` engine requests per upload, one per beam per pass (Request guards), so the route is not to be exposed to untrusted
    clients on such a core.

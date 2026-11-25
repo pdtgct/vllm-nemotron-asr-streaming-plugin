@@ -92,7 +92,9 @@ stage. Whether a CHUNK row starts a fresh stream is a per-row mask inside the ch
 whether a row belongs to a whole file, so freshness and files add no graphs. A *cell* is one
 captured graph: its geometry, kind and exact row count. The option declares the step populations
 the deployment expects, and the model captures a chunk cell and an echo cell at every count from 1
-to the largest of them. A step is covered only when every kind it
+to the largest of them. A population above core's admission limit (`--max-num-active-seqs`, or
+`max_num_seqs` when it is unset) can never occur, because core runs no more requests at once, so
+the option refuses it. A step is covered only when every kind it
 contains has a cell at its count (a 31-row step with 20 CHUNK rows needs the chunk cell at 20 and
 the echo cell at 11); any other step, or one whose signature differs from its cells', runs wholly
 as the option-off transaction, which is the reference, and is counted as a fallback. The host
@@ -194,6 +196,10 @@ the first captured counts and fail before capturing the rest. The eager arms (`e
 - The default configuration runs graphed segments (Approach, section 5). Tiers 1 to 4 are
   qualified with the default segment arms, for each runner configuration claimed; tier 5 adds
   transaction graphs to them.
+- With vLLM's batch-invariant mode on (`VLLM_BATCH_INVARIANT=1`) and transaction graphs off, a
+  stream's final transcript does not depend on how many other streams share its steps (the
+  `registration` design, REG-ENG-015). Outside that mode the FP32 kernels are not batch-invariant,
+  so two runs under load can differ on a near-tie.
 - Every acceptance claim in this repository is recorded in `docs/evidence.md` and names the tier it has met (Success Metrics); every figure the README summarizes names its tier, build and GPU or links that record.
 
 ## Non-Goals
@@ -298,7 +304,11 @@ the leaf designs cite them where they depend on them.
   state-group layout accessor. `docs/evidence.md` records the commits each acceptance tier was actually
   met on, and claims only the tiers met; a tier met on another core (the state pool of #67374 and
   #67375, or a build without #67583) is a historical record until it is met again on stage 1.
-  Python `>=3.11,<3.15`.
+  A comparison of the state layer with the state-pool build, by which RFC 1 retires the state
+  pool, takes as its baseline the last plugin release on the state-pool core, `v0.1.0b2`
+  (`d93dbb8399`, whose production code is that of `adfb24b`), on that core, `pdtgct/vllm`
+  `hook-build-20261114b` at `9c40a6ffd6`, where `docs/evidence.md` records its tier 2 and tier 5
+  runs. Python `>=3.11,<3.15`.
 - **Engine settings.** The resolved engine settings must be no prefix caching and a runner that
   captures no CUDA graph over the model's forward and compiles none of the model, and the plugin
   refuses to start otherwise. Asynchronous scheduling is accepted with transaction graphs off:
@@ -396,6 +406,14 @@ the leaf designs cite them where they depend on them.
   160 ms geometry. Transaction graphs require the 80 or 160 ms geometry and native burst off.
   The plugin refuses native burst on the target core and accepts transaction graphs there only
   under the restricted startup (the `registration` design, Engine settings).
+- **Admission on stage 1.** Core admits a state stream when `AsyncLLM.generate` opens it, before it
+  reads any input, and refuses one with `StreamAdmissionError` (reasons `active_limit`, at core's
+  admission limit, and `engine_paused`). Core's `/v1/realtime` sends `session.created` when it
+  accepts the WebSocket and opens the stream only when the client's first commit starts
+  generation. On stage 1 a server at its admission limit therefore does not refuse a client at
+  connection: the client receives `session.created`, and the refusal arrives after its first
+  commit as an `error` event of type `processing_error` naming the reason. This is a limit of
+  core's route on stage 1, which the user manual states (`registration`, REG-DOC-003).
 - **Completeness.** The model and the session factory treat a transcript as complete only after
   EOS following the final flush; a session that ends any other way fails. How core's own routes
   report a request that ends without EOS is core's behaviour, not the plugin's:
@@ -524,9 +542,9 @@ runs on neither build until then, so no leg that drives it through a real engine
      those two medians, in each of two blocks, with a separate pass result for each group; the
      `transaction-graph` design preregisters the procedure, the split compositions and their
      aggregation;
-   - the single-stream admission demand measured through `AsyncLLM` in a multiprocess engine,
-     from audio feed to slot park, improves by its own pre-registered rule, given in the
-     `transaction-graph` design;
+   - the single-stream admission demand measured through `AsyncLLM.generate` with a
+     streaming-input generator in a multiprocess engine, from one unit's feed to its park,
+     improves by its own pre-registered rule, given in the `transaction-graph` design;
    - the `transaction-graph` design's calibration measures U(1), the step time one admitted
      stream adds at the served geometry, from which admission computes how many streams fit a
      step, with the option on and with it off, and records the option as part of the
@@ -536,8 +554,8 @@ runs on neither build until then, so no leg that drives it through a real engine
      the serving capture retained no more; under a fixed budget the startup log reports the
      uncharged graph memory; each refusal in Constraints refuses its configuration (the option
      under `--enforce-eager`, at a geometry other than 80 or 160 ms, with native burst, outside the
-     restricted startup, on a core without #67583's hooks or without the state-group layout
-     accessor);
+     restricted startup, with a population above core's admission limit, on a core without
+     #67583's hooks or without the state-group layout accessor);
    - TLA+ models of the capture lifecycle on the hook, versioned in this repository as a system
      model and updated with every change to that lifecycle, check without violations.
 
@@ -561,6 +579,16 @@ that retained more graph memory than that profiling capture.
 - Frontend: [pdtgct/vllm-riva-frontend](https://github.com/pdtgct/vllm-riva-frontend)
 - Feature request: [vllm#47455](https://github.com/vllm-project/vllm/issues/47455)
 
+### Credits
+
+- Sohaib Ahmad's [vllm#59827](https://github.com/vllm-project/vllm/pull/59827) and offline plugin
+  serve this checkpoint's complete-audio transcription in vLLM; the offline plugin is this plugin's
+  independent reference for whole-file transcripts (Same model, two implementations).
+- The state layer builds on vLLM's `MambaSpec` state groups and hybrid KV-cache manager, and the
+  live-stream path on vLLM's streaming input and Realtime API (`/v1/realtime`).
+- The checkpoint, its card and its tokenizer are NVIDIA's
+  ([model card](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)).
+
 ## Future roadmap
 
 - **Runner-captured graphs.** Core capturing graphs over the model's forward, piecewise through
@@ -573,6 +601,15 @@ that retained more graph memory than that profiling capture.
   extensible KV cache grows; the qualification covers the reduced modes and asynchronous
   scheduling. Shape: the `registration` design, Future roadmap item 8, and the `transaction-graph`
   design's Future roadmap.
+- **Multi-unit rows.** A row that schedules several tokens, which only a direct engine client can
+  send, fails its request alone (the `registration` design, REG-STATE-014). Trigger: a client or
+  frontend needs to submit several units in one input. Shape and costs: the `registration`
+  design, Future roadmap 14.
+- **Latency parity with NVIDIA's NIM.** No measurement compares this plugin's streaming latency
+  with an NVIDIA NIM serving the same checkpoint. Trigger: tier 4 met on stage 1, with transaction
+  graphs off and on, and a NIM that serves this checkpoint available for a side-by-side run. Shape:
+  the same paced LibriSpeech streams against both servers on one GPU, comparing final latency and
+  time to the first transcript, recorded in `docs/evidence.md` with both builds.
 - **Session factory on core's automatic admission.** On the target core the factory is not
   available (Approach, section 2), so frontends' streaming routes do not run. Trigger: the model
   meets acceptance tier 2 on stage 1 through core's routes. Shape: the factory opens a session

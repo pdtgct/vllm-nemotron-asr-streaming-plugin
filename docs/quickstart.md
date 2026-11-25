@@ -1,22 +1,25 @@
 # Quick start
 
-This page installs release `v0.1.0b2` of `vllm-nemotron-asr-streaming`, serves
+This page installs `vllm-nemotron-asr-streaming` on the stage 1 build, the target core, serves
 [`nvidia/nemotron-3.5-asr-streaming-0.6b`](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
-from one `vllm serve` process, and checks that the server answers. Choose one of two builds:
+from one `vllm serve` process, and checks that the server answers. Stage 1 runs the plugin alone:
+core's `/v1/realtime` and `POST /v1/audio/transcriptions` serve requests directly.
 
-- Stage 1 runs the plugin alone. Core's `/v1/realtime` and `POST /v1/audio/transcriptions` serve
-  requests directly.
-- Stage 2 adds the Riva frontend `v0.4.0b3`. The same process also serves Riva gRPC, the Riva
-  Realtime WebSocket and the frontend's file route.
+Stage 2, which adds the Riva frontend, does not serve streams on the target core: the frontend's
+streaming routes use this plugin's session factory, which is not available on the target core
+([manual, Builds and compatibility](manual.md#builds-and-compatibility)). This page does not
+install it.
 
 The [user manual](manual.md) covers every setting, the clients, operations and troubleshooting.
 
 ## What has been measured
 
-This release was measured only on the stage 1 build, on one NVIDIA A40 at FP32, at 320 ms in the
-hook configuration. That run partly met tier 2, the installed-engine acceptance tier
-([evidence](evidence.md#tier-2-on-the-stage-1-build)). Stage 2 is unmeasured with this release, and
-the frontend `v0.4.0b3` passed CI on CPU only.
+No acceptance tier has been met on the target core. The last release, `v0.1.0b2`, ran on the
+earlier state-pool build, where it partly met tier 2, the installed-engine acceptance tier, on one
+NVIDIA A40 at FP32 at 320 ms in the hook configuration
+([evidence](evidence.md#tier-2-on-the-stage-1-build)). That release does not run on the target
+core, and the plugin's `main` requires the target core and no other RFC 1 build
+([high-level design, Constraints](high-level-design.md#constraints)).
 
 The install and serve commands below have not been run as written. The
 [evidence document](evidence.md) records the runs that were.
@@ -25,79 +28,73 @@ The install and serve commands below have not been run as written. The
 
 | Component | Repository | Revision |
 | --- | --- | --- |
-| This plugin | `pdtgct/vllm-nemotron-asr-streaming-plugin` | tag `v0.1.0b2` (`d93dbb8399`) |
-| Riva frontend (stage 2 only) | `pdtgct/vllm-riva-frontend` | tag `v0.4.0b3` (`125ac19884`) |
-| vLLM, stage 1 | `pdtgct/vllm`, branch `hook-build-20261114b` | `9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee` |
-| vLLM, stage 2 | `pdtgct/vllm`, branch `stage2-build-20261114b` | `54b457dd8f58e1011c5ec2a9d1e3a16c6c78b498` |
+| This plugin | `pdtgct/vllm-nemotron-asr-streaming-plugin` | `main` (unreleased for the target core) |
+| vLLM, stage 1 (the target core) | `pdtgct/vllm`, branch `pstate-impl-20261122` | `ddf6db2ab8cc788150b7a24473d66c47091dbd9c` |
 
-No released vLLM provides the interfaces the plugin needs. The plugin and the frontend are released
-as a pair: plugin `v0.1.0b2` needs frontend `v0.4.0b3`. Plugin `main` at `d5c5197` and frontend
-`v0.4.0b2` do not work with this pair ([manual, Builds and compatibility](manual.md#builds-and-compatibility)).
+No released vLLM provides the interfaces the plugin needs. The target core is upstream vLLM `main`
+at `842f74fa8dff2c6792bd68b021c92d8fbf2b93bc` with RFC 1's state layer, vllm#67583's model-state
+hooks and the state-group layout accessor on top. It changes no compiled code, so it installs over
+the precompiled wheel of that upstream commit.
 
 ## Requirements
 
-- One NVIDIA GPU with a driver that supports CUDA 13.2. The measured environment used vLLM's
-  precompiled wheel `191e5d5df2ec693d5536a635079d58864dfacebb`, variant `cu132`, with torch
-  `2.14.0+cu132`.
+- One NVIDIA GPU with a driver that supports CUDA 13.2. The target core pins torch `2.14.0`; the
+  commands below select vLLM's precompiled wheel variant `cu132`, which has not been checked
+  against this commit.
 - Python 3.11 or 3.12.
 - Network access to GitHub and Hugging Face.
 
 ## Install
 
-Use one virtual environment per build. Set `VLLM_BRANCH` to the stage 1 or the stage 2 branch.
+Use a fresh virtual environment.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 
-VLLM_BRANCH=hook-build-20261114b      # stage 1
-# VLLM_BRANCH=stage2-build-20261114b  # stage 2
-
-git clone --branch "$VLLM_BRANCH" --single-branch https://github.com/pdtgct/vllm.git
+git clone --branch pstate-impl-20261122 --single-branch https://github.com/pdtgct/vllm.git
 cd vllm
-git rev-parse HEAD   # 9c40a6ffd6... for stage 1, 54b457dd8f... for stage 2
+git checkout ddf6db2ab8cc788150b7a24473d66c47091dbd9c
 VLLM_USE_PRECOMPILED=1 \
-VLLM_PRECOMPILED_WHEEL_COMMIT=191e5d5df2ec693d5536a635079d58864dfacebb \
+VLLM_PRECOMPILED_WHEEL_COMMIT=842f74fa8dff2c6792bd68b021c92d8fbf2b93bc \
 VLLM_PRECOMPILED_WHEEL_VARIANT=cu132 \
     pip install -e .
 cd ..
 
-pip install "git+https://github.com/pdtgct/vllm-nemotron-asr-streaming-plugin.git@v0.1.0b2"
-
-# Stage 2 only:
-pip install "git+https://github.com/pdtgct/vllm-riva-frontend.git@v0.4.0b3"
+pip install "git+https://github.com/pdtgct/vllm-nemotron-asr-streaming-plugin.git@main"
 ```
 
 `VLLM_PRECOMPILED_WHEEL_COMMIT` must be the full 40-character commit. Do not install
 `vllm-riva-frontend-dev` into a serving environment; it is the frontend's test suite.
 
-## Serve, stage 1
+## Serve
 
 ```bash
 vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --dtype float32 \
+    --enforce-eager \
+    --no-async-scheduling \
     --config-format nemotron_asr_streaming \
     --tokenizer-mode nemotron_asr_streaming \
-    -cc.cudagraph_mode none \
-    -cc.mode none \
     --max-num-seqs 64 \
     --max-model-len 77000
 ```
 
-This command runs the hook configuration on CUDA: `-cc.cudagraph_mode none` and `-cc.mode none`,
-without `--enforce-eager`. Core captures the model's segment graphs through vllm#67583's capture
-hook and charges them in its graph-memory estimate. The tier 2 serving run used this configuration,
-and `--max-num-seqs 64` fit one A40 at 320 ms. The command serves the checkpoint's default
-lookahead: 3 (320 ms) on the published card.
+This is the README's serve command. It runs `--enforce-eager`, so the model captures its own segment
+graphs on core's memory-profiling step, inside the profiled budget. `--max-num-seqs 64` is an
+interim value from an unpublished A40 measurement at 320 ms under `--enforce-eager`.
+`--no-async-scheduling` keeps the step order every earlier run used; on the target core an unset
+option means asynchronous scheduling, which the plugin accepts but no run has qualified. The command
+serves the checkpoint's default lookahead: 3 (320 ms) on the published card.
 
-The README's serve command uses `--enforce-eager` instead. There, `--max-num-seqs 64` is an interim
-value from an unpublished A40 measurement
-([manual, Runner configuration](manual.md#runner-configuration)).
+To run the hook configuration instead, replace `--enforce-eager` with
+`-cc.cudagraph_mode none -cc.mode none`. Core then captures the model's segment graphs through
+vllm#67583's capture hook ([manual, Runner configuration](manual.md#runner-configuration)).
 
 If `VLLM_PLUGINS` is set, it must include `nemotron_asr_streaming`.
 
-Check the server. Stage 1 core has no `/ready` route; use `/health` and `/v1/models`:
+Check the server. The target core has no `/ready` route; use `/health` and `/v1/models`:
 
 ```bash
 curl -sf localhost:8000/health && echo healthy
@@ -115,45 +112,9 @@ curl -s localhost:8000/v1/audio/transcriptions \
 
 The response is JSON with the transcript in `text`.
 
-## Serve, stage 2
-
-```bash
-export VLLM_PLUGINS=riva_frontend,nemotron_asr_streaming
-
-vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
-    --dtype float32 \
-    --config-format nemotron_asr_streaming \
-    --tokenizer-mode nemotron_asr_streaming \
-    -cc.cudagraph_mode none \
-    -cc.mode none \
-    --max-num-seqs 64 \
-    --max-model-len 77000 \
-    --shutdown-timeout 60 \
-    --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50051"}}'
-```
-
-`VLLM_PLUGINS` must name both plugins; when it is unset, core loads no endpoint plugin. The model
-flags match stage 1. `--shutdown-timeout 60` is the frontend's drain budget. `grpc_bind` sets the
-address of the Riva gRPC listener, which has no transport security of its own.
-
-Check the server:
-
-```bash
-curl -sf localhost:8000/ready && echo ready
-curl -sf localhost:8000/plugins/riva/v1/health/ready && echo riva-ready
-curl -s localhost:8000/plugins/riva/v1/version
-grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check
-```
-
-`/plugins/riva/v1/version` returns `{"release": "0.4.0b3", "api": "v1"}`, and the gRPC health
-check returns `"status": "SERVING"`.
-
-To stop the server, send `SIGINT` or `SIGTERM` to the API-server process only
-(`kill -INT <api-server-pid>`). Do not use Ctrl-C ([manual, Shutdown](manual.md#shutdown-stage-2)).
-
 ## Next
 
 - [Serving configurations](manual.md#serving-configurations): lookahead, `--max-model-len`,
-  `--max-num-seqs` and graph memory.
-- [Clients](manual.md#clients): realtime, file transcription and Riva gRPC examples.
+  `--max-num-seqs`, graph memory and transaction graphs.
+- [Clients](manual.md#clients): realtime and file transcription examples.
 - [Troubleshooting](manual.md#troubleshooting): what each startup refusal means.

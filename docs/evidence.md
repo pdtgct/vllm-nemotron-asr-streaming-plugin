@@ -23,7 +23,7 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 ## Contents
 
 - [Builds](#builds)
-- [Tier 2 on the stage 1 build](#tier-2-on-the-stage-1-build)
+- [Tier 2 on the state-pool build](#tier-2-on-the-state-pool-build)
 - [Unpublished measurement under `--enforce-eager`](#unpublished-measurement-under---enforce-eager)
 - [Transaction graphs, tier 5](#transaction-graphs-tier-5)
 - [Owed](#owed)
@@ -31,16 +31,19 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 
 ## Builds
 
-- Stage 1 build: `pdtgct/vllm` `hook-build-20261114b` @ `9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee`
+- Stage 1 (target core): `pdtgct/vllm` `pstate-impl-20261122` @ `ddf6db2ab8`, the persistent-state
+  layer with the #67583 model-state hooks. No tier has been met on it yet (Owed).
+- State-pool build (historical; the baseline for retiring the state pool, with plugin `v0.1.0b2`):
+  `pdtgct/vllm` `hook-build-20261114b` @ `9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee`
   (with #67583), precompiled wheel `191e5d5df2` (cu132), one NVIDIA A40 at FP32, card revision
   `ea30d66d`, frontend v0.4.0b3. Evidence: `pdtgct/nemotron-omni-port`
   `experiments/2026-11-15-plugin-tier2-hook-build/`, `experiments/2026-11-15-plugin-h1-txg-tier5-a/`
   and `experiments/2026-11-15-plugin-h1-txg-tier5-b/`.
 - Stage 2 has not been measured with this release; frontend v0.4.0b3 passed CI on CPU only.
 
-## Tier 2 on the stage 1 build
+## Tier 2 on the state-pool build
 
-- Partly achieved (stage 1 build `9c40a6ffd6`, plugin `8166d85`, hook configuration, default
+- Partly achieved (state-pool build `9c40a6ffd6`, plugin `8166d85`, hook configuration, default
   segment arms, transaction graphs off), tier 2 (installed-engine cycle) at 320 ms: with
   `--max-num-seqs 64` and `--max-model-len 77000`, 5,559 LibriSpeech `/v1/realtime` sessions at
   concurrency 32 all ended `stop`, with WER 3.57 % on test-clean and 7.99 % on test-other. One final,
@@ -52,7 +55,7 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 The serving run's command was the README's serve command with `--enforce-eager` replaced by
 `-cc.cudagraph_mode none -cc.mode none` (the hook configuration), at the checkpoint's default
 lookahead, 3 (320 ms), with the default segment arms. The client sent audio at real-time pace.
-Figures from the same run (stage 1 build `9c40a6ffd6`, plugin `8166d85`, one A40):
+Figures from the same run (state-pool build `9c40a6ffd6`, plugin `8166d85`, one A40):
 
 | Figure | Value |
 |---|---|
@@ -88,12 +91,12 @@ retained 1.6 GiB.
 
 ## Transaction graphs, tier 5
 
-- Not met (stage 1 build `9c40a6ffd6`; transaction level, body check and the revised TXG-QUAL-008 at
+- Not met (state-pool build `9c40a6ffd6`; transaction level, body check and the revised TXG-QUAL-008 at
   plugin `adfb24b`, forced fallbacks and step rule at plugin `a19621e`, the first served runs,
   inventory and `U_api` at plugin `8166d85`), tier 5 for transaction graphs at 80 ms and at 160 ms:
   the step rule and `U_api` fail at both lookaheads, and the body check fails at population 1.
 
-The tier 5 run used one NVIDIA A40 at FP32, the stage 1 build `hook-build-20261114b`
+The tier 5 run used one NVIDIA A40 at FP32, the state-pool build `hook-build-20261114b`
 (`pdtgct/vllm` @ `9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee`), card revision `ea30d66d`, `N = 63`
 and `--max-num-seqs 64`, at 80 ms and at 160 ms. Three plugin revisions ran its parts:
 
@@ -195,7 +198,7 @@ the option-on run kept the comma and both `B_hook` runs dropped it; alone, all t
 
 The table gives graph memory on the A40 at `N = 63`, per capture, in MiB unless stated. The call
 total covers the whole capture call: segment graphs, cells and, in the profiling capture, a 64 MiB
-margin. The captures ran at plugin `adfb24b` on the stage 1 build `9c40a6ffd6`. Available KV memory
+margin. The captures ran at plugin `adfb24b` on the state-pool build `9c40a6ffd6`. Available KV memory
 and ready time come from the served runs at plugin `8166d85`, whose profiling transaction totals
 were 2,462 MiB (80 ms) and 2,702 MiB (160 ms).
 
@@ -228,27 +231,29 @@ and `E ≤ N` make up at least 99 % of served steps. At `N` = 63 they make up 10
 
 ## Owed
 
-- Tier 1 on the stage 1 build at the current plugin.
-- Tier 2 under `--enforce-eager`, and at lookaheads other than 320 ms.
-- Tiers 3 and 4 on the stage 1 build; tier 4 also with transaction graphs on.
+- Tiers 1 to 4 on the target core at the current plugin, at every chunk size (80, 160, 320, 560 and
+  1120 ms), under `--enforce-eager` and the hook configuration, with and without asynchronous
+  scheduling and batch invariance.
+- Transaction graphs at 80 and 160 ms on the target core, under the restricted startup.
+- The state-layer memory check (REG-STATE-019).
 
 ## Historical entries
 
-Every entry below is historical. The stage 1 entries ran on a stage 1 build without #67583, at
+Every entry below is historical. The state-pool entries ran on a state-pool build without #67583, at
 plugin revisions before the default graphed arms and the one-lookahead server. The other entries ran
 on the earlier integration build of RFC 1 (the superseded #65544 API) and RFC 2. None is a claim
-about the current plugin on stage 1 or stage 2.
+about the current plugin on the target core or on stage 2.
 
-- Historical stage 1 build (without #67583): `pdtgct/vllm` `stage1-build-20261113` @ `b7e7a20c26`
+- Historical state-pool build (without #67583): `pdtgct/vllm` `stage1-build-20261113` @ `b7e7a20c26`
   (upstream `main` `cf8fce503c` + vllm#67375 + vllm#67151), precompiled wheel `191e5d5df2` (cu132),
   one NVIDIA A40. Evidence: `pdtgct/nemotron-omni-port`
   `experiments/2026-11-13-two-stage-stage1-a40/`.
-- Achieved (historical, stage 1 build without #67583, plugin `5acd9d2`), tier 1 (CPU conformance):
+- Achieved (historical, state-pool build without #67583, plugin `5acd9d2`), tier 1 (CPU conformance):
   1203 passed, 43 skipped.
-- Achieved (historical, stage 1 build without #67583; serving at plugin `a850916`, GPU tier at
+- Achieved (historical, state-pool build without #67583; serving at plugin `a850916`, GPU tier at
   `5acd9d2`, which changes only tests since), tier 2 (installed-engine cycle): the GPU tier passed
   (35 passed, 1 skipped), and 5559 LibriSpeech `/v1/realtime` sessions at concurrency 32 each
-  reached a final transcript with none failed. Tiers 3 and 4 have not been run on stage 1.
+  reached a final transcript with none failed. Tiers 3 and 4 were not run on that build.
 
 - Historical build: the merge of RFC 1 `persistent-state-primitive-v2` @ `c384f178cd` and RFC 2
   `endpoint-plugin-lifecycle` @ `6b1ce05706` on `pdtgct/vllm` (branch `rfc12-integration-v2` @
