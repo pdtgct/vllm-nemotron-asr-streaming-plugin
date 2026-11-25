@@ -65,3 +65,14 @@ Routing constraints the tests observe:
   rows, at the server's one geometry.
 
 Tests assert the information a spec requires in a log line or error, not its exact wording.
+
+## Future roadmap
+
+- **Session factory on core's automatic admission.** Trigger: the port in the `session` design's
+  Future roadmap 1. Shape: `session.factory`'s session record loses its `pending`, `accepted` and
+  `refused` admission states and takes retirement from the stream's terminal output; the seam
+  conformance adapter's names change with it.
+- **Page initial values in core.** Trigger: the `registration` design's Future roadmap 11. Shape:
+  `state_layer` drops `initialize_pages`, and the forward's call to it goes.
+- **Multi-unit rows.** Trigger: the `registration` design's Future roadmap 14. Shape: the
+  transaction-graph seams address units instead of rows.

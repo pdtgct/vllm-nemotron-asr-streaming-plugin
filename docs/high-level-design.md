@@ -116,10 +116,14 @@ captures nothing (`cudagraph_mode` NONE). In its first release the option is off
 which the model reads at capture from the target core's state-group layout accessor. On the
 target core the option starts only under a *restricted startup*: synchronous scheduling
 (`--no-async-scheduling`), explicit `-cc.cudagraph_mode none -cc.mode none`, and either
-`--num-gpu-blocks-override` with at least `N + 1` blocks (`N` the largest declared population)
-or `--kv-cache-memory-bytes`, both of
+`--num-gpu-blocks-override` or `--kv-cache-memory-bytes`, both of
 which turn core's extensible KV cache off. Every other startup with the option on is refused,
-naming each unmet condition and its remedy. Without an explicit block count or budget, core's
+naming each unmet condition and its remedy. Either setting must give at least the admission limit
+plus one blocks: core's scheduler refuses fewer state pages than requests that can be active, and
+core builds it only after the model's captures, so the plugin refuses a smaller override at
+startup, and a smaller budget when the serving capture first reads the state pages, with a larger
+budget or a lower admission limit as the remedy. Every declared population is at most the
+admission limit. Without an explicit block count or budget, core's
 minimal profiling KV cache holds too few state pages for the profiling capture (one block under
 an explicit NONE), and the extensible KV cache backs only its first blocks at the serving capture
 and grows without refreshing the layout; the restriction lifts when core closes both gaps and the
@@ -412,7 +416,8 @@ the leaf designs cite them where they depend on them.
   accepts the WebSocket and opens the stream only when the client's first commit starts
   generation. On stage 1 a server at its admission limit therefore does not refuse a client at
   connection: the client receives `session.created`, and the refusal arrives after its first
-  commit as an `error` event of type `processing_error` naming the reason. This is a limit of
+  commit as an `error` event (`type` `error`, `code` `processing_error`) whose message names the
+  reason. This is a limit of
   core's route on stage 1, which the user manual states (`registration`, REG-DOC-003).
 - **Completeness.** The model and the session factory treat a transcript as complete only after
   EOS following the final flush; a session that ends any other way fails. How core's own routes
@@ -554,7 +559,8 @@ runs on neither build until then, so no leg that drives it through a real engine
      the serving capture retained no more; under a fixed budget the startup log reports the
      uncharged graph memory; each refusal in Constraints refuses its configuration (the option
      under `--enforce-eager`, at a geometry other than 80 or 160 ms, with native burst, outside the
-     restricted startup, with a population above core's admission limit, on a core without
+     restricted startup, with a population above core's admission limit, with a
+     `--num-gpu-blocks-override` below that limit plus one, on a core without
      #67583's hooks or without the state-group layout accessor);
    - TLA+ models of the capture lifecycle on the hook, versioned in this repository as a system
      model and updated with every change to that lifecycle, check without violations.

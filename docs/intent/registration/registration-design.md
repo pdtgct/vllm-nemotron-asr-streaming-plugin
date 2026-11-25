@@ -262,7 +262,9 @@ refuses:
   support a model-state capture over state pages and the qualification covers the other settings
   (Future roadmap 8); a core whose `ModelState` lacks `state_group_layouts` (TXG-CFG-016); and a
   population above core's admission limit (`--max-num-active-seqs`, or `max_num_seqs` when it is
-  unset), which no step can reach (TXG-CFG-020);
+  unset), which no step can reach (TXG-CFG-020); and a `--num-gpu-blocks-override` below the
+  admission limit plus one, which core's scheduler would refuse only after both captures
+  (TXG-CFG-005);
 - prefix caching: `enable_prefix_caching = True` in the resolved configuration. An unset command-line
   option arrives already `False`: `EngineArgs` resolves it from the model, which reports prefix
   caching as unsupported when it declares persistent state. A configuration built directly with
@@ -611,7 +613,10 @@ workspace, which core locks after the serving capture.
   because the block size is `max_model_len`. The scheduler fails construction unless the group
   holds a page for every request that can be active (`max_num_active_seqs`, by default
   `max_num_seqs`) besides core's null block; whether the budget yields that many pages at the
-  README's settings is unmeasured.
+  README's settings is unmeasured. Core builds the scheduler after the model's graph captures, so
+  a block count that is too small fails only after them; while transaction graphs are on, the
+  plugin refuses such an override in the configuration hook and such a budget at the
+  transaction-graph part's pool access (TXG-CFG-005, TXG-CAP-008).
 - **Graph runtime.** Graph capture uses core's graph-capture context, forward context and the
   platform's static graph wrapper. Under the hook configuration every capture runs on the `stream`
   core passes, inside `vllm.compilation.cudagraph_pool.capture_pool` with the `graph_pool` core
@@ -793,7 +798,9 @@ for a violation of core's contract with the model state, which means that core a
 disagree about a request's state, so that no outcome confined to one request is safe: a
 `NewRequestData` that does not carry exactly one block, a slot outside the bound pages, and an
 `add_request` that neither starts nor continues a request (State-slot access). It also raises for
-the configuration and lifecycle refusals of Engine settings and Execution memory.
+the configuration and lifecycle refusals of Engine settings and Execution memory. A planning
+fault that no list here names takes its class by the same test: it fails the request when the
+request's own prompt or multimodal items can cause it, and raises otherwise (REG-STATE-015).
 
 A stream CHUNK row's envelope header is resolved from the request's multimodal feature that
 overlaps the row's scheduled token (`resolve_row_envelope_header` in `nemotron_asr/plan.py`).
@@ -856,7 +863,11 @@ its cells captured (TXG-LIFE-009).
   `initial_values`, zeros because the layer sets none). The model's forward then initializes each
   fresh row's page through the layer's `initialize_pages` before its transaction: it zeroes every
   byte and writes each descriptor's non-zero initializer (the label book's blank label). Both
-  writes run on the current stream before any read of the page. The layout has no bytes outside
+  writes run on the current stream before any read of the page, whether or not the row later
+  fails at planning or the transaction rejects it, an all-failed step included: the body finds a
+  per-row rejection only on the device, and a fresh page must never expose an earlier request's
+  state. A rejected row's pages are then preserved as initialized (the `transaction-graph` design,
+  Fresh rows). The layout has no bytes outside
   its states, so core's zeroing and the layer's agree on every byte except the blank labels
   (Future roadmap 11).
 - **Retirement and turn continuation.** For each input after a stream's first, core calls
@@ -887,14 +898,22 @@ its cells captured (TXG-LIFE-009).
   cache keyed on the identity of the bound `kv_cache` object and drops the cache when core calls
   `bind_kv_cache`, when a read finds another object bound, and whenever core calls the model
   state's `clear_cudagraphs`; the next read rebuilds it from the bound `kv_cache`. A read of a
-  current cache costs one identity comparison, and the model state reads the views a few times
-  per step. The `clear_cudagraphs` drop is what releases core's profiling KV cache. Core's
-  teardown of that cache (`clear_layer_kv_caches` in `vllm/v1/worker/utils.py`, then
-  `gc.collect` and `empty_cache`) resets only the layer's `kv_cache`, and nothing reads the layer
-  between that teardown and the serving binding, so an identity check alone would keep the
-  profiling KV cache allocated until core rebinds the layer, after it has allocated the serving KV
-  cache: peak and resident memory would exceed the budget by the profiling KV cache while both
-  exist. The serving block count would not change, because core sizes it from a memory reading
+  current cache costs one identity comparison and no rebuild, and the model state reads the views
+  a few times per step. The `clear_cudagraphs` drop removes the plugin's own references to core's
+  profiling KV cache. When `clear_cudagraphs` returns, the plugin's objects hold that cache only
+  through the references core installed: the layer's `kv_cache` and the model state's
+  `_state_group_layouts`. Core's teardown of the cache, which follows the hook
+  (`_teardown_profiling_state` in `vllm/v1/worker/gpu/cudagraph_utils.py`), clears both: it sets
+  `_state_group_layouts` to an empty tuple, resets each layer's `kv_cache`
+  (`clear_layer_kv_caches` in `vllm/v1/worker/utils.py`), then runs `gc.collect` and
+  `empty_cache`. After that teardown no object of the plugin keeps the cache allocated
+  (REG-STATE-018). Nothing reads the layer between that teardown and the serving binding, so an
+  identity check alone would keep the profiling KV cache allocated until core rebinds the layer,
+  after it has allocated the serving KV cache: peak and resident memory would exceed the budget by
+  the profiling KV cache while both exist. Core also calls no model-state hook in that interval,
+  so the installed-engine check (REG-STATE-019) observes the release through a `StorageWeakRef`
+  taken at the profiling binding, which must have expired by the serving binding. The serving
+  block count would not change, because core sizes it from a memory reading
   taken before its graph-memory estimate. Core's `ModelState.clear_cudagraphs` contract releases
   whatever the model state kept from the profiling KV cache, and core calls it while that cache is
   still bound, after a successful and after a failed profiling capture, so the drop rests on an
@@ -1056,7 +1075,8 @@ adding it here and to the import-time check.
 | Resumable stops | `persistent_state_resumable_stops = frozenset({"eos"})`, declared | `{"eos", "max_tokens"}`; `{"max_tokens"}` alone or an empty set | The park token is the only EOS and ends every unit. A resumable `max_tokens` stop would hide a unit that never parked and leave the session waiting for a park; without `"eos"`, every park would end the stream after one unit |
 | State group type | `MambaSpec` with `mamba_type` `PERSISTENT_STATE` | `SHORT_CONV`, the short-convolution type with the same KV-cache shape handling; another Mamba type | Core refuses a group its tokens cannot rebuild unless its spec is a `MambaSpec` of `mamba_type` `PERSISTENT_STATE`. The model builds no attention metadata, so the backend the type selects changes nothing else for it |
 | Per-request failure | `postprocess_state` records the step's failed rows and `take_failed_requests` returns them, so core finishes each failed request alone with finish reason `error` | Raise from `postprocess_state`; retry or roll back the row in the model | A raise ends the engine, and with it every stream on the server, for one row's failure. A retry or rollback cannot recover a row: a stream row's status is final, and a file row's position has already advanced (the `transcription` design). Core's channel needs no host synchronization beyond the wait `postprocess_state` already makes |
-| Faults a request's inputs cause | Fail the request alone at planning, through the planning-failed set and `take_failed_requests`; raise only for a violation of core's contract with the model state | Raise for every fault; fail a contract violation per request too | A direct engine client can send a multi-token prompt, a unit at another geometry or a malformed file item, and a raise would end every stream on the server for one client's input. A contract violation means core and the model disagree about a request's state, so no outcome confined to that request is safe |
+| Faults a request's inputs cause | Fail the request alone at planning, through the planning-failed set and `take_failed_requests`; raise only for a violation of core's contract with the model state; a fault no list names takes its class by whether a request's input can cause it | Raise for every fault; fail a contract violation per request too; raise for every unlisted fault | A direct engine client can send a multi-token prompt, a unit at another geometry or a malformed file item, and a raise would end every stream on the server for one client's input. A contract violation means core and the model disagree about a request's state, so no outcome confined to that request is safe. Raising for every unlisted fault would end the server for an input the lists missed; the class test needs no list to be complete |
+| Observing the release of the profiling KV cache | A `StorageWeakRef` taken at the profiling binding, expired at the serving binding (REG-STATE-019) | Device and allocator memory readings after core's teardown | Core calls no model-state hook between its teardown and the serving KV-cache allocation, so the plugin has no point at which to read memory there without a core change; a reading at the serving binding, which follows the allocation, mixes both caches |
 | Rows that schedule more than one token | Fail the row's request alone at planning (REG-STATE-014), through the planning-failed set and `take_failed_requests`; the step's other rows run at their own token positions | Sample the row's last token and drop the others; run the row's tokens in order as several stream units, as vLLM's and SGLang's Mamba prefill scan a multi-token row from the request's state | Each token of this model's stream is one unit of audio, and the design keeps per-step work and per-request state constant: one unit per request per step, so a step's cost does not depend on what one client sends. A multi-token row would let one request's work grow within a step. Sampling the last token and dropping the rest discards audio and returns a wrong transcript with no error. Running the tokens as several units costs `k` dependent encoder and decoder passes for a `k`-unit row, which every co-batched row waits for; it needs the intermediate units' labels to pass through the model's own output queue, since core samples one position per row; and the transaction-graph cells and their per-unit checks (TXG-TXN-010, TXG-EXEC-007) would address units, not rows. Plugin-packed input never schedules a multi-token row. A consumer that needs multi-token input uses a design that re-prefills or scans history, such as Mamba prefill or bounded sessions. Running the tokens as several units is Future roadmap 14 |
 | State-layer view lifetime | Views held by reference in a cache keyed on the bound `kv_cache` object, dropped at a binding, at an identity mismatch and in `clear_cudagraphs` (State-slot access, View lifetime) | Derive the views on every read; hold weak references to the bound tensors; keep the views as plain attributes replaced at each binding | Deriving on every read needs no hook but costs about 2.7 µs per read, and weak references about 3.8 µs, against about 0.02 µs for the identity comparison (CPU measurements). Plain attributes hold the profiling KV cache until the serving binding, after core has allocated the serving KV cache |
 | Envelope-header faults | Each fault in one of REG-STATE-015's two classes, by whether a request's input can cause it (Model-state interface, Error boundary) | Raise for every envelope fault; fail the request for every one | Core lets a direct engine client bypass the processor, so a malformed item reaches planning, and a raise would end every stream on the server. A fault that no request input can cause means core and the model disagree about the step, which no per-request outcome makes safe |

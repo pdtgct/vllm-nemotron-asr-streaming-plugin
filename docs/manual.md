@@ -24,6 +24,7 @@ it.
 - [Limits and the support boundary](#limits-and-the-support-boundary)
 - [Testing the plugin](#testing-the-plugin)
 - [Evidence](#evidence)
+- [Future roadmap](#future-roadmap)
 
 ## What the plugin is
 
@@ -171,7 +172,7 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
 `--max-num-seqs 64` is an interim value from an unpublished A40 measurement at 320 ms under
 `--enforce-eager`; no tier has verified a value on the target core. On the earlier state-pool
 build, `--max-num-seqs 64` fit one A40 at 320 ms in the hook configuration
-([evidence](evidence.md#tier-2-on-the-stage-1-build)).
+([evidence](evidence.md#tier-2-on-the-state-pool-build)).
 
 `--config-format nemotron_asr_streaming` and `--tokenizer-mode nemotron_asr_streaming` are required.
 They select the plugin's translation of the Hub card and its tokenizer mode. Core resolves no
@@ -271,7 +272,7 @@ of the server. The capture peak is the device memory in use during capture, weig
 Capture fails when the peak does not fit, even when the retained memory would.
 
 Figures at 320 ms on one A40, measured with release `v0.1.0b2` on the earlier state-pool build
-([evidence](evidence.md#tier-2-on-the-stage-1-build)):
+([evidence](evidence.md#tier-2-on-the-state-pool-build)):
 
 | Runner configuration | `--max-num-seqs` | Retained | Capture peak (device memory in use) | Startup | Status |
 | --- | --- | --- | --- | --- | --- |
@@ -381,18 +382,22 @@ On the target core the option starts only under a restricted startup, which the 
 | --- | --- |
 | `--no-async-scheduling` | the baseline and the qualification run synchronously, and the worker's call order under asynchronous scheduling is unverified with cells; an unset value means asynchronous scheduling and is refused |
 | `-cc.cudagraph_mode none -cc.mode none`, both explicit | a mode that core reduces to NONE only later sizes core's profiling KV cache differently, and the qualification covers explicit NONE only; an unset mode is refused |
-| `--num-gpu-blocks-override` of at least `N + 1`, or a positive `--kv-cache-memory-bytes` | either turns core's extensible KV cache off. Without one, core's profiling KV cache holds too few state pages for the profiling capture, and the extensible KV cache backs only its first blocks when the serving capture runs and grows without refreshing the state pages' layout |
+| `--num-gpu-blocks-override` of at least the admission limit plus one, or a positive `--kv-cache-memory-bytes` that holds that many state pages | either turns core's extensible KV cache off. Without one, core's profiling KV cache holds too few state pages for the profiling capture, and the extensible KV cache backs only its first blocks when the serving capture runs and grows without refreshing the state pages' layout. The admission limit is `--max-num-active-seqs`, or `--max-num-seqs` when it is unset; core refuses fewer state pages than requests that can be active, but only after both captures, so the plugin checks the count first |
 
 `--num-gpu-blocks-override 65` holds the null block and one page for each of the 64 requests that
-`--max-num-seqs 64` lets be active; core refuses a smaller count. Under it, core still runs its
-graph-memory estimate, over a profiling KV cache of 65 blocks. A fixed `--kv-cache-memory-bytes`
-runs no estimate ([Memory and the startup log](#memory-and-the-startup-log)).
+`--max-num-seqs 64` lets be active. Core refuses a smaller count when it builds its scheduler,
+after both captures, so the plugin refuses an override below the admission limit plus one at
+startup; to run a smaller override, lower the admission limit with it. Under the override, core
+still runs its graph-memory estimate, over a profiling KV cache of 65 blocks. A fixed
+`--kv-cache-memory-bytes` runs no estimate
+([Memory and the startup log](#memory-and-the-startup-log)), and must hold at least the
+admission limit plus one state pages.
 
 `transaction_graph_populations` lists distinct step populations. Each is an integer from 1 to
-`min(max_num_seqs, max_num_batched_tokens)`, at most `--num-gpu-blocks-override` minus 1, and at
-most core's admission limit (`--max-num-active-seqs`, or `--max-num-seqs` when it is unset): core
-never runs a step with more rows than that limit, so a larger entry would capture cells that never
-replay, and startup refuses it. The largest entry, `N`, fixes the cell inventory: a chunk cell and
+`min(max_num_seqs, max_num_batched_tokens)` and at most core's admission limit
+(`--max-num-active-seqs`, or `--max-num-seqs` when it is unset): core never runs a step with more
+rows than that limit, so a larger entry would capture cells that never replay, and startup
+refuses it. The largest entry, `N`, fixes the cell inventory: a chunk cell and
 an echo cell at every count from 1 to `N`, `2N` cells in all. The other entries change no capture,
 so `[63]` and `[1, 31, 63]` capture the same cells. An absent key or an empty list turns the option
 off. Any other malformed value is refused.
@@ -416,9 +421,11 @@ at 80 ms (99.10 %; serving capture 832 MiB call total, 268 MiB transaction total
 
 A fixed `--kv-cache-memory-bytes` must leave room for the transaction graphs and the segment
 graphs. Core does not charge them under a fixed budget, and the startup log reports the uncharged
-bytes in a WARNING. Under `--num-gpu-blocks-override`, core's graph-memory estimate charges the
-profiling capture, and startup fails if the serving capture retains more than the profiling
-capture.
+bytes in a WARNING. A budget that holds fewer state pages than the admission limit plus one fails
+startup when the serving capture first reads the state pages, before it captures any cell; the
+remedies are a larger `--kv-cache-memory-bytes` or a lower admission limit, never a smaller budget.
+Under `--num-gpu-blocks-override`, core's graph-memory estimate charges the profiling capture, and
+startup fails if the serving capture retains more than the profiling capture.
 
 Each capture logs one INFO line with the cells, `N`, the call and transaction totals, the transient
 peak and the capture time. Post-warmup verification logs one INFO line when it passes. Shutdown
@@ -432,8 +439,9 @@ each capture took about 70 to 74 s. If startup exceeds `VLLM_ENGINE_READY_TIMEOU
 - One geometry (lookahead and chunk duration) per server. Transaction graphs need 80 or 160 ms
   (lookahead 0 or 1). The published card's default, 320 ms, and 560 and 1120 ms are refused, with
   the remedy `num_lookahead_tokens` 0 or 1.
-- `N` is bounded by `max_num_seqs`, by `max_num_batched_tokens`, by core's admission limit
-  (`--max-num-active-seqs`), and under `num_gpu_blocks_override` by the override minus 1.
+- `N` is bounded by `max_num_seqs`, by `max_num_batched_tokens` and by core's admission limit
+  (`--max-num-active-seqs`). The block count, whether set by `--num-gpu-blocks-override` or
+  derived from `--kv-cache-memory-bytes`, must be at least the admission limit plus one.
 - Startup outside the restricted startup is refused, naming each unmet setting and its remedy.
 - Steps with more than `N` CHUNK rows (`chunk-uncovered`) or more than `N` other rows
   (`echo-uncovered`) run without transaction graphs and are counted.
@@ -493,7 +501,8 @@ matters in three ways:
 - Core sends `session.created` when it accepts the connection, before it admits the stream. It
   admits the stream when the first `input_audio_buffer.commit` starts generation. A server that
   cannot admit it (reason `active_limit`, at core's admission limit, or `engine_paused`) answers
-  that commit with an `error` event of type `processing_error` whose message names the reason. A
+  that commit with an `error` event (`"type": "error"`) whose `code` is `processing_error` and
+  whose message, in `error`, names the reason. A
   server at its admission limit therefore does not refuse a client at connection.
 - An input that core refuses ends the stream with an error. When the model fails a stream's row
   (for example a unit at another lookahead, or a malformed unit from a client that bypasses the
@@ -718,7 +727,8 @@ With transaction graphs on, these conditions are also refused. Each refusal name
 | state layer | the core's `ModelState` lacks the state-group layout accessor `state_group_layouts` | remove `transaction_graph_populations`, or install the target core |
 | scheduling | `async_scheduling` is on or unset (unset means asynchronous on the target core) | `--no-async-scheduling` |
 | runner modes | `cudagraph_mode` or the compilation mode is not an explicit NONE | `-cc.cudagraph_mode none -cc.mode none` |
-| pool | neither `--num-gpu-blocks-override` nor a positive `--kv-cache-memory-bytes` | `--num-gpu-blocks-override` of at least the largest population plus one, or `--kv-cache-memory-bytes` |
+| pool | neither `--num-gpu-blocks-override` nor a positive `--kv-cache-memory-bytes` | `--num-gpu-blocks-override` of at least the admission limit plus one, or a `--kv-cache-memory-bytes` that holds that many state pages |
+| block count | `--num-gpu-blocks-override` minus 1 is below core's admission limit or a population; core would refuse it only after both captures | `--num-gpu-blocks-override` of at least the admission limit plus one, or a lower admission limit with the largest population at most it |
 | admission limit | a population above core's admission limit (`--max-num-active-seqs`, or `--max-num-seqs` when it is unset) | a largest population of at most the limit, or a larger `--max-num-active-seqs` (at most `--max-num-seqs`) or none |
 
 If startup times out during graph capture, raise `VLLM_ENGINE_READY_TIMEOUT_S`.
@@ -736,8 +746,8 @@ which only a client that bypasses the plugin's packer and processor can send.
 - The server runs on one device. Every parallel size must be 1.
 - Core's `/v1/realtime` serves streams directly, with no frontend. Core sends `session.created`
   before it admits the stream, so a server at its admission limit refuses a stream only after the
-  client's first commit, as a `processing_error` event. An input that core refuses ends the stream,
-  and core reports a stream done whatever its finish reason.
+  client's first commit, as an `error` event with code `processing_error`. An input that core
+  refuses ends the stream, and core reports a stream done whatever its finish reason.
 - The session factory is not available on the target core, so no frontend serves streams.
 - A direct engine client's prompt or streaming input of more than one token fails its request;
   every unit the plugin packs is one token.
@@ -784,3 +794,23 @@ is recorded yet. The raw evidence for release `v0.1.0b2` on the state-pool build
   tier 5 for transaction graphs.
 
 The design is in [`docs/high-level-design.md`](high-level-design.md) and [`docs/intent/`](intent/).
+
+## Future roadmap
+
+Each item names a limit this manual states, the trigger that lifts it and what changes here. The
+[high-level design's Future roadmap](high-level-design.md#future-roadmap) owns the design of each.
+
+- **A verified serve command.** `--max-num-seqs 64` is interim, and the serve command runs
+  `--enforce-eager` and `--no-async-scheduling`. Trigger: tier 2 met on the target core, in the hook
+  configuration and with asynchronous scheduling (`registration`, REG-ENG-007, REG-ENG-014).
+  Change: the serve command and Serving configurations give the verified values and flags.
+- **Frontend streaming on the target core.** The session factory is not available there. Trigger:
+  the session factory runs on core's automatic admission. Change: Builds and compatibility records
+  a stage 2 commit, and Clients gains the frontend's streaming examples.
+- **Transaction graphs beyond the restricted startup.** Trigger: core sizes its profiling KV cache
+  for a model-state capture and keeps the state pages' layout current when its extensible KV
+  cache grows, and the qualification covers the reduced modes and asynchronous scheduling.
+  Change: the restricted startup's rows leave the Transaction graphs section.
+- **The transcription route's guards and terminal forms.** Trigger: a build the plugin targets
+  carries vllm#67144 and vllm#67151. Change: Limits and the support boundary drops the
+  partial-text and inactive-guard limits for that build.

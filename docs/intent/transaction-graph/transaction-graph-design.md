@@ -93,9 +93,12 @@ position, with its binding and host-produced vectors. Core lays a step's tokens 
 `i` owns the **token positions** `query_start_loc[i]` to `query_start_loc[i+1] − 1`, and core
 samples each row at its last position. Row `i` reads only the runner's inputs at its own token
 positions and writes only the runner-facing output there, which has one row per scheduled token
-in the runner's order, so no input or output crosses between rows. Every unit the plugin packs is
-one token (`session`, Packer), so on plugin-packed input every step is a **one-token step**, in
-which row `i`'s one position is `i`. Only a direct engine client can schedule a **multi-token row**
+in the runner's order, so no input or output crosses between rows. Row `i`'s **step position** is
+its index `i` in the row plan, from 0 to `P − 1`; the step arena, the step static inputs and the
+step outputs address rows by it. Every unit the plugin packs is one token (`session`, Packer),
+so on plugin-packed input every step is a **one-token step**, in which row `i`'s one token
+position is `i`, equal to its step position; in any other step the two can differ. Only a direct
+engine client can schedule a **multi-token row**
 (a prompt or streaming input of several tokens); planning fails it (`registration`,
 REG-STATE-014), and the step's other rows still read and write at their own positions. The
 **row-failure path** fails a row at planning: a multi-token row (`registration`, REG-STATE-014),
@@ -122,16 +125,17 @@ cells.
 ### Configuration checks
 
 With the option on, the configuration must satisfy every condition below. A failure of a
-transaction-graph-specific condition (Populations, Admission limit, Geometry, Native burst,
-Segment arms, `enforce_eager` in Runner, State layer, Scheduling, Runner modes and Pool) is a configuration
-error that names `transaction_graph_populations`, the condition, the rejected value and the
-remedy. The shared runner and platform conditions are reported as `registration` states them
+transaction-graph-specific condition (Populations, Admission limit, Block count, Geometry, Native
+burst, Segment arms, `enforce_eager` in Runner, State layer, Scheduling, Runner modes and Pool) is
+a configuration error that names `transaction_graph_populations`, the condition, the rejected
+value and the remedy. The shared runner and platform conditions are reported as `registration` states them
 (REG-ENG-005, REG-ENG-006). Scheduling, Runner modes and Pool form the **restricted startup**.
 
 | Condition | Rule |
 | --- | --- |
-| Populations | A list of `int` values (not `bool`), distinct, each in `1 … min(max_num_seqs, max_num_batched_tokens)`; under `num_gpu_blocks_override`, each at most `override − 1` (the non-null pages). A limit core has not yet resolved when the configuration hook runs bounds nothing there; model-state construction applies the full bound. |
+| Populations | A list of `int` values (not `bool`), distinct, each in `1 … min(max_num_seqs, max_num_batched_tokens)`. A limit core has not yet resolved when the configuration hook runs bounds nothing there; model-state construction applies the full bound. |
 | Admission limit | Every entry is at most the number of requests core's scheduler admits into RUNNING: `max_num_active_seqs` when set (`--max-num-active-seqs`), otherwise `max_num_seqs`. Core never schedules a step with more rows than that, so a larger entry declares a population that can never run and cells that can never replay. Remedies: a largest population of at most the limit, or a larger `--max-num-active-seqs` (at most `max_num_seqs`) or none. Bounded as Populations is when the configuration hook runs before the limit is resolved. |
+| Block count | Under `num_gpu_blocks_override`, `override − 1` (the non-null pages) is at least the admission limit, and so at least every entry. Core's scheduler refuses to start when the cache holds fewer state pages (`num_blocks − 1`, at one block per request) than requests that can be active, but core builds it after both captures, so an override of `N + 1` with `N` below the limit would capture `2N` cells twice and then fail. Remedies: a `--num-gpu-blocks-override` of at least the admission limit plus one, or a lower admission limit with the largest population at most it. Before the limit is resolved, the configuration hook compares the override with the entries only. Under a fixed `kv_cache_memory_bytes` the block count is known only at the serving capture, where the pool-access check makes the same comparison (Rules of the capture call). |
 | Geometry | The server's one geometry, as `registration` resolves it at startup (the `num_lookahead_tokens` override, else the checkpoint's default lookahead), is lookahead 0 or 1 (80 or 160 ms). Lookahead 3 (320 ms), the published checkpoint's default, is refused with the remedy `num_lookahead_tokens` 0 or 1. When `served_lookahead` raises, the condition carries its message. |
 | Native burst | `experimental_native_burst` is false or absent. |
 | Segment arms | The arms the model will run are the default arms: `encoder_execution_arm` `eager-graphed` and `decode_dispatch_arm` `dense-graphed`, configured or written by card translation (REG-CARD-008). An unset key resolves to an eager arm (`eager` encoder, `compact-eager` decoder) and is refused. Every other arm is refused as well, the `dense-graphed` encoder included, which `registration` also refuses under the hook configuration (REG-ENG-005); a non-empty `chunk_bucket_graph_populations` is refused there by `registration`, not by this function. |
@@ -139,7 +143,7 @@ remedy. The shared runner and platform conditions are reported as `registration`
 | State layer | The running core's `ModelState` defines `state_group_layouts`, as the target core does. The cells bake in state-page addresses, which the model reads from that accessor at capture (Rules of the capture call). Refused on a core without it (remedy: remove `transaction_graph_populations`). |
 | Scheduling | `async_scheduling` is `False` (remedy `--no-async-scheduling`). An unset value is refused, because the target core resolves it to asynchronous scheduling. `B_hook` and the qualification run synchronously, and the worker's call order under asynchronous scheduling is unverified with cells. |
 | Runner modes | `cudagraph_mode` and the compilation mode are NONE: requested explicitly in the configuration hook (an unset mode is refused), and NONE as core's configuration build left them at construction (remedy `-cc.cudagraph_mode none -cc.mode none`). A mode that core reduces to NONE only when it initializes the KV cache sizes core's profiling KV cache differently (the `registration` design, Runner configurations), and the qualification covers explicit NONE only. This condition narrows the hook configuration's; it does not replace it. |
-| Pool | `num_gpu_blocks_override` is set, or `kv_cache_memory_bytes` is positive (remedy: `--num-gpu-blocks-override` of at least `N + 1`, or `--kv-cache-memory-bytes`). Either setting turns core's extensible KV cache off. Core's minimal profiling KV cache holds `min(max_num_seqs, max_cudagraph_capture_size) or 1` blocks, one block under an explicit NONE, while a profiling capture needs `N` capture-row pages beside the null page; under `num_gpu_blocks_override` that cache holds the override's block count, and under a fixed `kv_cache_memory_bytes` core runs no profiling capture. The extensible KV cache, on by default on CUDA, backs only its first one or two blocks when the serving capture runs, so capture rows would read unbacked pages, and its growth rebinds the views without refreshing `state_group_layouts`. |
+| Pool | `num_gpu_blocks_override` is set, or `kv_cache_memory_bytes` is positive (remedy: a `--num-gpu-blocks-override` of at least the admission limit plus one, or a `--kv-cache-memory-bytes` that holds that many state pages). Either setting turns core's extensible KV cache off. Core's minimal profiling KV cache holds `min(max_num_seqs, max_cudagraph_capture_size) or 1` blocks, one block under an explicit NONE, while a profiling capture needs `N` capture-row pages beside the null page; under `num_gpu_blocks_override` that cache holds the override's block count, and under a fixed `kv_cache_memory_bytes` core runs no profiling capture. The extensible KV cache, on by default on CUDA, backs only its first one or two blocks when the serving capture runs, so capture rows would read unbacked pages, and its growth rebinds the views without refreshing `state_group_layouts`. |
 
 **`--enforce-eager`.** Core runs no capture hook under `--enforce-eager`, so the option on
 with `--enforce-eager` is refused, naming both. Once the option is the default, the default
@@ -267,9 +271,10 @@ tolerated rate. A direct engine stream client that sets an endpoint policy or sc
 token causes an expected `signature` fallback. The first `signature`
 fallback per `(kind, field)` logs one WARNING naming the field.
 
-With `N = P_max` every reachable split whose signatures match is covered, which on
-plugin-packed input is every split. A smaller `N` trades coverage of large
-steps for graph memory (Fit analysis).
+With `N = P_max` every reachable split of a one-token step that reaches transaction execution
+(not an all-failed step) and whose signatures match is covered, which on plugin-packed input is
+every split; a step with a multi-token row still falls back with `multi-token`. A smaller `N`
+trades coverage of large steps for graph memory (Fit analysis).
 
 ### Step arena, static inputs and step outputs
 
@@ -409,9 +414,11 @@ rows or a host branch on the step's composition), if the decoder tier is keyed b
 - *Decoder tier.* For `K` at each tier boundary and one past it, the chunk cell's decoder tier
   equals the tier `T` selects for `K` CHUNK rows.
 - *Fresh rows.* With the recycled pages of fresh rows filled with sentinel patterns (NaN, ±Inf,
-  random bits), every output and status equals the run with zeroed pages. Written pages are
-  compared across the two runs for accepted rows only; a rejected row's pages keep their
-  different initial bytes, so each run's are compared with its own pre-step snapshot.
+  random bits) as the transaction starts, every output and status equals the run with zeroed
+  pages. Written pages are compared across the two runs for accepted rows only; a rejected row's
+  pages keep their different initial bytes, so each run's are compared with its own snapshot
+  taken as the transaction starts. In a served step that snapshot follows the fresh-page
+  initialization (Fresh rows), so the test shows only that the transaction does not rely on it.
 - *Mask identities.* With all-false fresh and file masks, the masked body equals the stream-only
   transaction of the same continuing rows (Mask identities).
 
@@ -419,9 +426,18 @@ rows or a host branch on the step's composition), if the decoder tier is keyed b
 
 ### Fresh rows
 
-A fresh row is a slot's first step in a new generation: a stream's first chunk or a file's first
-step. Its state starts from plan authority: zero encoder, frontend, predictor, replay-queue and
-endpoint state, and a book row holding the blank last label, the admitted prompt and the geometry.
+A fresh row is a request's first step (`num_computed_tokens` 0): a stream's first chunk or a
+file's first step. Its state starts from plan authority: zero encoder, frontend, predictor,
+replay-queue and endpoint state, and a book row holding the blank last label, the admitted prompt
+and the geometry.
+
+Before the transaction, the model initializes every fresh row's page (`registration`,
+REG-STATE-010), whether or not the row later fails at planning or the transaction rejects it, so
+that a fresh page never exposes an earlier request's state. Preservation starts after that
+initialization: a rejected row's pages keep their contents as the transaction found them, and on
+an all-failed step, which runs no transaction, as the initialization left them (TXG-EQ-006,
+TXG-MASK-006, TXG-FAIL-001, TXG-FAIL-008). The transaction does not rely on the initialization
+for its outputs.
 
 The body reads the zero state from the null page. Once per step it computes each row's
 initial-state index, `where(is_fresh, null_block_id, block)`, and gathers every zero-initial state
@@ -646,7 +662,7 @@ replay-cell oracle).
 | profiling forward pass | Runs under the hook configuration too, as the profiling dummy step that the model state's `prepare_inputs` classifies (REG-MEM-001); `registration` runs its profile transaction there, on the first profiling dummy step only (REG-MEM-016), over model-owned storage, at the maximum shape. It is a dummy step, so it never calls `execute` and is never counted as a fallback. No cell is captured or replayed. |
 | core's KV-cache binding and `initialize_kv_cache` | Core binds the state layer's views (`bind_kv_cache`) and sets `state_group_layouts` before `initialize_kv_cache`: first for its profiling KV cache, when its estimate runs, then for the serving KV cache. This component records nothing there; each capture call reads the layout itself (Rules of the capture call). Core clears the layout when it releases the profiling KV cache, after `clear_cudagraphs`. A binding after the serving capture follows Repeated bindings. |
 | `capture_cudagraphs(profile_only=True)` | Runs only when core's estimate runs. The profiling capture: segment graphs, the scatter warm-up, every cell, then the charged margin (Graph memory), over the profiling pools, which under the restricted startup hold `num_gpu_blocks_override` blocks, into the pool core passes (the estimate's throwaway pool). A fixed `kv_cache_memory_bytes` runs no profiling capture. |
-| `clear_cudagraphs()` | Releases every graph, buffer, signature, recorded layout and the margin the profiling capture created, this component's part before the segment graphs. It keeps the capture record, whose profiling totals are host integers. Core calls it also when the profiling capture raised or was never reached, so it tolerates nothing captured. In the same call the model state drops the state layer's views (`registration`, REG-STATE-018), so nothing of the plugin's holds the profiling KV cache when core tears it down. |
+| `clear_cudagraphs()` | Releases every graph, buffer, signature, recorded layout and the margin the profiling capture created, this component's part before the segment graphs. It keeps the capture record, whose profiling totals are host integers. Core calls it also when the profiling capture raised or was never reached, so it tolerates nothing captured. In the same call the model state drops the state layer's views (`registration`, REG-STATE-018), so when the call returns the plugin's objects hold the profiling KV cache only through the references core installed and clears in its teardown (the layer's `kv_cache` and the model state's `_state_group_layouts`), and after that teardown nothing of the plugin's keeps it allocated. |
 | `capture_cudagraphs(profile_only=False)` | Runs whenever `needs_cudagraph_capture()` is true and `enforce_eager` is off. Its entry checks run first, in this order: Ordering, A second serving capture, `registration`'s segment-graph entry check (REG-MEM-024), then whether a profiling capture was required (When core's estimate does not run). The serving capture: the same procedure, without the margin, over the serving pools, into core's global graph pool; then the memory comparison. Records the plain-value pool layout for post-warmup verification. |
 | `post_warmup()` | Called once per run of the worker's warmup; at startup after the serving capture and before the worker serves. Post-warmup verification. Allocates no device memory and replays nothing. |
 | scheduled steps | `execute` per step (Execute order). |
@@ -663,8 +679,12 @@ and the transaction-graph parts of the other hooks do nothing.
   transaction-graph part starts by checking it: exactly one layout, holding exactly the state
   layer; each of the layer's component tensors the layer's bound view of the same name and
   position (core builds the layout from the views it bound, `get_state_group_layouts` in
-  `vllm/v1/worker/utils.py`); and at least `N + 1` blocks. A failed check is a failure of the
-  pool-access phase (Capture failure messages). The layout grants no slot ownership and authorizes
+  `vllm/v1/worker/utils.py`); and at least the admission limit plus one blocks, the count core's
+  scheduler requires once it is built after the captures, which is at least `N + 1`. A failed
+  check is a failure of the pool-access phase (Capture failure messages). Under the restricted
+  startup the block-count part can fail only under a fixed `kv_cache_memory_bytes`, whose block
+  count no configuration check knows; under `num_gpu_blocks_override` the Block count condition
+  has already refused a smaller override. The layout grants no slot ownership and authorizes
   no store to any page, the null page included; capture, warm-ups and the self-check run only
   rejected rows and write only binding-owned memory. Core documents the layout as valid only until
   its next bind or release of the KV cache, so the call keeps no layout object and no tensor taken
@@ -851,15 +871,19 @@ reference, warm-ups, capture or validation replay, or the margin allocation); th
 and the transient peak; the budget setting (a block count fixed at the given
 `num_gpu_blocks_override`, with the estimate enabled or disabled, or a budget fixed at the given
 `kv_cache_memory_bytes`); the allocator settings; and the remedy for its case:
+- pool access with too few blocks, in either capture: a block count or budget that holds at least
+  the admission limit plus one state pages (a larger `--kv-cache-memory-bytes`, or a larger
+  `--num-gpu-blocks-override`), or a lower admission limit with the largest population at most
+  it; never a smaller budget, which would hold fewer pages still;
 - profiling capture: a smaller largest population, a smaller `max_num_seqs`, or the option off;
-- serving capture, fixed block count: a profiling-capture remedy; or a smaller
-  `--num-gpu-blocks-override` that still holds, besides the null block, a page for the largest
-  population and for every request that can be active, which helps only when the allocated state
-  pages leave too little device memory for the capture's transient peak;
-- serving capture, fixed budget: a `--kv-cache-memory-bytes` smaller by at least the projected
-  remainder (per kind with at least one cell captured in the call, the mean growth of those cells
-  times its cells not yet captured, stated as an estimate; for a kind with no captured cell the
-  estimate is stated as unavailable), or a profiling-capture remedy.
+- serving capture, fixed block count, in a later phase: a profiling-capture remedy; or a smaller
+  `--num-gpu-blocks-override` that still holds at least the admission limit plus one blocks, which
+  helps only when the allocated state pages leave too little device memory for the capture's
+  transient peak;
+- serving capture, fixed budget, in a later phase: a `--kv-cache-memory-bytes` smaller by at
+  least the projected remainder (per kind with at least one cell captured in the call, the mean
+  growth of those cells times its cells not yet captured, stated as an estimate; for a kind with
+  no captured cell the estimate is stated as unavailable), or a profiling-capture remedy.
 
 The serving-over-profiling failure names both call totals, `m`, `r`, the excess and the
 allocator settings, and gives as remedies a fixed `--kv-cache-memory-bytes` that leaves room for
@@ -911,7 +935,8 @@ workspace. Its one allocation is a bounded host shadow page of the state layout,
 ## Failure containment
 
 **Per-row rejections are not step failures.** A rejected row has a nonzero status, its pages stay
-as they were at the start of the step, and the other rows commit. Under
+as the transaction found them (a fresh row's as initialized before the transaction, Fresh rows),
+and the other rows commit. Under
 replay as under the option-off transaction, its status flows through the sink's collection, and
 `postprocess_state` then fails its request alone, returning it through the model state's
 `take_failed_requests` (the `registration` design, Row failure), as the owning design states:
@@ -1087,8 +1112,12 @@ use a fixed `--num-gpu-blocks-override` with the estimate enabled.
   progress, remaining counts and every page. The driver runs on the worker of a hook-captured
   process through a test-only adapter over the serving pools, which drives the model state's step
   lifecycle as core's runner does: per step it calls `remove_request` for each request that
-  finished or continues, then `add_request` with each new or continuing request's
-  `NewRequestData`, then `prepare_inputs`; it executes on the runner stream, then calls
+  finished, in ascending request-ID order; then, for each new or continuing request in the step's
+  scheduled order, `remove_request` for that request immediately followed by its `add_request`
+  with the request's `NewRequestData`; then `prepare_inputs`. Removal and addition interleave
+  per request, as in core's runner: in the order "remove A, remove B, add A" the model state
+  would retire A at B's removal (REG-STATE-011) and then refuse A's continuing turn
+  (REG-STATE-012). It executes on the runner stream, then calls
   `postprocess_state`, which waits for the step's commit event, and `take_failed_requests`
   before the next step. The adapter assigns each request one block at its first step, keeps it
   until the request's terminal finish and reuses it only after that, as core's allocator does, and
@@ -1299,12 +1328,14 @@ without violations, TXG-MODEL-005 is unmet.
 This component owns the option's sections of the user manual (`docs/manual.md`) and of
 `docs/evidence.md`. The manual's section gives a serve command that runs the hook configuration
 (no `--enforce-eager`) under the restricted startup (`-cc.cudagraph_mode none -cc.mode none
---no-async-scheduling` and `--num-gpu-blocks-override` of at least `N + 1`) with the default
+--no-async-scheduling` and a `--num-gpu-blocks-override` of at least the admission limit plus
+one) with the default
 segment arms, `num_lookahead_tokens` 0 or 1 and `transaction_graph_populations` in
 `--hf-overrides`, a `--max-model-len` that covers the geometry (`registration`, REG-ENG-010), at
 the `--max-num-seqs`, block count and `N` that the tier 5 run verified to fit the A40. It states that a fixed budget must leave room for the graphs, which the startup log
 reports; the limits (one geometry per server, 80 or 160 ms; `N` bounded by `max_num_seqs` and the
-admission limit `--max-num-active-seqs`; steps beyond `N` CHUNK or other rows, and steps with a
+admission limit `--max-num-active-seqs`; a block count or budget that holds at least the
+admission limit plus one state pages; steps beyond `N` CHUNK or other rows, and steps with a
 multi-token row, run option-off and are counted; refused under `--enforce-eager`,
 with native burst, and outside the restricted startup, each setting with its reason); that the server needs a frontend release that opens streams by locale only;
 and the tier each claim met, with its build. The evidence document's section states the measured
@@ -1409,7 +1440,7 @@ not set; and a frontend release that opens streams by locale only.
 | Cell range | Both kinds at every count 1 to `N` | Cells only at declared populations | Served populations drift step to step, so a sparse list rarely matches a real `K` or `E`; a contiguous range makes coverage a single bound |
 | Option value | A list whose largest entry fixes `N` | A single maximum | The HLD defines the option as declared step populations; the list keeps that surface while the cell range depends only on its maximum |
 | Freshness | A per-row select inside the chunk cell | A cell dimension (`chunk-fresh`, `chunk-continuing`); separate launches for fresh and continuing rows | A dimension triples cells and sends every step with both to fallback; separating fresh from continuing rows changes the encoder's batch dimension and so its numerics |
-| Fresh-row state | Gather the zero-initial state tensors by an initial-state index that names the null page for a fresh row, and select the initial book row after the book's gather | A select of the initial state after the gather of every state tensor; the variable-length continuing index; a masked-load kernel that skips fresh rows' loads; a select of the book row only, relying on core's new-generation slot initialization | A select after every gather reads and writes every gathered state tensor once more per step (three per encoder layer and eight more), a cost that grows with the population; the null page is zero and never stored to, so the index gives the same values with one small select. The variable-length index is data-dependent and cannot be captured; a masked-load kernel adds a JIT specialization for no change in values; the book-row-only select rests on an unverified coincidence of the fresh flag with core's initialization of a newly allocated page, which the null page does not need |
+| Fresh-row state | Gather the zero-initial state tensors by an initial-state index that names the null page for a fresh row, and select the initial book row after the book's gather | A select of the initial state after the gather of every state tensor; the variable-length continuing index; a masked-load kernel that skips fresh rows' loads; a select of the book row only, relying on core's initialization of a newly allocated page | A select after every gather reads and writes every gathered state tensor once more per step (three per encoder layer and eight more), a cost that grows with the population; the null page is zero and never stored to, so the index gives the same values with one small select. The variable-length index is data-dependent and cannot be captured; a masked-load kernel adds a JIT specialization for no change in values; the book-row-only select rests on an unverified coincidence of the fresh flag with core's initialization of a newly allocated page, which the null page does not need |
 | Launch boundary | Validation, signatures, allocations and the reservation before the first launch; worker-fatal after it | A reservation per launch; option-off fallback of the second half after a failed first launch | The first launch may already have scattered; a second-half fallback would commit a step neither path produced, and two reservations break the sink's one-in-flight rule |
 | Reservation disposition | Exactly one successful stage or one cancel resolves a reservation, a covered step's or the option-off transaction's; a stage that raises before publication leaves it cancellable; a cancel after a successful stage is a no-op | Treating a called stage as the disposition whether or not it returns; limiting the rule and its model check to covered steps | A stage that raised and counted as the disposition would leave the sink's one in-flight reservation held, so every later reserve fails; every declined step uses the option-off reservation, so the rule and its check must cover it too |
 | Host inputs | One step arena with a section per kind, one upload, double-buffered pinned host side | One arena per cell (two uploads); per-call staging; captured host-to-device copies | One upload per step; captured copies replay a frozen source; per-call staging adds launches |
@@ -1420,12 +1451,16 @@ not set; and a frontend release that opens streams by locale only.
 | Profiling capture content | The serving capture's procedure and cells over the profiling pools, plus the charged margin | A synthetic upper bound; extrapolation from one cell | The same procedure gives the same allocation sequence; extrapolation is unsound because cells do not share memory predictably |
 | Serving against profiling | Aggregate call totals; startup fails when the serving total exceeds the profiling total, which includes one flat charged margin | A per-cell margin; a per-cell inequality; a warning only; an uncharged tolerance | Rounding arises per allocator segment over the whole call, so a per-cell margin overcharges at large `N` and undercharges at small `N`; per-cell growth is order-dependent under reuse; a warning serves with uncharged memory where core estimated; an uncharged tolerance hides real overruns. The margin is memory core charges, so the strict comparison still bounds serving memory |
 | Missing profiling capture | Required from the effective cache configuration at the serving capture (When core's estimate does not run); otherwise logged as uncharged | Allow every absence; refuse the option under a fixed budget | An unexplained absence means core skipped a charge the configuration promises; refusing fixed budgets would break every such deployment once the option is default-on |
-| Startup on the target core | A restricted startup: synchronous scheduling, an explicit NONE runner and compilation mode, and `--num-gpu-blocks-override` of at least `N + 1` or a positive `--kv-cache-memory-bytes`; every other startup refused, naming each unmet condition and its remedy; lifted when core sizes its profiling KV cache and its extensible KV cache for a model-state capture over state pages (Future roadmap) | Refuse the option until core changes; capture the profiling cells over `N + 1` model-owned scratch pages freed before the hook returns; accept every startup | Under the restricted startup the cells capture over core's own pages in both captures with no plugin mechanism beyond configuration checks, and every setting it needs exists in core. Scratch pages would address only the profiling KV cache: the extensible KV cache would still back only its first blocks at the serving capture, and the capture procedure, capture rows, scatter warm-up, pool access and profiling lifecycle (TXG-CAP-004 to TXG-CAP-006, TXG-CAP-008, TXG-LIFE-004) and their models would change for a gap that core can close. Under core's defaults the profiling capture has one page and the serving capture would read unbacked pages |
+| Startup on the target core | A restricted startup: synchronous scheduling, an explicit NONE runner and compilation mode, and a `--num-gpu-blocks-override` of at least the admission limit plus one or a positive `--kv-cache-memory-bytes`; every other startup refused, naming each unmet condition and its remedy; lifted when core sizes its profiling KV cache and its extensible KV cache for a model-state capture over state pages (Future roadmap) | Refuse the option until core changes; capture the profiling cells over `N + 1` model-owned scratch pages freed before the hook returns; accept every startup | Under the restricted startup the cells capture over core's own pages in both captures with no plugin mechanism beyond configuration checks, and every setting it needs exists in core. Scratch pages would address only the profiling KV cache: the extensible KV cache would still back only its first blocks at the serving capture, and the capture procedure, capture rows, scatter warm-up, pool access and profiling lifecycle (TXG-CAP-004 to TXG-CAP-006, TXG-CAP-008, TXG-LIFE-004) and their models would change for a gap that core can close. Under core's defaults the profiling capture has one page and the serving capture would read unbacked pages |
 | Pool source at capture | Core's accessor `ModelState.state_group_layouts`, checked against the state layer's bound views, keeping only plain values | The state layer's own views (`component_pools`), which hold the same tensors | The accessor is core's contract that a held page keeps its block ID and address until terminal finish, and core sets it only while a KV cache is bound. The layer holds its views by reference to the bound storage and drops them when core rebinds, when the bound object changes and in `clear_cudagraphs` (`registration`, REG-STATE-018), so both name the same tensors at a capture; the identity check keeps the two in agreement |
 | Option-off body regression | Tier 5 rests on the option-on/off comparisons of one body (TXG-QUAL-002 to TXG-QUAL-006); no check compares the option-off step time with a commit from before the phase split | A preregistered non-regression check of the option-off step time against the newest commit whose `advance_model_rows` is not composed of prepare, body and commit functions; rebasing that commit onto the target core | That commit runs only on the state-pool core, which the plugin refuses (REG-002), so the check cannot run on the target core. Rebasing it would time a body that no release ships on a core it never ran on. Its result on the state-pool core stays in `docs/evidence.md` as a historical record |
 | Feed-to-park client path | `AsyncLLM.generate` with an input generator of packer-built `StreamingInput` units, in a multiprocess engine | The session factory's `feed`; an `LLM.generate` arm | The factory is not available on the target core (HLD, Approach, section 2). An input generator is the client path the target core offers and the one core's `/v1/realtime` uses. `LLM.generate` takes complete prompts only, so an `LLM` arm can time only a whole one-unit request, not a feed into an open stream (Future roadmap) |
 | Steps with a multi-token row | The step falls back with reason `multi-token`; the option-off transaction places every row by its token positions | Cells and static inputs addressed by token position; failing every request of the step | Planning fails the multi-token row, and only a direct engine client produces one. Token-position addressing in the cells would size the static inputs by `max_num_batched_tokens` and change the arena and every cell for a step that plugin-packed input never produces. Failing the whole step would fail requests that did nothing wrong |
 | Populations above the admission limit | Refused (TXG-CFG-020) | Accepted; `N` clamped to the limit | Core schedules at most the admission limit's rows per step, so cells above it are captured, charged and never replayed. Clamping would capture an inventory other than the one declared, without telling the operator |
+| Block count under the restricted startup | At least the admission limit plus one: refused in the configuration hook under `num_gpu_blocks_override` (TXG-CFG-005), and checked at pool access under a fixed `kv_cache_memory_bytes` (TXG-CAP-008) | At least `N + 1`, the capture's own need; leave the check to core's scheduler | Core builds its scheduler, which refuses fewer state pages than requests that can be active, only after both captures, so a count between `N + 1` and the admission limit would capture `2N` cells twice and then fail with core's message. Checking the capture's need alone passes a configuration that cannot serve |
+| Pool-access remedy | A larger block count or budget, or a lower admission limit (TXG-MEM-017) | TXG-MEM-013's smaller `--kv-cache-memory-bytes` | A pool-access failure means the budget holds too few state pages, and a smaller budget holds fewer still. TXG-MEM-013 answers a serving capture that ran out of device memory after pool access |
+| Pages of rejected fresh rows | Initialized before the transaction whether or not the row is rejected; preservation starts after initialization (Fresh rows) | Initialize only the rows that commit; preserve a rejected fresh row's recycled contents | The body finds a per-row rejection on the device, after the initialization has run, so initializing only committed rows would need every rejection on the host before the step. Preserving recycled contents would leave an earlier request's state in a page that the rejected request holds |
+| Qualification adapter's call order | Core's runner order: finished requests removed first, then each new or continuing request removed and at once added (TXG-QUAL-026) | All removals, then all additions | With all removals first, the next request's removal retires a continuing request's pending removal (REG-STATE-011), and the model state then refuses that request's continuing turn (REG-STATE-012), so the adapter would not drive the model state as core does |
 | Option-off baseline | `B_hook`: the default segment arms under the hook configuration, no CHUNK-bucket graphs | The eager encoder; the `--enforce-eager` graphed configuration | `B_hook` is the default at the same geometry, so the option is the only difference; the eager encoder would credit the option with the encoder graphs' gain |
 | CHUNK-bucket graphs | Refused under the option | Accept the binding inside or beside the cells | The binding graphs an already-gathered bucket, which a chunk cell captures in full; it is experimental, covers three counts at 160 ms, and would only change fallback steps |
 | Endpoint arguments | The forward passes the endpoint pools and EOU token on every step, option on or off; cells run with `endpoint_enabled` true and the policy-free endpoint bookkeeping; a step with an endpoint-policy row or a forced-EOU candidate, marked conservatively on the host, falls back by `signature` | Cells with `endpoint_enabled` false and the endpoint arguments passed only for a step with a policy row; forcing EOU only for a row that carries a policy; cells that also cover policy rows and forced EOU | Passing the arguments only for policy steps makes the option change the transaction: policy-free rows' endpoint pages would differ from `B_hook`'s, and a policy-free row that schedules the EOU token would be rejected instead of forced, against TXG-EQ-001. Forcing EOU only for policy rows changes `B_hook` itself, a session-protocol decision outside this component. Policy evaluation and forced EOU arise only from a direct engine client and have no qualification evidence, so they wait for cells of their own (Deferred 6) |

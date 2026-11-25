@@ -119,20 +119,20 @@ No acceptance tier has been measured on the target core. All figures below come 
 last release, `v0.1.0b2`, on the earlier state-pool build (`hook-build-20261114b`, which carried
 the state pool and stream admission of vllm#67374 and #67375), on one NVIDIA A40 at FP32, at
 320 ms, in the hook configuration with `--max-num-seqs 64` and the default segment arms
-([evidence](docs/evidence.md#tier-2-on-the-stage-1-build)). They are a historical record for this
+([evidence](docs/evidence.md#tier-2-on-the-state-pool-build)). They are a historical record for this
 plugin until tier 2 is met on the target core. Other GPUs, other lookaheads and stage 2 are
 unmeasured.
 
 - Accuracy: 5,559 LibriSpeech `/v1/realtime` sessions at concurrency 32 all ended `stop`. WER was
   3.57 % on test-clean and 7.99 % on test-other. 640 test-clean sessions at concurrency 64 gave WER
   2.89 %. The server logged no preemption
-  ([evidence](docs/evidence.md#tier-2-on-the-stage-1-build)).
+  ([evidence](docs/evidence.md#tier-2-on-the-state-pool-build)).
 - Final latency, from the client's final commit to `transcription.done`, with audio sent at
   real-time pace: p50 206 ms and p99 430 ms on test-clean at concurrency 32; p50 234 ms and p99
-  499 ms at concurrency 64 ([evidence](docs/evidence.md#tier-2-on-the-stage-1-build)).
+  499 ms at concurrency 64 ([evidence](docs/evidence.md#tier-2-on-the-state-pool-build)).
 - Startup and memory: the server was ready 130.6 s after launch. Device memory in use peaked at
   16,445 MiB during startup, and 35.74 GiB remained for KV memory
-  ([evidence](docs/evidence.md#tier-2-on-the-stage-1-build)).
+  ([evidence](docs/evidence.md#tier-2-on-the-state-pool-build)).
 - `--max-num-seqs` bounds concurrent streams and actively scheduled files. Segment-graph memory
   grows faster than linearly with it. Under `--enforce-eager`, an unpublished A40 measurement put
   the capture peak at 18.3 GiB for 64 and 44.4 GiB of the card's 45 GiB for 128
@@ -198,3 +198,18 @@ NEMOTRON_CONFORMANCE_ACCEPTANCE=1 PYTHONPATH=<stage 1 vLLM tree> \
 
 The run fails when either frontend distribution is an editable or local install, or came from a
 commit other than the pinned one. Tier 1 is met only by a run in which no test fails or is skipped.
+
+## Future roadmap
+
+The [high-level design's Future roadmap](docs/high-level-design.md#future-roadmap) gives each
+deferred item with its trigger and shape. The items that change this README:
+
+- **Measured figures on the target core.** Expected performance cites only the state-pool build.
+  Trigger: tiers 2, 4 and 5 met on the target core. Shape: Expected performance cites those
+  records, and the serve command gives the `--max-num-seqs` and runner flags tier 2 verified.
+- **Frontend streaming.** A frontend's streaming routes do not run on either build. Trigger: the
+  session factory runs on core's automatic admission. Shape: Builds and What you can serve name a
+  stage 2 commit that serves them.
+- **Transaction graphs beyond the restricted startup.** Trigger: core sizes its profiling and
+  extensible KV caches for a model-state capture over state pages. Shape: the option starts with
+  the default serve command's settings.

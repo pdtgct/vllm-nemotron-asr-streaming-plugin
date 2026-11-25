@@ -253,18 +253,22 @@ stream-unit carrier-width check does not apply to file items.
 
 At the request's first schedule, the model state takes the samples and header from the scheduled
 request's multimodal features into a **host buffer owned by the request**, recorded with the
-request's state slot handle. The buffer is independent of core's encoder cache, which may drop the
-item once the one-token prompt is consumed. Each later step copies at most one chunk's samples to
-the device.
+request's slot (its block ID) and the admission generation the model state gave it (the
+`registration` design, State-slot access). The buffer is independent of core's encoder cache,
+which may drop the item once the one-token prompt is consumed. Each later step copies at most one
+chunk's samples to the device.
 
-The buffer is freed when the request leaves the engine for any reason (finish, abort, preemption,
-error), which the model state learns from the next step's finished request IDs; the engine
-delivers that cleanup even when the step has no forward work. No step that reads the buffer is
-still in flight then, under synchronous or asynchronous scheduling: the worker runs each step's
-`postprocess_state`, where the model waits for the step's commit event, before it executes the
-next step (the `registration` design, Engine settings). A slot handle seen again with a new generation
-drops any stale buffer recorded for the old one. A request aborted before its first schedule never
-creates one.
+The buffer is freed when core calls the model state's `remove_request` for the request, which core
+does when the request finishes for any reason (stop, abort, error or a length limit), also on a
+step with no forward work; the model state retires a file request within that call (the
+`registration` design, REG-STATE-016). Core never preempts a request of this model. No step that
+reads the buffer is still in flight then, under synchronous or asynchronous scheduling: the worker
+runs each step's `postprocess_state`, where the model waits for the step's commit event, before it
+executes the next step (the `registration` design, Engine settings). An `add_request` that gives a
+slot a new admission generation drops any buffer still recorded for the slot under an earlier
+one; core removes a finished request in the step that delivers its finish, before it adds that
+step's new requests, so this drop is a defensive check. A request aborted before its first
+schedule never creates a buffer.
 
 Memory: 64,000 bytes per second of audio (about 3.8 MB per minute) per file in flight. Without a
 frontend, `max_num_seqs` bounds the files actively scheduled, not uploads: requests queued in core
@@ -513,7 +517,7 @@ submission (Request guards), so neither can truncate a transcript.
 | Chunks per step | At most one | Up to `k > 1` | One chunk keeps a file row within the encoder's captured populations and profiled memory and fits the one-token-per-step queue; `k > 1` needs capture and profiling for `k ×` rows and a queue holding `k` bursts |
 | Cadence | The server's one geometry, from the shared geometry function | A cadence chosen per request (for example through `vllm_xargs`) | A server warms and captures graphs for one geometry only (HLD Constraints), so another cadence would have no warmed path; core's transcription request has no lookahead field |
 | Where samples live | Request-owned host buffer, one chunk staged per step | A device copy of the file; reading from the encoder cache | A device copy grows with file length; core may drop encoder-cache entries once the prompt is consumed |
-| When the buffer is freed | When the request is reported finished (any reason) | A release-fence hook | The engine exposes no model hook at the release fence; the model's commit wait in `postprocess_state` completes every step that reads the buffer before the worker executes the next step |
+| When the buffer is freed | Within core's `remove_request` for the request, which core calls when the request finishes for any reason (REG-STATE-016) | A release-fence hook; the next model-state call after the removal | The engine exposes no model hook at the release fence; the model's commit wait in `postprocess_state` completes every step that reads the buffer before the worker executes the next step. Deferring the free to the next model-state call would keep the last file's buffer on an idle engine |
 | Repeated uploads | A random per-request multimodal UUID | A nonce in the header; disabling the multimodal cache | Core hashes items by their UUID, so no header field is needed, and the server's cache settings stay untouched |
 | Silence | A continuation token | Emitting nothing; the park/EOS token | Every step emits a token; EOS would end the request |
 | Distinguishing file rows | A dedicated file-carrier prompt token at the first schedule, kept as host metadata for the request's life | The stream carrier with a different header field | The first scheduled token is host authority the model state reads before any device work |
@@ -555,3 +559,8 @@ submission (Request guards), so neither can truncate a transcript.
 - **More than one chunk per step.** Trigger: measured file latency needs `k > 1` chunks per
   step. Shape: the file row stages up to `k` chunks and plans them as consecutive CHUNK work in one
   step, with the per-step copy and commit status sized for `k`.
+- **Terminal forms on a core with vllm#67144 and #67151.** FILE-BUD-004 is deferred because
+  neither build the plugin targets carries the two PRs. Trigger: a build the plugin targets carries
+  both. Shape: FILE-BUD-004 becomes current conformance, the request guards activate, the
+  installed-engine tests check the HTTP 422, 500 and 503 responses and the streaming terminal
+  events, and the user manual's partial-text limits name only cores without the PRs.

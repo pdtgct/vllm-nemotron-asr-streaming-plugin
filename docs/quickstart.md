@@ -17,7 +17,7 @@ The [user manual](manual.md) covers every setting, the clients, operations and t
 No acceptance tier has been met on the target core. The last release, `v0.1.0b2`, ran on the
 earlier state-pool build, where it partly met tier 2, the installed-engine acceptance tier, on one
 NVIDIA A40 at FP32 at 320 ms in the hook configuration
-([evidence](evidence.md#tier-2-on-the-stage-1-build)). That release does not run on the target
+([evidence](evidence.md#tier-2-on-the-state-pool-build)). That release does not run on the target
 core, and the plugin's `main` requires the target core and no other RFC 1 build
 ([high-level design, Constraints](high-level-design.md#constraints)).
 
@@ -118,3 +118,12 @@ The response is JSON with the transcript in `text`.
   `--max-num-seqs`, graph memory and transaction graphs.
 - [Clients](manual.md#clients): realtime and file transcription examples.
 - [Troubleshooting](manual.md#troubleshooting): what each startup refusal means.
+
+## Future roadmap
+
+- **A measured quick start.** No command on this page has been run as written on the target
+  core. Trigger: tier 2 met on the target core. Shape: the evidence document records the install
+  and serve commands, and this page gives the `--max-num-seqs` that tier 2 verified.
+- **Stage 2.** This page installs no frontend. Trigger: the session factory runs on core's
+  automatic admission ([high-level design, Future roadmap](high-level-design.md#future-roadmap)).
+  Shape: an optional step installs the RFC 2 build and the frontend and checks a streaming route.

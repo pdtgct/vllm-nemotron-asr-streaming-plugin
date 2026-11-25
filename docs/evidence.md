@@ -28,6 +28,7 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 - [Transaction graphs, tier 5](#transaction-graphs-tier-5)
 - [Owed](#owed)
 - [Historical entries](#historical-entries)
+- [Future roadmap](#future-roadmap)
 
 ## Builds
 
@@ -277,3 +278,19 @@ about the current plugin on the target core or on stage 2.
   from 0.55 s to 3.64 s, with no preemptions. Run file traffic on a separate server, or keep files
   short, until this is fixed.
 - These are exploratory measurements on one GPU, not a qualification run.
+
+## Future roadmap
+
+Owed lists the records due on the target core now. These records wait on a trigger:
+
+- **Stage 2 records.** Trigger: the session factory runs on core's automatic admission
+  ([high-level design, Future roadmap](high-level-design.md#future-roadmap)). Shape: tier 2 and
+  tier 3 entries for the frontend's routes on a recorded stage 2 commit.
+- **Latency parity with NVIDIA's NIM.** Trigger: tier 4 met on stage 1 with transaction graphs off
+  and on, and a NIM that serves this checkpoint available. Shape: an entry comparing final latency
+  and time to the first transcript on one GPU, naming both builds.
+- **Transaction graphs at 320, 560 and 1120 ms.** Trigger: their cells are specified (the
+  `transaction-graph` design, Deferred 5). Shape: a tier 5 entry per geometry.
+- **The state-pool comparison.** Trigger: tier 2 and tier 5 met on the target core. Shape: an
+  entry that compares them with the state-pool build's records above, by which RFC 1 retires the
+  state pool.

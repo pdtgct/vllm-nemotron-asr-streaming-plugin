@@ -5,6 +5,20 @@ Design: [session-design.md](session-design.md). Prefix `SESS`.
 A session is one live audio stream served through the plugin's `SessionFactory` on one RFC 1
 admitted stream; a lease is the handle `open` returns for it.
 
+**Scope on the target core.** These specs hold two kinds of obligation:
+- **Current model-side and shared obligations**, conformance on the target core (`pdtgct/vllm` at
+  `ddf6db2ab8`): SESS-FAC-001 to SESS-FAC-003 (the entry point, and `create_session_factory`,
+  which refuses on the target core because its engine client has no stream-admission calls),
+  Server geometry, Packer, Geometry check in the model, Core `/v1/realtime` and SESS-EP-001.
+- **The session factory on the stream-admission client path**, which the target core does not
+  provide: SESS-FAC-004 to SESS-FAC-007 and the groups Audio input to `feed`, Lease states and
+  call discipline, Opening a session, Engine binding, Locale, Flush, finish, abort, release,
+  teardown, Factory ownership, Error contract and Transcript projection. They are the factory's
+  design, which tier 1 runs against the repository's engine double (SESS-FAC-007); a pass makes no
+  claim for the target core. The factory's port to core's automatic admission (the session
+  design's Future roadmap 1) revises them; until then they are not deferred, because the factory
+  ships and its tests run, but no build the plugin targets runs it.
+
 ## Discovery and construction
 
 - [x] **SESS-FAC-001**: The distribution shall expose an entry point in the group `vllm_riva_frontend.session_factories`, named `nemotron_asr_streaming`, with the value `vllm_nemotron_asr_streaming.session:create_session_factory`.
@@ -139,3 +153,10 @@ packer implementation.
 
 - [x] **SESS-EP-001**: Neither the session factory nor `buffer_realtime_audio` shall set an endpoint policy on the requests they create, so every stream they serve runs with the model's endpointing disabled.
 - [D] **SESS-EP-002**: Where per-utterance finals are designed with the frontend, the session shall bind an endpoint policy on core, close a transcript segment at each EOU token (`blank + 3`), and report segment completions to the frontend.
+
+## Future roadmap
+
+The session design's Future roadmap gives each deferred item with its trigger and shape. Its item
+1, the session factory on core's automatic admission, revises the factory groups that the scope
+above names. SESS-EP-002 is the obligation of the deferred utterance finals (the session design,
+Open Questions & Future Decisions), whose trigger is their design with the frontend.

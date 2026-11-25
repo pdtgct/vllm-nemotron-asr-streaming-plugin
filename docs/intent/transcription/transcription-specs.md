@@ -59,10 +59,10 @@ A guard field is *present* when its value is not `None` (and, for `use_beam_sear
 
 ## Request-owned host buffer
 
-- [x] **FILE-BUF-001**: When a file request is first scheduled, the model state shall copy the samples and header from the request's multimodal features into a host buffer owned by that request and recorded with its state slot handle.
+- [x] **FILE-BUF-001**: When a file request is first scheduled, the model state shall copy the samples and header from the request's multimodal features into a host buffer owned by that request and recorded with its slot (its block ID, REG-STATE-002) and its admission generation.
 - [x] **FILE-BUF-002**: While a file request is running, each step shall copy to the device at most the samples of the one chunk or tail it advances.
-- [x] **FILE-BUF-003**: When a file request's ID appears in a step's finished request IDs, for any finish reason, the model state shall free that request's host buffer, including in a step with no forward work.
-- [x] **FILE-BUF-004**: When a state slot handle is seen with a new generation, the model state shall drop any host buffer recorded for that slot's previous generation.
+- [ ] **FILE-BUF-003**: When core calls the model state's `remove_request` for a file request it holds, which core does when the request finishes for any reason, the model state shall free that request's host buffer within that call, including on a step with no forward work (REG-STATE-016).
+- [ ] **FILE-BUF-004**: When `add_request` gives a request a new admission generation on a slot (REG-STATE-002) for which a host buffer recorded under an earlier admission generation remains, the model state shall drop that buffer.
 - [x] **FILE-BUF-005**: If a file request is aborted before its first schedule, then the model state shall create no host buffer for it.
 
 ## Whole-file rows
@@ -118,7 +118,6 @@ can emit at most `B = 1 + (C + 1) × Q + 1` tokens. `B` is an upper bound for si
 not an admission limit. Core stops a request at its actual token count reaching `max_model_len`.
 
 - [ ] **FILE-BUD-002**: When a file's actual token count stays below `max_model_len`, no client completion limit was given (FILE-GRD-002 refuses any) and the deployment sets no generation-config `max_tokens`, and the request is not aborted and does not fail, the request shall end with EOS and never with finish reason `length`.
-- [ ] **FILE-BUD-004**: Where core carries vllm#67144 and vllm#67151 (neither build the plugin targets does: stage 1 is the target core alone, so on it REG-DOC-003's limits apply), on the transcription route (the translation route refuses every request, FILE-IF-004): if a file request ends with a `length` caused by a server limit (the request reaching `max_model_len`; EOS at the boundary is not one, since core checks EOS first), then non-streaming it shall be reported as HTTP 422 with no partial text, and streaming it shall carry an error event after any partial deltas, followed only by `data: [DONE]`; if it ends with `error`, then non-streaming it shall be reported as HTTP 500 with no partial text, and streaming as an error event after any partial deltas followed only by `data: [DONE]`; if it ends with `abort`, then non-streaming it shall be reported as HTTP 503 with no partial text, and streaming its last transcript chunk shall carry `finish_reason` `abort`, followed by at most a usage chunk and `data: [DONE]`. (On a core without these PRs, such a file returns partial text with HTTP 200.)
 
 ## Engine interaction
 
@@ -126,12 +125,13 @@ not an admission limit. Core stops a request at its actual token count reaching 
 - [ ] **FILE-ENG-002**: File requests shall run with the model's endpointing disabled.
 - [ ] **FILE-ENG-003**: A step may hold file rows and stream rows together; a file row that runs as a CHUNK row shall run in the step's one CHUNK bucket beside the step's stream CHUNK rows, and a file row that runs as a REPLAY or FLUSH row shall run beside the step's stream rows of the same role.
 - [ ] **FILE-ENG-005**: When no state slot is free, a file request shall wait in core's queue and be scheduled when a slot frees, not be refused.
-- [ ] **FILE-ENG-006**: With `stream=true`, core's streaming transcription response for a file request shall carry only label text in its events before the finish, with no event for a step that emitted only a special token, and shall end with core's usual terminal events when the request finishes with EOS; if it ends in a server-caused `length`, `error` or `abort`, the terminal form is that of FILE-BUD-004.
+- [ ] **FILE-ENG-006**: With `stream=true`, core's streaming transcription response for a file request shall carry only label text in its events before the finish, with no event for a step that emitted only a special token, and shall end with core's usual terminal events when the request finishes with EOS; where core carries vllm#67144 and vllm#67151, if it ends in a server-caused `length`, `error` or `abort`, the terminal form is that of FILE-BUD-004 (deferred: neither build the plugin targets carries them).
 
 ## Deferred
 
 - [D] **FILE-DEF-003**: Where core lets a model-state request run past `max_model_len` or the transcription route feeds a file as a resumable stream, a file of any length shall be transcribed. (Needs core; see the `transcription` design, Input length.)
 - [D] **FILE-DEF-002**: Where measured file latency requires it, a file row shall advance up to `k > 1` chunks per step.
+- [D] **FILE-BUD-004**: Where core carries vllm#67144 and vllm#67151 (neither build the plugin targets does: stage 1 is the target core alone, so on it REG-DOC-003's limits apply), on the transcription route (the translation route refuses every request, FILE-IF-004): if a file request ends with a `length` caused by a server limit (the request reaching `max_model_len`; EOS at the boundary is not one, since core checks EOS first), then non-streaming it shall be reported as HTTP 422 with no partial text, and streaming it shall carry an error event after any partial deltas, followed only by `data: [DONE]`; if it ends with `error`, then non-streaming it shall be reported as HTTP 500 with no partial text, and streaming as an error event after any partial deltas followed only by `data: [DONE]`; if it ends with `abort`, then non-streaming it shall be reported as HTTP 503 with no partial text, and streaming its last transcript chunk shall carry `finish_reason` `abort`, followed by at most a usage chunk and `data: [DONE]`. (On a core without these PRs, such a file returns partial text with HTTP 200.)
 
 ## Future roadmap
 
