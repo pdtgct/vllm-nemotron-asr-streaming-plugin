@@ -174,25 +174,56 @@ def current_settings(vllm_config: object) -> dict[str, object]:
     return {flag: value for flag, value in values.items() if value is not None}
 
 
+#: What may stand between an option and its current value in a statement of
+#: the configuration: punctuation (``--max-num-seqs (3)``,
+#: ``num_gpu_blocks_override=8``) or a stating phrase (``--kv-cache-memory-bytes
+#: fixed at 1073741824``, ``--max-num-seqs is 3``).
+_STATED_AS = r"(?:[\s=:(\"'`]|\b(?:fixed|set|at|to|is|of)\b)*"
+
+
 def diagnostic_facts(message: str, settings: dict[str, object]) -> list[str]:
     """The places where ``message`` names an option of ``settings`` together
     with its current value (``--kv-cache-memory-bytes 1073741824``,
+    ``--kv-cache-memory-bytes fixed at 1073741824``,
     ``num_gpu_blocks_override=8``, ``--max-num-seqs (3)``): facts about the
     configuration, not suggested changes."""
     facts = []
     for flag, value in settings.items():
         names = "|".join(re.escape(name) for name in OPTION_NAMES[flag])
-        pattern = rf"(?:{names})[\s=:(\"'`]*{re.escape(str(value))}(?![\d.])"
+        pattern = rf"(?:{names}){_STATED_AS}{re.escape(str(value))}(?![\d.])"
         facts += [m.group(0) for m in re.finditer(pattern, message)]
     return facts
 
 
+#: The phrasing of a suggested change (a remedy): an imperative (``set``,
+#: ``raise``, ``lower``, ``use``, ``remove``, ``turn ... off``), a comparative
+#: target (``a smaller --max-num-seqs``, ``a larger --kv-cache-memory-bytes``,
+#: ``of at least 9``), or the word remedy itself (``remedies: ...``). A
+#: clause without one states facts, whatever options it names.
+SUGGESTION = re.compile(
+    r"(?i)\b(?:set|use|pass|raise|increase|lower|reduce|decrease|remove|drop"
+    r"|disable|turn|switch|leave|add|choose|give|try|consider|instead"
+    r"|larger|smaller|greater|higher|fewer|at least|at most|remed\w*)\b"
+)
+
+
+def _clauses(message: str) -> list[str]:
+    """``message``'s clauses: its parts between ``;``, line breaks and
+    sentence ends."""
+    return [c for c in re.split(r"[;\n]|\.(?=\s|$)", message) if c.strip()]
+
+
 def suggested_changes(message: str, settings: dict[str, object] | None = None) -> str:
-    """``message`` without its diagnostic facts (:func:`diagnostic_facts`):
-    what remains can only suggest changes."""
-    for fact in diagnostic_facts(message, settings or {}):
-        message = message.replace(fact, " ")
-    return message
+    """The clauses of ``message`` that suggest a change (:data:`SUGGESTION`),
+    joined by ``;``, each without its diagnostic facts
+    (:func:`diagnostic_facts`): what remains names only what to change."""
+    changes = []
+    for clause in _clauses(message):
+        for fact in diagnostic_facts(clause, settings or {}):
+            clause = clause.replace(fact, " ")
+        if found(SUGGESTION, clause):
+            changes.append(clause)
+    return ";".join(changes)
 
 
 def configuration_remedies(
@@ -200,10 +231,12 @@ def configuration_remedies(
 ) -> list[str]:
     """The configuration remedies ``message`` gives (empty for a break of
     core's state-group layout contract, TXG-CAP-008, TXG-MEM-010): the
-    changes of :data:`CONFIGURATION_REMEDIES` it suggests. A mention of an
-    option with its current value in ``settings`` (:func:`current_settings`)
-    states the configuration, as TXG-MEM-010's budget setting does, and is
-    not a remedy."""
+    changes of :data:`CONFIGURATION_REMEDIES` it suggests
+    (:func:`suggested_changes`). An option named in a clause that suggests no
+    change (``budget setting: --kv-cache-memory-bytes fixed at 1073741824``),
+    or named with its current value in ``settings``
+    (:func:`current_settings`), states the configuration, as TXG-MEM-010's
+    budget setting does, and is not a remedy."""
     changes = suggested_changes(message, settings)
     return [
         name

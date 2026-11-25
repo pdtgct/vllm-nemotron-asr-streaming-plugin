@@ -821,6 +821,9 @@ fall in both classes (REG-STATE-015):
 | a scheduled encoder input that names a feature other than the overlapping one | raise | core's scheduler and the request's positions disagree |
 | an envelope payload that is not host-resident | raise | where the payload lives when the model state reads it is decided by core's multimodal delivery, not by the request |
 
+A row that matches both a fail-the-request fault and a raise fault fails its request: the client
+caused it.
+
 **Exceptions.** Core ends the engine when a model-state method or the forward raises, so every
 raise is worker-fatal and no later step of the worker runs. `postprocess_state` records a step's
 failed requests only after the step's collection completes; if it raises, it first drops the

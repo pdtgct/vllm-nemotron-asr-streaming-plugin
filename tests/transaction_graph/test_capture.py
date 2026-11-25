@@ -348,15 +348,19 @@ def test_cells_are_captured_largest_first_chunk_then_echo(on_cpu):
         assert t.cell_order(env, capture) == t.largest_first(env.n), capture
 
 
-def _dead(refs) -> bool:
+def _dead(storages) -> bool:
+    """Whether every storage weakly referenced in ``storages``
+    (``StorageWeakRef``) is freed: a view the plugin kept of a component
+    keeps the storage although the component object is gone."""
     gc.collect()
-    return all(ref() is None for ref in refs)
+    return all(ref.expired() for ref in storages)
 
 
 def _assert_the_plugin_holds_no_accessor_object(env, when):
     """TXG-CAP-008: the plugin holds no layout object, component or tensor
-    that the accessor returned (core's own references and the state layer's
-    bound views aside), checked at ``when``."""
+    that the accessor returned, nor any tensor sharing a component tensor's
+    storage (core's own references and the state layer's bound views
+    aside), checked at ``when``."""
     held = t.plugin_holds(env, t.accessor_objects(env.state))
     assert held == [], (f"{when}, the plugin holds what the accessor returned", held)
 
@@ -369,11 +373,12 @@ def test_cells_reach_the_pools_only_through_the_state_group_layouts_in_the_call(
     inside each capture call and nowhere else (not at core's binding, not in
     ``post_warmup`` or a step), stores to no page of either pool (the null
     page included), and, as soon as each call returns, holds no layout
-    object, component layout or tensor the accessor returned, nor a view of
-    one: only plain values. Core still holds them then (it installed them),
-    so the check is what the plugin's objects reach, not whether they are
-    dead. Once core releases the profiling KV cache and binds the serving
-    one, the profiling tensors are gone."""
+    object, component layout or tensor the accessor returned, nor any tensor
+    sharing one's storage: only plain values. Core still holds them then (it
+    installed them), so the check is what the plugin's objects reach, not
+    whether they are dead. Once core releases the profiling KV cache and
+    binds the serving one, the profiling component tensors' storage is
+    freed."""
     run = on_cpu(n=2)
     env, core = run.env, run.core
     spy = t.AccessorSpy(monkeypatch, env.state)
@@ -403,9 +408,13 @@ def test_cells_reach_the_pools_only_through_the_state_group_layouts_in_the_call(
         "the transaction-graph part read the state-group layouts outside a capture call"
     )
     h.drop_advance_records()
-    assert _dead(ref for r in profiling for ref in r["tensors"]), (
-        "a profiling component tensor outlived core's release"
-    )
+    core.profiling_bindings = None  # the harness's own reference to core's pool
+    if not _dead([ref for r in profiling for ref in r["storages"]]):
+        spans = [span for r in profiling for span in r["spans"]]
+        pytest.fail(
+            "a profiling component tensor's storage outlived core's release; "
+            f"the plugin's paths to it: {t.plugin_holds(env, [], spans=spans)}"
+        )
 
 
 def _break_layouts(env, broken):

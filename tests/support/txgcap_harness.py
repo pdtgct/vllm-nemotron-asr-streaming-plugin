@@ -378,13 +378,16 @@ class AccessorSpy:
     (the property, shadowed on the model state's class for the test): whether
     it happened inside a ``capture_cudagraphs`` call, whether the
     transaction-graph module (``transaction_graph.py``) made it, how many
-    layouts it returned and weak references to each component tensor
-    (TXG-CAP-008, TXG-LIFE-003). Core's layout types take no weak reference
-    (slotted dataclasses), so what holds a layout object is checked by
-    reachability instead (:func:`plugin_holds`)."""
+    layouts it returned, and for each component tensor a weak reference to
+    its storage (``storages``) and the storage's span (``spans``,
+    :func:`storage_span`) (TXG-CAP-008, TXG-LIFE-003). The storage, not the
+    tensor object: a slice the plugin kept outlives the component and keeps
+    the storage. Core's layout types take no weak reference (slotted
+    dataclasses), so what holds a layout object is checked by reachability
+    instead (:func:`plugin_holds`)."""
 
     def __init__(self, monkeypatch: Any, state: Any) -> None:
-        import weakref
+        from torch.multiprocessing.reductions import StorageWeakRef
 
         self.reads: list[dict[str, Any]] = []
         self.inside = False
@@ -392,16 +395,22 @@ class AccessorSpy:
 
         def state_group_layouts(self: Any) -> Any:
             layouts = self._state_group_layouts
+            tensors = [
+                component.tensor
+                for layout in layouts
+                for components in layout.layers.values()
+                for component in components
+            ]
             spy.reads.append(
                 {
                     "inside": spy.inside,
                     "txg": _called_from(TRANSACTION_GRAPH_SOURCE),
                     "layouts": len(layouts),
-                    "tensors": [
-                        weakref.ref(component.tensor)
-                        for layout in layouts
-                        for components in layout.layers.values()
-                        for component in components
+                    "storages": [StorageWeakRef(t.untyped_storage()) for t in tensors],
+                    "spans": [
+                        (f"component tensor {i}", span)
+                        for i, t in enumerate(tensors)
+                        if (span := storage_span(t)) is not None
                     ],
                 }
             )
@@ -452,21 +461,32 @@ CORE_ATTRIBUTE = "_state_group_layouts"
 #: Modules whose objects are the harness's or pytest's, never the plugin's.
 _HARNESS_MODULES = ("support.", "test_", "tests.", "_pytest", "pytest", "pluggy")
 
+#: The plugin's package: its module namespaces and classes are walked as the
+#: plugin's (module-level state such as ``advance._batch_stats_slot``).
+PLUGIN_PACKAGE = "vllm_nemotron_asr_streaming"
+
 
 def _harness_object(obj: Any) -> bool:
     import types
 
-    owner = obj if isinstance(obj, types.FunctionType) else type(obj)
+    owner = obj if isinstance(obj, (type, types.FunctionType)) else type(obj)
     return getattr(owner, "__module__", "").startswith(_HARNESS_MODULES)
+
+
+def _plugin_name(name: str) -> bool:
+    return name == PLUGIN_PACKAGE or name.startswith(PLUGIN_PACKAGE + ".")
 
 
 def _referents(obj: Any) -> list[Any]:
     """What ``obj`` holds, for :func:`plugin_holds`: a function's closure
     cells and defaults (not its module globals), a bound method's object
-    and function, and otherwise the garbage collector's referents."""
+    and function, a plugin class's attributes (no other class's, no
+    module's), and otherwise the garbage collector's referents."""
     import types
 
-    if isinstance(obj, (type, types.ModuleType)):
+    if isinstance(obj, type):
+        return list(vars(obj).values()) if _plugin_name(obj.__module__) else []
+    if isinstance(obj, types.ModuleType):
         return []
     if isinstance(obj, types.FunctionType):
         held = [c.cell_contents for c in obj.__closure__ or () if _filled(c)]
@@ -486,28 +506,76 @@ def _filled(cell: Any) -> bool:
     return True
 
 
+def storage_span(tensor: torch.Tensor) -> tuple[str, int, int] | None:
+    """The allocation ``tensor`` views, as ``(device, start, end)`` byte
+    addresses of its untyped storage: every view, slice, ``detach`` or
+    reshape-as-view of a tensor shares its span, whichever tensor PyTorch
+    records as its ``_base``. ``None`` for a tensor with no addressable
+    storage (a meta tensor, an empty allocation)."""
+    try:
+        storage = tensor.untyped_storage()
+        start, size = storage.data_ptr(), storage.nbytes()
+    except (RuntimeError, NotImplementedError, TypeError):
+        return None
+    if not start or not size:
+        return None
+    return str(tensor.device), start, start + size
+
+
+def _overlapping(
+    span: tuple[str, int, int] | None, spans: list[tuple[str, tuple[str, int, int]]]
+) -> str | None:
+    if span is None:
+        return None
+    device, start, end = span
+    for label, (other_device, other_start, other_end) in spans:
+        if device == other_device and start < other_end and other_start < end:
+            return label
+    return None
+
+
 def plugin_holds(
-    env: Any, targets: list[tuple[str, Any]], *, limit: int = 3_000_000
+    env: Any,
+    targets: list[tuple[str, Any]],
+    *,
+    spans: list[tuple[str, tuple[str, int, int]]] = (),
+    limit: int = 3_000_000,
 ) -> list[str]:
     """Every path through which the plugin's objects hold one of
-    ``targets`` (``[(label, object)]``) or a view of a target tensor: a walk
-    of every object the model and its model state reach, except core's
-    attribute on the model state (``_state_group_layouts``; another
-    reference to the same objects counts), the state layer (its bound
-    ``kv_cache`` and its view cache are the layer's, REG-STATE-018), module
-    namespaces, and the harness's and pytest's objects (spies, fakes, the
-    runner). Empty when the plugin holds none (TXG-CAP-008)."""
+    ``targets`` (``[(label, object)]``) or any tensor that shares storage
+    with a target tensor (its untyped storage overlaps the target's,
+    :func:`storage_span`: a view, slice, ``detach`` or flattened view of it,
+    whatever its ``_base``), or with one of ``spans`` (``[(label, span)]``,
+    for a tensor already dropped). The walk covers every object the model,
+    its model state and the plugin's module namespaces (with its classes'
+    attributes) reach, except core's attribute on the model state
+    (``_state_group_layouts``; another reference to the same objects
+    counts), the state layer (its bound ``kv_cache`` and its view cache are
+    the layer's, REG-STATE-018), other modules' namespaces, and the
+    harness's and pytest's objects (spies, fakes, the runner). Empty when the
+    plugin holds none (TXG-CAP-008)."""
     import sys
     from collections import deque
 
     wanted = {id(obj): label for label, obj in targets}
+    storages = list(spans)
+    for label, obj in targets:
+        if isinstance(obj, torch.Tensor) and (span := storage_span(obj)):
+            storages.append((label, span))
     state = env.state
     layer = h.state_layer_of(env.model)
+    modules = [(n, m) for n, m in list(sys.modules.items()) if m is not None]
     seen = {id(layer)}
-    seen |= {id(vars(m)) for m in list(sys.modules.values()) if hasattr(m, "__dict__")}
+    seen |= {id(vars(m)) for _, m in modules if hasattr(m, "__dict__")}
     parent: dict[int, tuple[int | None, str]] = {}
     queue: deque[Any] = deque()
-    for name, root in (("model", env.model), ("model state", state)):
+    roots: list[tuple[str, Any]] = [("model", env.model), ("model state", state)]
+    roots += [
+        (f"module {n}", vars(m))
+        for n, m in sorted(modules, key=lambda item: item[0])
+        if _plugin_name(n) and hasattr(m, "__dict__")
+    ]
+    for name, root in roots:
         seen.add(id(root))
         parent[id(root)] = (None, name)
         queue.append(root)
@@ -538,9 +606,9 @@ def plugin_holds(
                 found.append(f"{path(key)}: {wanted[key]}")
                 continue
             if isinstance(child, torch.Tensor):
-                base = child._base
-                if base is not None and id(base) in wanted:
-                    found.append(f"{path(key)}: a view of {wanted[id(base)]}")
+                shared = _overlapping(storage_span(child), storages)
+                if shared is not None:
+                    found.append(f"{path(key)}: shares storage with {shared}")
                 continue
             if _harness_object(child):
                 continue

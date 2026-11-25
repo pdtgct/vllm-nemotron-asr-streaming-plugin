@@ -1306,6 +1306,16 @@ def _second_feature(env, req_id: str):
     return _envelope_feature(env, req_id, identifier=f"uuid-{req_id}-second")
 
 
+def _cached(env, feature):
+    """``feature`` with its encoder output already in core's encoder cache
+    (keyed by its identifier), as core leaves a feature it encoded at an
+    earlier step: the output is the model's own encoding of the feature's
+    envelope, so core's scheduler does not schedule it again."""
+    (output,) = env.model.embed_multimodal(audio=[feature.data["audio"].data])
+    env.state.encoder_cache.encoder_outputs[feature.identifier] = output
+    return feature
+
+
 def _payload_without_an_envelope():
     """A kwargs payload whose only field is not the envelope (``audio``)."""
     from vllm.multimodal.inputs import (
@@ -1344,7 +1354,10 @@ _REQUEST_FAULTS = {
         lambda env: _carrier_request(
             env,
             "bad",
-            features=[_envelope_feature(env, "bad"), _second_feature(env, "bad")],
+            features=[
+                _envelope_feature(env, "bad"),
+                _cached(env, _second_feature(env, "bad")),
+            ],
         ),
         {"bad": [0]},
     ),
@@ -1429,8 +1442,8 @@ def _raised_in(error: BaseException) -> str:
 
 
 #: The plugin's error for each contract fault of a stream row's envelope
-#: header: the class it raises for these (``ValueError``) and what the message
-#: names.
+#: header: what the message names. The class is checked with ``isinstance``
+#: (``ValueError`` or a subclass), the plugin's convention; no spec names it.
 _PLUGIN_CONTRACT_ERRORS = {
     "feature without position metadata": r"(?i)position",
     "feature of non-positive length": r"(?i)non-positive length",
@@ -1557,7 +1570,8 @@ def test_a_contract_fault_of_the_envelope_header_raises(build, fault):
         assert _raised_in(error) == "plugin", (fault, _raised_in(error), repr(error))
         expected = ((ValueError, _PLUGIN_CONTRACT_ERRORS[fault]),)
     assert any(
-        type(error) is cls and re.search(pattern, message) for cls, pattern in expected
+        isinstance(error, cls) and re.search(pattern, message)
+        for cls, pattern in expected
     ), (fault, repr(error))
     assert env.runner.failed_log == [], "a contract fault was recorded as a row failure"
 
