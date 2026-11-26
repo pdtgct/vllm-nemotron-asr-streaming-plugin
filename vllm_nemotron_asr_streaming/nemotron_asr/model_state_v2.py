@@ -66,6 +66,7 @@ from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
     RequestRowFault,
     check_envelope_header,
     encoder_item_fault,
+    feature_placement_fault,
     file_envelope_header,
     resolve_row_envelope_header,
     stream_order_key,
@@ -503,13 +504,16 @@ class NemotronASRModelState(ModelState):
         """Take a file request's samples and header into a request-owned
         host buffer at its first schedule and mark it a FILE request.
 
-        A malformed item (the processor refuses these at input processing,
-        so only a direct engine client can send one) fails that row alone
-        through the transaction's row-failure path; it never raises out of
-        the step. An item the encoder path refuses (``encoder_item_fault``,
-        the rule screening drops encoder inputs by: an item not shaped as the
-        processor builds it among them) is malformed, so a file row whose
-        input screening drops also leaves core's gather.
+        A malformed request fails that row alone through the transaction's
+        row-failure path; it never raises out of the step. The model's
+        processor builds no malformed file request (it refuses audio that is
+        not one-dimensional and a bad header at input processing), so only a
+        direct engine client can send one: a feature not placed as the
+        processor places it (``feature_placement_fault``) or not on the file's
+        carrier token, or an item the encoder path refuses
+        (``encoder_item_fault``, an item not shaped as the processor builds it
+        among them). Screening drops encoder inputs by the same item rule, so
+        a file row whose input screening drops also leaves core's gather.
         """
         req_id = request.req_id
         try:
@@ -525,6 +529,13 @@ class NemotronASRModelState(ModelState):
         if len(request.mm_features) != 1:
             raise ValueError(f"file request {req_id!r} needs exactly one audio item")
         (feature,) = request.mm_features
+        placement = feature_placement_fault(request.mm_features)
+        if placement is not None:
+            raise ValueError(f"file request {req_id!r} is refused: {placement}")
+        if int(feature.mm_position.offset) != int(request.num_computed_tokens):
+            # The processor places the item on the file carrier, the token
+            # that made this a file request.
+            raise ValueError(f"file request {req_id!r} item is not on its carrier")
         item = feature.data
         if item is None:
             raise ValueError(f"file request {req_id!r} arrived without its samples")
@@ -845,12 +856,12 @@ class NemotronASRModelState(ModelState):
     ) -> _Screen | None:
         """Classify a real step's rows before any of them is read: each row's
         scheduled host tokens, the rows that fail at planning for a fault
-        their request caused (a stream row's envelope, a file whose item
-        ``add_request`` could not take, any row's endpoint policy), each clean
-        stream CHUNK row's validated envelope header and the encoder inputs
-        core's encoder may run (``_runnable_encoder_inputs``). ``None`` for a
-        dummy step (a row the model state does not hold). A fault of core's
-        contract raises.
+        their request caused (a stream row's features or envelope, a file
+        whose item ``add_request`` could not take, any row's endpoint policy),
+        each clean stream CHUNK row's validated envelope header and the
+        encoder inputs core's encoder may run (``_runnable_encoder_inputs``).
+        ``None`` for a dummy step (a row the model state does not hold). A
+        fault of core's contract raises.
 
         Core sends no token slices for cached requests unless pipeline
         parallelism is on, which this model refuses, so a row's host tokens
@@ -943,7 +954,8 @@ class NemotronASRModelState(ModelState):
         the processor builds it, an envelope smaller than its header or wider
         than the carrier) is dropped; its row fails at planning, and a
         request whose feature has the same identifier has the same item and
-        fails too. A row that fails for its prompt's structure keeps its valid
+        fails too. A row that fails for its prompt's structure or for its
+        feature's placement (``feature_placement_fault``) keeps its valid
         inputs, which another request sharing their identifier gathers, in
         this step or a later one. An input that names no feature of its
         request is core's to refuse."""

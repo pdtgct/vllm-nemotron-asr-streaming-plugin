@@ -1446,7 +1446,6 @@ def _raised_in(error: BaseException) -> str:
 #: (``ValueError`` or a subclass), the plugin's convention; no spec names it.
 _PLUGIN_CONTRACT_ERRORS = {
     "feature without position metadata": r"(?i)position",
-    "feature of non-positive length": r"(?i)non-positive length",
     "non-CHUNK row with a scheduled encoder input": (
         r"(?i)non-CHUNK row[^.]*scheduled encoder input"
     ),
@@ -1486,23 +1485,13 @@ def _far_feature(env, req_id: str):
 
 #: Faults of a stream row's envelope header that core's scheduling or
 #: multimodal plumbing produces and no request input can (REG-STATE-015):
-#: name -> (request builder, scheduled encoder inputs).
+#: name -> (request builder, scheduled encoder inputs). Core's msgpack
+#: decoder refuses a feature whose position is null; a feature's other
+#: placement faults are the request's (``_UNPLACED_FEATURES``).
 _CONTRACT_FAULTS = {
     "feature without position metadata": (
         lambda env: _carrier_request(
             env, "bad", features=[_envelope_feature(env, "bad", mm_position=None)]
-        ),
-        [0],
-    ),
-    "feature of non-positive length": (
-        lambda env: _carrier_request(
-            env,
-            "bad",
-            features=[
-                _envelope_feature(
-                    env, "bad", mm_position=_placeholder(offset=0, length=0)
-                )
-            ],
         ),
         [0],
     ),
@@ -1541,12 +1530,6 @@ _CONTRACT_FAULTS = {
         [0],
     ),
 }
-
-
-def _placeholder(*, offset: int, length: int):
-    from vllm.multimodal.inputs import PlaceholderRange
-
-    return PlaceholderRange(offset=offset, length=length)
 
 
 @pytest.mark.parametrize("fault", list(_CONTRACT_FAULTS))
@@ -1933,9 +1916,312 @@ def test_items_the_processor_builds_pass_the_item_rule_and_commit(build):
     assert statuses.get("s1") == 0 and statuses.get("f1") == 0, statuses
 
 
-#: Prompt-structure faults of a row whose own item is valid (REG-STATE-015):
-#: name -> (request builder over the shared feature, the row's scheduled
-#: encoder inputs).
+def _through_core(request):
+    """``request`` as core delivers a direct engine client's request to the
+    worker, with the encoder inputs core schedules for its first token: an
+    ``EngineCoreRequest`` through core's msgpack encoder and decoder (which
+    keep a placeholder range's ``offset``, ``length`` and ``is_embed`` as
+    sent), core's ``Request``, core's encoder-input scheduling
+    (``Scheduler._try_schedule_encoder_inputs`` over an empty encoder cache)
+    and core's ``NewRequestData``. Core's scheduling must schedule the row's
+    one token: a feature it cannot schedule never reaches the worker."""
+    from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
+    from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.engine import EngineCoreRequest
+    from vllm.v1.request import Request
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    sent = EngineCoreRequest(
+        request_id=request.req_id,
+        prompt_token_ids=np.array(request.prompt_token_ids, dtype=np.int32),
+        mm_features=list(request.mm_features),
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    received = MsgpackDecoder(EngineCoreRequest).decode(MsgpackEncoder().encode(sent))
+    core_request = Request.from_engine_core_request(received, None)
+    # the attributes the scheduling routine reads, as core's scheduler sets
+    # them for this model (no encoder-decoder, no EC connector)
+    scheduler = object.__new__(Scheduler)
+    scheduler.is_encoder_decoder = False
+    scheduler.scheduler_config = SimpleNamespace(disable_chunked_mm_input=False)
+    scheduler.encoder_cache_manager = EncoderCacheManager(1 << 20)
+    scheduler.ec_connector = None
+    scheduler.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(multimodal_config=None)
+    )
+    scheduled, num_new_tokens, *_ = scheduler._try_schedule_encoder_inputs(
+        core_request, 0, 1, 1 << 20
+    )
+    assert num_new_tokens == 1, "core's scheduler does not schedule the row"
+    prompt = [int(token) for token in core_request.prompt_token_ids]
+    delivered = NewRequestData.from_request(core_request, request.block_ids, prompt)
+    return delivered, list(scheduled)
+
+
+def _placed(*, offset: int = 0, length: int = 1, is_embed=None):
+    """A change that places a request's one feature at ``offset`` over
+    ``length`` positions with the embedding mask ``is_embed``. The processor
+    places a unit on its one carrier position with no mask (``offset`` 0,
+    ``length`` 1, ``is_embed`` ``None``)."""
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    def change(request):
+        (feature,) = request.mm_features
+        placement = PlaceholderRange(offset=offset, length=length, is_embed=is_embed)
+        moved = dataclasses.replace(feature, mm_position=placement)
+        return dataclasses.replace(request, mm_features=[moved])
+
+    return change
+
+
+def _out_of_offset_order(request):
+    """``request`` whose features are a well-formed unit at a later position
+    (its own identifier) followed by its own unit at the first token. Core
+    keeps a request's features in the order sent, and its window search
+    assumes offset order, so it schedules and gathers both for the first
+    token."""
+    from vllm.multimodal.inputs import PlaceholderRange
+    from vllm.multimodal.utils import get_mm_features_in_window
+
+    (feature,) = request.mm_features
+    later = dataclasses.replace(
+        feature,
+        identifier=f"{feature.identifier}-later",
+        mm_position=PlaceholderRange(offset=5, length=1),
+    )
+    features = [later, feature]
+    assert get_mm_features_in_window(features, start=0, end=1) == (0, 2)
+    return dataclasses.replace(request, mm_features=features)
+
+
+#: Features not placed as the model's processor places them (REG-STATE-015):
+#: name -> (the kind of request that carries it, the change). Each is
+#: well formed in its item, survives core's msgpack decoding, and is
+#: scheduled by core's encoder-input scheduling (``_through_core``). Each was
+#: accepted: core's gather raised for the whole step (an integer or float
+#: mask, which core ors into its boolean placement mask; a feature that
+#: starts before the prompt, whose gathered rows do not match its marked
+#: positions), the plugin raised a contract fault for the whole step (a
+#: feature of no position; features out of offset order, for which core
+#: schedules two inputs for one token), or the request ran as if placed by
+#: the processor.
+_UNPLACED_FEATURES = {
+    "int64 embedding mask": ("stream", _placed(is_embed=torch.tensor([1]))),
+    "float32 embedding mask": ("stream", _placed(is_embed=torch.tensor([1.0]))),
+    "boolean mask of its one position": (
+        "stream",
+        _placed(is_embed=torch.tensor([True])),
+    ),
+    "boolean mask of no position": ("stream", _placed(is_embed=torch.tensor([False]))),
+    "feature of no position": ("stream", _placed(length=0)),
+    "feature of two positions": ("stream", _placed(length=2)),
+    "feature that starts before the prompt": ("stream", _placed(offset=-1, length=2)),
+    "features out of offset order": ("stream", _out_of_offset_order),
+    "file feature with an int64 embedding mask": (
+        "file",
+        _placed(is_embed=torch.tensor([1])),
+    ),
+    "file feature of no position": ("file", _placed(length=0)),
+    "file feature of two positions": ("file", _placed(length=2)),
+    "file feature off its carrier token": ("file", _placed(offset=1)),
+}
+
+
+@pytest.mark.parametrize("order", ["bad first", "bad last", "alone"])
+@pytest.mark.parametrize("case", list(_UNPLACED_FEATURES))
+# @spec REG-STATE-015
+def test_a_feature_not_placed_as_the_processor_places_it_fails_alone(
+    build, case, order
+):
+    """A feature's placement (its placeholder range's ``offset``, ``length``
+    and ``is_embed``) is the request's: core's msgpack decoder keeps it as a
+    direct engine client sends it, and core's scheduling, gather and the
+    plugin's planning read it. A request whose feature is not placed as the
+    processor places it, delivered and scheduled as core delivers and
+    schedules it, sits first or last beside a healthy stream and a healthy
+    file (each its own identifier), or alone in its step. The step does not
+    raise, the bad request alone fails through ``take_failed_requests``, the
+    healthy requests commit, and the healthy stream's encoder output is its
+    own envelope's encoding."""
+    env = build(max_num_seqs=3)
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    kind, change = _UNPLACED_FEATURES[case]
+    template = stream(env, "bad") if kind == "stream" else file(env, "bad")
+    delivered = {
+        "bad": _through_core(change(template)),
+        "s1": _through_core(stream(env, "s1")),
+        "f1": _through_core(file(env, "f1")),
+    }
+    names = {
+        "bad first": ("bad", "s1", "f1"),
+        "bad last": ("f1", "s1", "bad"),
+        "alone": ("bad",),
+    }[order]
+    rows = tuple(delivered[name][0] for name in names)
+    identifiers = [f.identifier for r in rows for f in r.mm_features]
+    assert len(set(identifiers)) == len(identifiers)
+    scheduled = {name: delivered[name][1] for name in names}
+    output = h.scheduler_output(
+        new=rows,
+        handles={"bad": 3, "s1": 1, "f1": 2},
+        encoder_inputs={name: inputs for name, inputs in scheduled.items() if inputs},
+    )
+    error = h.call_with(env.runner.real_step, output)
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [{"bad"}]
+    if order == "alone":
+        return
+    statuses, _ = env.runner.commit_log[-1]
+    assert statuses.get("s1") == 0 and statuses.get("f1") == 0, statuses
+    (feature,) = delivered["s1"][0].mm_features
+    (own,) = env.model.embed_multimodal(audio=[feature.data["audio"].data])
+    cached = env.state.encoder_cache.encoder_outputs[feature.identifier]
+    assert torch.equal(cached, own), "a neighbour's feature changed s1's input"
+
+
+def _processor_request(env, req_id: str, *, envelope=None, samples=None):
+    """The request core's input processing builds from the model's processor
+    for a stream unit's envelope (as the session packer builds it) or a
+    complete file's ``samples``: the processor's prompt, its item
+    (``_processor_item``) and its placeholder as the processor places it
+    (``_maybe_apply_prompt_updates``), turned into a placeholder range as core
+    turns it (``PlaceholderFeaturesInfo.to_range``)."""
+    from vllm.multimodal.inputs import MultiModalFeatureSpec
+    from vllm.multimodal.parse import MultiModalDataParser
+
+    from vllm_nemotron_asr_streaming.nemotron_asr.processor import (
+        NemotronASRMultiModalProcessor,
+    )
+
+    processor = object.__new__(NemotronASRMultiModalProcessor)
+    processor.info = SimpleNamespace(get_hf_config=lambda: env.config)
+    carrier = (
+        env.config.audio_chunk_token_id
+        if samples is None
+        else env.config.file_carrier_token_id
+    )
+    audio = envelope if samples is None else samples
+    items = MultiModalDataParser(target_sr=16000).parse_mm_data({"audio": audio})
+    prompt, placeholders = processor._maybe_apply_prompt_updates(
+        items, SimpleNamespace(prompt_ids=[int(carrier)])
+    )
+    (placeholder,) = placeholders["audio"]
+    template = h.new_request(req_id, int(carrier))
+    feature = MultiModalFeatureSpec(
+        data=_processor_item(env, envelope=envelope, samples=samples),
+        modality="audio",
+        identifier=f"uuid-{req_id}",
+        mm_position=placeholder.to_range(),
+        mm_hash=f"uuid-{req_id}",
+    )
+    return dataclasses.replace(
+        template,
+        prompt_token_ids=list(prompt),
+        prefill_token_ids=list(prompt),
+        mm_features=[feature],
+    )
+
+
+@pytest.mark.parametrize("right_context", LOOKAHEADS)
+# @spec REG-STATE-015, FILE-PROMPT-003
+def test_features_the_processor_builds_pass_and_commit_at_every_chunk_size(
+    build, right_context
+):
+    """Positive control of the feature and item rules at every chunk size: a
+    regular unit and a final tail as the session packer builds them, and a
+    complete file, each as the model's processor builds its request and core
+    delivers and schedules it (``_through_core``), pass both rules; the
+    regular unit and the file commit in one step."""
+    from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
+        encoder_item_fault,
+        feature_placement_fault,
+    )
+    from vllm_nemotron_asr_streaming.session.packer import Packer
+
+    env = build(right_context=right_context)
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    packer = Packer(
+        right_context=right_context,
+        geometry_index=geometry_of(right_context),
+        locale_row=0,
+        carrier_token_id=int(env.config.audio_chunk_token_id),
+    )
+    rng = np.random.default_rng(1)
+    audio = rng.standard_normal(1280 * (right_context + 1) + 300).astype(np.float32)
+    (unit,) = packer.append(audio * 0.1)
+    tail = packer.close()
+    samples = rng.standard_normal(5000).astype(np.float32) * 0.1
+    requests = {
+        "s1": _processor_request(env, "s1", envelope=unit.row),
+        "s2": _processor_request(env, "s2", envelope=tail.row),
+        "f1": _processor_request(env, "f1", samples=samples),
+    }
+    delivered = {name: _through_core(r) for name, r in requests.items()}
+    width = int(env.config.hidden_size)
+    for name, (request, inputs) in delivered.items():
+        assert inputs == [0], (name, inputs)
+        (feature,) = request.mm_features
+        assert feature_placement_fault(request.mm_features) is None, name
+        assert encoder_item_fault(feature, carrier_width=width) is None, name
+    output = h.scheduler_output(
+        new=(delivered["s1"][0], delivered["f1"][0]),
+        handles={"s1": 1, "f1": 2},
+        encoder_inputs={"s1": [0], "f1": [0]},
+    )
+    error = h.call_with(env.runner.real_step, output)
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [None]
+    statuses, _ = env.runner.commit_log[-1]
+    assert statuses.get("s1") == 0 and statuses.get("f1") == 0, statuses
+
+
+@pytest.mark.parametrize("kind", ["stream", "file"])
+@pytest.mark.parametrize("rows", [1, 2], ids=["one row", "two rows"])
+# @spec REG-STATE-021
+def test_the_processor_refuses_audio_that_is_not_one_dimensional(build, kind, rows):
+    """Core's audio parser keeps the rank of an array given in a list
+    (``{"audio": [array]}``), so the model's processor can receive a
+    two-dimensional audio item, whose item the item rule refuses. The
+    processor refuses it at input processing with a ``ValueError`` naming
+    its shape, so the client gets an input-processing error and no request
+    reaches the engine; a file's header counts the array's rows, which is
+    all the header check compares."""
+    from vllm.multimodal.parse import MultiModalDataParser
+
+    from vllm_nemotron_asr_streaming.nemotron_asr.processor import (
+        NemotronASRMultiModalProcessor,
+    )
+
+    env = build()
+    processor = object.__new__(NemotronASRMultiModalProcessor)
+    processor.info = SimpleNamespace(get_hf_config=lambda: env.config)
+    audio = np.zeros((rows, 300), dtype=np.float32)
+    kwargs = {} if kind == "stream" else {"file_header": [env.max_geometry, 0, rows]}
+    items = MultiModalDataParser(target_sr=16000).parse_mm_data({"audio": [audio]})
+    with pytest.raises(ValueError, match=re.escape(str((rows, 300)))):
+        processor._apply_hf_processor_main(items, kwargs)
+
+
+def _masked(feature):
+    """``feature`` placed with an ``int64`` embedding mask over its one
+    position."""
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    placement = PlaceholderRange(offset=0, length=1, is_embed=torch.tensor([1]))
+    return dataclasses.replace(feature, mm_position=placement)
+
+
+#: Faults of a row's prompt structure or of its feature's placement, whose
+#: own item is valid (REG-STATE-015): name -> (request builder over the
+#: shared feature, the row's scheduled encoder inputs).
 _STRUCTURE_FAULTS = {
     "non-CHUNK row a feature overlaps": (
         lambda env, shared: _carrier_request(env, "bad", token=7, features=[shared]),
@@ -1946,6 +2232,10 @@ _STRUCTURE_FAULTS = {
             env, "bad", features=[shared, _second_feature(env, "bad")]
         ),
         [0, 1],
+    ),
+    "feature with an int64 embedding mask": (
+        lambda env, shared: _carrier_request(env, "bad", features=[_masked(shared)]),
+        [0],
     ),
 }
 
@@ -1959,8 +2249,9 @@ def test_a_structure_fault_keeps_the_encoder_output_a_shared_item_needs(
     """Core's scheduler encodes an identifier once, for the first request it
     schedules, and treats it as cached for every other request whose feature
     has that identifier, in the same step or a later one. A row that fails
-    for a prompt-structure fault still runs the encoder inputs whose own item
-    is valid, so another request with the same item gathers its encoder
+    for a prompt-structure fault, or for its feature's placement (which is
+    the request's, not the item's), still runs the encoder inputs whose own
+    item is valid, so another request with the same item gathers its encoder
     output: the faulty request alone fails and the other one commits."""
     env = build()
     env.runner.profile_run(core_embeds=False)

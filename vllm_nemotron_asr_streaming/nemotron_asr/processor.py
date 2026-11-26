@@ -158,6 +158,7 @@ class NemotronASRMultiModalProcessor(
         # Realtime cannot use the content-hash cache (streams are unique).
         return self._apply_hf_processor(inputs, timing_ctx)
 
+    # @spec REG-STATE-021
     def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
@@ -174,6 +175,14 @@ class NemotronASRMultiModalProcessor(
         # via _encode_nested_tensors, which only handles torch tensors
         # (it recurses into an ndarray and chokes on the scalar leaves).
         arrays = [torch.as_tensor(np.asarray(a, dtype=np.float32)) for a in audios]
+        for array in arrays:
+            # Core's audio parser keeps the rank of an array given in a list;
+            # the model state refuses any item but one of 1-D samples.
+            if array.dim() != 1:
+                raise ValueError(
+                    "audio must be one-dimensional samples, got an array of "
+                    f"shape {tuple(array.shape)}"
+                )
         header = hf_kwargs.get(FILE_HEADER_KEY)
         if header is not None:
             # A complete-file prompt: the samples and the file header travel

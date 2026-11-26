@@ -160,37 +160,37 @@ def resolve_row_envelope_header(
     (PORT-ADV-003 / PORT-INT-003).
 
     Its faults fall in two classes (REG-STATE-015). Those the request's
-    prompt and items cause raise :class:`RequestRowFault`: a non-CHUNK row
-    that a feature overlaps; a CHUNK row that no feature, or more than one,
-    overlaps; an overlapping feature that is not audio, carries no kwargs
-    payload or no envelope payload; an item not shaped as the processor
-    builds it (:func:`encoder_item_fault`); an envelope smaller than its
-    header or wider than the carrier row (``carrier_width``, the model's
-    ``hidden_size``). Those only core's scheduling or multimodal delivery can
-    produce raise a plain ``ValueError``: a feature without position metadata
-    or of non-positive length; a non-CHUNK row with a scheduled encoder input;
-    a CHUNK row with more than one scheduled encoder input, or one naming a
+    prompt and items cause raise :class:`RequestRowFault`: a feature not
+    placed as the processor places it (:func:`feature_placement_fault`); a
+    non-CHUNK row that a feature overlaps; a CHUNK row that no feature, or
+    more than one, overlaps; an overlapping feature that is not audio,
+    carries no kwargs payload or no envelope payload; an item not shaped as
+    the processor builds it (:func:`encoder_item_fault`); an envelope smaller
+    than its header or wider than the carrier row (``carrier_width``, the
+    model's ``hidden_size``). Those only core's scheduling or multimodal
+    delivery can produce raise a plain ``ValueError``: a feature without
+    position metadata; a non-CHUNK row with a scheduled encoder input; a
+    CHUNK row with more than one scheduled encoder input, or one naming a
     feature other than the overlapping one; an envelope payload that is not
     host-resident. A row with faults of both classes raises
     :class:`RequestRowFault`: the request caused it. A feature without
-    usable position metadata raises at once: no overlap can be judged
-    without it.
+    position metadata raises at once, and a feature not placed as the
+    processor places it fails the row at once: no overlap can be judged
+    without either.
     """
     start = int(num_computed_tokens)
     end = start + 1
     contract: list[str] = []
+    for index, feature in enumerate(mm_features):
+        if getattr(feature, "mm_position", None) is None:
+            raise ValueError(f"multimodal feature {index} has no position metadata")
+    placement = feature_placement_fault(mm_features)
+    if placement is not None:
+        raise RequestRowFault(placement)
     overlapping: list[tuple[int, object]] = []
     for index, feature in enumerate(mm_features):
-        position = getattr(feature, "mm_position", None)
-        if position is None:
-            raise ValueError(f"multimodal feature {index} has no position metadata")
-        offset = int(position.offset)
-        length = int(position.length)
-        if length <= 0:
-            raise ValueError(
-                f"multimodal feature {index} has non-positive length {length}"
-            )
-        if offset < end and offset + length > start:
+        offset = int(feature.mm_position.offset)
+        if offset < end and offset + int(feature.mm_position.length) > start:
             overlapping.append((index, feature))
 
     scheduled = tuple(int(index) for index in scheduled_encoder_input_ids)
@@ -243,6 +243,49 @@ def _envelope_payload(
     return None, item["audio"].data
 
 
+#: The number of prompt positions the model's processor places each unit's
+#: feature on: its one carrier token.
+FEATURE_POSITIONS = 1
+
+
+# @spec REG-STATE-015
+def feature_placement_fault(mm_features: Sequence[object]) -> str | None:
+    """Why a request's features are not placed as the model's processor and
+    core's session turns place them, or ``None``.
+
+    The processor places each unit's feature on its one carrier position
+    with no embedding mask (a placeholder range of length
+    :data:`FEATURE_POSITIONS` and ``is_embed`` ``None``), at its prompt's
+    first position, and core moves a later turn's features past the tokens
+    before them, so a request's features sit at non-negative, increasing
+    offsets. Core's msgpack decoder keeps a placeholder range's ``offset``,
+    ``length`` and ``is_embed`` as a direct engine client sends them, and
+    core's encoder-input scheduling and gather read all three: they search a
+    request's features by offset, assuming that order, slice the encoder
+    output by the mask's running count and merge the mask into the step's
+    Boolean placement mask with a logical OR. The checks read only the
+    placement, never the item. A placement is the request's, not its item's, so a request whose
+    feature shares the item's identifier keeps that item's encoder output.
+    Every feature must have position metadata (core's decoder refuses a
+    feature without it)."""
+    previous_end = 0
+    for index, feature in enumerate(mm_features):
+        position = feature.mm_position
+        offset, length = int(position.offset), int(position.length)
+        if length != FEATURE_POSITIONS:
+            return (
+                f"multimodal feature {index} spans {length} positions, not "
+                f"{FEATURE_POSITIONS}"
+            )
+        if position.is_embed is not None:
+            return f"multimodal feature {index} carries an embedding mask"
+        if offset < previous_end:
+            before = "the prompt" if index == 0 else "the end of the feature before it"
+            return f"multimodal feature {index} at position {offset} is before {before}"
+        previous_end = offset + length
+    return None
+
+
 #: The item of each kind of audio feature as the model's processor builds it
 #: (FILE-PROMPT-003; a stream unit's envelope row, SESS-PACK-001): each field
 #: name with its tensor's dtype. Each field is batched
@@ -285,7 +328,8 @@ def encoder_item_fault(feature: object, *, carrier_width: int) -> str | None:
 
     The faults are the item's content, so every request whose feature has
     the same encoder-cache identifier has them too; a fault of a row's
-    prompt structure is not one of them."""
+    prompt structure or of a feature's placement
+    (:func:`feature_placement_fault`) is not one of them."""
     modality = getattr(feature, "modality", None)
     if modality != "audio":
         return f"feature must be audio, got {modality!r}"
