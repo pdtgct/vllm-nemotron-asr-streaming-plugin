@@ -1132,9 +1132,11 @@ def test_real_hook_configuration_on_cpu_is_refused_for_its_platform(
 def test_real_hook_configuration_constructs_on_cuda(
     make_model_config, card_dir, build_model_state
 ):
-    """The serve flags of the hook configuration (``-cc.mode none``; core
-    resolves ``cudagraph_mode`` to NONE for persistent state) with the default
-    arms construct, and the model state's re-check accepts the result."""
+    """The serve flags of the hook configuration (``-cc.mode none``, graph mode
+    left unset) with the default arms construct, and the model state's re-check
+    accepts the result. Core resolves an unset ``cudagraph_mode`` to a mode
+    other than FULL at construction (REG-ENG-021) and reduces it to NONE only
+    when the runner reads the model state's graph support."""
     from vllm.config import (
         CacheConfig,
         CompilationConfig,
@@ -1152,7 +1154,10 @@ def test_real_hook_configuration_constructs_on_cuda(
         scheduler_config=SchedulerConfig.default_factory(async_scheduling=False),
         compilation_config=CompilationConfig(mode=0),
     )
-    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert config.compilation_config.cudagraph_mode not in (
+        None,
+        CUDAGraphMode.FULL,
+    )
     build_model_state(config)
 
 

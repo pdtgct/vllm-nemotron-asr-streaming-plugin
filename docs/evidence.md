@@ -25,6 +25,7 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 - [Builds](#builds)
 - [Tier 2 on the state-pool build](#tier-2-on-the-state-pool-build)
 - [Unpublished measurement under `--enforce-eager`](#unpublished-measurement-under---enforce-eager)
+- [Light round on the target core](#light-round-on-the-target-core)
 - [Transaction graphs, tier 5](#transaction-graphs-tier-5)
 - [Owed](#owed)
 - [Historical entries](#historical-entries)
@@ -33,7 +34,8 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 ## Builds
 
 - Stage 1 (target core): `pdtgct/vllm` `pstate-impl-20261122` @ `ddf6db2ab8`, the persistent-state
-  layer with the #67583 model-state hooks. No tier has been met on it yet (Owed).
+  layer with the #67583 model-state hooks. No tier has been met on it yet (Owed); the light round
+  below ran on its child `de0b0bccdb`, which changes no behaviour.
 - State-pool build (historical; the baseline for retiring the state pool, with plugin `v0.1.0b2`):
   `pdtgct/vllm` `hook-build-20261114b` @ `9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee`
   (with #67583), precompiled wheel `191e5d5df2` (cu132), one NVIDIA A40 at FP32, card revision
@@ -89,6 +91,37 @@ of that command's interim `--max-num-seqs 64`.
 
 With the eager arms, startup took about 25 s. At 64 rows, 160 ms retained 1.8 GiB and 80 ms
 retained 1.6 GiB.
+
+## Light round on the target core
+
+No tier is met by this round. It records measurements on stage 1 that the owed tiers build on.
+
+- Build: `pdtgct/vllm` `pstate-impl-20261122` @ `de0b0bccdb`, a child of `ddf6db2ab8` that adds
+  docstrings and stub tests only, with precompiled wheel `842f74fa8d` (cu132), torch 2.14.0+cu132;
+  plugin `feat/core-graphs-20261123` @ `2a55139`; card revision `ea30d66d`; one NVIDIA A40 at FP32;
+  2026-11-26. Evidence: `pdtgct/nemotron-omni-port`
+  `experiments/2026-11-25-plugin-core-graphs-a40/`.
+- Served transcripts, 200 paced LibriSpeech test-clean utterances at 32 sessions on `/v1/realtime`,
+  compared by utterance id, are equal in every comparison:
+  - the hook configuration (`-cc.cudagraph_mode none -cc.mode none`) and no runner flag, each
+    against `--enforce-eager`, at 80, 160, 320, 560 and 1120 ms;
+  - asynchronous scheduling, with and without `--enforce-eager`, against synchronous
+    `--enforce-eager` at 160 and 320 ms;
+  - under `VLLM_BATCH_INVARIANT=1`, 8 sessions and 1 session (20 utterances) against 32 sessions at
+    320 ms;
+  - transaction graphs on (`transaction_graph_populations=[63]`) against off at 80 and 160 ms under
+    the restricted startup (`--num-gpu-blocks-override 65`, NONE/NONE, synchronous scheduling).
+- The state-layer memory check (REG-STATE-019) passed in both arms.
+- Served accuracy is not valid on this build. Word-error rate is 47 to 100%, rising as the chunk
+  size falls, in every arm alike: finals lose the space before a word that starts a turn. The cause
+  is in core's detokenizer for persistent-state streams, which starts each turn's decoding from the
+  turn's prompt; the fix belongs to core. No accuracy, latency or block-count figure is claimed.
+- Plugin GPU tests: registration 8 of 8 after one test correction; transcription 26 passed, 10
+  failed; transaction graphs 113 passed, 3 failed (the exhaustive and random-plan equivalence cases
+  were not run). Every failure is in the tests' own setup: the ten transcription tests build their
+  stream reference through the session factory, which is not available on stage 1; the three
+  transaction-graph tests start an engine without the restricted startup, or pass a Python function
+  to a multiprocess engine.
 
 ## Transaction graphs, tier 5
 
@@ -236,8 +269,11 @@ and `E ≤ N` make up at least 99 % of served steps. At `N` = 63 they make up 10
 - Tiers 1 to 4 on the target core at the current plugin, at every chunk size (80, 160, 320, 560 and
   1120 ms), under `--enforce-eager` and the hook configuration, with and without asynchronous
   scheduling and batch invariance.
-- Transaction graphs at 80 and 160 ms on the target core, under the restricted startup.
-- The state-layer memory check (REG-STATE-019).
+- Served accuracy and latency on the target core, once core's persistent-state detokenizer keeps
+  word-start spaces across turns (Light round on the target core).
+- Tier 5 for transaction graphs at 80 and 160 ms on the target core, under the restricted startup;
+  served equality is measured above.
+- The plugin GPU tests whose setup failed in the light round, after their setup is corrected.
 
 ## Historical entries
 
