@@ -25,7 +25,8 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 - [Builds](#builds)
 - [Tier 2 on the state-pool build](#tier-2-on-the-state-pool-build)
 - [Unpublished measurement under `--enforce-eager`](#unpublished-measurement-under---enforce-eager)
-- [Light round on the target core](#light-round-on-the-target-core)
+- [Served accuracy on the target core](#served-accuracy-on-the-target-core)
+- [Light round on the parent of the target core](#light-round-on-the-parent-of-the-target-core)
 - [Transaction graphs, tier 5](#transaction-graphs-tier-5)
 - [Owed](#owed)
 - [Historical entries](#historical-entries)
@@ -33,9 +34,10 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 
 ## Builds
 
-- Stage 1 (target core): `pdtgct/vllm` `pstate-impl-20261122` @ `de0b0bccdb`, the persistent-state
-  layer with the #67583 model-state hooks. No tier has been met on it yet (Owed); the light round
-  below ran on it.
+- Stage 1 (target core): `pdtgct/vllm` `pstate-impl-20261122` @ `cbf13fed4a`, the persistent-state
+  layer with the #67583 model-state hooks. No tier has been met on it yet (Owed). The served
+  accuracy round below ran on it; the light round below ran on its parent `de0b0bccdb`, which
+  differs only in core's persistent-state detokenizer.
 - State-pool build (historical; the baseline for retiring the state pool, with plugin `v0.1.0b2`):
   `pdtgct/vllm` `hook-build-20261114b` @ `9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee`
   (with #67583), precompiled wheel `191e5d5df2` (cu132), one NVIDIA A40 at FP32, card revision
@@ -92,9 +94,29 @@ of that command's interim `--max-num-seqs 64`.
 With the eager arms, startup took about 25 s. At 64 rows, 160 ms retained 1.8 GiB and 80 ms
 retained 1.6 GiB.
 
-## Light round on the target core
+## Served accuracy on the target core
 
-No tier is met by this round. It records measurements on stage 1 that the owed tiers build on.
+No tier is met by this round. It records served word-error rate on stage 1.
+
+- Build: `pdtgct/vllm` `pstate-impl-20261122` @ `cbf13fed4a`, with precompiled wheel `842f74fa8d`
+  (cu132); plugin `feat/core-graphs-20261123` @ `0951319`; card revision `ea30d66d`; one NVIDIA
+  A40 at FP32; 2026-11-26. Evidence: `pdtgct/nemotron-omni-port`
+  `experiments/2026-11-26-plugin-wer-cbf13fed4a/`.
+- 200 paced LibriSpeech test-clean utterances at 32 sessions on `/v1/realtime`, 0 failed in every
+  run. Word-error rate under `--enforce-eager`:
+
+  | Chunk size (ms) | 80 | 160 | 320 | 560 | 1120 |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | WER (%) | 3.15 | 2.63 | 2.55 | 2.70 | 2.44 |
+
+- At 320 ms with no runner flag, WER is 2.55% and all 200 transcripts equal those under
+  `--enforce-eager`.
+- One unprofiled run per setting with no repeats: no latency claim rests on this round.
+
+## Light round on the parent of the target core
+
+No tier is met by this round. It ran on `de0b0bccdb`, the parent of stage 1, which differs only in
+core's persistent-state detokenizer, and records measurements that the owed tiers build on.
 
 - Build: `pdtgct/vllm` `pstate-impl-20261122` @ `de0b0bccdb`, with precompiled wheel `842f74fa8d`
   (cu132), torch 2.14.0+cu132; plugin `feat/core-graphs-20261123` @ `2a55139`; card revision
@@ -268,11 +290,12 @@ and `E ≤ N` make up at least 99 % of served steps. At `N` = 63 they make up 10
 - Tiers 1 to 4 on the target core at the current plugin, at every chunk size (80, 160, 320, 560 and
   1120 ms), under `--enforce-eager` and the hook configuration, with and without asynchronous
   scheduling and batch invariance.
-- Served accuracy and latency on the target core, once core's persistent-state detokenizer keeps
-  word-start spaces across turns (Light round on the target core).
+- Served latency on the target core, with repeats (Served accuracy on the target core gives one
+  unprofiled run per chunk size).
 - Tier 5 for transaction graphs at 80 and 160 ms on the target core, under the restricted startup;
   served equality is measured above.
-- The plugin GPU tests whose setup failed in the light round, after their setup is corrected.
+- The plugin GPU tests whose setup failed in the light round, rerun with their corrected setup on
+  `cbf13fed4a`: four of the file-against-stream text checks need its detokenizer fix.
 
 ## Historical entries
 

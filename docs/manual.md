@@ -1,7 +1,7 @@
 # User manual
 
 This manual covers `vllm-nemotron-asr-streaming` at `main` on the target core, RFC 1's state
-layer (`pdtgct/vllm` at `de0b0bccdb`). For the shortest path to a running server, use the
+layer (`pdtgct/vllm` at `cbf13fed4a`). For the shortest path to a running server, use the
 [quick start](quickstart.md).
 
 No acceptance tier has been met on the target core. The last release, `v0.1.0b2`, ran on the
@@ -81,7 +81,7 @@ on a fork branch of upstream vLLM `main`, which carries changes that upstream ha
 
 | Build | `pdtgct/vllm` branch | Commit | Carries |
 | --- | --- | --- | --- |
-| Stage 1 (the target core) | `pstate-impl-20261122` | `de0b0bccdb34228fd47bfe39a862e8db7417837e` | RFC 1's state layer, vllm#67583's model-state hooks and the state-group layout accessor `ModelState.state_group_layouts`, on upstream `main` at `842f74fa8dff2c6792bd68b021c92d8fbf2b93bc` |
+| Stage 1 (the target core) | `pstate-impl-20261122` | `cbf13fed4aff1a72cf0dfbb5cd4cb95d43773e52` | RFC 1's state layer, vllm#67583's model-state hooks and the state-group layout accessor `ModelState.state_group_layouts`, on upstream `main` at `842f74fa8dff2c6792bd68b021c92d8fbf2b93bc` |
 | Stage 2 | none recorded | none recorded | stage 1 plus RFC 2 (#65546 and #67294) and a frontend endpoint plugin |
 
 RFC 1's state layer keeps each request's state in one page of a non-recomputable state group:
@@ -133,7 +133,7 @@ Use a fresh virtual environment, with Python 3.11 or 3.12. The plugin declares P
    ```bash
    git clone --branch pstate-impl-20261122 --single-branch https://github.com/pdtgct/vllm.git
    cd vllm
-   git checkout de0b0bccdb34228fd47bfe39a862e8db7417837e
+   git checkout cbf13fed4aff1a72cf0dfbb5cd4cb95d43773e52
    VLLM_USE_PRECOMPILED=1 \
    VLLM_PRECOMPILED_WHEEL_COMMIT=842f74fa8dff2c6792bd68b021c92d8fbf2b93bc \
    VLLM_PRECOMPILED_WHEEL_VARIANT=cu132 \

@@ -64,7 +64,7 @@ A refusal in these specs is a refusal of this release: it holds until transactio
 refused configuration are specified and measured, and none forecloses capturing a graph through
 #67583's capture hook. Deferred (`[D]`) specs are future obligations, excluded from current
 conformance. Every other spec is current conformance on the target core (`pdtgct/vllm` at
-`de0b0bccdb`), whose `ModelState` defines `state_group_layouts`; on a core whose `ModelState` does
+`cbf13fed4a`), whose `ModelState` defines `state_group_layouts`; on a core whose `ModelState` does
 not, transaction graphs are refused (TXG-CFG-016), and there the specs that hold only where
 transaction graphs are on apply to no configuration.
 
