@@ -379,21 +379,53 @@ def test_the_detached_copy_holds_only_the_pages_below_the_final_committed_count(
 
 
 # @spec TXG-QUAL-003
-def test_a_copy_of_views_above_the_final_committed_count_is_a_problem(off_cpu):
+def test_a_copy_of_views_above_the_final_committed_count_holds_only_its_pages(
+    off_cpu,
+):
     """Views that keep more pages than the final committed block count (a
     layout core's extension leaves at the reservation's page count) are
-    reported: the copy would not be limited to the committed pages."""
+    copied up to that count only: the copy holds pages ``0 … 5`` of six
+    committed, with the views' layout, and equals the live views there."""
     env = off_cpu(right_context=0, max_num_seqs=4)
-    pools = narrowed_pools(pages=8)
+    pools = narrowed_pools(pages=8, storage_pages=12)
+    for _, view in pools.flat():
+        view.copy_(torch.randint(-100, 100, view.shape).to(view.dtype))
     monitor = TransactionMonitor(env.model, compare=True, final_blocks=6)
+    assert monitor.copy_extent == 6
     call = Call(kind="execute")
     copy = monitor._copy(pools.kwargs(), call)
-    assert any("final committed" in p for p in call.problems), call.problems
+    assert call.problems == [], call.problems
+    assert copy.first_dimensions() == {6}
+    assert copy.storage_bytes() <= 6 * PAGE + 512, copy.storage_bytes()
+    assert pools.narrowed(6).differences(copy) == []
+    copied = dict(copy.flat())
+    for name, a in pools.narrowed(6).flat():
+        b = copied[name]
+        assert (a.shape, a.stride(), a.dtype) == (b.shape, b.stride(), b.dtype)
     within = TransactionMonitor(env.model, compare=True, final_blocks=8)
     call = Call(kind="execute")
-    within._copy(pools.kwargs(), call)
+    assert within._copy(pools.kwargs(), call).first_dimensions() == {8}
     assert call.problems == [], call.problems
-    assert copy.first_dimensions() == {8}
+
+
+# @spec TXG-QUAL-003
+def test_the_copy_reads_no_page_at_or_above_the_final_committed_count(off_cpu):
+    """Taking the detached copy addresses only pages below the final
+    committed block count (``txgcap_harness.BlockAccesses`` over the pool's
+    whole storage), and leaves every page at or above it untouched."""
+    env = off_cpu(right_context=0, max_num_seqs=4)
+    pools = narrowed_pools(pages=8, storage_pages=12)
+    storage = pools.tensors["channel_pools"][0]._base
+    assert storage is not None and storage.shape[0] == 12
+    storage.copy_(torch.randint(-100, 100, storage.shape, dtype=torch.int8))
+    above = storage[6:].clone()
+    monitor = TransactionMonitor(env.model, compare=True, final_blocks=6)
+    with t.BlockAccesses(storage.view(12, 1, 1, PAGE)) as rec:
+        copy = monitor._copy(pools.kwargs(), Call(kind="execute"))
+    assert rec.accesses, "the copy addressed no page (positive control)"
+    assert rec.outside(set(range(6))) == [], rec.outside(set(range(6)))
+    assert torch.equal(storage[6:], above), "a page at or above the count changed"
+    assert copy.first_dimensions() == {6}
 
 
 # @spec TXG-QUAL-026, TXG-QUAL-003
@@ -430,32 +462,86 @@ def test_the_adapter_reads_the_final_committed_block_count(off_cpu):
 
 
 # @spec TXG-QUAL-028
-def test_the_alone_mode_runs_one_stream_and_each_file_to_its_end(off_cpu):
-    """One stream served alone, then each of TXG-QUAL-004's files alone (the
-    four special files and one utterance), each its own request on an
-    otherwise idle server; each item's transcript is recorded for the
-    comparison with ``B_hook``."""
+def test_the_alone_items_are_one_stream_then_each_file_in_order(off_cpu):
+    """One stream (the run's first clip), then TXG-QUAL-004's files in order
+    from the same permutation, then ``alone_utterances`` utterances; each is
+    served alone, its own request, on the client path."""
     env = off_cpu(right_context=0, max_num_seqs=4)
-    ctx = context(env, lengths=(3000, 2600, 4100, 3300, 2900, 3100, 2700))
-    try:
-        result = d.run_alone(ctx, {"seed": 5, "alone_utterances": 1})
-    finally:
-        ctx.monitor.uninstall()
-    names = [item["name"] for item in result["items"]]
-    assert names == ["alone-stream", *(f"alone-file{i}" for i in range(5))]
-    kinds = [
-        next(iter(item["transcripts"].values()))["utt"].split(":")[0]
-        for item in result["items"][1:]
-    ]
-    assert kinds == [
+    requests = d.Requests(env.model, lookahead=0)
+    corpus = d.SyntheticCorpus(0, (3000, 2600, 4100, 3300, 2900, 3100, 2700))
+    items = d.alone_items(requests, corpus, {"seed": 5, "alone_utterances": 2})
+    names = [name for name, *_ in items]
+    assert names == ["alone-stream", *(f"alone-file{i}" for i in range(6))]
+    kinds = [kind for _, kind, *_ in items]
+    assert kinds == ["stream"] + ["file"] * 6
+    utterances = [utt.split(":")[0] for _, _, utt, _ in items[1:]]
+    assert utterances == [
         "silence-padded",
         "whole-chunks",
         "zero-samples",
         "short",
         "utterance",
+        "utterance",
     ]
-    for item in result["items"]:
-        assert len(item["transcripts"]) == 1, item
-        assert item["steps"] >= 1 and item["failed_rows"] == 0, item
-    assert result["fallbacks"] == {} and result["replays"] == 0
-    assert not ctx.blocks.held, "a request was left live"
+    assert items[3][3].shape[0] == 0, "the third file has zero samples"
+    assert 0 < items[4][3].shape[0] < requests.unit_samples
+    assert items[2][3].shape[0] % requests.unit_samples == 0
+    first = corpus.clips(5).take()[0]
+    assert items[0][2] == first, "the stream is the run's first clip"
+
+
+# @spec TXG-QUAL-028
+def test_each_alone_item_reads_its_own_replays_and_fallbacks():
+    """The counters are read around each item, so an item's replays and its
+    fallbacks by reason are its own, not the mode's aggregate."""
+    before = {"replays": 10, "fallbacks": {"signature": 1, "chunk-uncovered": 2}}
+    after = {"replays": 14, "fallbacks": {"signature": 1, "chunk-uncovered": 3}}
+    assert d.alone_deltas(before, after) == {
+        "replays": 4,
+        "fallbacks": {"chunk-uncovered": 1},
+    }
+    empty = {"replays": 0, "fallbacks": {}}
+    assert d.alone_deltas(empty, empty) == {"replays": 0, "fallbacks": {}}
+
+
+# @spec TXG-QUAL-028
+def test_the_alone_mode_serves_through_a_multiprocess_engine_with_its_probes():
+    """The ``alone`` mode's worker extension resolves as core resolves it in
+    the engine-core process, takes no name of core's worker, and its import
+    installs the startup probes there; it runs in a child process, so this
+    process keeps core's own classes."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    tests = Path(__file__).resolve().parents[1]
+    code = (
+        "from vllm.utils.import_utils import resolve_obj_by_qualname\n"
+        "from vllm.v1.worker import gpu_worker\n"
+        "from vllm.v1.worker.gpu import model_runner\n"
+        "from support import txg_qual_driver as d\n"
+        "cls = resolve_obj_by_qualname(d.ALONE_READER)\n"
+        "import support.txg_alone_worker as w\n"
+        "assert isinstance(w.PROBES, d.StartupProbes)\n"
+        "assert 'runner_init' in model_runner.GPUModelRunner.__init__.__qualname__\n"
+        "assert 'extend_kv_cache' in gpu_worker.Worker.extend_kv_cache.__qualname__\n"
+        "names = [a for a in dir(cls) if not a.startswith('__')]\n"
+        "assert names == ['alone_counters', 'alone_startup'], names\n"
+        "assert not [a for a in names if hasattr(gpu_worker.Worker, a)]\n"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(tests), env.get("PYTHONPATH", "")) if p
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tests,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr[-3000:]
+    assert d.ALONE_READER == "support.txg_alone_worker.AloneReader"

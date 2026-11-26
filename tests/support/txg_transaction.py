@@ -197,6 +197,26 @@ class Pools:
             seen[(t.device, storage.data_ptr())] = storage.nbytes()
         return sum(seen.values())
 
+    def narrowed(self, pages: int | None) -> Pools:
+        """The same views limited to their first ``pages`` pages (every page
+        when ``pages`` is ``None``): views over the same storage, at the same
+        addresses and strides, that cover no page at or above ``pages``.
+        Neither reads nor allocates."""
+        if pages is None:
+            return self
+        if pages < 1:
+            raise ValueError(f"a pool extent of {pages} pages holds no page")
+
+        def narrow(t: torch.Tensor) -> torch.Tensor:
+            return t[: min(pages, int(t.shape[0]))]
+
+        return Pools(
+            {
+                k: [narrow(t) for t in v] if isinstance(v, list) else narrow(v)
+                for k, v in self.tensors.items()
+            }
+        )
+
     def first_dimensions(self) -> set[int]:
         """The first dimension (the page count) of every pool view."""
         return {int(t.shape[0]) for _, t in self.flat()}

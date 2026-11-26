@@ -6,12 +6,12 @@ These are the measurement harness's decision arithmetic, written once so the
 preregistered run and its CPU tests use the same code: the restricted startup
 every qualifying engine runs under and the KV-cache sizing beside it
 (TXG-QUAL-001, -010, -021, -025), the step rule (TXG-QUAL-013, -014), the
-``U_api`` procedure and gain (TXG-QUAL-016, -017), the void rule
-(TXG-QUAL-005), the frozen preregistration (TXG-QUAL-018), the choice of
-``N`` (TXG-QUAL-025, -027), the exactness runs' test-only headroom
-(TXG-QUAL-029), and the required contents of the qualification and
-calibration records (TXG-QUAL-001, -019, -020, TXG-CAL-001 to -003). Times
-are milliseconds.
+``U_api`` procedure and gain (TXG-QUAL-016, -017), the served checks of
+requests alone (TXG-QUAL-028), the void rule (TXG-QUAL-005), the frozen
+preregistration (TXG-QUAL-018), the choice of ``N`` (TXG-QUAL-025, -027),
+the exactness runs' test-only headroom (TXG-QUAL-029), and the required
+contents of the qualification and calibration records (TXG-QUAL-001, -019,
+-020, TXG-CAL-001 to -003). Times are milliseconds.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from support.txg_api import NOT_APPLICABLE, Sizing, sizing_settings
+from support.txg_api import NOT_APPLICABLE, Sizing, sizing_arguments
 
 #: Step-rule legs: 2 warm-up and 21 counted steps (TXG-QUAL-013).
 WARMUP, COUNTED = 2, 21
@@ -62,20 +62,13 @@ def kv_cache_sizing(
     budget: int | None = None,
 ) -> dict[str, Any]:
     """The ``AsyncEngineArgs`` keywords of a KV-cache sizing
-    (``txg_api.Sizing``): none for core's default, the extensible KV cache,
-    which a serve command without KV-cache options selects;
-    ``enable_extensible_kv_cache`` false for a profiled budget;
-    ``num_gpu_blocks_override`` or ``kv_cache_memory_bytes`` for a fixed
-    block count or budget, each of which turns the extensible KV cache
+    (``txg_api.Sizing``; ``txg_api.sizing_arguments``): none for core's
+    default, the extensible KV cache, which a serve command without KV-cache
+    options selects; ``enable_extensible_kv_cache`` false for a profiled
+    budget; ``num_gpu_blocks_override`` or ``kv_cache_memory_bytes`` for a
+    fixed block count or budget, each of which turns the extensible KV cache
     off."""
-    settings = sizing_settings(sizing, blocks=blocks, budget=budget)
-    if sizing == Sizing.EXTENSIBLE:
-        return {}
-    if sizing == Sizing.PROFILED:
-        return {"enable_extensible_kv_cache": False}
-    if sizing == Sizing.BLOCK_COUNT:
-        return {"num_gpu_blocks_override": int(settings["num_gpu_blocks_override"])}
-    return {"kv_cache_memory_bytes": int(settings["kv_cache_memory_bytes"])}
+    return sizing_arguments(sizing, blocks=blocks, budget=budget)
 
 
 def estimate_startup(
@@ -581,6 +574,67 @@ def missing_run_record_fields(identity: Mapping[str, Any]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Requests served alone (TXG-QUAL-028)
+
+#: The fallback reason that plugin-packed input never causes (TXG-QUAL-028).
+SIGNATURE = "signature"
+
+
+def alone_problems(on: Mapping[str, Any], off: Mapping[str, Any]) -> list[str]:
+    """TXG-QUAL-028's served checks of the driver's ``alone`` results of an
+    option-on run and its ``B_hook`` run under the same KV-cache sizing:
+    the same items in the same order; every item of both runs completed
+    (finish reason ``stop``, the normal close) with no failed row and no
+    client error; each option-on item replayed at least one cell and had no
+    fallback of reason ``signature``; no ``B_hook`` item replayed a cell;
+    and each item's token IDs equal ``B_hook``'s. Every check is per item."""
+    problems = []
+    on_items = list(on.get("items") or [])
+    off_items = list(off.get("items") or [])
+    if not on_items:
+        problems.append("the option-on run served no item")
+    names = [item.get("name") for item in on_items]
+    if names != [item.get("name") for item in off_items]:
+        problems.append(
+            f"the runs served different items: {names} and "
+            f"{[item.get('name') for item in off_items]}"
+        )
+    for arm, items in (("option-on", on_items), ("B_hook", off_items)):
+        for item in items:
+            name = item.get("name")
+            if item.get("error"):
+                problems.append(f"{arm} {name}: the client received {item['error']}")
+            if item.get("finish_reason") != "stop":
+                problems.append(
+                    f"{arm} {name} finished with {item.get('finish_reason')!r}, "
+                    "not 'stop'"
+                )
+            failed = item.get("failed_rows")
+            if failed != 0:
+                problems.append(f"{arm} {name} has failed rows: {failed!r}")
+    for item in on_items:
+        name = item.get("name")
+        replays = item.get("replays")
+        if not isinstance(replays, int) or replays < 1:
+            problems.append(f"option-on {name} replayed no cell ({replays!r})")
+        signature = (item.get("fallbacks") or {}).get(SIGNATURE, 0)
+        if signature:
+            problems.append(
+                f"option-on {name} fell back {signature} times with reason "
+                f"{SIGNATURE!r}"
+            )
+    for item in off_items:
+        if item.get("replays"):
+            problems.append(f"B_hook {item.get('name')} replayed a cell")
+    for a, b in zip(on_items, off_items, strict=False):
+        if a.get("token_ids") != b.get("token_ids"):
+            problems.append(
+                f"{a.get('name')}: the option-on tokens differ from B_hook's"
+            )
+    return problems
+
+
+# ---------------------------------------------------------------------------
 # The exactness runs' test-only headroom (TXG-QUAL-029)
 
 #: The allocator figures the record of an exactness run under the
@@ -612,11 +666,19 @@ def headroom_utilization(
     return (int(device_total_bytes) - headroom) / int(device_total_bytes)
 
 
+def _byte_count(value: Any) -> bool:
+    """Whether ``value`` is a byte count: an integer, not a ``bool``, at
+    least zero."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def headroom_problems(reply: Mapping[str, Any]) -> list[str]:
     """TXG-QUAL-029's checks of an exactness run's reply (the driver's
-    ``spec``, ``identity`` and ``exactness_memory``). The device-level
-    context (``nvidia-smi``, ``torch.cuda.mem_get_info``) is recorded and
-    read by no check."""
+    ``spec``, ``identity`` and ``exactness_memory``). Each allocator figure
+    and the copy's bytes must be a byte count; a missing figure, ``None`` or
+    a non-integer value is a problem. The device-level context
+    (``nvidia-smi``, ``torch.cuda.mem_get_info``) is recorded and read by no
+    check."""
     problems = []
     spec = reply.get("spec") or {}
     identity = reply.get("identity") or {}
@@ -634,10 +696,12 @@ def headroom_problems(reply: Mapping[str, Any]) -> list[str]:
             problems.append(f"the preregistered headroom has no {name}")
     memory = reply.get("exactness_memory") or {}
     problems += [
-        f"the record has no {name}" for name in HEADROOM_FIGURES if name not in memory
+        f"the record has no {name}"
+        for name in HEADROOM_FIGURES
+        if not _byte_count(memory.get(name))
     ]
     copied = memory.get("copy_bytes")
-    if not isinstance(copied, int):
+    if not _byte_count(copied):
         problems.append("the record has no copy_bytes")
     elif (
         isinstance(headroom.get("copy_bytes"), int) and copied > headroom["copy_bytes"]

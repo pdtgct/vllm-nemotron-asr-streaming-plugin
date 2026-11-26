@@ -46,15 +46,18 @@ progress and remaining queue counts through a proxy commit sink, and, with
 ``compare``, runs the option-off transaction of every covered or declined
 step on a detached copy of the pools taken before the call: new storage with
 the same resident layout, test-only storage outside REG-STATE-003 and
-TXG-CAP-013, limited to the pages below the final committed block count
-(the state layer's bound views; ``txg_transaction.layout_clone`` copies the
-bytes the views cover, not their whole storage). The reference receives no
-view of the serving pools, so it can neither read nor write them; the
-monitor checks that, and compares rows, status, progress, queue counts and
-every page bit for bit (TXG-QUAL-003). With ``memory``, it records
-``torch.cuda.memory_reserved`` and ``max_memory_reserved`` before and after
-each copy and the copy's bytes (TXG-QUAL-029). The pool copy, the option-off
-reference, the checks and the comparison are outside the timer.
+TXG-CAP-013. The copy holds pages ``0 … copy_extent - 1`` and no more
+(:attr:`TransactionMonitor.copy_extent`, the final committed block count):
+each view is narrowed to that extent before anything is read or allocated,
+and ``txg_transaction.layout_clone`` copies only the bytes the narrowed
+views cover, so no page at or above the extent is read or cloned. The
+reference receives no view of the serving pools, so it can neither read nor
+write them; the monitor checks that, and compares rows, status, progress,
+queue counts and every copied page bit for bit (TXG-QUAL-003). With
+``memory``, it records ``torch.cuda.memory_reserved`` and
+``max_memory_reserved`` before and after each copy and the copy's bytes
+(TXG-QUAL-029). The pool copy, the option-off reference, the checks and the
+comparison are outside the timer.
 ``force_off`` makes ``execute`` decline without counting, so the forward
 runs the option-off transaction (the step rule's OFF legs).
 """
@@ -627,9 +630,12 @@ class TransactionMonitor:
         import importlib
 
         self.model = model
-        #: The final committed block count: a copy of views with more pages
-        #: is reported as a problem (TXG-QUAL-003).
+        #: The final committed block count (TXG-QUAL-003).
         self.final_blocks = final_blocks
+        #: The pages each detached copy holds, ``0 … copy_extent - 1`` (every
+        #: page of the views when ``None``): the one value that sets the
+        #: copy's extent, here the final committed block count.
+        self.copy_extent = final_blocks
         #: Record the allocator around each copy (TXG-QUAL-029).
         self.memory = memory
         #: ``{"copy_bytes", "memory_reserved_before", ...}`` per copy.
@@ -670,18 +676,18 @@ class TransactionMonitor:
         self.calls = []
         self._declined = None
 
+    def _live(self, kwargs: dict[str, Any]) -> tx.Pools:
+        """The step's pool views narrowed to the copy's extent
+        (:attr:`copy_extent`): the pages a detached copy holds and a
+        comparison reads."""
+        return tx.pools_of(kwargs).narrowed(self.copy_extent)
+
     def _copy(self, kwargs: dict[str, Any], call: Call) -> tx.Pools:
-        """The detached copy of the step's pools (TXG-QUAL-003), with the
-        allocator read around it when ``memory`` is set (TXG-QUAL-029)."""
-        live = tx.pools_of(kwargs)
-        if self.final_blocks is not None:
-            over = sorted(d for d in live.first_dimensions() if d > self.final_blocks)
-            if over:
-                call.problems.append(
-                    f"pool views of {over} pages exceed the final committed "
-                    f"block count {self.final_blocks}: the copy is not limited "
-                    "to the committed pages"
-                )
+        """The detached copy of the step's pools (TXG-QUAL-003): the views
+        are narrowed to :attr:`copy_extent` before any byte is read or
+        allocated, so the copy holds no page at or above it. The allocator
+        is read around it when ``memory`` is set (TXG-QUAL-029)."""
+        live = self._live(kwargs)
         reading: dict[str, int] = {}
         if self.memory and self.cuda:
             torch.cuda.synchronize()
@@ -792,7 +798,7 @@ class TransactionMonitor:
             if sink.reservations:
                 call.problems.append("a declined step made a reservation")
             if before is not None:
-                if before.differences(tx.pools_of(kwargs)):
+                if before.differences(self._live(kwargs)):
                     call.problems.append("a declined step changed resident pages")
                 self._declined = (before, call)
             return None
@@ -801,7 +807,7 @@ class TransactionMonitor:
             reference = self._reference(
                 core, input_ids, inputs_embeds, plan, before, kwargs
             )
-            self._compare(call, reference, tx.pools_of(kwargs))
+            self._compare(call, reference, self._live(kwargs))
         return out
 
     def _advance(self, core, input_ids, inputs_embeds, plan, **kwargs):
@@ -827,7 +833,7 @@ class TransactionMonitor:
             reference = self._reference(
                 core, call.input_ids, call.inputs_embeds, plan, before, kwargs
             )
-            self._compare(call, reference, tx.pools_of(kwargs))
+            self._compare(call, reference, self._live(kwargs))
         return out
 
 

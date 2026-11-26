@@ -331,6 +331,84 @@ def test_capture_rows_alternate_their_fresh_and_file_bits(on_cpu, monkeypatch):
             assert set(fresh) == set(file) == {True, False}, (kind, count)
 
 
+def fill_block_zero(run, content):
+    """Write ``content`` into block 0 of every component pool before the
+    capture: ``bookkeeping-<seed>`` sets each integer component to bounded
+    values (a seeded draw from 0 to 3; seed 0 writes zeros, seed 1 ones) and
+    leaves the floating-point components; ``nan``, ``inf`` and ``-inf`` fill
+    every floating-point component and leave the integer ones."""
+    layer = h.state_layer_of(run.env.model)
+    filled = 0
+    for name, view in layer.component_pools.items():
+        page = view[0]
+        if content.startswith("bookkeeping-"):
+            if page.is_floating_point():
+                continue
+            seed = int(content.rsplit("-", 1)[1])
+            if seed < 2:
+                page.fill_(seed)
+            else:
+                gen = torch.Generator().manual_seed(seed)
+                page.copy_(torch.randint(0, 4, page.shape, generator=gen))
+        else:
+            if not page.is_floating_point():
+                continue
+            page.fill_(float(content))
+        filled += 1
+    assert filled, f"block 0 holds no component that {content} fills"
+
+
+#: Block 0's contents for TXG-CAP-005's content independence: bounded
+#: bookkeeping values (all zero, all one, seeded draws) and the IEEE specials.
+BLOCK_ZERO_CONTENTS = [
+    "bookkeeping-0",
+    "bookkeeping-1",
+    "bookkeeping-7",
+    "bookkeeping-11",
+    "nan",
+    "inf",
+    "-inf",
+]
+
+
+@pytest.mark.parametrize("content", BLOCK_ZERO_CONTENTS)
+# @spec TXG-CAP-005
+def test_each_capture_row_keeps_its_rejection_whatever_block_zero_holds(
+    on_cpu, content
+):
+    """The rejection predicate does not read the page a capture row gathers:
+    with block 0 holding bounded bookkeeping values, NaN or an infinity,
+    every captured row of every cell, fresh stream and continuing file rows
+    alike, keeps its rejection bit (``ROW_STATUS_ENVELOPE`` for a CHUNK row,
+    ``ROW_STATUS_ROLE_MISMATCH`` for an echo row) and no page changes. The
+    cells need not publish: a validation replay may find NaN outputs."""
+    run = on_cpu(n=3, max_num_seqs=3)
+    env = run.env
+    ready_to_capture(run)
+    fill_block_zero(run, content)
+    before = pool_snapshot(run.core.serving_bindings)
+    mark = len(env.events)
+    h.call_with(run.core.serving_capture)
+    windows = cell_windows(env, mark)
+    assert windows, f"{content}: no cell reached its capture"
+    seen = set()
+    for (kind, count), (begin, end) in zip(t.largest_first(env.n), windows):
+        scatters = [e[1] for e in env.events[begin:end] if e[0] == "scatter"]
+        assert scatters, f"{kind} cell {count}: no predicated scatter captured"
+        expected = ROW_STATUS_ENVELOPE if kind == "chunk" else ROW_STATUS_ROLE_MISMATCH
+        for call in scatters:
+            assert call["rows"] == count, (content, kind, count, call)
+            assert all(s & expected for s in call["status"]), (
+                content,
+                kind,
+                count,
+                call,
+            )
+        seen.add(kind)
+    assert "chunk" in seen, (content, seen)
+    assert_pools_equal(before, pool_snapshot(run.core.serving_bindings))
+
+
 # @spec TXG-CAP-006
 def test_scatter_warm_up_names_block_zero_of_each_pool_before_the_first_cell(on_cpu):
     """Both captures, under a fixed block count with core's estimate
@@ -978,12 +1056,16 @@ def test_the_profiling_capture_addresses_only_block_zero_of_its_one_block_cache(
 ):
     """The profiling capture over core's one-block profiling KV cache (a
     profiled budget with the extensible KV cache off) addresses block 0
-    alone: no operation reaches past the cache's only block."""
+    alone: no operation reaches past the cache's only block. The cache is
+    bound as one page over a storage of four, and the reading covers the
+    whole storage, so an operation on any page past block 0 is observed."""
     run = on_cpu(n=3, max_num_seqs=3, sizing=Sizing.PROFILED)
     run.core.prepare()
-    bindings = run.core.bind_profiling()
+    assert run.core.profiling_capacity() == 1
+    storage = run.core.bindings(4)
+    bindings = run.core.bind_profiling(t.narrow_pool(storage, 1))
     assert h.core_bindings(bindings).capacity == 1
-    with t.BlockAccesses(h.core_bindings(bindings).tensor) as rec:
+    with t.BlockAccesses(h.core_bindings(storage).tensor) as rec:
         run.core.profiling_capture()
     assert t.fake_graph_count(run.env) == 2 * run.env.n
     assert_only_block_zero(rec, "the profiling capture")

@@ -487,6 +487,11 @@ def test_the_driver_refuses_a_headroom_outside_the_extensible_kv_cache():
         ({"exactness_memory.max_memory_reserved_after": ...}, "max_memory_reserved"),
         ({"exactness_memory.copy_bytes": 11 << 30}, "more than the preregistered"),
         ({"spec.headroom.margin_bytes": ...}, "margin_bytes"),
+        ({"exactness_memory.memory_reserved_before": None}, "memory_reserved_before"),
+        ({"exactness_memory.memory_reserved_after": 1.5e9}, "memory_reserved_after"),
+        ({"exactness_memory.torch_memory_limit": "20 GiB"}, "torch_memory_limit"),
+        ({"exactness_memory.max_memory_reserved_before": True}, "max_memory_reserved"),
+        ({"exactness_memory.copy_bytes": None}, "copy_bytes"),
     ],
 )
 # @spec TXG-QUAL-029
@@ -496,6 +501,19 @@ def test_an_exactness_run_records_the_allocator_around_the_copy(changes, problem
         assert problems == [], problems
     else:
         assert any(problem in p for p in problems), (problem, problems)
+
+
+# @spec TXG-QUAL-029
+def test_a_record_whose_allocator_figures_are_all_none_fails():
+    """A record that holds every allocator figure and the copy's bytes as
+    ``None`` (an exactness run on a device the allocator did not read)
+    records nothing TXG-QUAL-029 requires."""
+    figures = {f"exactness_memory.{name}": None for name in q.HEADROOM_FIGURES}
+    problems = q.headroom_problems(
+        _headroom_reply(**figures, **{"exactness_memory.copy_bytes": None})
+    )
+    for name in (*q.HEADROOM_FIGURES, "copy_bytes"):
+        assert any(name in p for p in problems), (name, problems)
 
 
 # @spec TXG-QUAL-029
@@ -553,3 +571,77 @@ def test_a_deployment_n_below_63_carries_no_tier5_claim():
     )
     assert choice == {"n": 16, "histogram": {(10, 5): 995, (40, 30): 5}, "tier5": False}
     assert q.deployment_choice({(40, 30): 100}, {16: True, 32: True}) is None
+
+
+# ---------------------------------------------------------------------------
+# Requests served alone (TXG-QUAL-028)
+
+
+def _alone(option: bool, **changes):
+    """An ``alone`` result of three items; ``changes`` maps ``"<item>.<key>"``
+    to a value (``...`` deletes the key)."""
+    names = ["alone-stream", "alone-file0", "alone-file1"]
+    items = [
+        {
+            "name": name,
+            "kind": "stream" if i == 0 else "file",
+            "finish_reason": "stop",
+            "token_ids": [i + 1, i + 2, 7],
+            "failed_rows": 0,
+            "error": None,
+            "replays": 3 if option else 0,
+            "fallbacks": {},
+        }
+        for i, name in enumerate(names)
+    ]
+    for path, value in changes.items():
+        index, key = path.split(".")
+        if value is ...:
+            del items[int(index)][key]
+        else:
+            items[int(index)][key] = value
+    return {"items": items}
+
+
+@pytest.mark.parametrize(
+    "on, off, problem",
+    [
+        ({}, {}, None),
+        ({"1.finish_reason": "error", "1.failed_rows": 1}, {}, "failed rows"),
+        ({}, {"2.finish_reason": "length"}, "not 'stop'"),
+        ({"0.error": "EngineDeadError: dead"}, {}, "EngineDeadError"),
+        ({"0.failed_rows": ...}, {}, "failed rows"),
+        ({"2.replays": 0}, {}, "replayed no cell"),
+        ({"1.fallbacks": {"signature": 1}}, {}, "'signature'"),
+        ({}, {"1.replays": 2}, "B_hook alone-file0 replayed"),
+        ({"2.token_ids": [3, 4, 8]}, {}, "differ from B_hook"),
+        ({"2.name": "alone-file9"}, {}, "different items"),
+    ],
+)
+# @spec TXG-QUAL-028
+def test_each_item_served_alone_completes_replays_and_equals_b_hook(on, off, problem):
+    """Every check is per item: each item of both runs completes with no
+    failed row and no client error, each option-on item replays a cell with
+    no ``signature`` fallback, no ``B_hook`` item replays, and each item's
+    tokens equal ``B_hook``'s."""
+    problems = q.alone_problems(_alone(True, **on), _alone(False, **off))
+    if problem is None:
+        assert problems == [], problems
+    else:
+        assert any(problem in p for p in problems), (problem, problems)
+
+
+# @spec TXG-QUAL-028
+def test_replays_of_other_items_do_not_cover_an_item_that_replayed_none():
+    """An item with no replay fails even when the run's total is positive,
+    and a ``signature`` fallback in one item fails though another item's
+    fallbacks of other reasons are allowed."""
+    on = _alone(
+        True,
+        **{"0.replays": 40, "1.replays": 0, "2.fallbacks": {"chunk-uncovered": 1}},
+    )
+    problems = q.alone_problems(on, _alone(False))
+    assert problems == ["option-on alone-file0 replayed no cell (0)"], problems
+    assert q.alone_problems({"items": []}, {"items": []}) == [
+        "the option-on run served no item"
+    ]

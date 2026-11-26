@@ -14,8 +14,10 @@ included, with ``transaction_graph_populations`` absent. The
 transaction-level modes start one engine in this process (``LLMEngine`` with
 ``VLLM_ENABLE_V1_MULTIPROCESSING=0``, so the engine core and its worker live
 here) and drive the worker through ``support.txg_qual_adapter.QualAdapter``
-(TXG-QUAL-026), assigning blocks below the final committed block count. Every
-pass/fail decision is ``support.txgcap_qual``'s.
+(TXG-QUAL-026), assigning blocks below the final committed block count. The
+``uapi`` and ``alone`` modes serve through a multiprocess engine
+(``AsyncLLM``) on the client path. Every pass/fail decision is
+``support.txgcap_qual``'s.
 
 The reply records, for every run, the KV-cache sizing, each capture
 layout's page count and the final bound count the driver reads after
@@ -45,9 +47,13 @@ Modes (``spec["mode"]``):
   (TXG-CAL-001), which the calibration runs once under the step rule's fixed
   block count and once with ``kv_cache_sizing`` ``"extensible"``, core's
   default (TXG-CAL-001, -002).
-* ``alone``: TXG-QUAL-028's served part: one stream served alone, then each
-  of TXG-QUAL-004's files transcribed alone on the idle server
-  (:func:`run_alone`), with their transcripts and the fallbacks by reason.
+* ``alone``: TXG-QUAL-028's served part in a fresh multiprocess engine
+  (``AsyncLLM``): one stream served alone on the client path of core's
+  ``/v1/realtime``, then each of TXG-QUAL-004's files transcribed alone on
+  the idle server as core's transcription serving submits it
+  (:func:`run_alone`); per item, its outcome, token IDs, cell replays and
+  fallbacks by reason. Its worker extension (:data:`ALONE_READER`) installs
+  the startup probes in the engine-core process.
 * ``uapi``: one leg of ``U_api`` (TXG-QUAL-016) in a multiprocess engine
   (``AsyncLLM``): repeats 0 to 3, each a fresh stream opened with
   ``AsyncLLM.generate`` and an input generator that yields the plugin
@@ -785,105 +791,192 @@ class Workload:
 
 
 # ---------------------------------------------------------------------------
-# One request alone (TXG-QUAL-028)
+# Requests alone on the client path (TXG-QUAL-028)
+
+#: The worker extension of the ``alone`` mode (core's
+#: ``--worker-extension-cls``): core imports its module in the engine-core
+#: process before it builds the model runner, and the import installs the
+#: startup probes there (``support.txg_alone_worker``).
+ALONE_READER = "support.txg_alone_worker.AloneReader"
 
 
-class AloneWorkload(Workload):
-    """One stream (``file`` ``None``) or one file alone on an otherwise idle
-    server: it runs until that request finishes and admits nothing after
-    it."""
-
-    def __init__(
-        self,
-        ctx: Any,
-        *,
-        name: str,
-        seed: int,
-        clips: Clips,
-        file: tuple[str, np.ndarray] | None = None,
-    ) -> None:
-        self._file = file
-        self._admitted = False
-        super().__init__(
-            ctx,
-            name=name,
-            n_streams=0 if file is not None else 1,
-            n_files=1 if file is not None else 0,
-            steps=0,
-            seed=seed,
-            clips=clips,
-        )
-
-    def _admit_files(self) -> None:
-        if self._file is None or self._admitted:
-            return
-        self._admitted = True
-        name, samples = self._file
-        self.counter += 1
-        req_id = f"{self.name}-f0-{self.counter}"
-        self.file_slots[0] = FileItem(req_id, name, samples)
-        if samples.shape[0] == 0:
-            self.zero_files.add(req_id)
-
-    def finished(self) -> bool:
-        streams = all(s is None or s.retired for s in self.streams)
-        files = all(f is not None and f.done for f in self.file_slots)
-        return streams and files
+def alone_items(
+    requests: Requests, corpus: Any, spec: dict[str, Any]
+) -> list[tuple[str, str, str, np.ndarray]]:
+    """TXG-QUAL-028's items in order, each ``(name, kind, utterance,
+    samples)``: one stream (the run's first clip), then TXG-QUAL-004's files
+    from the same permutation (leading and trailing silence, a whole number
+    of chunks, zero samples, shorter than one chunk), then
+    ``alone_utterances`` test-clean utterances, default 1."""
+    clips = corpus.clips(int(spec["seed"]))
+    utt, clip = clips.take()
+    items = [("alone-stream", "stream", utt, clip)]
+    files = special_files(requests, clips)
+    for index in range(4 + int(spec.get("alone_utterances", 1))):
+        name, samples = next(files)
+        items.append((f"alone-file{index}", "file", name, samples))
+    return items
 
 
-def run_alone(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
-    """TXG-QUAL-028's served part: one stream served alone, as TXG-QUAL-024
-    serves it, then each of TXG-QUAL-004's files transcribed alone on the
-    idle server (leading and trailing silence, a whole number of chunks,
-    zero samples, shorter than one chunk, then ``alone_utterances``
-    test-clean utterances, default 1), each its own request run to its end.
-    Returns each item's transcripts and step counts, and the fallbacks by
-    reason and the cell replays over the whole mode (zero while transaction
-    graphs are off)."""
+def alone_counters(worker: Any) -> dict[str, Any]:
+    """The worker's cell replays (their total) and fallbacks by reason, as
+    plain values (TXG-OBS-008); none while transaction graphs are off."""
     from support import txg_api
 
-    seed = int(spec["seed"])
-    clips = ctx.corpus.clips(seed)
+    reading = txg_api.counters(worker)
+    if not reading:
+        return {"replays": 0, "fallbacks": {}}
+    counters = reading["counters"]
+    fallbacks: dict[str, int] = {}
+    for key, value in dict(counters["fallbacks"]).items():
+        reason = str(key[0] if isinstance(key, tuple) else key)
+        fallbacks[reason] = fallbacks.get(reason, 0) + int(value)
+    replays = int(sum(dict(counters["replays"]).values()))
+    return {"replays": replays, "fallbacks": fallbacks}
 
-    def replays() -> int:
-        reading = txg_api.counters(ctx.model)
-        return int(sum(dict(reading["counters"]["replays"]).values())) if reading else 0
 
-    before, replayed = _fallbacks(ctx.model), replays()
-    runs = [AloneWorkload(ctx, name="alone-stream", seed=seed, clips=clips)]
-    files = special_files(ctx.requests, clips)
-    for index in range(4 + int(spec.get("alone_utterances", 1))):
-        runs.append(
-            AloneWorkload(
-                ctx, name=f"alone-file{index}", seed=seed, clips=clips, file=next(files)
+def alone_deltas(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """The counters' growth over one item: its cell replays and its
+    fallbacks by reason."""
+    reasons = set(before["fallbacks"]) | set(after["fallbacks"])
+    grown = {
+        r: int(after["fallbacks"].get(r, 0)) - int(before["fallbacks"].get(r, 0))
+        for r in reasons
+    }
+    return {
+        "replays": int(after["replays"]) - int(before["replays"]),
+        "fallbacks": {r: v for r, v in sorted(grown.items()) if v},
+    }
+
+
+def alone_startup(worker: Any, spec: dict[str, Any], probes: Any) -> dict[str, Any]:
+    """Read on the worker after startup: the startup probes, the capture
+    record, the run record's fields (:func:`run_record`, read after core's
+    extension) and the state layer's page count and page bytes."""
+    import torch
+
+    from support.txg_qual_adapter import QualAdapter
+
+    adapter = QualAdapter.from_worker(worker)
+    ctx = Context(adapter=adapter, model=adapter.model, probes=probes)
+    return _plain(
+        {
+            "probes": probes.reply(),
+            "capture_record": capture_record(adapter.model),
+            "record": run_record(ctx, spec),
+            "state_capacity": int(adapter.capacity),
+            "state_page_bytes": adapter.page_bytes,
+            "device": torch.cuda.get_device_name(0)
+            if torch.cuda.is_available()
+            else "cpu",
+        }
+    )
+
+
+async def serve_alone_item(llm: Any, kind: str, samples: np.ndarray) -> dict:
+    """One item alone on the idle server, through the client path: a stream
+    as core's ``/v1/realtime`` serving feeds it, a file as core's
+    transcription serving submits it (``support.served_clients``). Its
+    finish reason, token IDs and failed rows (an ``error`` finish), or the
+    error the client received."""
+    from support import served_clients as served
+
+    try:
+        if kind == "stream":
+            result = await served.transcribe_stream(llm, samples)
+        else:
+            result = await served.transcribe_file(llm, samples)
+    except Exception as error:  # noqa: BLE001 - the client's error, recorded
+        return {
+            "finish_reason": None,
+            "token_ids": [],
+            "failed_rows": 1,
+            "error": f"{type(error).__name__}: {error}"[:500],
+        }
+    return {
+        "finish_reason": result.finish_reason,
+        "token_ids": [int(t) for t in result.token_ids],
+        "failed_rows": int(result.finish_reason == "error"),
+        "error": None,
+    }
+
+
+async def run_alone(spec: dict[str, Any]) -> dict[str, Any]:
+    """TXG-QUAL-028's served part in a fresh multiprocess engine
+    (``AsyncLLM``) with the run's KV-cache sizing: each of
+    :func:`alone_items` served alone, in order, each its own request run to
+    its end before the next starts, with the worker's counters read before
+    and after it (outside the request). Returns the run's ``identity``, the
+    worker's ``capture_record`` and startup ``probes``, and per item its
+    outcome, token IDs, cell replays and fallbacks by reason (``result``)."""
+    import importlib.metadata as md
+
+    import torch
+    import vllm
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    import vllm_nemotron_asr_streaming as plugin
+    from vllm_nemotron_asr_streaming import register
+
+    os.environ.update(engine_env(spec))
+    register()
+    llm = AsyncLLM.from_engine_args(
+        AsyncEngineArgs(**engine_settings(spec), worker_extension_cls=ALONE_READER)
+    )
+    try:
+
+        async def read() -> dict[str, Any]:
+            return (await llm.collective_rpc("alone_counters"))[0]
+
+        worker = (await llm.collective_rpc("alone_startup", args=(spec,)))[0]
+        requests = Requests(
+            SimpleNamespace(config=llm.model_config.hf_config),
+            lookahead=int(spec["lookahead"]),
+        )
+        corpus = corpus_of(spec)
+        items = []
+        for name, kind, utt, samples in alone_items(requests, corpus, spec):
+            before = await read()
+            outcome = await serve_alone_item(llm, kind, samples)
+            after = await read()
+            items.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "utt": utt,
+                    "samples": int(samples.shape[0]),
+                    **outcome,
+                    **alone_deltas(before, after),
+                }
             )
-        )
-    items = []
-    for run in runs:
-        run.run()
-        run.close()
-        summary = run.summary()
-        items.append(
-            {
-                key: summary[key]
-                for key in (
-                    "name",
-                    "steps",
-                    "covered_steps",
-                    "fallback_steps",
-                    "failed_rows",
-                    "transcripts",
-                )
-            }
-        )
-    after = _fallbacks(ctx.model)
-    grown: dict[str, int] = {}
-    for key, value in after.items():
-        delta = value - before.get(key, 0)
-        if delta:
-            reason = key[0] if isinstance(key, tuple) else str(key)
-            grown[reason] = grown.get(reason, 0) + delta
-    return {"items": items, "fallbacks": grown, "replays": replays() - replayed}
+        scheduler = llm.vllm_config.scheduler_config
+    finally:
+        llm.shutdown()
+    identity = {
+        "plugin_file": plugin.__file__,
+        "plugin_version": md.version("vllm-nemotron-asr-streaming"),
+        "vllm_file": vllm.__file__,
+        "vllm_version": md.version("vllm"),
+        "torch": torch.__version__,
+        "device": worker["device"],
+        "settings": engine_settings(spec),
+        "env": engine_env(spec),
+        "max_num_batched_tokens": int(scheduler.max_num_batched_tokens),
+        **worker["record"],
+        "state_capacity": worker["state_capacity"],
+        "state_page_bytes": worker["state_page_bytes"],
+        "locale_row": requests.locale_row,
+        "corpus_sha256": corpus.manifest_sha256,
+        "corpus_count": corpus.count,
+        "git_head": os.environ.get("TXG_QUAL_PLUGIN_HEAD"),
+    }
+    return {
+        "identity": identity,
+        "capture_record": worker["capture_record"],
+        "probes": worker["probes"],
+        "result": {"items": items},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1923,8 +2016,6 @@ def run_mode(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
         }
     if mode == "fallback":
         return run_fallbacks(ctx, n)
-    if mode == "alone":
-        return run_alone(ctx, spec)
     if mode == "steprule":
         out = []
         for k, e in spec["compositions"]:
@@ -1948,11 +2039,14 @@ def main(spec_path: str, out_path: str) -> int:
     spec = json.loads(Path(spec_path).read_text())
     reply: dict[str, Any] = {"spec": spec, "ok": False}
     t0 = time.time()
-    if spec["mode"] == "uapi":
+    if spec["mode"] in ("uapi", "alone"):
         import asyncio
 
         try:
-            reply["result"] = _plain(asyncio.run(run_u_api_leg(spec)))
+            if spec["mode"] == "uapi":
+                reply["result"] = _plain(asyncio.run(run_u_api_leg(spec)))
+            else:
+                reply.update(_plain(asyncio.run(run_alone(spec))))
             reply["ok"] = True
         except BaseException as error:  # noqa: BLE001 - reported in the reply
             reply["error"] = {"type": type(error).__name__, "message": str(error)}

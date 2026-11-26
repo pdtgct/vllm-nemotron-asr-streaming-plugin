@@ -253,6 +253,27 @@ def sizing_settings(
     }
 
 
+def sizing_arguments(
+    sizing: str, *, blocks: int | None = None, budget: int | None = None
+) -> dict[str, Any]:
+    """The engine arguments (``AsyncEngineArgs`` or ``CacheConfig``
+    keywords) a serve command of ``sizing`` sets, which the configuration's
+    validators and the plugin's configuration hook see: none for core's
+    default, the extensible KV cache, which a command without KV-cache
+    options selects; ``enable_extensible_kv_cache`` false for a profiled
+    budget; ``num_gpu_blocks_override`` or ``kv_cache_memory_bytes`` for a
+    fixed block count or budget, each of which turns the extensible KV cache
+    off. ``blocks`` and ``budget`` follow :func:`sizing_settings`."""
+    settings = sizing_settings(sizing, blocks=blocks, budget=budget)
+    if sizing == Sizing.EXTENSIBLE:
+        return {}
+    if sizing == Sizing.PROFILED:
+        return {"enable_extensible_kv_cache": False}
+    if sizing == Sizing.BLOCK_COUNT:
+        return {"num_gpu_blocks_override": int(settings["num_gpu_blocks_override"])}
+    return {"kv_cache_memory_bytes": int(settings["kv_cache_memory_bytes"])}
+
+
 #: How a message or a record names each KV-cache sizing (TXG-MEM-010,
 #: TXG-OBS-003): the information, not the wording.
 SIZING_NAMES = {

@@ -18,8 +18,10 @@ uncharged WARNING under a fixed ``--kv-cache-memory-bytes`` and the
 required-but-suppressed profiling capture (TXG-QUAL-022); core's
 graph-memory estimate against ``B_hook`` under the fixed block count
 (TXG-QUAL-021); the block-0 capture under each of the three sizings with one
-stream and each file served alone equal to ``B_hook``'s under the same
-sizing (TXG-QUAL-028, through the qualification driver's ``alone`` mode); an
+stream and each file served alone on the client path, through a
+multiprocess engine, equal to ``B_hook``'s under the same sizing
+(TXG-QUAL-028, through the qualification driver's ``alone`` mode, on
+LibriSpeech test-clean named by ``TXG_QUAL_CORPUS``); an
 exactness run's test-only headroom and its allocator record (TXG-QUAL-029);
 and one ``U_api`` leg of each arm through ``AsyncLLM`` (TXG-QUAL-016; the
 qualifying brackets are preregistered runs of the same driver mode). Each
@@ -399,9 +401,18 @@ ALONE_N = 8
 
 
 def driver_spec(lookahead: int, sizing: str, *, option: bool) -> dict[str, Any]:
+    """The driver's ``alone`` mode on LibriSpeech test-clean
+    (``TXG_QUAL_CORPUS``, the directory holding ``test-clean``), whose
+    utterances TXG-QUAL-004's files take."""
     card = os.environ.get("NEMOTRON_CARD_DIR")
     if not card:
         pytest.skip("NEMOTRON_CARD_DIR not set")
+    corpus = os.environ.get("TXG_QUAL_CORPUS")
+    if not corpus:
+        pytest.skip(
+            "TXG_QUAL_CORPUS not set: TXG-QUAL-028 serves TXG-QUAL-004's files, "
+            "which take LibriSpeech test-clean utterances"
+        )
     hf = {"num_lookahead_tokens": lookahead}
     if option:
         hf[t.OPTION] = [ALONE_N]
@@ -415,14 +426,8 @@ def driver_spec(lookahead: int, sizing: str, *, option: bool) -> dict[str, Any]:
         "kv_cache_sizing": sizing,
         "seed": 20261126,
         "alone_utterances": 2,
+        "corpus": corpus,
     }
-    corpus = os.environ.get("TXG_QUAL_CORPUS")
-    if corpus:
-        spec["corpus"] = corpus
-    else:
-        # Seeded noise stands in for test-clean where no corpus is named;
-        # the A40 round names LibriSpeech test-clean.
-        spec["synthetic_lengths"] = [48000, 40000, 56000, 30000, 64000, 52000]
     return spec
 
 
@@ -440,17 +445,6 @@ def _fits(view: list[Any], recorded: list[Any]) -> bool:
     )
 
 
-def _signature_fallbacks(reply: dict[str, Any]) -> int:
-    return int(reply["result"]["fallbacks"].get("signature", 0))
-
-
-def _transcripts(reply: dict[str, Any]) -> list[list[int]]:
-    return [
-        [t["tokens"] for t in item["transcripts"].values()]
-        for item in reply["result"]["items"]
-    ]
-
-
 @pytest.mark.card
 @pytest.mark.parametrize(
     "sizing", [Sizing.EXTENSIBLE, Sizing.PROFILED, Sizing.BLOCK_COUNT]
@@ -466,9 +460,12 @@ def test_block_0_capture_serves_alone_equal_to_b_hook_under_each_sizing(
     unlatched, and the measured-memory INFO line appears; under a profiled
     budget the profiling capture runs over a one-block profiling KV cache;
     under a fixed block count both captures pass. Under each sizing one
-    stream and each of TXG-QUAL-004's files, each alone on the idle server,
-    replay cells with no ``signature`` fallback and produce ``B_hook``'s
-    transcripts under the same sizing."""
+    stream, served alone through the client path of core's ``/v1/realtime``
+    as TXG-QUAL-024 serves it, and each of TXG-QUAL-004's files, each alone
+    on the idle server as core's transcription serving submits it, completes
+    with no failed row, replays cells with no ``signature`` fallback, each
+    item checked on its own, and produces ``B_hook``'s tokens under the same
+    sizing (``txgcap_qual.alone_problems``)."""
     on = run_driver(driver_spec(lookahead, sizing, option=True), tmp_path, "on")
     assert on["ok"], on.get("traceback")
     off = run_driver(driver_spec(lookahead, sizing, option=False), tmp_path, "off")
@@ -512,9 +509,9 @@ def test_block_0_capture_serves_alone_equal_to_b_hook_under_each_sizing(
     else:
         assert set(captures) == {"profiling", "serving"}
         assert record[Record.PROFILING][Record.PAGE_COUNT] == ALONE_N + 1
-    assert on["result"]["replays"] > 0, "no cell replayed"
-    assert _signature_fallbacks(on) == 0, on["result"]["fallbacks"]
-    assert _transcripts(on) == _transcripts(off)
+    items = [item["name"] for item in on["result"]["items"]]
+    assert items[0] == "alone-stream" and len(items) == 1 + 4 + 2, items
+    assert q.alone_problems(on["result"], off["result"]) == []
 
 
 @pytest.mark.card

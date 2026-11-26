@@ -101,7 +101,9 @@ def build_vllm_config(
     overrides: dict[str, Any] | None = None,
     device: str = "cpu",
     enforce_eager: bool = True,
-    num_gpu_blocks_override: int | None = None,
+    sizing: str | None = None,
+    blocks: int | None = None,
+    budget: int | None = None,
 ) -> Any:
     """The engine configuration of a server at lookahead ``right_context``.
 
@@ -114,8 +116,15 @@ def build_vllm_config(
     hooks. The CPU tests keep the eager runner. While ``overrides`` turn
     transaction graphs on, the configuration is the restricted startup
     (TXG-CFG-017, TXG-CFG-018: synchronous scheduling and both modes NONE)
-    under core's default KV-cache sizing: ``num_gpu_blocks_override`` is
-    set only when given, where a test's spec names one."""
+    under core's default KV-cache sizing. ``sizing`` (``txg_api.Sizing``,
+    with ``blocks`` for a fixed block count and ``budget`` for a fixed
+    budget) passes that sizing's engine arguments
+    (``txg_api.sizing_arguments``) to the cache configuration as it is
+    built, so core's validators and the plugin's configuration hook see it;
+    a test names a sizing only where its spec names one. Core resolves the
+    extensible KV cache off on the CPU platform and refuses it requested
+    there, so a CPU test sets that sizing on the built configuration
+    (``txgcap_harness.set_cache``)."""
     from vllm.config import (
         CacheConfig,
         CompilationConfig,
@@ -126,9 +135,15 @@ def build_vllm_config(
     )
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
+    from support.txg_api import sizing_arguments
     from vllm_nemotron_asr_streaming import register
 
     register()
+    cache: dict[str, Any] = {}
+    if sizing is not None:
+        cache = sizing_arguments(sizing, blocks=blocks, budget=budget)
+    elif blocks is not None or budget is not None:
+        raise ValueError("blocks and budget take a named sizing")
     hf_overrides: dict[str, Any] = {"num_lookahead_tokens": right_context}
     hf_overrides.update(overrides or {})
     model_config = ModelConfig(
@@ -147,10 +162,7 @@ def build_vllm_config(
     return VllmConfig(
         model_config=model_config,
         device_config=DeviceConfig(device=device),
-        cache_config=CacheConfig(
-            enable_prefix_caching=False,
-            num_gpu_blocks_override=num_gpu_blocks_override,
-        ),
+        cache_config=CacheConfig(enable_prefix_caching=False, **cache),
         **compilation,
         scheduler_config=SchedulerConfig.default_factory(
             async_scheduling=False,

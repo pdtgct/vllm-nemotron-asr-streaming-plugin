@@ -5,15 +5,16 @@ CPU tests (``engine``) hold an option-on model state through the stated
 fake-capture seam of ``support.txgcap_harness`` (``FakeCuda`` for core's CUDA
 surface, ``FakeGraphRuntime`` for segment graphs) and call the hooks in
 core's order (``support.core_order.CoreOrder``); they pin ordering,
-inventory, release and refusal behaviour. The lifecycle includes the
-profiling capture, which core runs only for its graph-memory estimate, so a
-test runs a fixed ``--num-gpu-blocks-override`` with the estimate enabled
-(the HLD's choice for the checks that need the estimate; TXG-LIFE-004 names
-the override's profiling KV cache) unless it names another KV-cache sizing:
-core's default, the extensible KV cache, for its extension
-(TXG-LIFE-009), or a profiled budget for core's one-block profiling KV
-cache. ``gpu`` tests run the same lifecycle on CUDA with core's
-``graph_capture`` stream and graph pools and read the allocator.
+inventory, release and refusal behaviour. A test runs core's
+default KV-cache sizing, the extensible KV cache, unless it names another.
+The lifecycle includes the profiling capture, which core runs only for its
+graph-memory estimate, so a test whose subject includes that capture names
+a fixed ``--num-gpu-blocks-override`` with the estimate enabled (the HLD's
+choice for the checks that need the estimate; TXG-LIFE-004 names the
+override's profiling KV cache), a profiled budget for core's one-block
+profiling KV cache, or a fixed budget. ``gpu`` tests run the same
+lifecycle on CUDA with core's ``graph_capture`` stream and graph pools and
+read the allocator.
 """
 
 from __future__ import annotations
@@ -35,29 +36,9 @@ from support.txg_api import Record, Sizing
 pytestmark = pytest.mark.engine
 
 
-@pytest.fixture
-def on_cpu(on_cpu):
-    """The shared ``on_cpu`` under a fixed block count unless the test names
-    a sizing or a budget (module docstring)."""
-
-    def build(**kwargs):
-        if "sizing" not in kwargs and not kwargs.get("kv_cache_memory_bytes"):
-            kwargs["sizing"] = Sizing.BLOCK_COUNT
-        return on_cpu(**kwargs)
-
-    return build
-
-
-@pytest.fixture
-def on_cuda(on_cuda):
-    """The shared ``on_cuda`` under a fixed block count unless the test
-    names a sizing (module docstring)."""
-
-    def build(**kwargs):
-        kwargs.setdefault("sizing", Sizing.BLOCK_COUNT)
-        return on_cuda(**kwargs)
-
-    return build
+#: The KV-cache sizing of a test whose subject includes core's graph-memory
+#: estimate and its profiling capture (module docstring).
+ESTIMATE = {"sizing": Sizing.BLOCK_COUNT}
 
 
 def names_since(env, mark):
@@ -93,13 +74,17 @@ def assert_option_recognized(env):
     assert env.state.needs_cudagraph_capture() is True
 
 
-def assert_capture_creates_cells(env, core):
+def assert_capture_creates_cells(env, core, capture="profiling"):
     """Positive control: the same fake counters a guard reads as zero become
-    nonzero once the profiling capture runs."""
-    # Bind the profiling pool again: after a clear, core's layout is empty, and
-    # TXG-CAP-008 refuses a capture without one.
-    core.bind_profiling()
-    core.profiling_capture()
+    nonzero once ``capture``, the profiling or the serving capture, runs."""
+    if capture == "serving":
+        core.bind_serving()
+        core.serving_capture()
+    else:
+        # Bind the profiling pool again: after a clear, core's layout is
+        # empty, and TXG-CAP-008 refuses a capture without one.
+        core.bind_profiling()
+        core.profiling_capture()
     assert env.fake.capture_attempts == 2 * env.n, env.fake.capture_attempts
     assert env.fake.replay_count >= 2 * env.n, env.fake.replay_count
     assert env.fake.pinned_allocations > 0, "no binding-owned pinned buffer"
@@ -152,12 +137,12 @@ def test_prepare_execution_memory_allocates_nothing_for_transaction_graphs(on_cp
         "a transaction-graph scatter warm-up ran in prepare_execution_memory"
     )
     env.runner.profile_run(core_embeds=False)
-    assert_capture_creates_cells(env, run.core)
+    assert_capture_creates_cells(env, run.core, capture="serving")
 
 
 # @spec TXG-LIFE-002
 def test_profiling_forward_captures_and_replays_no_cell(on_cpu):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env = run.env
     assert_option_recognized(env)
     run.core.prepare()
@@ -195,7 +180,7 @@ def test_cells_exist_only_from_their_capture_over_the_current_layouts(on_cpu):
     profiling ones."""
     from support import txg_api
 
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     binding = txg_api.binding_of(env.model)
     core.prepare()
@@ -223,7 +208,7 @@ def test_cells_exist_only_from_their_capture_over_the_current_layouts(on_cpu):
 
 # @spec TXG-LIFE-004
 def test_profiling_capture_runs_segments_warm_up_cells_then_the_margin(on_cpu):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     core.prepare()
     core.bind_profiling()
@@ -290,7 +275,7 @@ def test_profiling_capture_over_one_block_under_a_profiled_budget(on_cpu):
 
 # @spec TXG-LIFE-005
 def test_clear_releases_the_profiling_capture_and_keeps_its_figures(on_cpu):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     core.prepare()
     core.bind_profiling()
@@ -309,7 +294,7 @@ def test_clear_releases_the_profiling_capture_and_keeps_its_figures(on_cpu):
 @pytest.mark.parametrize("before", ["nothing-captured", "capture-raised"])
 # @spec TXG-LIFE-005
 def test_clear_tolerates_a_profiling_capture_that_raised_or_never_ran(on_cpu, before):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     assert_option_recognized(env)
     core.prepare()
@@ -329,7 +314,7 @@ def test_clear_tolerates_a_profiling_capture_that_raised_or_never_ran(on_cpu, be
 
 # @spec TXG-LIFE-006
 def test_serving_capture_runs_segments_warm_up_cells_without_a_margin(on_cpu):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     core.prepare()
     core.bind_profiling()
@@ -378,7 +363,7 @@ def test_serving_capture_checks_the_second_capture_before_the_profiling_decision
 
 # @spec TXG-LIFE-007
 def test_serving_capture_while_profiling_cells_exist_is_refused_at_entry(on_cpu):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     core.prepare()
     core.bind_profiling()
@@ -429,7 +414,7 @@ def test_a_retry_after_a_failed_serving_capture_is_refused(on_cpu, where):
     the (empty) inventory stay as they were."""
     from support import txg_api
 
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     core.prepare()
     core.bind_profiling()
@@ -463,7 +448,7 @@ def test_a_retry_after_a_failed_serving_capture_is_refused(on_cpu, where):
 def test_a_retry_after_a_failed_serving_capture_is_refused_with_the_option_off(
     on_cpu,
 ):
-    run = on_cpu(n=2, populations=[])
+    run = on_cpu(n=2, populations=[], **ESTIMATE)
     env, core = run.env, run.core
     core.prepare()
     core.bind_profiling()
@@ -566,7 +551,7 @@ def test_bindings_before_the_serving_capture_take_no_part_in_the_comparison(on_c
     """Core's profiling KV cache, bound twice here, and a serving binding
     replaced before the serving capture are not compared: the serving
     capture records the layout current at its call."""
-    core = on_cpu(n=2).core
+    core = on_cpu(n=2, **ESTIMATE).core
     core.prepare()
     core.bind_profiling()
     core.bind_profiling()  # another temporary pool before the estimate
@@ -856,7 +841,7 @@ def _assert_nothing_of_the_call_remains(
 @pytest.mark.parametrize("where", FAILURES[True])
 # @spec TXG-LIFE-012
 def test_failed_profiling_capture_discards_everything_the_call_created(on_cpu, where):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     core.prepare()
     core.bind_profiling()
@@ -874,7 +859,7 @@ def test_failed_profiling_capture_discards_everything_the_call_created(on_cpu, w
 @pytest.mark.parametrize("where", FAILURES[False])
 # @spec TXG-LIFE-012
 def test_failed_serving_capture_discards_everything_the_call_created(on_cpu, where):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     core.prepare()
     core.bind_profiling()
@@ -898,7 +883,7 @@ def test_failed_serving_capture_discards_everything_the_call_created(on_cpu, whe
 
 # @spec TXG-LIFE-013
 def test_cells_replay_only_in_their_own_validation_and_on_verified_steps(on_cpu):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     core.prepare()
     core.bind_profiling()
@@ -947,7 +932,7 @@ def _assert_cells_released_before_segments(env, mark):
 @pytest.mark.parametrize("release", ["clear", "shutdown", "failure"])
 # @spec TXG-LIFE-014
 def test_transaction_graph_part_is_released_before_the_segment_graphs(on_cpu, release):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     core.prepare()
     core.bind_profiling()
@@ -1029,7 +1014,7 @@ def _warm_the_process(on_cuda) -> None:
     torch.cuda.synchronize()
     torch.cuda.memory._record_memory_history(stacks="python", max_entries=200_000)
     try:
-        env = on_cuda(n=2)
+        env = on_cuda(n=2, **ESTIMATE)
         env.core.prepare()
         env.core.bind_profiling()
         env.core.profiling_capture()
@@ -1140,7 +1125,7 @@ def test_lifecycle_captures_releases_and_serves_on_cuda(on_cuda, request):
     if ran_in_child(request):
         return
     _warm_the_process(on_cuda)
-    env = on_cuda(n=2)
+    env = on_cuda(n=2, **ESTIMATE)
     core = env.core
     core.prepare()
     core.bind_profiling()
@@ -1179,7 +1164,7 @@ def test_failed_cell_capture_on_cuda_returns_its_memory(on_cuda, monkeypatch, re
     if ran_in_child(request):
         return
     _warm_the_process(on_cuda)
-    env = on_cuda(n=2)
+    env = on_cuda(n=2, **ESTIMATE)
     core = env.core
     core.prepare()
     core.bind_profiling()

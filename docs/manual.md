@@ -309,10 +309,10 @@ took about 25 s in the unpublished A40 measurement at 320 ms. The compiled `dens
 
 ### `--kv-cache-memory-bytes`
 
-By default, core profiles memory and sizes the KV cache, whose one group holds the state pages,
-from the remaining budget. The model prepares its execution memory on core's memory-profiling step, so the budget
-includes that memory. In the hook configuration, core's graph-memory estimate also charges the
-profiling capture.
+With the extensible KV cache off (`--no-enable-extensible-kv-cache`), core profiles memory and
+sizes the KV cache, whose one group holds the state pages, from the remaining budget. The model
+prepares its execution memory on core's memory-profiling step, so the budget includes that memory.
+In the hook configuration, core's graph-memory estimate there also charges the profiling capture.
 
 A fixed `--kv-cache-memory-bytes` changes this. Core takes the budget as given and charges neither
 the model's execution memory nor the segment graphs (nor transaction graphs). Leave room for the

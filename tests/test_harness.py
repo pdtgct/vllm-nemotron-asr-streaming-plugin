@@ -322,3 +322,83 @@ def test_plugin_holds_finds_a_flattened_view_of_a_component(monkeypatch):
     assert len(held) == 1 and "shares storage" in held[0], held
     binding.kept = None
     assert t.plugin_holds(env, targets) == []
+
+
+# ---------------------------------------------------------------------------
+# The block-access reading of TXG-CAP-018
+
+
+def _scatter_op():
+    """A CPU op named as the plugin's masked page scatter (its CUDA op is
+    registered only on CUDA), with the same arguments and row predicate."""
+    import torch
+    from support import txgcap_harness as t
+    from torch.library import custom_op
+
+    name = f"txgharness::{t._MASKED_SCATTER}"
+    namespace = getattr(torch.ops, "txgharness", None)
+    if namespace is not None and hasattr(namespace, t._MASKED_SCATTER):
+        return getattr(namespace, t._MASKED_SCATTER)
+
+    @custom_op(name, mutates_args=["pool"])
+    def scatter(
+        pool: torch.Tensor,
+        scratch: torch.Tensor,
+        block_ids: torch.Tensor,
+        row_status: torch.Tensor,
+    ) -> None:
+        for row in range(scratch.shape[0]):
+            if int(row_status[row]) == 0:
+                pool[int(block_ids[row])].copy_(scratch[row])
+
+    return getattr(torch.ops.txgharness, t._MASKED_SCATTER)
+
+
+def test_block_accesses_classify_the_masked_scatter_by_its_stored_rows():
+    """The masked page scatter op addresses the block IDs of its rows whose
+    status is 0, and nothing for rejected rows, which return before they
+    read a block ID; an op the reading does not list addresses the whole
+    view it takes."""
+    import torch
+    from support import txgcap_harness as t
+
+    op = _scatter_op()
+    pool = torch.zeros(6, 1, 1, 16, dtype=torch.uint8)
+    view = pool.view(6, 16)
+    scratch = torch.ones(3, 16, dtype=torch.uint8)
+    cases = (
+        ([0, 3, 4], [1, 0, 2], (3,)),
+        ([0, 0, 0], [1, 2, 4], ()),
+        ([5, 2, 1], [0, 0, 1], (2, 5)),
+    )
+    for ids, status, expected in cases:
+        with t.BlockAccesses(pool) as rec:
+            op(
+                view,
+                scratch,
+                torch.tensor(ids, dtype=torch.int64),
+                torch.tensor(status, dtype=torch.int32),
+            )
+        assert rec.accesses == [(t._MASKED_SCATTER, expected)], (ids, status, rec)
+    with t.BlockAccesses(pool) as rec:
+        view.sum()
+    assert rec.blocks() == set(range(6)), rec.accesses
+
+
+def test_block_accesses_charge_the_whole_view_for_values_they_cannot_read():
+    """Index values the reading cannot read (a CUDA stream capturing) are
+    taken from the same tensor's last reading, else the call is charged with
+    every block of its view."""
+    import torch
+    from support import txgcap_harness as t
+
+    pool = torch.zeros(4, 1, 1, 8, dtype=torch.uint8)
+    rec = t.BlockAccesses(pool)
+    index = torch.tensor([2])
+    assert rec._rows(pool.view(4, 8), index) == {2}
+    key = (index.device, index.data_ptr(), tuple(index.shape), index.dtype)
+    assert rec._read[key] == [2]
+    unread = t.BlockAccesses(pool)
+    unread._values = lambda index: None
+    assert unread._rows(pool.view(4, 8), index) == {0, 1, 2, 3}
+    assert unread._scattered(pool.view(4, 8), 1, index, index) == {0, 1, 2, 3}

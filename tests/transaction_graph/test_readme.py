@@ -112,6 +112,19 @@ def test_serve_command_runs_the_restricted_startup(section):
     assert "--no-async-scheduling" in argv, argv
 
 
+#: TXG-DOC-001's serve command and its verified ``N`` follow the tier 5 A40
+#: round on the target core (TXG-QUAL-028); until that round passes, the
+#: manual claims nothing for core's default sizing, so these checks fail.
+AWAITS_TIER_5 = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the manual gives core's default KV-cache sizing and the verified N "
+        "only after the tier 5 A40 round on the target core passes"
+    ),
+)
+
+
+@AWAITS_TIER_5
 # @spec TXG-DOC-001
 def test_serve_command_runs_cores_default_kv_cache_sizing(section):
     """The command sets no KV-cache sizing: core's default, the extensible KV
@@ -148,17 +161,77 @@ def test_serve_command_runs_the_hook_configuration(section):
     assert max(populations) <= admission_limit(argv)
 
 
+#: A sentence that names the target build, the core the plugin is pinned to.
+TARGET_BUILD = re.compile(r"(?i)\btarget (core|build)\b")
+#: A negated or absent verification ("No ... has been verified", "has not
+#: been verified", "unverified").
+NEGATED = re.compile(
+    r"(?i)\b(no|not|never|nor|none)\b[^.;:]*\bverified\b|\bunverified\b"
+)
+
+
+def verified_claims(section: str, *needles: str) -> list[str]:
+    """The sentences that claim, without negation, that the tier 5 run on
+    the A40 verified something on the target build, and name every needle."""
+    claims = []
+    for passage in passages(section):
+        for sentence in re.split(r"(?<=[.;])\s+", passage):
+            lowered = sentence.lower()
+            if (
+                all(n.lower() in lowered for n in ("A40", "tier 5", "verified"))
+                and all(
+                    re.search(rf"(?<![\d.]){re.escape(n)}(?!\d)", sentence)
+                    for n in needles
+                )
+                and TARGET_BUILD.search(sentence)
+                and not NEGATED.search(sentence)
+            ):
+                claims.append(sentence)
+    return claims
+
+
+@AWAITS_TIER_5
 # @spec TXG-DOC-001
 def test_serve_command_is_the_one_tier_5_verified(section):
     """The command's ``--max-num-seqs`` and ``N`` are the ones the tier 5 run
-    verified to fit the A40."""
+    verified to fit the A40 on the target build: one sentence that names the
+    target build makes the claim, and no negation ("No block count or ``N``
+    has been verified on the target core") counts."""
     section = section()
     argv = the_command(section)
     overrides = json.loads(flag(argv, "--hf-overrides"))
     n = str(max(overrides[KEY]))
     seqs = flag(argv, "--max-num-seqs")
-    assert find(section, "A40", "tier 5", n), "no passage ties N to the tier 5 A40 run"
-    assert find(section, "A40", seqs), "no passage ties --max-num-seqs to the A40 run"
+    assert verified_claims(section, n), (
+        "no sentence claims the tier 5 A40 run verified N on the target build"
+    )
+    assert verified_claims(section, seqs), (
+        "no sentence claims the tier 5 A40 run verified --max-num-seqs on the "
+        "target build"
+    )
+
+
+# @spec TXG-DOC-001
+def test_a_negated_or_other_build_claim_is_no_verified_claim():
+    """The check of the verified ``N`` takes no negated sentence and no claim
+    for another build as the target build's."""
+    negated = (
+        "No block count or `N` = 63 has been verified on the target core by tier 5 "
+        "on the A40."
+    )
+    other = (
+        "On the state-pool build, the tier 5 run on one A40 verified that `N` = 63 "
+        "and `--max-num-seqs 64` fit."
+    )
+    claim = (
+        "On the target core, the tier 5 run on one A40 verified that `N` = 63 and "
+        "`--max-num-seqs 64` fit at 80 ms and at 160 ms."
+    )
+    assert verified_claims(negated, "63") == []
+    assert verified_claims(other, "63") == []
+    assert verified_claims(claim, "63") == [claim]
+    assert verified_claims(claim, "64") == [claim]
+    assert verified_claims(claim, "6") == []
 
 
 # @spec TXG-DOC-002

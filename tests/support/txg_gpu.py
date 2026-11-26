@@ -50,9 +50,9 @@ import torch
 from support import model_harness as h
 from support import txg_api as api
 from support import txg_transaction as tx
-from support.txg_api import Sizing, sizing_settings
+from support.txg_api import Sizing
 from support.txg_fakes import RecordingSink
-from support.txgcap_harness import TxgCoreOrder, set_cache
+from support.txgcap_harness import TxgCoreOrder, kv_cache_sizing
 
 KEY = api.KEY
 
@@ -333,19 +333,6 @@ class GpuEnv:
                 final.bias[blank].copy_(original)
 
 
-def set_sizing(
-    vllm_config: Any,
-    sizing: str,
-    *,
-    blocks: int | None = None,
-    budget: int | None = None,
-) -> None:
-    """The KV-cache sizing ``sizing`` (``txg_api.Sizing``) on the built
-    configuration, without re-running its validators: the cache values of
-    ``txg_api.sizing_settings``."""
-    set_cache(vllm_config, **sizing_settings(sizing, blocks=blocks, budget=budget))
-
-
 def build_option_on(
     tmp_path: Path,
     *,
@@ -372,11 +359,13 @@ def build_option_on(
     ``capacity`` is the page count of every serving state pool the core
     order binds (the reservation capacity under the extensible KV cache);
     under :attr:`Sizing.BLOCK_COUNT` the override is ``blocks``, ``capacity``
-    unless given, set before the configuration is built so core's and the
-    plugin's configuration hooks see it; :attr:`Sizing.BUDGET` takes
-    ``budget``. ``startup`` runs ``core.startup(profiling=profile,
-    verify=verify)``: ``profile`` ``None`` runs the profiling capture exactly
-    when core's estimate runs under the sizing."""
+    unless given, and :attr:`Sizing.BUDGET` takes ``budget``. The sizing's
+    engine arguments are passed as the configuration is built
+    (``model_harness.build_vllm_config``), so core's and the plugin's
+    configuration hooks see it; the built configuration must select it.
+    ``startup`` runs ``core.startup(profiling=profile, verify=verify)``:
+    ``profile`` ``None`` runs the profiling capture exactly when core's
+    estimate runs under the sizing."""
     patches = monkeypatch or pytest.MonkeyPatch()
     events = h.Events()
     advance = h.AdvanceSpy(events).install(patches)
@@ -399,17 +388,18 @@ def build_option_on(
         },
         device="cuda",
         enforce_eager=False,
-        num_gpu_blocks_override=blocks if sizing == Sizing.BLOCK_COUNT else None,
+        sizing=sizing,
+        blocks=blocks if sizing == Sizing.BLOCK_COUNT else None,
+        budget=budget,
     )
+    built = kv_cache_sizing(vllm_config)
+    assert built == sizing, f"core resolved the KV-cache sizing {built!r}, not {sizing}"
     if max_num_active_seqs is not None:
         scheduler = vllm_config.scheduler_config
         try:
             scheduler.max_num_active_seqs = max_num_active_seqs
         except Exception:  # noqa: BLE001 - validated dataclass
             object.__setattr__(scheduler, "max_num_active_seqs", max_num_active_seqs)
-    # A fixed budget and a profiled budget are set on the built
-    # configuration: ``model_harness.build_vllm_config`` takes neither.
-    set_sizing(vllm_config, sizing, blocks=blocks, budget=budget)
     torch.manual_seed(0)
     model = h.build_model(vllm_config)
     state = h.build_model_state(vllm_config, model)

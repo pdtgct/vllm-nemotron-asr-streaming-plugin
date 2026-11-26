@@ -6,13 +6,14 @@ capture retains ``capture_cost`` bytes, the charged margin ``m +
 margin_rounding``, and each free-memory reading is logged, so the record's
 figures, the margin's retained charge from its two raw readings, the
 aggregate serving-over-profiling guard, the required-profiling decision and
-every failure message are checked against hand-computed values. The
-environment runs the restricted startup under a fixed
+every failure message are checked against hand-computed values. Each test
+names its KV-cache sizing under the restricted startup: a fixed
 ``--num-gpu-blocks-override`` (``support.txgcap_harness.CAPACITY``) with
-core's estimate enabled, the HLD's choice for the checks that need the
-estimate, unless a test names another KV-cache sizing: core's default, the
-extensible KV cache (measured after the captures), a profiled budget, or a
-fixed ``kv_cache_memory_bytes``. ``gpu`` tests read the real allocator.
+core's estimate enabled where its subject includes the estimate or the
+profiling capture (the HLD's choice for the checks that need the
+estimate), core's default, the extensible KV cache (measured after the
+captures), a profiled budget, or a fixed ``kv_cache_memory_bytes``.
+``gpu`` tests read the real allocator.
 """
 
 from __future__ import annotations
@@ -36,19 +37,16 @@ GEOMETRY_LABEL = re.compile(r"80\s*ms|geometry\s*(index\s*)?0\b", re.IGNORECASE)
 ALLOC_CONF = "expandable_segments:True"
 
 
+#: The KV-cache sizing of a test whose subject includes core's graph-memory
+#: estimate or its profiling capture (module docstring).
+ESTIMATE = {"sizing": Sizing.BLOCK_COUNT}
+
+
 @pytest.fixture
 def on_cpu(on_cpu, monkeypatch):
-    """The shared ``on_cpu`` under a stated allocator configuration, and a
-    fixed block count unless the test names a sizing or a budget (module
-    docstring)."""
+    """The shared ``on_cpu`` under a stated allocator configuration."""
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", ALLOC_CONF)
-
-    def build(**kwargs):
-        if "sizing" not in kwargs and not kwargs.get("kv_cache_memory_bytes"):
-            kwargs["sizing"] = Sizing.BLOCK_COUNT
-        return on_cpu(**kwargs)
-
-    return build
+    return on_cpu
 
 
 def profiled(run, *, capture_cost=MiB, rounding=0):
@@ -69,7 +67,7 @@ def profiled(run, *, capture_cost=MiB, rounding=0):
 
 # @spec TXG-MEM-001
 def test_every_reading_follows_a_synchronize_and_a_cache_release(on_cpu):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     core.prepare()
     core.bind_profiling()
@@ -105,7 +103,7 @@ def test_transaction_graph_module_has_no_measurement_of_its_own():
 @pytest.mark.parametrize("capture", [Record.PROFILING, Record.SERVING])
 # @spec TXG-MEM-002
 def test_record_holds_call_transaction_kind_cell_and_peak_figures(on_cpu, capture):
-    run = on_cpu(n=3, max_num_seqs=3)
+    run = on_cpu(n=3, max_num_seqs=3, **ESTIMATE)
     env, core = profiled(run, capture_cost=2 * MiB, rounding=MiB)
     if capture == Record.SERVING:
         core.serving_capture()
@@ -125,7 +123,7 @@ def test_record_holds_call_transaction_kind_cell_and_peak_figures(on_cpu, captur
 
 # @spec TXG-MEM-002
 def test_transient_peak_resets_at_the_call_start(on_cpu):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = profiled(run)
     mark = len(env.events)
     core.serving_capture()
@@ -146,7 +144,7 @@ def test_transient_peak_resets_at_the_call_start(on_cpu):
 # @spec TXG-MEM-003
 def test_record_holds_allocator_settings_and_versions(on_cpu, monkeypatch):
     monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = profiled(run)
     core.serving_capture()
     rec = t.record(env)
@@ -164,7 +162,7 @@ def test_record_holds_allocator_settings_and_versions(on_cpu, monkeypatch):
 @pytest.mark.parametrize("n", [1, 3])
 # @spec TXG-MEM-004
 def test_profiling_capture_ends_with_one_flat_margin_and_its_raw_charge(on_cpu, n):
-    run = on_cpu(n=n, max_num_seqs=3)
+    run = on_cpu(n=n, max_num_seqs=3, **ESTIMATE)
     env, core = run.env, run.core
     env.fake.jitter = 4096  # every reading is a distinct value
     env.fake.margin_rounding = 2 * MiB
@@ -188,7 +186,7 @@ def test_profiling_capture_ends_with_one_flat_margin_and_its_raw_charge(on_cpu, 
 
 # @spec TXG-MEM-005
 def test_serving_over_profiling_fails_startup_with_both_totals(on_cpu):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = profiled(run, capture_cost=MiB, rounding=MiB)
     profiling = t.record(env)[Record.PROFILING][Record.CALL_TOTAL]
     env.fake.capture_cost = MiB + MARGIN_BYTES // 4 + MiB
@@ -207,7 +205,7 @@ def test_serving_over_profiling_fails_startup_with_both_totals(on_cpu):
 def test_serving_within_profiling_passes_and_no_guard_without_a_profiling_capture(
     on_cpu,
 ):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = profiled(run, rounding=MiB)
     core.serving_capture()  # equal cells: serving ≤ profiling − nothing
     fixed = on_cpu(n=2, kv_cache_memory_bytes=1 << 30)
@@ -219,7 +217,7 @@ def test_serving_within_profiling_passes_and_no_guard_without_a_profiling_captur
 
 # @spec TXG-MEM-006
 def test_record_keeps_profiling_figures_and_absorbed_rounding(on_cpu):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     env.fake.margin_rounding = 3 * MiB
     core.prepare()
@@ -317,7 +315,7 @@ def test_the_record_holds_each_capture_layouts_page_count_and_the_final_count(
 
 # @spec TXG-MEM-007, TXG-MEM-008
 def test_a_startup_plan_budget_is_an_expected_absence(on_cpu, caplog):
-    run = on_cpu(n=2, kv_cache_memory_bytes=None)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     budget = 7 << 30
     core.prepare()
@@ -457,7 +455,7 @@ def test_an_extensible_cache_disabled_after_construction_requires_profiling(on_c
 def test_the_estimate_setting_decides_the_requirement(
     on_cpu, monkeypatch, caplog, estimate
 ):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = run.env, run.core
     t.set_estimate(monkeypatch, estimate)
     core.prepare()
@@ -501,7 +499,7 @@ def test_the_estimate_setting_decides_the_requirement(
 
 # @spec TXG-MEM-007
 def test_a_profiled_startup_records_the_requirement_and_its_values(on_cpu):
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     env, core = profiled(run)
     core.serving_capture()
     rec = t.record(env)
@@ -568,7 +566,7 @@ def test_a_transaction_graph_part_failure_names_its_phase_and_figures(
 ):
     if phase == "margin allocation" and capture == "serving":
         pytest.skip("the serving capture allocates no margin")
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     error, peak = _failure(run, capture=capture, phase=phase)
     assert any("injected fault" in str(e) for e in t.chain(error)[1:]), (
         "the error is not chained from the original"
@@ -628,7 +626,7 @@ def assert_profiling_remedies(message):
 def test_profiling_failure_remedies(on_cpu):
     """A profiling capture that fails after pool access gives TXG-MEM-011's
     remedies, and none of TXG-MEM-017's larger budget or block count."""
-    error, _ = _failure(on_cpu(n=2), capture="profiling", phase="capture")
+    error, _ = _failure(on_cpu(n=2, **ESTIMATE), capture="profiling", phase="capture")
     message = str(error)
     assert t.OPTION in message
     assert_profiling_remedies(message)
@@ -644,7 +642,7 @@ def test_serving_failure_under_a_fixed_block_count_remedies(on_cpu):
     pages leave too little memory for the transient peak; no
     ``--gpu-memory-utilization`` (the budget is not profiled) and no
     ``--kv-cache-memory-bytes`` remedy (TXG-MEM-013's case)."""
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, **ESTIMATE)
     error, _ = _failure(run, capture="serving", phase="capture")
     message = str(error)
     assert t.OPTION in message

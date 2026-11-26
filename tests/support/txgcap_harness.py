@@ -1431,6 +1431,12 @@ _INDEXED = {
     "scatter_": (0, 1),
     "scatter": (0, 1),
 }
+#: The plugin's masked page scatter, a custom op on CUDA
+#: (``torch.ops.vllm``, ``state_scatter``): for each row whose status is 0
+#: it stores that row's page at the row's block ID; a row with any other
+#: status returns before it reads its block ID or the pool. Its arguments are
+#: ``(pool, scratch, block_ids, row_status)``.
+_MASKED_SCATTER = "nemotron_asr_masked_page_scatter_"
 
 
 def _tensors(value: Any) -> list[torch.Tensor]:
@@ -1454,10 +1460,19 @@ class BlockAccesses(torch.overrides.TorchFunctionMode):
     views, slices of either) shares its storage. A call that creates a view
     or reads metadata addresses nothing; a call that indexes a pool view
     along its first dimension by an index tensor addresses the blocks of the
-    rows it names; any other call that takes a pool view (a copy, a
-    comparison, an elementwise operation, a reduction) addresses every block
-    the view spans. ``accesses`` lists ``(call name, sorted blocks)``; it
-    holds no tensor.
+    rows it names; the plugin's masked page scatter op addresses the block
+    IDs of its rows whose status is 0, the rows it stores; any other call
+    that takes a pool view (a copy, a comparison, an elementwise operation,
+    a reduction) addresses every block the view spans. ``accesses`` lists
+    ``(call name, sorted blocks)``; it holds no tensor.
+
+    Only torch calls are recorded: a CUDA graph's replay
+    (``CUDAGraph.replay``) and a Triton kernel launched directly, not
+    through a torch op, address pages unrecorded. While a CUDA stream
+    captures, an index or status tensor on the device cannot be read without
+    ending the capture: the reading then takes the values it last read from
+    the same tensor (the capture's own warm-ups), or, with none, charges the
+    whole view.
     """
 
     def __init__(self, pool: torch.Tensor) -> None:
@@ -1467,6 +1482,9 @@ class BlockAccesses(torch.overrides.TorchFunctionMode):
         self._page = int(pool.stride(0)) * pool.element_size()
         self._blocks = int(pool.shape[0])
         self.accesses: list[tuple[str, tuple[int, ...]]] = []
+        #: The values last read from each index or status tensor, by its
+        #: device, address, shape and dtype.
+        self._read: dict[tuple[Any, ...], list[int]] = {}
 
     def _aliases(self, tensor: torch.Tensor) -> bool:
         try:
@@ -1490,20 +1508,51 @@ class BlockAccesses(torch.overrides.TorchFunctionMode):
             )
         )
 
-    def _rows(self, tensor: torch.Tensor, index: Any) -> set[int]:
-        """The blocks of the rows ``index`` names along the view's first
-        dimension."""
-        values = torch.as_tensor(index).reshape(-1)
+    def _values(self, index: Any) -> list[int] | None:
+        """The row indices ``index`` holds (a boolean mask's true
+        positions), or, while a CUDA stream captures, the values last read
+        from the same device tensor (``None`` when there are none)."""
+        if isinstance(index, torch.Tensor):
+            key = (index.device, index.data_ptr(), tuple(index.shape), index.dtype)
+            if index.is_cuda and torch.cuda.is_current_stream_capturing():
+                return self._read.get(key)
+            values = index.reshape(-1)
+        else:
+            key, values = None, torch.as_tensor(index).reshape(-1)
         if values.dtype == torch.bool:
             values = values.nonzero().reshape(-1)
+        out = [int(v) for v in values.tolist()]
+        if key is not None:
+            self._read[key] = out
+        return out
+
+    def _rows(self, tensor: torch.Tensor, index: Any) -> set[int]:
+        """The blocks of the rows ``index`` names along the view's first
+        dimension (every block the view spans when the values cannot be
+        read)."""
+        values = self._values(index)
+        if values is None:
+            return self._span(tensor)
         rows = tensor[0] if tensor.dim() > 1 else tensor[:1]
         first = tensor.data_ptr() - self._base
         step = int(tensor.stride(0)) * tensor.element_size()
         blocks: set[int] = set()
-        for value in {int(v) for v in values.tolist()}:
+        for value in set(values):
             value = value + tensor.shape[0] if value < 0 else value
             blocks |= self._span(rows, start=first + value * step)
         return blocks
+
+    def _scattered(
+        self, pool: torch.Tensor, rows: int, block_ids: Any, status: Any
+    ) -> set[int]:
+        """The blocks the masked page scatter stores over its ``rows`` rows:
+        the block IDs of the rows whose status is 0 (every block the pool
+        view spans when the arguments cannot be read)."""
+        ids, statuses = self._values(block_ids), self._values(status)
+        if ids is None or statuses is None:
+            return self._span(pool)
+        stored = [i for i, s in zip(ids[:rows], statuses[:rows]) if s == 0]
+        return self._rows(pool, stored) if stored else set()
 
     def _key_rows(self, tensor: torch.Tensor, key: Any) -> set[int] | None:
         """The rows an indexing key names by an index tensor in the first
@@ -1523,6 +1572,19 @@ class BlockAccesses(torch.overrides.TorchFunctionMode):
             return result
         pooled = [t for t in _tensors((args, kwargs)) if self._aliases(t)]
         if not pooled:
+            return result
+        if (
+            name.split(".")[0] == _MASKED_SCATTER
+            and len(args) >= 4
+            and isinstance(args[0], torch.Tensor)
+            and self._aliases(args[0])
+        ):
+            pool, scratch, block_ids, status = args[:4]
+            blocks = self._scattered(pool, int(scratch.shape[0]), block_ids, status)
+            for tensor in pooled:
+                if tensor is not pool:
+                    blocks |= self._span(tensor)
+            self.accesses.append((name, tuple(sorted(blocks))))
             return result
         if (
             name not in _IN_PLACE
