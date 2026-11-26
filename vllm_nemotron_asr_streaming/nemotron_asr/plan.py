@@ -33,12 +33,15 @@ provisional until the transaction's status is consumed at the normal
 scheduling boundary: a failed row clears the proposal and preserves
 the prior admitted prompt, while a clean row publishes it.
 
-Torch + stdlib only (CPU tensors): the whole module runs under the
-macOS loader chain and is differentially tested locally.
+Torch + stdlib only at import (CPU tensors): the whole module runs under
+the macOS loader chain and is differentially tested locally. The item rule
+(``encoder_item_fault``) reads core's batched field class from the
+processor's field configuration when it is first called.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field, fields
@@ -160,8 +163,9 @@ def resolve_row_envelope_header(
     prompt and items cause raise :class:`RequestRowFault`: a non-CHUNK row
     that a feature overlaps; a CHUNK row that no feature, or more than one,
     overlaps; an overlapping feature that is not audio, carries no kwargs
-    payload or no envelope payload; an envelope smaller than its header or
-    wider than the carrier row (``carrier_width``, the model's
+    payload or no envelope payload; an item not shaped as the processor
+    builds it (:func:`encoder_item_fault`); an envelope smaller than its
+    header or wider than the carrier row (``carrier_width``, the model's
     ``hidden_size``). Those only core's scheduling or multimodal delivery can
     produce raise a plain ``ValueError``: a feature without position metadata
     or of non-positive length; a non-CHUNK row with a scheduled encoder input;
@@ -226,53 +230,104 @@ def resolve_row_envelope_header(
 def _envelope_payload(
     feature: object, *, carrier_width: int
 ) -> tuple[str | None, torch.Tensor | None]:
-    """The overlapping feature's flat envelope, or the request-caused fault
-    that leaves it without one (REG-STATE-015)."""
+    """The overlapping feature's envelope, or the request-caused fault that
+    leaves it without one (REG-STATE-015): a CHUNK row's feature carries a
+    stream unit's item that the item rule (:func:`encoder_item_fault`)
+    takes."""
+    fault = encoder_item_fault(feature, carrier_width=carrier_width)
+    if fault is not None:
+        return f"CHUNK row {fault}", None
+    item = feature.data
+    if frozenset(item.keys()) != frozenset(STREAM_ITEM_FIELDS):
+        return "CHUNK row audio feature has no envelope payload", None
+    return None, item["audio"].data
+
+
+#: The item of each kind of audio feature as the model's processor builds it
+#: (FILE-PROMPT-003; a stream unit's envelope row, SESS-PACK-001): each field
+#: name with its tensor's dtype. Each field is batched
+#: (``MultiModalFieldConfig.batched``) and holds a one-dimensional tensor; a
+#: complete file's fields are kept on the host.
+STREAM_ITEM_FIELDS = {"audio": torch.float32}
+FILE_ITEM_FIELDS = {"samples": torch.float32, "file_header": torch.int64}
+
+#: The values of a complete file's ``file_header``: geometry index, locale row
+#: and sample count.
+FILE_HEADER_VALUES = 3
+
+
+@functools.cache
+def _batched_field_class() -> type:
+    """The class of a field the processor declares batched: the only field
+    class of an item the item rule takes."""
+    from vllm.multimodal.inputs import MultiModalFieldConfig
+
+    return type(MultiModalFieldConfig.batched("audio").field)
+
+
+# @spec REG-STATE-015, FILE-PROMPT-003
+def encoder_item_fault(feature: object, *, carrier_width: int) -> str | None:
+    """Why core's encoder path or the model's encoder (``embed_multimodal``)
+    would refuse this feature's own item, or ``None`` when they take it.
+
+    They take only an audio item shaped as the model's processor builds it:
+    exactly the fields of :data:`STREAM_ITEM_FIELDS` or of
+    :data:`FILE_ITEM_FIELDS`, each a batched field holding a dense
+    one-dimensional tensor of that field's dtype, a file's fields kept on the
+    host, a file header of :data:`FILE_HEADER_VALUES` values and an envelope
+    whose width fits the carrier row. Core's msgpack decoder rebuilds each
+    field's class from the factory name the sender gives and each tensor
+    with the dtype it was sent with, so a direct engine client can send any
+    other shape; core batches consecutive items with the same fields and
+    field classes and stacks same-shape tensors into the first one's dtype,
+    so another shape raises for the whole step or changes a neighbour's
+    input. The checks read only the item's metadata, never its values.
+
+    The faults are the item's content, so every request whose feature has
+    the same encoder-cache identifier has them too; a fault of a row's
+    prompt structure is not one of them."""
     modality = getattr(feature, "modality", None)
     if modality != "audio":
-        return f"CHUNK row feature must be audio, got {modality!r}", None
+        return f"feature must be audio, got {modality!r}"
     item = getattr(feature, "data", None)
     if item is None:
-        return "CHUNK row envelope has no kwargs payload", None
+        return "audio feature has no kwargs payload"
     try:
-        payload = item["audio"].data
-    except (KeyError, TypeError, AttributeError):
-        return "CHUNK row audio feature has no envelope payload", None
-    try:
-        envelope = (
-            payload if isinstance(payload, torch.Tensor) else torch.as_tensor(payload)
-        ).reshape(-1)
-    except (TypeError, ValueError, RuntimeError):
-        return "CHUNK row audio feature has no envelope payload", None
-    width = envelope_width_fault(int(envelope.shape[0]), carrier_width=carrier_width)
-    if width is not None:
-        return f"CHUNK row {width}", None
-    return None, envelope
-
-
-#: The fields of a complete-file item (``samples`` and ``file_header``): the
-#: model's encoder takes an item that carries either as a file placeholder.
-FILE_ITEM_FIELDS = ("samples", "file_header")
-
-
-# @spec REG-STATE-015
-def encoder_item_fault(feature: object, *, carrier_width: int) -> str | None:
-    """Why the model's encoder (``embed_multimodal``) would refuse this
-    feature's own item, or ``None`` when it takes it: a complete-file item
-    (a field of :data:`FILE_ITEM_FIELDS`), or a stream envelope whose
-    modality is audio and whose width fits the carrier row. The faults are
-    the item's content (its modality, its payload, its envelope's width), so
-    every request whose feature has the same encoder-cache identifier has
-    them too; a fault of a row's prompt structure is not one of them."""
-    item = getattr(feature, "data", None)
-    if getattr(feature, "modality", None) == "audio" and item is not None:
-        try:
-            if any(name in item for name in FILE_ITEM_FIELDS):
-                return None
-        except TypeError:
-            return "audio feature has no kwargs payload"
-    fault, _ = _envelope_payload(feature, carrier_width=carrier_width)
-    return fault
+        names = frozenset(item.keys())
+    except (AttributeError, TypeError):
+        return "audio feature has no kwargs payload"
+    if names == frozenset(STREAM_ITEM_FIELDS):
+        kind = STREAM_ITEM_FIELDS
+    elif names == frozenset(FILE_ITEM_FIELDS):
+        kind = FILE_ITEM_FIELDS
+    else:
+        return (
+            f"audio item has fields {sorted(map(str, names))}, neither a stream "
+            f"unit's {sorted(STREAM_ITEM_FIELDS)} nor a file's "
+            f"{sorted(FILE_ITEM_FIELDS)}"
+        )
+    for name, dtype in kind.items():
+        elem = item[name]
+        elem_field = getattr(elem, "field", None)
+        payload = getattr(elem, "data", None)
+        if type(elem_field) is not _batched_field_class():
+            return f"audio item field {name!r} is not a batched field"
+        if kind is FILE_ITEM_FIELDS and not elem_field.keep_on_cpu:
+            return f"file item field {name!r} is not kept on the host"
+        if not isinstance(payload, torch.Tensor) or payload.layout != torch.strided:
+            return f"audio item field {name!r} is not a dense tensor"
+        if payload.dtype != dtype:
+            return f"audio item field {name!r} is {payload.dtype}, not {dtype}"
+        if payload.dim() != 1:
+            return f"audio item field {name!r} has {payload.dim()} dimensions, not 1"
+    if kind is FILE_ITEM_FIELDS:
+        values = int(item["file_header"].data.shape[0])
+        if values != FILE_HEADER_VALUES:
+            return f"file header holds {values} values, not {FILE_HEADER_VALUES}"
+        return None
+    return envelope_width_fault(
+        int(item["audio"].data.shape[0]), carrier_width=carrier_width
+    )
 
 
 # @spec REG-STATE-015

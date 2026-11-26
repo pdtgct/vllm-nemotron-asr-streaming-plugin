@@ -813,6 +813,7 @@ fall in both classes (REG-STATE-015):
 | a CHUNK row that no feature, or more than one, overlaps | fail the request | the request's prompt and items disagree on where the units are |
 | an overlapping feature whose modality is not audio | fail the request | the request sent another modality |
 | an overlapping feature with no kwargs payload or no envelope payload | fail the request | the request's item carries no envelope |
+| an overlapping feature whose item is not shaped as the processor builds it | fail the request | the request chooses each field's class and each tensor's dtype (Item shape, below) |
 | an envelope smaller than its header | fail the request | the request's item is truncated |
 | an envelope wider than the carrier row (`hidden_size`) | fail the request | the request's item is oversized |
 | a feature without position metadata | raise | core's multimodal processing places every feature it delivers |
@@ -828,14 +829,32 @@ caused it.
 The model state screens a step's rows in `prepare_inputs_embeds`, before it runs core's encoder
 (`execute_mm_encoder`) and gather (`gather_mm_embeddings`), so core never meets a request's fault:
 a row that fails at planning, a file whose item `add_request` could not take included, is left out
-of the gather. An encoder input is dropped only when its own item is one the model's encoder
-refuses (its modality, its payload, or an envelope smaller than its header or wider than the
+of the gather. An encoder input is dropped only when its own item is one the encoder path
+refuses (its modality, its shape, or an envelope smaller than its header or wider than the
 carrier row); every other input runs, a failed row's included. `add_request` refuses a file's item
 by the same rule (`encoder_item_fault` in `nemotron_asr/plan.py`), so a file row whose input is
 dropped fails too and file and stream rows cannot disagree about an item. Core's scheduler encodes
 an item once and treats its identifier as cached for every request whose feature shares it, in the
 same step or a later one, so a row failed for its prompt's structure must still run its valid
-items; an item the encoder refuses fails every request that carries it.
+items; an item the encoder path refuses fails every request that carries it.
+
+**Item shape.** Core's msgpack decoder rebuilds each field of an item from the factory name the
+sender gives and each tensor with the dtype it was sent with, so a direct engine client chooses
+both. Core's encoder path batches consecutive items with the same fields and field classes and
+stacks same-shape tensors into the first one's dtype, and `embed_multimodal` counts a file item's
+rows by its headers and reads a stream batch envelope by envelope. The encoder path therefore
+takes only an item shaped as the model's processor builds it (FILE-PROMPT-003; a stream unit's
+row, the `session` design's SESS-PACK-001): an audio item whose fields are exactly `audio`, or
+exactly `samples` and `file_header`; each a batched field holding a dense one-dimensional tensor;
+`audio` and `samples` `float32` and `file_header` three `int64` values; a file's fields kept on
+the host. Any other item fails its request (REG-STATE-015). Another field class makes
+`embed_multimodal` read a header's values or an envelope's samples as items, so it or core's
+output check raises. Another dtype makes core's stacking raise (an integer tensor stacked first),
+round a neighbour's envelope (a `float16` envelope stacked first, which also fails that
+neighbour), or break the header conversion (a complex envelope). A file field not kept on the host
+lets core's batching copy every file of its batch to the device. The rule reads only an item's
+metadata, never its values, so an envelope payload that is not host-resident remains core's
+contract fault.
 
 **Exceptions.** Core ends the engine when a model-state method or the forward raises, so every
 raise is worker-fatal and no later step of the worker runs. `postprocess_state` records a step's
@@ -1115,6 +1134,7 @@ adding it here and to the import-time check.
 | Rows that schedule more than one token | Fail the row's request alone at planning (REG-STATE-014), through the planning-failed set and `take_failed_requests`; the step's other rows run at their own token positions | Sample the row's last token and drop the others; run the row's tokens in order as several stream units, as vLLM's and SGLang's Mamba prefill scan a multi-token row from the request's state | Each token of this model's stream is one unit of audio, and the design keeps per-step work and per-request state constant: one unit per request per step, so a step's cost does not depend on what one client sends. A multi-token row would let one request's work grow within a step. Sampling the last token and dropping the rest discards audio and returns a wrong transcript with no error. Running the tokens as several units costs `k` dependent encoder and decoder passes for a `k`-unit row, which every co-batched row waits for; it needs the intermediate units' labels to pass through the model's own output queue, since core samples one position per row; and the transaction-graph cells and their per-unit checks (TXG-TXN-010, TXG-EXEC-007) would address units, not rows. Plugin-packed input never schedules a multi-token row. A consumer that needs multi-token input uses a design that re-prefills or scans history, such as Mamba prefill or bounded sessions. Running the tokens as several units is Future roadmap 14 |
 | State-layer view lifetime | Views held by reference in a cache keyed on the bound `kv_cache` object, dropped at a binding, at an identity mismatch and in `clear_cudagraphs` (State-slot access, View lifetime) | Derive the views on every read; hold weak references to the bound tensors; keep the views as plain attributes replaced at each binding | Deriving on every read needs no hook but costs about 2.7 µs per read, and weak references about 3.8 µs, against about 0.02 µs for the identity comparison (CPU measurements). Plain attributes hold the profiling KV cache until the serving binding, after core has allocated the serving KV cache |
 | Envelope-header faults | Each fault in one of REG-STATE-015's two classes, by whether a request's input can cause it (Model-state interface, Error boundary) | Raise for every envelope fault; fail the request for every one | Core lets a direct engine client bypass the processor, so a malformed item reaches planning, and a raise would end every stream on the server. A fault that no request input can cause means core and the model disagree about the step, which no per-request outcome makes safe |
+| Item shape | Accept only the item the processor builds (fields, field class, dtype, rank, a file's host placement), by one rule shared by file intake, encoder-input screening and envelope resolution (Model-state interface, Item shape) | Refuse each fault as it is found; accept any real floating-point envelope | Core's decoder lets a client choose each field's class and each tensor's dtype, so a list of found faults leaves every shape not yet found free to end the server. Core stacks a batch into its first tensor's dtype before the model's own cast, so a lower-precision envelope rounds or fails its neighbours |
 | Retirement of a finished request | A file request within `remove_request`; a stream request at the next model-state call | Every request at the next model-state call; every request within `remove_request` | A file is one request that core never continues, so nothing after its removal reads its buffer, and a deferred retirement would keep the last file's buffer (64,000 bytes per second of audio) on an idle engine. A stream's `remove_request` may precede its next turn's `add_request`, which keeps the admission generation, so retiring it at once would lose the generation a continuing turn needs; the deferred stream record holds no host buffer |
 | Settings core refuses before the configuration hook | Core's message, which names one setting (Engine settings, Core's checks first); the plugin keeps its own rules for them | Ask core to defer its check to the hook; drop the plugin's rules for those settings | Core's check runs while it builds the engine configuration, before the hook, and its message names the setting to remove, which is the remedy. The plugin's rules still list every failed check when the hook is called directly, and keep the plugin's refusals independent of core's list |
 | `generate` task | Not advertised (model-state override) | Advertise for compatibility | The model emits transcript labels, not text generation |

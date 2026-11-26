@@ -506,9 +506,10 @@ class NemotronASRModelState(ModelState):
         A malformed item (the processor refuses these at input processing,
         so only a direct engine client can send one) fails that row alone
         through the transaction's row-failure path; it never raises out of
-        the step. An item the model's encoder refuses (``encoder_item_fault``,
-        the rule screening drops encoder inputs by) is malformed, so a file
-        row whose input screening drops also leaves core's gather.
+        the step. An item the encoder path refuses (``encoder_item_fault``,
+        the rule screening drops encoder inputs by: an item not shaped as the
+        processor builds it among them) is malformed, so a file row whose
+        input screening drops also leaves core's gather.
         """
         req_id = request.req_id
         try:
@@ -937,14 +938,15 @@ class NemotronASRModelState(ModelState):
         carrier_width: int,
     ) -> dict[str, list[int]]:
         """The scheduled encoder inputs core's encoder may run: each input
-        whose own item the model's encoder takes (``encoder_item_fault``).
-        An input whose item it refuses (its modality, its payload, an
-        envelope smaller than its header or wider than the carrier) is
-        dropped; its row fails at planning, and a request whose feature has
-        the same identifier has the same item and fails too. A row that fails
-        for its prompt's structure keeps its valid inputs, which another
-        request sharing their identifier gathers, in this step or a later one.
-        An input that names no feature of its request is core's to refuse."""
+        whose own item the encoder path takes (``encoder_item_fault``).
+        An input whose item it refuses (its modality, an item not shaped as
+        the processor builds it, an envelope smaller than its header or wider
+        than the carrier) is dropped; its row fails at planning, and a
+        request whose feature has the same identifier has the same item and
+        fails too. A row that fails for its prompt's structure keeps its valid
+        inputs, which another request sharing their identifier gathers, in
+        this step or a later one. An input that names no feature of its
+        request is core's to refuse."""
         runnable: dict[str, list[int]] = {}
         for req_id, inputs in scheduled_encoder_inputs.items():
             record = self._requests.get(req_id)

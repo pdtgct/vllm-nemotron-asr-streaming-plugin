@@ -1727,6 +1727,212 @@ def test_a_file_item_the_encoder_refuses_fails_that_file_request_alone(build, be
     assert statuses.get(good.req_id) == 0
 
 
+def _with_item(request, item):
+    """``request`` whose one feature carries the kwargs item ``item``."""
+    (feature,) = request.mm_features
+    return dataclasses.replace(
+        request, mm_features=[dataclasses.replace(feature, data=item)]
+    )
+
+
+def _field(kind: str, size: int, *, keep_on_cpu: bool = True):
+    """A field of class ``kind`` (``batched``, ``flat`` or ``shared``) over a
+    one-item payload of ``size`` values: core's msgpack decoder rebuilds the
+    field class a direct engine client names (``serial_utils``)."""
+    from vllm.multimodal.inputs import (
+        MultiModalBatchedField,
+        MultiModalFlatField,
+        MultiModalSharedField,
+    )
+
+    if kind == "flat":
+        return MultiModalFlatField(slices=[slice(0, size)], keep_on_cpu=keep_on_cpu)
+    if kind == "shared":
+        return MultiModalSharedField(batch_size=1, keep_on_cpu=keep_on_cpu)
+    return MultiModalBatchedField(keep_on_cpu=keep_on_cpu)
+
+
+def _with_field(request, name: str, change):
+    """``request`` whose item has its field ``name`` rebuilt by ``change``, a
+    function of the field's payload and field that returns the new ones, as
+    a direct engine client can send it: core's decoder keeps each tensor's
+    dtype and shape as sent."""
+    from vllm.multimodal.inputs import MultiModalFieldElem, MultiModalKwargsItem
+
+    (feature,) = request.mm_features
+    item = dict(feature.data)
+    item[name] = MultiModalFieldElem(*change(item[name].data, item[name].field))
+    return _with_item(request, MultiModalKwargsItem(item))
+
+
+#: Items not shaped as the model's processor builds them (REG-STATE-015,
+#: FILE-PROMPT-003): name -> (the kind of request that carries it, the field
+#: changed, the change). Each was accepted by the item rule: core's encoder
+#: path or the plugin's header conversion raised for the whole step, the
+#: stacked batch failed a healthy neighbour (a ``float16`` envelope stacked
+#: first rounds every envelope of its group to ``float16``), or the item ran
+#: as if well formed.
+_UNSHAPED_ITEMS = {
+    "envelope in a flat field": (
+        "stream",
+        "audio",
+        lambda data, field: (data, _field("flat", data.shape[0])),
+    ),
+    "envelope in a shared field": (
+        "stream",
+        "audio",
+        lambda data, field: (data, _field("shared", data.shape[0])),
+    ),
+    "int64 envelope": (
+        "stream",
+        "audio",
+        lambda data, field: (data.round().to(torch.int64), field),
+    ),
+    "float16 envelope": (
+        "stream",
+        "audio",
+        lambda data, field: (data.to(torch.float16), field),
+    ),
+    "complex envelope": (
+        "stream",
+        "audio",
+        lambda data, field: (data.to(torch.complex64), field),
+    ),
+    "two-dimensional envelope": (
+        "stream",
+        "audio",
+        lambda data, field: (data.unsqueeze(0), field),
+    ),
+    "file header in a flat field": (
+        "file",
+        "file_header",
+        lambda data, field: (data, _field("flat", 3)),
+    ),
+    "file header in a shared field": (
+        "file",
+        "file_header",
+        lambda data, field: (data, _field("shared", 3)),
+    ),
+    "float32 file header": (
+        "file",
+        "file_header",
+        lambda data, field: (data.to(torch.float32), field),
+    ),
+    "samples not kept on the host": (
+        "file",
+        "samples",
+        lambda data, field: (data, _field("batched", 0, keep_on_cpu=False)),
+    ),
+}
+
+
+@pytest.mark.parametrize("order", ["bad first", "bad last", "alone"])
+@pytest.mark.parametrize("case", list(_UNSHAPED_ITEMS))
+# @spec REG-STATE-015, FILE-PROMPT-003
+def test_an_item_not_shaped_as_the_processor_builds_it_fails_alone(build, case, order):
+    """Core's msgpack decoder rebuilds each field's class from the factory
+    name the sender gives and each tensor with the dtype it was sent with, so
+    a direct engine client can send an item the model's processor never
+    builds. Core's encoder path batches consecutive items with the same
+    fields and field classes, stacking same-shape tensors into the first
+    one's dtype, so the bad item sits next to a healthy item of its kind
+    (first or last; or alone in its step) beside a healthy stream and a
+    healthy file, each with its own identifier. The step does not raise, the
+    bad request alone fails through ``take_failed_requests``, the healthy
+    requests commit, and the healthy stream's encoder output is its own
+    envelope's encoding."""
+    env = build(max_num_seqs=3)
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    kind, name, change = _UNSHAPED_ITEMS[case]
+    template = stream(env, "bad") if kind == "stream" else file(env, "bad")
+    bad = _with_field(template, name, change)
+    healthy_stream, healthy_file = stream(env, "s1"), file(env, "f1")
+    same, other = (
+        (healthy_stream, healthy_file)
+        if kind == "stream"
+        else (healthy_file, healthy_stream)
+    )
+    rows = {
+        "bad first": (bad, same, other),
+        "bad last": (other, same, bad),
+        "alone": (bad,),
+    }[order]
+    assert len({r.mm_features[0].identifier for r in rows}) == len(rows)
+    output = h.scheduler_output(
+        new=rows,
+        handles={"bad": 3, "s1": 1, "f1": 2},
+        encoder_inputs={r.req_id: [0] for r in rows},
+    )
+    error = h.call_with(env.runner.real_step, output)
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [{"bad"}]
+    if order == "alone":
+        return
+    statuses, _ = env.runner.commit_log[-1]
+    assert statuses.get("s1") == 0 and statuses.get("f1") == 0, statuses
+    (feature,) = healthy_stream.mm_features
+    (own,) = env.model.embed_multimodal(audio=[feature.data["audio"].data])
+    cached = env.state.encoder_cache.encoder_outputs[feature.identifier]
+    assert torch.equal(cached, own), "a neighbour's item changed s1's encoder input"
+
+
+def _processor_item(env, *, envelope=None, samples=None):
+    """The item the model's processor builds for a stream unit's envelope
+    (``envelope``, as the session packer builds it) or a complete file's
+    ``samples`` at the server's geometry, delivered as core delivers it to the
+    engine core: through core's msgpack encoder and decoder."""
+    from types import SimpleNamespace
+
+    from vllm.multimodal.inputs import MultiModalKwargsItem, MultiModalKwargsItems
+    from vllm.multimodal.parse import MultiModalDataParser
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    from vllm_nemotron_asr_streaming.nemotron_asr.processor import (
+        NemotronASRMultiModalProcessor,
+    )
+
+    # the processor's field building reads only the served configuration
+    processor = object.__new__(NemotronASRMultiModalProcessor)
+    processor.info = SimpleNamespace(get_hf_config=lambda: env.config)
+    audio = envelope if samples is None else samples
+    kwargs = (
+        {} if samples is None else {"file_header": [env.max_geometry, 0, len(samples)]}
+    )
+    items = MultiModalDataParser(target_sr=16000).parse_mm_data({"audio": audio})
+    batch = processor._apply_hf_processor_main(items, kwargs)
+    fields = processor._get_mm_fields_config(batch, kwargs)
+    (item,) = MultiModalKwargsItems.from_hf_inputs(batch, fields)["audio"]
+    return MsgpackDecoder(MultiModalKwargsItem).decode(MsgpackEncoder().encode(item))
+
+
+# @spec REG-STATE-015, FILE-PROMPT-003
+def test_items_the_processor_builds_pass_the_item_rule_and_commit(build):
+    """Positive control of the item rule (``encoder_item_fault``): a stream
+    unit's item and a complete file's item, as the model's processor builds
+    them and core delivers them, pass the rule and commit in one step."""
+    from vllm_nemotron_asr_streaming.nemotron_asr.plan import encoder_item_fault
+
+    env = build()
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    s1, f1 = stream(env, "s1"), file(env, "f1")
+    envelope = s1.mm_features[0].data["audio"].data.numpy()
+    samples = f1.mm_features[0].data["samples"].data.numpy()
+    s1 = _with_item(s1, _processor_item(env, envelope=envelope))
+    f1 = _with_item(f1, _processor_item(env, samples=samples))
+    for request in (s1, f1):
+        (feature,) = request.mm_features
+        fault = encoder_item_fault(feature, carrier_width=int(env.config.hidden_size))
+        assert fault is None, (request.req_id, fault)
+    output = h.scheduler_output(new=(s1, f1), handles={"s1": 1, "f1": 2})
+    error = h.call_with(env.runner.real_step, output)
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [None]
+    statuses, _ = env.runner.commit_log[-1]
+    assert statuses.get("s1") == 0 and statuses.get("f1") == 0, statuses
+
+
 #: Prompt-structure faults of a row whose own item is valid (REG-STATE-015):
 #: name -> (request builder over the shared feature, the row's scheduled
 #: encoder inputs).
