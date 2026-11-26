@@ -7,13 +7,24 @@ Each test builds the runnable synthetic card's model with transaction graphs
 on (``on_cuda``, ``support.txg_gpu``), drives scheduled steps, and
 compares every covered step with the option-off transaction of the same row
 plan on a copy of the pools (``GpuEnv.compare``). ``N = P_max`` unless a test
-says otherwise, so every step is covered.
+says otherwise, so every step is covered. The environments run core's
+default KV-cache sizing, the extensible KV cache, whose startup extends the
+cache after post-warmup verification and before the first step.
+
+TXG-EQ-003's replay set runs at the transaction level: composed steps
+(``txg_transaction.replay_set``) through the binding's own ``execute`` over
+the serving pools, each replaying its captured cell
+(``txg_eager.CoveredSteps`` with the real cells), compared with the option-off
+transaction of the same sub-plan on a copy of the same pools.
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from support import txg_api as api
+from support import txg_eager as eager
 from support import txg_gpu as g
 from support import txg_transaction as tx
 
@@ -187,7 +198,8 @@ def one_kind_steps(env, driver, kind: str, n: int):
     CHUNK rows are units delivered to parked streams; echo rows are drains of
     streams with queued labels. Streams take slots in descending order and
     alternate prompts, so block indices, row orders and prompts differ from
-    the capture rows (pages 1..k). The counts rise from 1 to ``n`` and fall
+    the capture rows (every one on block 0). The counts rise from 1 to ``n``
+    and fall
     back to 1, so a cell at ``k`` runs after larger steps left rows beyond
     ``k`` in its arena section."""
     d = driver
@@ -225,6 +237,63 @@ def test_each_cell_equals_its_sub_plan_at_every_count(on_cuda, kind):
         if kind == api.ECHO and k == 0:
             counts.add(e)
     assert set(range(1, N + 1)) <= counts, sorted(counts)
+
+
+def covered_cuda(env, monkeypatch) -> eager.CoveredSteps:
+    """Composed steps through ``env``'s started binding over its serving
+    pools, each replay running its real captured cell: the transaction
+    environment is built over the runner while the binding declines every
+    step (``txg_transaction.env_from_runner``)."""
+    binding = env.binding
+    with monkeypatch.context() as patch:
+        patch.setattr(binding, "execute", lambda *args, **kwargs: None)
+        tenv = tx.env_from_runner(
+            env.runner,
+            env.model,
+            env.state,
+            lookahead=env.lookahead,
+            capacity=env.capacity,
+            monkeypatch=patch,
+            device="cuda",
+        )
+    return eager.CoveredSteps(tenv, SimpleNamespace(binding=binding))
+
+
+@pytest.mark.parametrize("kind", [api.CHUNK, api.ECHO])
+@pytest.mark.parametrize("lookahead", [0, 1], ids=["80ms", "160ms"])
+# @spec TXG-EQ-003, TXG-MASK-001, TXG-CAP-005
+def test_each_captured_cell_equals_its_fresh_continuing_and_mixed_sub_plans(
+    on_cuda, monkeypatch, lookahead, kind
+):
+    """For the same captured cell at every count from 1 to ``N``: one
+    sub-plan of fresh rows whose recycled pages hold sentinel patterns (NaN,
+    ±Inf or random bits), one of continuing rows whose pages hold nonzero
+    state distinct from the null page, and, at every count of 2 or more, one
+    mixing fresh and continuing rows; each replay equals the option-off
+    transaction bit for bit, every page compared as well as the outputs. The
+    capture rows all name block 0, so the self-check cannot separate the
+    initial-state index's arms or see a baked page address; these replays
+    do."""
+    env = on_cuda(startup=True, lookahead=lookahead, n=N)
+    cells = {key: cell for key, cell in env.binding.cells.items()}
+    steps = covered_cuda(env, monkeypatch)
+    failures = []
+    for count in range(1, N + 1):
+        key = (env.geometry, kind, count)
+        before = dict(env.counters().get("replays", {}))
+        sub_plans = tx.replay_set(steps.env, kind, count, seed=count)
+        assert len(sub_plans) == (3 if count >= 2 else 2)
+        for label, step in sub_plans:
+            problems = steps.compare(step)
+            if problems:
+                failures.append((label, problems))
+        after = dict(env.counters().get("replays", {}))
+        grown = {
+            k: v - before.get(k, 0) for k, v in after.items() if v != before.get(k, 0)
+        }
+        assert grown == {key: len(sub_plans)}, (count, grown)
+        assert env.binding.cells[key] is cells[key], "the cell was recaptured"
+    assert not failures, failures[:5]
 
 
 # @spec TXG-MASK-002

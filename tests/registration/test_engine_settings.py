@@ -612,55 +612,66 @@ def _no_state_layer_refusal(message: str) -> None:
     assert c.state_layer_refusals(message) == [], message
 
 
-@STAGES
-# @spec REG-ENG-005, REG-ENG-006, REG-ENG-025, TXG-CFG-016
-def test_transaction_graphs_at_80_ms_are_accepted_under_the_restricted_startup(
-    engine_config, platform, stage
-):
-    """80 ms, the default arms, NONE/NONE on CUDA, synchronous scheduling and
-    a block count of the admission limit plus one: accepted on the target
-    core."""
-    config = _hook_config(
-        engine_config,
-        platform,
-        breakable=None if stage == "hook" else False,
-        num_lookahead_tokens=0,
-        transaction_graph_populations=[2],
-    )
-    config.cache_config.num_gpu_blocks_override = (
-        config.scheduler_config.max_num_seqs + 1
-    )
-    _check(config, stage)
+#: The KV-cache sizings the checks see on the target core: core's default,
+#: the extensible KV cache; a profiled budget with it off; a block count of
+#: the admission limit plus one (TXG-CFG-005); a fixed budget.
+_SIZINGS = ("extensible", "profiled", "block-count", "budget")
 
 
-@STAGES
-# @spec REG-ENG-005, REG-ENG-006, TXG-CFG-016, TXG-CFG-019, TXG-CFG-011
-def test_transaction_graphs_without_a_block_count_are_refused_for_that_alone(
-    engine_config, platform, stage
-):
-    """Every other condition holds; without an explicit block count or KV
-    budget the refusal names the pool condition (TXG-CFG-019) and nothing
-    refuses transaction graphs for the state layer itself."""
-    config = _hook_config(
-        engine_config,
-        platform,
-        breakable=None if stage == "hook" else False,
-        num_lookahead_tokens=0,
-        transaction_graph_populations=[2],
+def _sized(config, sizing):
+    """``config`` under the KV-cache sizing ``sizing``."""
+    cache = config.cache_config
+    cache.num_gpu_blocks_override = (
+        config.scheduler_config.max_num_seqs + 1 if sizing == "block-count" else None
     )
-    message = _refused_at(config, stage)
-    assert re.search(r"num[_-]gpu[_-]blocks[_-]override", message), message
-    assert rc.TRANSACTION_GRAPH_KEY in message, message
-    _no_state_layer_refusal(message)
-
-
-def _restricted(config):
-    """The block count of the restricted startup (TXG-CFG-019): the
-    admission limit plus one."""
-    config.cache_config.num_gpu_blocks_override = (
-        config.scheduler_config.max_num_seqs + 1
-    )
+    cache.kv_cache_memory_bytes = 1 << 30 if sizing == "budget" else None
+    cache.enable_extensible_kv_cache = sizing == "extensible"
     return config
+
+
+def _default_sizing(config):
+    """Core's default KV-cache sizing, the extensible KV cache: no block count
+    and no budget. The restricted startup's settings are TXG-CFG-017's and
+    TXG-CFG-018's alone."""
+    return _sized(config, "extensible")
+
+
+@pytest.mark.parametrize("sizing", _SIZINGS)
+@STAGES
+# @spec REG-ENG-005, REG-ENG-006, REG-ENG-025, TXG-CFG-016, TXG-CFG-003
+def test_transaction_graphs_at_80_ms_are_accepted_under_the_restricted_startup(
+    engine_config, platform, stage, sizing
+):
+    """80 ms, the default arms, NONE/NONE on CUDA and synchronous scheduling:
+    accepted on the target core under every KV-cache sizing core offers."""
+    config = _hook_config(
+        engine_config,
+        platform,
+        breakable=None if stage == "hook" else False,
+        num_lookahead_tokens=0,
+        transaction_graph_populations=[2],
+    )
+    _check(_sized(config, sizing), stage)
+
+
+@pytest.mark.parametrize("extensible", [True, False], ids=["extensible", "profiled"])
+@STAGES
+# @spec REG-ENG-005, REG-ENG-006, TXG-CFG-016, TXG-CFG-003, TXG-CFG-011
+def test_transaction_graphs_without_a_block_count_or_budget_are_accepted(
+    engine_config, platform, stage, extensible
+):
+    """Every condition of the restricted startup holds, and neither a block
+    count nor a KV budget is set, with the extensible KV cache on or off:
+    nothing refuses transaction graphs, for the KV-cache sizing or for the
+    state layer."""
+    config = _hook_config(
+        engine_config,
+        platform,
+        breakable=None if stage == "hook" else False,
+        num_lookahead_tokens=0,
+        transaction_graph_populations=[2],
+    )
+    _check(_sized(config, "extensible" if extensible else "profiled"), stage)
 
 
 @pytest.mark.parametrize("value", [True, None], ids=repr)
@@ -672,7 +683,7 @@ def test_transaction_graphs_refuse_any_async_scheduling_but_false(
     """REG-ENG-001's exception: while transaction graphs are on, an
     ``async_scheduling`` that is not ``False`` is refused, naming the value
     and ``--no-async-scheduling``."""
-    config = _restricted(
+    config = _default_sizing(
         _hook_config(
             engine_config,
             platform,
@@ -719,7 +730,7 @@ def test_with_transaction_graphs_on_each_mode_remedy_is_the_explicit_none_alone(
     ``-cc.mode none`` and no other alternative."""
     modes, remedy, forbidden = _TXG_ONLY_REMEDY[condition]
     settings = {"breakable": False, **modes}
-    config = _restricted(
+    config = _default_sizing(
         _hook_config(
             engine_config,
             platform,
@@ -1193,10 +1204,10 @@ def test_model_state_refuses_a_core_without_the_hooks(
 def test_model_state_reruns_the_transaction_graph_checks(
     good_vllm_config, build_model_state
 ):
-    """The option turned on after the hook ran (under ``--enforce-eager``,
-    with no block count) is refused at construction, naming the option and
-    the conditions it violates (the eager runner, TXG-CFG-009; the pool,
-    TXG-CFG-019), and nothing refuses it for the state layer itself."""
+    """The option turned on after the hook ran (under ``--enforce-eager``)
+    is refused at construction, naming the option and the condition it
+    violates (the eager runner, TXG-CFG-009), and nothing refuses it for the
+    state layer itself."""
     config = good_vllm_config()
     config.model_config.hf_config.transaction_graph_populations = [2]
     with pytest.raises(ValueError) as excinfo:

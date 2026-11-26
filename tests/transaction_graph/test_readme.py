@@ -93,18 +93,37 @@ def admission_limit(argv: list[str]) -> int:
     return int(active if active is not None else seqs)
 
 
+#: The serve flags that select a KV-cache sizing other than core's default,
+#: the extensible KV cache.
+SIZING_FLAGS = (
+    "--num-gpu-blocks-override",
+    "--kv-cache-memory-bytes",
+    "--no-enable-extensible-kv-cache",
+)
+
+
 # @spec TXG-DOC-001
 def test_serve_command_runs_the_restricted_startup(section):
-    """``-cc.cudagraph_mode none -cc.mode none --no-async-scheduling`` and a
-    ``--num-gpu-blocks-override`` of at least the admission limit plus one
-    (TXG-CFG-005, TXG-CFG-017 to TXG-CFG-019)."""
+    """``-cc.cudagraph_mode none -cc.mode none --no-async-scheduling``
+    (TXG-CFG-017, TXG-CFG-018)."""
     argv = the_command(section())
     assert (flag(argv, "-cc.cudagraph_mode") or "").lower() == "none", argv
     assert (flag(argv, "-cc.mode") or "").lower() == "none", argv
     assert "--no-async-scheduling" in argv, argv
-    blocks = flag(argv, "--num-gpu-blocks-override")
-    assert blocks is not None, "the command sets no --num-gpu-blocks-override"
-    assert int(blocks) >= admission_limit(argv) + 1, (blocks, argv)
+
+
+# @spec TXG-DOC-001
+def test_serve_command_runs_cores_default_kv_cache_sizing(section):
+    """The command sets no KV-cache sizing: core's default, the extensible KV
+    cache, which the tier 5 exactness and served runs use (TXG-QUAL-001)."""
+    argv = the_command(section())
+    set_flags = [
+        f for f in SIZING_FLAGS if f in argv or any(a.startswith(f + "=") for a in argv)
+    ]
+    assert set_flags == [], (
+        "the serve command selects a KV-cache sizing other than core's default",
+        set_flags,
+    )
 
 
 # @spec TXG-DOC-001
@@ -131,19 +150,15 @@ def test_serve_command_runs_the_hook_configuration(section):
 
 # @spec TXG-DOC-001
 def test_serve_command_is_the_one_tier_5_verified(section):
-    """The command's ``--max-num-seqs``, block count and ``N`` are the ones the
-    tier 5 run verified to fit the A40."""
+    """The command's ``--max-num-seqs`` and ``N`` are the ones the tier 5 run
+    verified to fit the A40."""
     section = section()
     argv = the_command(section)
     overrides = json.loads(flag(argv, "--hf-overrides"))
     n = str(max(overrides[KEY]))
     seqs = flag(argv, "--max-num-seqs")
-    blocks = flag(argv, "--num-gpu-blocks-override")
     assert find(section, "A40", "tier 5", n), "no passage ties N to the tier 5 A40 run"
     assert find(section, "A40", seqs), "no passage ties --max-num-seqs to the A40 run"
-    assert blocks is not None and find(section, "A40", "tier 5", blocks), (
-        "no passage ties the block count to the tier 5 A40 run"
-    )
 
 
 # @spec TXG-DOC-002
@@ -178,12 +193,23 @@ def test_section_states_the_fixed_budget_rule(section):
 
 
 # @spec TXG-DOC-003
+def test_section_states_that_the_default_sizing_sizes_the_cache_after_the_captures(
+    section,
+):
+    section = section()
+    assert find(section, "default", "after the captures", "memory"), (
+        "no passage says that under core's default KV-cache sizing core sizes the "
+        "KV cache after the captures, from the memory they leave"
+    )
+
+
+# @spec TXG-DOC-003
 @pytest.mark.parametrize(
     "needles",
     [
         ("one geometry", "80", "160"),
         ("`N`", "bounded", "max_num_seqs", "--max-num-active-seqs"),
-        ("block count", "admission limit plus one"),
+        ("fixed block count or budget", "when set", "admission limit plus one"),
         ("`chunk-uncovered`", "without transaction graphs", "counted"),
         ("`echo-uncovered`", "without transaction graphs", "counted"),
         ("multi-token", "without transaction graphs", "counted"),
@@ -226,24 +252,27 @@ def table_rows(text: str) -> list[list[str]]:
 
 # @spec TXG-DOC-003
 @pytest.mark.parametrize(
-    "setting",
-    [
-        "--no-async-scheduling",
-        "-cc.cudagraph_mode none",
-        "-cc.mode none",
-        "--num-gpu-blocks-override",
-        "--kv-cache-memory-bytes",
-    ],
+    "setting", ["--no-async-scheduling", "-cc.cudagraph_mode none", "-cc.mode none"]
 )
 def test_section_names_each_restricted_startup_setting_with_its_reason(
     section, setting
 ):
-    """The restricted startup's settings (TXG-CFG-017 to TXG-CFG-019), each
+    """The restricted startup's settings (TXG-CFG-017, TXG-CFG-018), each
     with the reason it is required."""
     section = section()
     rows = [r for r in table_rows(section) if setting in r[0]]
     assert rows, f"no row names {setting}"
     assert all(len(r) > 1 and len(r[1].split()) >= 5 for r in rows), rows
+
+
+# @spec TXG-DOC-003
+@pytest.mark.parametrize("setting", SIZING_FLAGS)
+def test_no_kv_cache_sizing_is_a_restricted_startup_setting(section, setting):
+    """The restricted startup's settings table names no KV-cache sizing: the
+    option starts under every sizing core offers."""
+    section = section()
+    rows = [r for r in table_rows(section) if setting in r[0]]
+    assert rows == [], (f"a restricted-startup row names {setting}", rows)
 
 
 # @spec TXG-DOC-003

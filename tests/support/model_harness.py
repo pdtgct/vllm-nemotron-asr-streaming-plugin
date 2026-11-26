@@ -113,8 +113,9 @@ def build_vllm_config(
     (TXG-CFG-009); ``support.core_order.CoreOrder`` then runs core's capture
     hooks. The CPU tests keep the eager runner. While ``overrides`` turn
     transaction graphs on, the configuration is the restricted startup
-    (TXG-CFG-017 to TXG-CFG-019: synchronous scheduling, both modes NONE, and
-    ``num_gpu_blocks_override`` the admission limit plus one unless given)."""
+    (TXG-CFG-017, TXG-CFG-018: synchronous scheduling and both modes NONE)
+    under core's default KV-cache sizing: ``num_gpu_blocks_override`` is
+    set only when given, where a test's spec names one."""
     from vllm.config import (
         CacheConfig,
         CompilationConfig,
@@ -143,9 +144,6 @@ def build_vllm_config(
         compilation["compilation_config"] = CompilationConfig(
             mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE
         )
-    populations = (overrides or {}).get("transaction_graph_populations")
-    if num_gpu_blocks_override is None and populations not in (None, []):
-        num_gpu_blocks_override = max_num_seqs + 1
     return VllmConfig(
         model_config=model_config,
         device_config=DeviceConfig(device=device),

@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Capture procedure (TXG-CAP-001 to TXG-CAP-015).
+"""Capture procedure (TXG-CAP-001 to TXG-CAP-018).
 
 CPU tests (``engine``) use the fake-capture seam of
 ``support.txgcap_harness``: a fake cell capture runs the body eagerly inside
 the capture block and records nothing, so these tests pin the procedure's
-order, inventory, rows, pools, streams and refusals. ``gpu`` tests capture
-real cells.
+order, inventory, rows, pools, streams and refusals. They run under core's
+default KV-cache sizing, the extensible KV cache, whose one capture is the
+serving capture. A test whose subject includes the profiling capture runs a
+fixed ``--num-gpu-blocks-override`` with core's estimate enabled (the HLD's
+choice for the checks that need the estimate; TXG-LIFE-004 names the
+override's profiling KV cache), or a profiled budget with the extensible KV
+cache off where core's one-block profiling KV cache is the subject
+(``support.txgcap_harness.TxgCoreOrder``). ``gpu`` tests capture real
+cells.
 """
 
 from __future__ import annotations
@@ -18,7 +25,7 @@ import torch
 from support import model_harness as h
 from support import txg_eager as eager
 from support import txgcap_harness as t
-from support.txg_api import Record
+from support.txg_api import CAPTURE_ONLY_KEYWORD, Record, Sizing
 
 from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
     ROW_STATUS_ENVELOPE,
@@ -27,9 +34,10 @@ from vllm_nemotron_asr_streaming.nemotron_asr.advance import (
 
 pytestmark = pytest.mark.engine
 
-#: The start of the error a validation replay raises when a component pool's
-#: null page or capture-row pages differ from the call's snapshot (TXG-CAP-004).
-PAGE_MISMATCH = "the null page or the capture rows' pages"
+#: What the error a validation replay raises names when block 0 of a
+#: component pool, the null page, differs from the call's snapshot
+#: (TXG-CAP-004).
+PAGE_MISMATCH = re.compile(r"(?i)null page|block 0")
 
 
 def cell_windows(env, mark):
@@ -55,9 +63,11 @@ def assert_pools_equal(before, after):
         assert torch.equal(before[name], after[name]), f"pool {name} was written"
 
 
-def startup_through_profiling(run):
+def ready_to_capture(run):
+    """Core's calls before the serving capture under the extensible KV
+    cache: no profiling capture runs."""
     run.core.prepare()
-    run.core.bind_profiling()
+    run.core.bind_serving()
 
 
 # ---------------------------------------------------------------------------
@@ -68,9 +78,9 @@ def startup_through_profiling(run):
 def test_no_nested_graph_launch_while_a_cell_captures(on_cpu):
     run = on_cpu(n=2)
     env = run.env
-    startup_through_profiling(run)
+    ready_to_capture(run)
     mark = len(env.events)
-    run.core.profiling_capture()
+    run.core.serving_capture()
     for begin, end in cell_windows(env, mark):
         nested = [
             e for e in env.events[begin:end] if e[0] in ("replay", "cuda.graph.replay")
@@ -84,7 +94,7 @@ def test_no_nested_graph_launch_while_a_cell_captures(on_cpu):
 def test_host_staging_inside_an_outer_capture_raises(on_cpu):
     run = on_cpu(n=2)
     env = run.env
-    startup_through_profiling(run)
+    ready_to_capture(run)
     outcomes = []
 
     def stage(graph):
@@ -99,7 +109,7 @@ def test_host_staging_inside_an_outer_capture_raises(on_cpu):
             outcomes.append(None)
 
     env.fake.on_capture = stage
-    run.core.profiling_capture()
+    run.core.serving_capture()
     assert outcomes, "no cell capture began"
     assert all(o is not None for o in outcomes), (
         "staging inside a capture did not raise"
@@ -110,8 +120,8 @@ def test_host_staging_inside_an_outer_capture_raises(on_cpu):
 def test_segment_bindings_expose_their_uncaptured_paths(on_cpu):
     run = on_cpu(n=2)
     env = run.env
-    startup_through_profiling(run)
-    run.core.profiling_capture()
+    ready_to_capture(run)
+    run.core.serving_capture()
     decode = env.model._decode_graph_binding
     assert callable(decode.uncaptured_decode_fn(geometry=env.geometry, tier=1))
     encoder = env.model._encoder_execution
@@ -160,7 +170,7 @@ def test_each_cell_runs_reference_three_warm_ups_capture_and_one_validation_repl
 
     run = on_cpu(n=2)
     env = run.env
-    startup_through_profiling(run)
+    ready_to_capture(run)
     t.spy_phases(monkeypatch, env, "model_rows_body")
     published_early = []
 
@@ -171,7 +181,7 @@ def test_each_cell_runs_reference_three_warm_ups_capture_and_one_validation_repl
 
     env.fake.on_replay = check_unpublished
     mark = len(env.events)
-    run.core.profiling_capture()
+    run.core.serving_capture()
     windows = cell_windows(env, mark)
     assert len(windows) == 2 * env.n
     for index, ((start, begin), (_, end)) in enumerate(
@@ -203,39 +213,85 @@ def test_each_cell_runs_reference_three_warm_ups_capture_and_one_validation_repl
     assert all(g is not None and g.captured for g in published), "a cell is unpublished"
 
 
-@pytest.mark.parametrize("page", [1, 0], ids=["capture-row-page", "null-page"])
 # @spec TXG-CAP-004, TXG-CAP-008
-def test_a_validation_replay_that_differs_from_the_reference_fails_the_capture(
-    on_cpu, page
-):
-    """After each replay, one page differs from the call's snapshot: page 1,
-    the first capture row's page, or the null page, which no capture may
-    store to and from which the fresh capture rows gather their zero-initial
-    state (TXG-MASK-001). The pages are checked before the outputs, so the
-    error names the changed page in both cases."""
+def test_a_validation_replay_that_changes_block_zero_fails_the_capture(on_cpu):
+    """After each replay, block 0, the null page, differs from the call's
+    snapshot: no capture may store to it, and every capture row gathers it
+    (TXG-CAP-005). Block 0 is checked before the outputs, so the error names
+    the changed page."""
     run = on_cpu(n=2)
     env = run.env
-    startup_through_profiling(run)
-    bindings = run.core.profiling_bindings
+    ready_to_capture(run)
+    bindings = run.core.serving_bindings
 
     def corrupt(graph):
-        h.slot_bytes(bindings, page).fill_(0x7F)
+        h.slot_bytes(bindings, 0).fill_(0x7F)
 
     env.fake.on_replay = corrupt
-    error = h.call_with(run.core.profiling_capture)
+    error = h.call_with(run.core.serving_capture)
     assert error is not None, "a mismatching validation replay published its cell"
-    assert PAGE_MISMATCH in t.text(error), t.text(error)
+    assert PAGE_MISMATCH.search(t.text(error)), t.text(error)
     assert t.fake_graph_count(env) == 0
 
 
+# @spec TXG-CAP-004
+def test_the_snapshot_precedes_the_scatter_warm_up(on_cpu, monkeypatch):
+    """The call takes its snapshot of block 0 at the start of its
+    transaction-graph part, before the scatter warm-up: a warm-up launch
+    that changed block 0 makes the first cell's validation replay differ
+    from the snapshot, and the capture fails with nothing published."""
+    from vllm_nemotron_asr_streaming.nemotron_asr import state_scatter
+
+    run = on_cpu(n=2)
+    env = run.env
+    ready_to_capture(run)
+    original = state_scatter.launch_rejected_row_scatter
+
+    def warm_and_change_block_zero(pool, *args, **kwargs):
+        original(pool, *args, **kwargs)
+        pool[0].fill_(7)
+
+    monkeypatch.setattr(
+        state_scatter, "launch_rejected_row_scatter", warm_and_change_block_zero
+    )
+    error = h.call_with(run.core.serving_capture)
+    assert error is not None, "a block 0 changed by the warm-up passed validation"
+    assert PAGE_MISMATCH.search(t.text(error)), t.text(error)
+    assert t.fake_graph_count(env) == 0
+
+
+# @spec TXG-CAP-004, TXG-CAP-018
+def test_the_call_compares_and_addresses_no_page_but_block_zero(on_cpu):
+    """A page other than block 0 that changes during the call is neither
+    read nor compared: under the extensible KV cache it may have no memory
+    at the capture, so the snapshot, the validation replay's comparison and
+    every capture row name block 0 alone, and the cells publish."""
+    run = on_cpu(n=2)
+    env = run.env
+    ready_to_capture(run)
+    bindings = run.core.serving_bindings
+
+    def change_another_page(graph):
+        h.slot_bytes(bindings, 1).fill_(0x7F)
+
+    env.fake.on_replay = change_another_page
+    error = h.call_with(run.core.serving_capture)
+    assert error is None, ("a change outside block 0 failed the capture", error)
+    assert t.fake_graph_count(env) == 2 * env.n
+
+
 # @spec TXG-CAP-005
-def test_capture_rows_use_pages_one_to_k_and_are_all_rejected(on_cpu):
+def test_capture_rows_all_name_block_zero_and_are_all_rejected(on_cpu):
+    """Every capture row of a cell at count ``k`` names block 0, the only
+    page core guarantees backed at a capture, ``k`` times; every row is
+    rejected (a CHUNK row by its zero envelope header, an echo row by the
+    stream carrier token), so no page is stored."""
     run = on_cpu(n=3, max_num_seqs=3)
     env = run.env
-    startup_through_profiling(run)
-    before = pool_snapshot(run.core.profiling_bindings)
+    ready_to_capture(run)
+    before = pool_snapshot(run.core.serving_bindings)
     mark = len(env.events)
-    run.core.profiling_capture()
+    run.core.serving_capture()
     order = t.largest_first(env.n)
     windows = cell_windows(env, mark)
     assert len(windows) == len(order)
@@ -245,23 +301,19 @@ def test_capture_rows_use_pages_one_to_k_and_are_all_rejected(on_cpu):
         expected = ROW_STATUS_ENVELOPE if kind == "chunk" else ROW_STATUS_ROLE_MISMATCH
         for call in scatters:
             assert call["rows"] == count, (kind, count, call)
-            assert sorted(call["pages"]) == list(range(1, count + 1)), (
-                kind,
-                count,
-                call,
-            )
+            assert call["pages"] == [0] * count, (kind, count, call)
             assert all(s & expected for s in call["status"]), (kind, count, call)
-    assert_pools_equal(before, pool_snapshot(run.core.profiling_bindings))
+    assert_pools_equal(before, pool_snapshot(run.core.serving_bindings))
 
 
 # @spec TXG-CAP-005
 def test_capture_rows_alternate_their_fresh_and_file_bits(on_cpu, monkeypatch):
     run = on_cpu(n=3, max_num_seqs=3)
     env = run.env
-    startup_through_profiling(run)
+    ready_to_capture(run)
     t.spy_phases(monkeypatch, env, "prepare_model_rows")
     mark = len(env.events)
-    run.core.profiling_capture()
+    run.core.serving_capture()
     windows = cell_windows(env, mark)
     spans = windows_before(env, mark, windows)
     for (kind, count), (start, begin) in zip(
@@ -280,10 +332,13 @@ def test_capture_rows_alternate_their_fresh_and_file_bits(on_cpu, monkeypatch):
 
 
 # @spec TXG-CAP-006
-def test_scatter_warm_up_names_each_pools_first_free_page_before_the_first_cell(on_cpu):
-    run = on_cpu(n=2)
+def test_scatter_warm_up_names_block_zero_of_each_pool_before_the_first_cell(on_cpu):
+    """Both captures, under a fixed block count with core's estimate
+    enabled."""
+    run = on_cpu(n=2, sizing=Sizing.BLOCK_COUNT)
     env, core = run.env, run.core
-    startup_through_profiling(run)
+    core.prepare()
+    core.bind_profiling()
     for capture in ("profiling", "serving"):
         if capture == "serving":
             core.clear()
@@ -319,7 +374,7 @@ def test_scatter_warm_up_names_each_pools_first_free_page_before_the_first_cell(
             warm,
         )
         for call in warm:
-            assert call["rows"] == 1 and call["pages"] == [1], call
+            assert call["rows"] == 1 and call["pages"] == [0], call
             assert all(s != 0 for s in call["status"]), call
         # After the component pools come the projected resident-pool views
         # that are not themselves a component pool (TXG-CAP-013): each a view
@@ -332,6 +387,7 @@ def test_scatter_warm_up_names_each_pools_first_free_page_before_the_first_cell(
             capture,
             views,
         )
+        assert all(c["pages"] == [0] for c in views), (capture, views)
         layouts = [c["layout"] for c in (*warm, *views)]
         assert len(set(layouts)) == len(layouts), (
             capture,
@@ -341,7 +397,9 @@ def test_scatter_warm_up_names_each_pools_first_free_page_before_the_first_cell(
 
 # @spec TXG-CAP-007
 def test_cells_are_captured_largest_first_chunk_then_echo(on_cpu):
-    run = on_cpu(n=3, max_num_seqs=3)
+    """Both captures, under a fixed block count with core's estimate
+    enabled."""
+    run = on_cpu(n=3, max_num_seqs=3, sizing=Sizing.BLOCK_COUNT)
     env, core = run.env, run.core
     core.startup(verify=False)
     for capture in (Record.PROFILING, Record.SERVING):
@@ -379,7 +437,7 @@ def test_cells_reach_the_pools_only_through_the_state_group_layouts_in_the_call(
     whether they are dead. Once core releases the profiling KV cache and
     binds the serving one, the profiling component tensors' storage is
     freed."""
-    run = on_cpu(n=2)
+    run = on_cpu(n=2, sizing=Sizing.BLOCK_COUNT)
     env, core = run.env, run.core
     spy = t.AccessorSpy(monkeypatch, env.state)
     core.prepare()
@@ -503,11 +561,31 @@ def test_the_block_count_check_uses_the_admission_limit(on_cpu, limit, passes):
     assert t.fake_graph_count(run.env) == (2 * run.env.n if passes else 0)
 
 
+# @spec TXG-CAP-008, TXG-LIFE-004
+def test_the_profiling_capture_makes_no_page_count_check(on_cpu):
+    """Under a profiled budget with the extensible KV cache off, core's
+    profiling KV cache holds one block under the explicit NONE runner mode,
+    fewer than the admission limit plus one: the profiling capture's cells
+    need block 0 alone and its page count is not the serving count, so the
+    profiling capture captures every cell over it."""
+    run = on_cpu(n=2, max_num_seqs=2, sizing=Sizing.PROFILED)
+    env, core = run.env, run.core
+    assert core.profiling_capacity() == 1
+    core.prepare()
+    core.bind_profiling()
+    error = h.call_with(core.profiling_capture)
+    assert error is None, t.text(error)
+    assert t.fake_graph_count(env) == 2 * env.n
+
+
 # @spec TXG-CAP-009
 def test_every_capture_uses_cores_stream_and_pool_and_creates_neither(on_cpu):
-    run = on_cpu(n=2)
+    """Both captures, under a fixed block count with core's estimate
+    enabled."""
+    run = on_cpu(n=2, sizing=Sizing.BLOCK_COUNT)
     env, core = run.env, run.core
-    startup_through_profiling(run)
+    core.prepare()
+    core.bind_profiling()
     created = env.fake.streams_created
     for capture, pool in (("profiling", "profiling-pool"), ("serving", "global-pool")):
         if capture == "serving":
@@ -536,11 +614,11 @@ def test_every_capture_uses_cores_stream_and_pool_and_creates_neither(on_cpu):
 def test_the_capture_stream_is_synchronized_before_the_call_ends(on_cpu, outcome):
     run = on_cpu(n=2)
     env, core = run.env, run.core
-    startup_through_profiling(run)
+    ready_to_capture(run)
     if outcome == "raises":
         env.fake.fail["replay"] = env.fake.replay_count + 1
     mark = len(env.events)
-    h.call_with(core.profiling_capture)
+    h.call_with(core.serving_capture)
     names = [e for e in env.events[mark:]]
     work = [
         i
@@ -561,7 +639,9 @@ def test_the_capture_stream_is_synchronized_before_the_call_ends(on_cpu, outcome
 @pytest.mark.parametrize("on", [False, True], ids=["off", "on"])
 # @spec TXG-CAP-011
 def test_a_capture_call_captures_no_cell_off_and_exactly_2n_on(on_cpu, on):
-    run = on_cpu(n=3, max_num_seqs=3, populations=[1, 3] if on else [])
+    run = on_cpu(
+        n=3, max_num_seqs=3, populations=[1, 3] if on else [], sizing=Sizing.BLOCK_COUNT
+    )
     env, core = run.env, run.core
     expected = 2 * 3 if on else 0
     core.prepare()
@@ -580,6 +660,21 @@ def startup_scatter_arguments(calls, serving_pool):
     startup these are the serving capture's scatter warm-up and its cells'
     eager references, warm-ups and captures, which pass the same views."""
     return {c["layout"] for c in calls if t.within(serving_pool, c["pool"])}
+
+
+def fits(argument, launched):
+    """TXG-CAP-013's rule: the same address, page shape (every dimension
+    after the first), strides and dtype, and a first dimension at most the
+    launched argument's."""
+    address, shape, strides, dtype = argument
+    return any(
+        address == a
+        and tuple(shape[1:]) == tuple(s[1:])
+        and tuple(strides) == tuple(st)
+        and dtype == d
+        and shape[0] <= s[0]
+        for a, s, st, d in launched
+    )
 
 
 def run_fallback_classes_at_any_n(env, core, *, first_slot: int = 1) -> list[str]:
@@ -626,8 +721,8 @@ def assert_scatter_arguments_were_launched_at_startup(
 ):
     """TXG-CAP-013: every resident-pool argument a scheduled step passes to
     the masked scatter, covered or in any reachable fallback class (run by
-    ``run_classes``, at ``N = 2`` by default), has the address, shape,
-    strides and dtype of an argument launched at startup."""
+    ``run_classes``, at ``N = 2`` by default), fits an argument launched at
+    startup (:func:`fits`)."""
     serving_pool = h.pool_tensor(core.serving_bindings)
     startup = startup_scatter_arguments(spy.calls, serving_pool)
     assert startup, "the serving capture launched no scatter over the serving pool"
@@ -637,23 +732,261 @@ def assert_scatter_arguments_were_launched_at_startup(
     assert later, f"no scatter was launched by {classes}"
     foreign = [c for c in later if not t.within(serving_pool, c["pool"])]
     assert not foreign, "a step scattered outside the serving pool"
-    unwarmed = {c["layout"] for c in later} - startup
+    unwarmed = {c["layout"] for c in later if not fits(c["layout"], startup)}
     assert not unwarmed, (
         "the masked scatter received arguments that startup never launched",
         sorted(map(str, unwarmed)),
     )
 
 
+@pytest.mark.parametrize("final", [None, 6], ids=["final-capacity", "final-6"])
 # @spec TXG-CAP-013
 def test_the_masked_scatter_receives_only_arguments_launched_at_startup(
-    on_cpu, monkeypatch
+    on_cpu, monkeypatch, final
 ):
+    """Under the extensible KV cache, after core's extension: to the whole
+    reservation (views equal to the captured ones), and to 6 of its 12
+    pages, whose views of fewer pages over the same addresses fit the
+    arguments the serving capture launched."""
     run = on_cpu(n=2, max_num_seqs=3, capacity=12)
     env, core = run.env, run.core
-    core.startup()
+    core.startup(extend=False)
+    core.extend(final)
     # The cells compute, so the covered step's scatters are compared too.
     eager.EagerCells(env.model).install(monkeypatch)
     assert_scatter_arguments_were_launched_at_startup(env, core, env.scatter)
+    if final is not None:
+        later = [c["layout"] for c in env.scatter.calls]
+        assert any(shape[0] == final for _, shape, *_ in later), (
+            "no step scattered over the extended views"
+        )
+
+
+# ---------------------------------------------------------------------------
+# The structural preflight's capture-only mode (TXG-CAP-017)
+
+
+def null_row_plan(count: int = 3, **fields):
+    """A CPU row plan of ``count`` CHUNK capture rows, every one naming the
+    null block ID 0, with an empty live set: the shape of a cell's capture
+    rows (TXG-CAP-005). ``fields`` replace plan fields."""
+    import dataclasses
+
+    from support.txg_fakes import Row, row_plan
+
+    plan = row_plan([Row("chunk", fresh=i % 2 == 0) for i in range(count)])
+    plan = dataclasses.replace(
+        plan,
+        state_indices_p=torch.zeros(count, dtype=torch.int64),
+        live_block_ids=torch.zeros(0, dtype=torch.int64),
+        num_pool_blocks=8,
+        bindings=tuple(dataclasses.replace(b, block_id=0) for b in plan.bindings),
+    )
+    return dataclasses.replace(plan, **fields)
+
+
+def preflight(plan, *, rows=None, **kwargs):
+    from support import txg_api
+
+    rows = plan.num_prefills if rows is None else rows
+    return txg_api.structural_preflight()(plan, rows, rows, **kwargs)
+
+
+# @spec TXG-CAP-017
+def test_the_capture_only_mode_accepts_rows_that_all_name_the_null_block():
+    """The mode waives exactly three row checks: the null block ID named by
+    a real row, a block ID named by two rows and a block ID outside the live
+    set, which an empty live set makes every row's."""
+    for count in (1, 3):
+        index = preflight(null_row_plan(count), capture_only=True)
+        assert index.tolist() == [0] * count
+
+
+def _off_the_null_block(plan):
+    import dataclasses
+
+    bindings = list(plan.bindings)
+    bindings[1] = dataclasses.replace(bindings[1], block_id=1)
+    return dataclasses.replace(
+        plan,
+        state_indices_p=torch.tensor([0, 1, 0], dtype=torch.int64),
+        bindings=tuple(bindings),
+    )
+
+
+def _with_live(plan):
+    import dataclasses
+
+    return dataclasses.replace(plan, live_block_ids=torch.tensor([1]))
+
+
+@pytest.mark.parametrize(
+    "defect", [_off_the_null_block, _with_live], ids=["row-on-block-1", "live-set"]
+)
+# @spec TXG-CAP-017
+def test_the_capture_only_mode_refuses_a_live_page(defect):
+    """In the mode, a plan whose row names a block ID other than the null
+    block ID, or whose live set is not empty, is refused: the mode never
+    lets a plan name a page a request holds."""
+    plan = defect(null_row_plan(3))
+    with pytest.raises(ValueError):
+        preflight(plan, capture_only=True)
+
+
+def _row_count(plan):
+    return plan, {"rows": plan.num_prefills + 1}
+
+
+def _duplicate_request(plan):
+    import dataclasses
+
+    ids = (plan.request_ids[0],) * plan.num_prefills
+    bindings = tuple(dataclasses.replace(b, request_id=ids[0]) for b in plan.bindings)
+    return dataclasses.replace(plan, request_ids=ids, bindings=bindings), {}
+
+
+def _binding_mismatch(plan):
+    import dataclasses
+
+    bindings = list(plan.bindings)
+    bindings[0] = dataclasses.replace(bindings[0], admission_generation=7)
+    return dataclasses.replace(plan, bindings=tuple(bindings)), {}
+
+
+def _null_outside_pool(plan):
+    import dataclasses
+
+    return dataclasses.replace(plan, null_block_id=8), {}
+
+
+def _chunk_deadline(plan):
+    import dataclasses
+
+    deadlines = plan.ready_deadline_ns.clone()
+    deadlines[0] = 0
+    bindings = list(plan.bindings)
+    bindings[0] = dataclasses.replace(bindings[0], ready_deadline_ns=0)
+    return dataclasses.replace(
+        plan, ready_deadline_ns=deadlines, bindings=tuple(bindings)
+    ), {}
+
+
+OTHER_CHECKS = {
+    "row-count": _row_count,
+    "duplicate-request": _duplicate_request,
+    "binding-mismatch": _binding_mismatch,
+    "null-outside-pool": _null_outside_pool,
+    "chunk-deadline": _chunk_deadline,
+}
+
+
+@pytest.mark.parametrize("defect", list(OTHER_CHECKS))
+# @spec TXG-CAP-017
+def test_the_capture_only_mode_keeps_every_other_check(defect):
+    """Every structural check other than the three waived row checks holds
+    in the mode: here the row count, unique request IDs, each row's prepared
+    binding, the null block ID's bounds and the CHUNK deadlines."""
+    preflight(null_row_plan(3), capture_only=True)  # the positive control
+    plan, kwargs = OTHER_CHECKS[defect](null_row_plan(3))
+    with pytest.raises(ValueError):
+        preflight(plan, capture_only=True, **kwargs)
+
+
+# @spec TXG-CAP-017
+def test_outside_the_capture_only_mode_a_null_block_row_is_refused():
+    """A scheduled step's plan never takes the mode: without it, a real row
+    that names the null block ID is refused, as is a block ID named by two
+    rows."""
+    from support import txg_api
+
+    with pytest.raises(ValueError, match="null block"):
+        txg_api.advance_module()._structural_preflight(null_row_plan(3), 3, 3)
+
+
+# @spec TXG-CAP-017, TXG-TXN-007
+def test_only_a_capture_calls_cell_programs_pass_the_capture_only_mode(
+    on_cpu, monkeypatch
+):
+    """``prepare_model_rows`` receives the mode only from the capture call's
+    cell programs, one call per cell; ``advance_model_rows`` has no such
+    parameter, and no scheduled step (the option-off transaction or
+    ``execute``) passes it."""
+    import inspect
+
+    from support import txg_api
+
+    advance = txg_api.advance_module()
+    assert (
+        CAPTURE_ONLY_KEYWORD in inspect.signature(advance.prepare_model_rows).parameters
+    ), "prepare_model_rows takes no capture-only keyword"
+    assert (
+        CAPTURE_ONLY_KEYWORD
+        not in inspect.signature(advance.advance_model_rows).parameters
+    ), "advance_model_rows's interface changed"
+    run = on_cpu(n=2, max_num_seqs=3)
+    env, core = run.env, run.core
+    calls = []
+    original = advance.prepare_model_rows
+
+    def spy(*args, **kwargs):
+        calls.append(bool(kwargs.get(CAPTURE_ONLY_KEYWORD, False)))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(advance, "prepare_model_rows", spy)
+    ready_to_capture(run)
+    core.serving_capture()
+    assert calls == [True] * (2 * env.n), calls
+    calls.clear()
+    core.post_warmup()
+    core.extend()
+    core.step(t.stream_unit(env, "cap17-s1"))
+    run_fallback_classes_at_any_n(env, core, first_slot=2)
+    assert calls and not any(calls), calls
+
+
+# ---------------------------------------------------------------------------
+# Block 0 alone (TXG-CAP-018)
+
+
+def assert_only_block_zero(recorder, what):
+    assert recorder.accesses, f"{what} addressed no state page (positive control)"
+    outside = recorder.outside({0})
+    assert outside == [], (f"{what} addressed pages other than block 0", outside)
+
+
+# @spec TXG-CAP-018, TXG-CAP-004, TXG-CAP-005, TXG-CAP-006
+def test_a_capture_call_addresses_only_block_zero_of_the_state_pools(on_cpu):
+    """Every operation of the serving capture that reads or writes a
+    component pool or a projected resident-pool view (the snapshot, the
+    scatter warm-up, each cell's eager reference, warm-ups, capture and
+    validation replay, the comparison with the snapshot) addresses block 0
+    alone, so the call needs memory behind block 0 only, as under the
+    extensible KV cache, which backs only its minimum blocks then. The
+    reading is ``support.txgcap_harness.BlockAccesses`` over the pool's
+    backing storage."""
+    run = on_cpu(n=3, max_num_seqs=3)
+    ready_to_capture(run)
+    with t.BlockAccesses(h.core_bindings(run.core.serving_bindings).tensor) as rec:
+        run.core.serving_capture()
+    assert t.fake_graph_count(run.env) == 2 * run.env.n
+    assert_only_block_zero(rec, "the serving capture")
+
+
+# @spec TXG-CAP-018, TXG-LIFE-004
+def test_the_profiling_capture_addresses_only_block_zero_of_its_one_block_cache(
+    on_cpu,
+):
+    """The profiling capture over core's one-block profiling KV cache (a
+    profiled budget with the extensible KV cache off) addresses block 0
+    alone: no operation reaches past the cache's only block."""
+    run = on_cpu(n=3, max_num_seqs=3, sizing=Sizing.PROFILED)
+    run.core.prepare()
+    bindings = run.core.bind_profiling()
+    assert h.core_bindings(bindings).capacity == 1
+    with t.BlockAccesses(h.core_bindings(bindings).tensor) as rec:
+        run.core.profiling_capture()
+    assert t.fake_graph_count(run.env) == 2 * run.env.n
+    assert_only_block_zero(rec, "the profiling capture")
 
 
 # ---------------------------------------------------------------------------
@@ -707,23 +1040,24 @@ def test_host_staging_inside_an_outer_capture_raises_cuda(on_cuda, monkeypatch):
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("page", [1, 0], ids=["capture-row-page", "null-page"])
-# @spec TXG-CAP-004, TXG-CAP-008, TXG-CAP-011
+@pytest.mark.parametrize("page", [0, 1], ids=["null-page", "another-page"])
+# @spec TXG-CAP-004, TXG-CAP-008, TXG-CAP-011, TXG-CAP-018
 def test_corrupted_validation_replay_fails_and_publishes_nothing_cuda(
     on_cuda, monkeypatch, page
 ):
     """Every replay in the call (the segment graphs' and the cells') writes a
-    value no earlier replay wrote into one page of the profiling pool, so the
-    page after each cell's validation replay differs from the page at the
-    start of the call's transaction-graph part: page 1, the first capture
-    row's page, or the null page, which no capture may store to either and
-    from which the fresh capture rows gather their zero-initial state. The
-    pool is one flat byte tensor (``model_harness.real_bindings``); a page is
+    value no earlier replay wrote into one page of the serving pool, under
+    the extensible KV cache. Block 0, the null page, then differs after each
+    cell's validation replay from its snapshot at the start of the call's
+    transaction-graph part, and the capture fails and publishes nothing;
+    page 1 is neither read nor compared (it may have no memory then), so the
+    capture publishes every cell. The pool is one flat byte tensor
+    (``model_harness.real_bindings``); a page is
     ``model_harness.slot_bytes``."""
-    env = on_cuda(n=2)
+    env = on_cuda(n=2, sizing=Sizing.EXTENSIBLE)
     core = env.core
     core.prepare()
-    bindings = core.bind_profiling()
+    bindings = core.bind_serving()
     original = torch.cuda.CUDAGraph.replay
     replays = []
 
@@ -733,24 +1067,28 @@ def test_corrupted_validation_replay_fails_and_publishes_nothing_cuda(
         h.slot_bytes(bindings, page).fill_(len(replays) % 255 + 1)
 
     monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", replay)
-    error = h.call_with(core.profiling_capture)
+    error = h.call_with(core.serving_capture)
     monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", original)
-    assert error is not None, "the mismatching validation replay was accepted"
-    assert "validation replay" in t.text(error), t.text(error)
-    if page == 0:
-        # The pages are checked before the outputs, so the page check reports
-        # the change although the fresh capture rows gather the null page.
-        assert PAGE_MISMATCH in t.text(error), t.text(error)
     from support import txg_api
 
+    if page == 1:
+        assert error is None, t.text(error)
+        assert len(txg_api.binding_of(env.model).cells) == 2 * env.n
+        return
+    assert error is not None, "the mismatching validation replay was accepted"
+    assert "validation replay" in t.text(error), t.text(error)
+    # Block 0 is checked before the outputs, so the page check reports the
+    # change although every capture row gathers the null page.
+    assert PAGE_MISMATCH.search(t.text(error)), t.text(error)
     assert not txg_api.binding_of(env.model).cells, "a cell was published"
-    core.clear()
 
 
 @pytest.mark.gpu
 # @spec TXG-CAP-005, TXG-CAP-008
 def test_capture_stores_no_page_cuda(on_cuda):
-    env = on_cuda(n=2)
+    """Both captures, under a profiled budget with the extensible KV cache
+    off (a one-block profiling KV cache)."""
+    env = on_cuda(n=2, sizing=Sizing.PROFILED)
     core = env.core
     core.prepare()
     bindings = core.bind_profiling()
@@ -771,7 +1109,7 @@ def test_capture_stores_no_page_cuda(on_cuda):
 @pytest.mark.gpu
 # @spec TXG-CAP-009
 def test_cells_use_cores_stream_and_pool_cuda(on_cuda, monkeypatch):
-    env = on_cuda(n=2)
+    env = on_cuda(n=2, sizing=Sizing.BLOCK_COUNT)
     pools = []
     original_graph = torch.cuda.graph
 
@@ -826,7 +1164,8 @@ def test_the_masked_scatter_receives_only_arguments_launched_at_startup_cuda(
     section misaligned."""
     env = on_cuda(n=n, max_num_seqs=n + 1, capacity=12)
     spy = t.ScatterSpy(env.events).install(monkeypatch)
-    env.core.startup()
+    env.core.startup(extend=False)
+    env.core.extend(8)  # views of fewer pages over the captured addresses
     assert_scatter_arguments_were_launched_at_startup(
         env, env.core, spy, run_classes=run_fallback_classes_at_any_n
     )
@@ -850,3 +1189,25 @@ def test_covered_steps_keep_passing_their_host_checks_after_startup_cuda(on_cuda
         replays_now = sum(t.counter(env, "replays").values())
         assert replays_now > replays, "a covered step did not replay"
         replays = replays_now
+
+
+@pytest.mark.gpu
+# @spec TXG-CAP-018
+def test_a_capture_call_addresses_only_block_zero_cuda(on_cuda):
+    """TXG-CAP-018's CUDA leg: under the extensible KV cache, the serving
+    capture's operations on the state pools (snapshot, scatter warm-up, each
+    cell's eager reference, warm-ups, capture and validation replay, the
+    comparison with the snapshot) address block 0 alone, read as the CPU
+    test reads them, over the real CUDA pool; the capture then publishes
+    every cell. The installed-engine leg, with only core's minimum blocks
+    backed, is TXG-QUAL-028's."""
+    env = on_cuda(n=2, sizing=Sizing.EXTENSIBLE)
+    core = env.core
+    core.prepare()
+    bindings = core.bind_serving()
+    with t.BlockAccesses(h.core_bindings(bindings).tensor) as rec:
+        core.serving_capture()
+    from support import txg_api
+
+    assert len(txg_api.binding_of(env.model).cells) == 2 * env.n
+    assert_only_block_zero(rec, "the serving capture")

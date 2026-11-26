@@ -112,7 +112,7 @@ def state_layer_refusals(message: str) -> list[str]:
 def is_admission_condition(error: str) -> bool:
     """TXG-CFG-020's condition, recognized by its remedy
     ``--max-num-active-seqs`` without the block-count option of
-    TXG-CFG-005 and TXG-CFG-019."""
+    TXG-CFG-005."""
     return (
         KEY in error
         and found(ACTIVE_SEQS, error)
@@ -121,16 +121,22 @@ def is_admission_condition(error: str) -> bool:
     )
 
 
-def is_pool_condition(error: str) -> bool:
-    """TXG-CFG-019's condition: both remedies, a block count and a KV
-    budget."""
-    return KEY in error and found(BLOCKS_OVERRIDE, error) and found(KV_BYTES, error)
-
-
 def is_block_count_condition(error: str) -> bool:
-    """TXG-CFG-005's condition: the block-count remedy without the KV-budget
-    one (TXG-CFG-019's)."""
+    """TXG-CFG-005's condition: the block-count remedy, without a KV-budget
+    remedy."""
     return KEY in error and found(BLOCKS_OVERRIDE, error) and not found(KV_BYTES, error)
+
+
+def is_sizing_condition(error: str) -> bool:
+    """A refusal of a KV-cache sizing: an error naming the option that asks
+    for an explicit block count or KV budget, or names the extensible KV
+    cache as the reason to refuse. The restricted startup has no such
+    condition (TXG-CFG-017 and TXG-CFG-018 are its settings), so no option-on
+    configuration error matches it."""
+    return KEY in error and (
+        (found(BLOCKS_OVERRIDE, error) and found(KV_BYTES, error))
+        or (found(EXTENSIBLE, error) and not found(BLOCKS_OVERRIDE, error))
+    )
 
 
 #: The configuration remedies a capture failure can give (TXG-MEM-011 to

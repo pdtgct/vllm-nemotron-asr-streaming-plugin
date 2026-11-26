@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Graph memory (TXG-MEM-001 to TXG-MEM-013, TXG-MEM-017).
+"""Graph memory (TXG-MEM-001 to TXG-MEM-013, TXG-MEM-017 to TXG-MEM-019).
 
 CPU tests (``engine``) read memory through ``FakeCuda``: a completed cell
 capture retains ``capture_cost`` bytes, the charged margin ``m +
@@ -7,9 +7,12 @@ margin_rounding``, and each free-memory reading is logged, so the record's
 figures, the margin's retained charge from its two raw readings, the
 aggregate serving-over-profiling guard, the required-profiling decision and
 every failure message are checked against hand-computed values. The
-environment runs the restricted startup: ``num_gpu_blocks_override`` fixes
-the block count (``support.txgcap_harness.CAPACITY``) unless a test fixes
-``kv_cache_memory_bytes``. ``gpu`` tests read the real allocator.
+environment runs the restricted startup under a fixed
+``--num-gpu-blocks-override`` (``support.txgcap_harness.CAPACITY``) with
+core's estimate enabled, the HLD's choice for the checks that need the
+estimate, unless a test names another KV-cache sizing: core's default, the
+extensible KV cache (measured after the captures), a profiled budget, or a
+fixed ``kv_cache_memory_bytes``. ``gpu`` tests read the real allocator.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from support import model_harness as h
 from support import txg_conditions as c
 from support import txgcap_harness as t
 from support.fake_cuda import MARGIN_BYTES
-from support.txg_api import Record
+from support.txg_api import NOT_APPLICABLE, SIZING_NAMES, Record, Sizing
 
 pytestmark = pytest.mark.engine
 
@@ -35,9 +38,17 @@ ALLOC_CONF = "expandable_segments:True"
 
 @pytest.fixture
 def on_cpu(on_cpu, monkeypatch):
-    """The shared ``on_cpu`` under a stated allocator configuration."""
+    """The shared ``on_cpu`` under a stated allocator configuration, and a
+    fixed block count unless the test names a sizing or a budget (module
+    docstring)."""
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", ALLOC_CONF)
-    return on_cpu
+
+    def build(**kwargs):
+        if "sizing" not in kwargs and not kwargs.get("kv_cache_memory_bytes"):
+            kwargs["sizing"] = Sizing.BLOCK_COUNT
+        return on_cpu(**kwargs)
+
+    return build
 
 
 def profiled(run, *, capture_cost=MiB, rounding=0):
@@ -231,6 +242,75 @@ def test_record_keeps_profiling_figures_and_absorbed_rounding(on_cpu):
     assert rec[Record.ABSORBED] == serving - (profiling - rec[Record.CHARGE])
 
 
+def profiling_figures_not_applicable(rec):
+    """The profiling-only fields of TXG-MEM-006, each marked not applicable
+    (``support.txg_api.NOT_APPLICABLE``), never zero."""
+    profiling = rec[Record.PROFILING]
+    marked = {
+        key: rec[key]
+        for key in (
+            Record.MARGIN,
+            Record.FREE_BEFORE,
+            Record.FREE_AFTER,
+            Record.CHARGE,
+            Record.ABSORBED,
+        )
+    }
+    if profiling == NOT_APPLICABLE:
+        marked[Record.PROFILING] = profiling
+    else:
+        for key in (Record.CALL_TOTAL, Record.TXN_TOTAL, Record.KIND_TOTALS):
+            marked[f"{Record.PROFILING}.{key}"] = (profiling or {}).get(key)
+    return {key: value for key, value in marked.items() if value != NOT_APPLICABLE}
+
+
+@pytest.mark.parametrize("sizing", [Sizing.EXTENSIBLE, Sizing.BUDGET])
+# @spec TXG-MEM-006, TXG-OBS-003
+def test_with_no_profiling_capture_the_profiling_figures_are_not_applicable(
+    on_cpu, sizing
+):
+    """Under the extensible KV cache and under a fixed budget no profiling
+    capture runs: the profiling call's totals, ``m``, both margin readings,
+    ``r`` and the absorbed rounding are marked not applicable, by a value no
+    reader can take for a measurement, never zero."""
+    budget = 1 << 30 if sizing == Sizing.BUDGET else None
+    run = on_cpu(n=2, sizing=sizing, kv_cache_memory_bytes=budget)
+    env, core = run.env, run.core
+    core.startup()
+    rec = t.record(env)
+    assert rec[Record.RAN] is False
+    assert profiling_figures_not_applicable(rec) == {}, rec
+
+
+@pytest.mark.parametrize("sizing", [Sizing.BLOCK_COUNT, Sizing.EXTENSIBLE])
+# @spec TXG-OBS-003
+def test_the_record_holds_each_capture_layouts_page_count_and_the_final_count(
+    on_cpu, sizing
+):
+    """The record holds the page count of each capture's state-group layout
+    (the profiling KV cache's and the serving KV cache's, the reservation
+    capacity under the extensible KV cache), the KV-cache sizing, and, under
+    the extensible KV cache, the final bound count (the first dimension of
+    the views reported at core's extension) as a separate field."""
+    run = on_cpu(n=2, sizing=sizing)
+    env, core = run.env, run.core
+    core.startup(extend=False)
+    if sizing == Sizing.EXTENSIBLE:
+        core.extend(5)
+    rec = t.record(env)
+    assert rec[Record.SERVING][Record.PAGE_COUNT] == t.CAPACITY, rec[Record.SERVING]
+    assert re.search(SIZING_NAMES[sizing], str(rec[Record.SIZING])), rec[Record.SIZING]
+    if sizing == Sizing.BLOCK_COUNT:
+        assert rec[Record.PROFILING][Record.PAGE_COUNT] == t.CAPACITY
+        assert c.shows_number(str(rec[Record.SIZING]), t.CAPACITY), rec[Record.SIZING]
+        assert rec[Record.FINAL_BOUND_COUNT] == NOT_APPLICABLE
+    else:
+        assert rec[Record.FINAL_BOUND_COUNT] == 5, rec[Record.FINAL_BOUND_COUNT]
+        assert rec[Record.PROFILING] == NOT_APPLICABLE or (
+            rec[Record.PROFILING].get(Record.PAGE_COUNT) == NOT_APPLICABLE
+        ), rec[Record.PROFILING]
+
+
 # ---------------------------------------------------------------------------
 # Whether a profiling capture was required
 
@@ -270,9 +350,96 @@ def test_a_startup_plan_budget_is_an_expected_absence(on_cpu, caplog):
     assert "segment" in message.lower(), "the segment graphs are not named"
 
 
+#: What TXG-MEM-018's INFO line states: core sizes the KV cache from the
+#: device memory left after the captures.
+MEASURED = re.compile(r"(?i)after the captures")
+
+
+def _txg_records(caplog, level):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == level and r.name.startswith("vllm_nemotron_asr_streaming")
+    ]
+
+
+@pytest.mark.parametrize(
+    "case", ["default", "startup-plan-budget", "estimate-disabled"]
+)
+# @spec TXG-MEM-018, TXG-MEM-007, TXG-MEM-008
+def test_under_the_extensible_kv_cache_the_graph_memory_is_logged_as_measured(
+    on_cpu, monkeypatch, caplog, case
+):
+    """With the effective extensible KV cache on, whatever the budget or
+    estimate setting (a startup plan's ``kv_cache_memory_bytes`` set with the
+    extensible KV cache left on, or the estimate disabled), no profiling
+    capture ran and none was required: the serving capture records that
+    reason, logs no uncharged-memory WARNING, and logs one INFO line that
+    core sizes the KV cache from the memory left after the captures, which
+    includes the transaction graphs and segment graphs, with the call,
+    transaction and per-kind totals."""
+    run = on_cpu(n=2, sizing=Sizing.EXTENSIBLE)
+    env, core = run.env, run.core
+    if case == "estimate-disabled":
+        t.set_estimate(monkeypatch, False)
+    core.prepare()
+    if case == "startup-plan-budget":
+        t.set_cache(env.vllm_config, kv_cache_memory_bytes=7 << 30)
+    core.bind_serving()
+    with caplog.at_level(logging.INFO):
+        core.serving_capture()
+    rec = t.record(env)
+    assert rec[Record.REQUIRED] is False and rec[Record.RAN] is False
+    assert re.search(SIZING_NAMES[Sizing.EXTENSIBLE], str(rec[Record.REASON])), rec[
+        Record.REASON
+    ]
+    warnings = [m for m in _txg_records(caplog, logging.WARNING) if "charged" in m]
+    assert warnings == [], ("the measured case was logged as uncharged", warnings)
+    measured = [
+        m
+        for m in _txg_records(caplog, logging.INFO)
+        if MEASURED.search(m) and "segment" in m.lower()
+    ]
+    assert len(measured) == 1, _txg_records(caplog, logging.INFO)
+    serving = rec[Record.SERVING]
+    for value in (
+        serving[Record.CALL_TOTAL],
+        serving[Record.TXN_TOTAL],
+        *serving[Record.KIND_TOTALS].values(),
+    ):
+        assert t.mentions_bytes(measured[0], value), (value, measured[0])
+
+
+@pytest.mark.parametrize("sizing", [Sizing.BLOCK_COUNT, Sizing.PROFILED])
+# @spec TXG-MEM-008, TXG-MEM-007
+def test_with_the_extensible_kv_cache_off_a_disabled_estimate_is_uncharged(
+    on_cpu, monkeypatch, caplog, sizing
+):
+    """With the extensible KV cache off and the estimate disabled, under a
+    fixed block count or a profiled budget, no profiling capture was
+    required, and the serving capture logs the uncharged-memory WARNING with
+    the estimate's setting, and no measured INFO line."""
+    run = on_cpu(n=2, sizing=sizing)
+    env, core = run.env, run.core
+    t.set_estimate(monkeypatch, False)
+    core.prepare()
+    core.bind_serving()
+    with caplog.at_level(logging.INFO):
+        core.serving_capture()
+    assert t.record(env)[Record.REQUIRED] is False
+    warnings = [
+        m
+        for m in _txg_records(caplog, logging.WARNING)
+        if "not charged" in m and "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" in m
+    ]
+    assert len(warnings) == 1, _txg_records(caplog, logging.WARNING)
+    measured = [m for m in _txg_records(caplog, logging.INFO) if MEASURED.search(m)]
+    assert measured == [], measured
+
+
 # @spec TXG-MEM-007, TXG-MEM-009
 def test_an_extensible_cache_disabled_after_construction_requires_profiling(on_cpu):
-    run = on_cpu(n=2, kv_cache_memory_bytes=None, extensible_kv_cache=True)
+    run = on_cpu(n=2, sizing=Sizing.EXTENSIBLE)
     env, core = run.env, run.core
     core.prepare()
     t.set_cache(env.vllm_config, enable_extensible_kv_cache=False)
@@ -379,7 +546,7 @@ def _failure(run, *, capture, phase, budget=None):
     if capture == "profiling":
         core.bind_profiling()
     else:
-        if budget is None:
+        if core.estimate_runs():
             core.bind_profiling()
             core.profiling_capture()
             core.clear()
@@ -429,6 +596,26 @@ def test_a_transaction_graph_part_failure_names_its_phase_and_figures(
     ), message
 
 
+@pytest.mark.parametrize("sizing", [Sizing.EXTENSIBLE, Sizing.PROFILED, Sizing.BUDGET])
+# @spec TXG-MEM-010
+def test_a_serving_capture_failure_names_the_kv_cache_sizing(on_cpu, sizing):
+    """The error names the KV-cache sizing: the extensible KV cache with its
+    page count; a profiled budget with the extensible KV cache off, with the
+    estimate enabled; or a budget fixed at the given
+    ``kv_cache_memory_bytes``."""
+    budget = 9 << 30 if sizing == Sizing.BUDGET else None
+    run = on_cpu(n=2, sizing=sizing, kv_cache_memory_bytes=budget)
+    error, _ = _failure(run, capture="serving", phase="capture")
+    message = str(error)
+    assert re.search(SIZING_NAMES[sizing], message), message
+    if sizing == Sizing.EXTENSIBLE:
+        assert c.shows_number(message, t.CAPACITY), message
+    elif sizing == Sizing.PROFILED:
+        assert re.search(r"(?i)estimate[^;\n]{0,40}enabled", message), message
+    else:
+        assert t.mentions_bytes(message, budget), message
+
+
 def assert_profiling_remedies(message):
     """TXG-MEM-011: a smaller largest population, a smaller ``max_num_seqs``,
     or transaction graphs off."""
@@ -471,6 +658,38 @@ def test_serving_failure_under_a_fixed_block_count_remedies(on_cpu):
     assert not c.found(c.KV_BYTES, message), message
 
 
+#: A lower ``--gpu-memory-utilization`` remedy (TXG-MEM-019).
+LOWER_UTILIZATION = re.compile(
+    r"(?i)(lower|smaller|reduce)[^;\n]{0,40}--gpu-memory-utilization"
+)
+
+
+@pytest.mark.parametrize("sizing", [Sizing.PROFILED, Sizing.EXTENSIBLE])
+# @spec TXG-MEM-019, TXG-MEM-010
+def test_serving_failure_under_a_profiled_budget_or_the_extensible_cache_remedies(
+    on_cpu, sizing
+):
+    """A serving capture that fails after pool access under a profiled
+    budget or the extensible KV cache gives TXG-MEM-011's remedies; under a
+    profiled budget also a lower ``--gpu-memory-utilization``, stating that
+    it helps only when the allocated state pages leave too little device
+    memory for the capture's transient peak. Under the extensible KV cache
+    the capture precedes core's sizing, so no such remedy; neither sizing
+    gives a block-count or budget remedy."""
+    run = on_cpu(n=2, sizing=sizing)
+    error, _ = _failure(run, capture="serving", phase="capture")
+    message = str(error)
+    assert t.OPTION in message
+    assert_profiling_remedies(message)
+    if sizing == Sizing.PROFILED:
+        assert LOWER_UTILIZATION.search(message), message
+        assert "transient peak" in message.lower(), message
+    else:
+        assert not LOWER_UTILIZATION.search(message), message
+    assert not c.found(c.BLOCKS_OVERRIDE, message), message
+    assert not c.found(c.KV_BYTES, message), message
+
+
 @pytest.mark.parametrize(
     "fail_at,remainder,unavailable",
     [
@@ -506,32 +725,35 @@ def test_serving_failure_under_a_fixed_budget_projects_the_remainder(
     assert not c.found(c.BLOCKS_OVERRIDE, message), message
 
 
-@pytest.mark.parametrize("capture", ["profiling", "serving"])
+@pytest.mark.parametrize("sizing", [Sizing.BUDGET, Sizing.PROFILED, Sizing.EXTENSIBLE])
 # @spec TXG-MEM-017, TXG-MEM-010, TXG-CAP-008
-def test_too_few_blocks_fail_pool_access_with_a_larger_budget_or_lower_limit(
-    on_cpu, capture
+def test_too_few_pages_fail_the_serving_pool_access_with_a_larger_budget_or_lower_limit(
+    on_cpu, sizing
 ):
-    """The admission limit is ``max_num_seqs`` 4, so pool access needs five
-    blocks; the pool holds three (enough for the two capture rows of
-    ``N = 2``). The serving capture runs under a fixed
-    ``--kv-cache-memory-bytes``, whose block count no configuration check
-    knows; the profiling capture finds a profiling KV cache smaller than the
-    override. The pool-access failure names the block count and the layouts
-    it received, and its remedies are a larger budget or block count, or a
-    lower admission limit, never a smaller budget or block count."""
-    budget = None if capture == "profiling" else 1 << 30
-    run = on_cpu(n=2, max_num_seqs=4, kv_cache_memory_bytes=budget)
+    """The admission limit is ``max_num_seqs`` 4, so the serving capture's
+    pool access needs five pages; the serving layout holds three. Under a
+    fixed ``--kv-cache-memory-bytes``, a profiled budget or the extensible
+    KV cache (whose layout's page count is the reservation capacity) no
+    configuration check knows the count. The pool-access failure names the
+    page count and the layouts it received, and its remedies are a larger
+    budget or block count (under a profiled budget or the extensible KV
+    cache, a larger ``--gpu-memory-utilization``), or a lower admission
+    limit, never a smaller budget or block count. The profiling capture
+    makes no page-count check (``test_capture.py``)."""
+    budget = 1 << 30 if sizing == Sizing.BUDGET else None
+    run = on_cpu(n=2, max_num_seqs=4, sizing=sizing, kv_cache_memory_bytes=budget)
     env, core = run.env, run.core
     small = h.real_bindings(h.model_spec(env.model), capacity=3)
     core.prepare()
-    if capture == "profiling":
-        core.bind_profiling(small)
-    else:
-        core.bind_serving(small)
-    error = h.call_with(core.capture, profile_only=capture == "profiling")
-    assert error is not None, "a pool of too few blocks passed pool access"
+    if core.estimate_runs():
+        core.bind_profiling()
+        core.profiling_capture()
+        core.clear()
+    core.bind_serving(small)
+    error = h.call_with(core.serving_capture)
+    assert error is not None, "a pool of too few pages passed pool access"
     message, full = str(error), t.text(error)
-    assert t.OPTION in message and capture in message.lower(), message
+    assert t.OPTION in message and "serving" in message.lower(), message
     assert "pool access" in message.lower(), message
     assert not re.search(r"\b(chunk|echo) cell\b", message), message
     assert "layout" in full.lower() and c.shows_number(full, 3), full
@@ -542,6 +764,10 @@ def test_too_few_blocks_fail_pool_access_with_a_larger_budget_or_lower_limit(
         "a pool-access block-count failure gave a lowering remedy",
         message,
     )
+    if sizing != Sizing.BUDGET:
+        assert re.search(
+            r"(?i)(larger|higher|raise)[^;\n]{0,40}--gpu-memory-utilization", message
+        ), message
     assert t.fake_graph_count(env) == 0, "a cell was captured past pool access"
 
 
@@ -552,7 +778,7 @@ def test_too_few_blocks_fail_pool_access_with_a_larger_budget_or_lower_limit(
 @pytest.mark.gpu
 # @spec TXG-MEM-002, TXG-MEM-004, TXG-MEM-006
 def test_capture_record_figures_are_consistent_on_cuda(on_cuda):
-    env = on_cuda(n=2)
+    env = on_cuda(n=2, sizing=Sizing.BLOCK_COUNT)
     core = env.core
     core.startup()
     rec = t.record(env)
@@ -594,7 +820,7 @@ def test_measurement_readings_follow_synchronize_and_cache_release_cuda(
         return original_sync(self)
 
     monkeypatch.setattr(torch.cuda.Stream, "synchronize", stream_sync)
-    env = on_cuda(n=2)
+    env = on_cuda(n=2, sizing=Sizing.BLOCK_COUNT)
     env.core.prepare()
     env.core.bind_profiling()
     log.clear()

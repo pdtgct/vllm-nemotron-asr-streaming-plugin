@@ -29,13 +29,13 @@ ACTION_STEMS = [
     # Core binds the profiling and the serving KV cache's views, setting the
     # state-group layout at each binding, and clears it when it releases the
     # profiling KV cache after clear_cudagraphs; a binding after the serving
-    # capture with an equal and with a changed layout (TXG-LIFE-009).
+    # capture with views that fit and with views that do not (TXG-LIFE-009).
     "bindkvcache",
     "stategrouplayout",
     "releaseprofilingkvcache",
     # The pool-access check of TXG-CAP-008, able to fail.
     "poolaccess",
-    # The restricted startup's block-count or budget setting (TXG-CFG-019).
+    # The KV-cache sizing, a nondeterministic choice (its fixed settings).
     "blockcount",
     "budget",
     "prepareexecutionmemory",
@@ -126,6 +126,107 @@ def test_models_have_every_required_action(models_dir):
     text = normalized(" ".join(t.read_text() for t in specs(models_dir)))
     missing = [stem for stem in ACTION_STEMS if stem not in text]
     assert not missing, f"no action for {missing}"
+
+
+def variables(text: str) -> list[str]:
+    """The names a specification declares in its ``VARIABLES`` block."""
+    names = []
+    for block in re.findall(r"^VARIABLES\b(.*?)(?=^\S)", text, re.S | re.M):
+        block = re.sub(r"\\\*[^\n]*", "", block)
+        names += re.findall(r"[A-Za-z_][A-Za-z0-9_]*", block)
+    return names
+
+
+def definitions(text: str) -> list[str]:
+    """The operator names a specification defines (``Name ==`` or
+    ``Name(args) ==`` at the start of a line)."""
+    return re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^)]*\))?\s*==", text, re.M)
+
+
+#: The KV-cache sizings the models choose among (TXG-MODEL-002): the
+#: extensible KV cache, a profiled budget with it off, a fixed block count and
+#: a fixed budget, as quoted model values (case and underscores ignored).
+SIZING_VALUES = {"extensible", "profiled", "blockcount", "budget"}
+
+
+# @spec TXG-MODEL-002
+def test_models_choose_every_kv_cache_sizing(models_dir):
+    """The nondeterministic choice of the KV-cache sizing covers all four of
+    core's sizings, the extensible KV cache and a profiled budget included."""
+    text = " ".join(t.read_text() for t in specs(models_dir))
+    values = {normalized(v) for v in re.findall(r'"([A-Za-z_\- ]+)"', text)}
+    missing = sorted(SIZING_VALUES - values)
+    assert not missing, f"the models choose no KV-cache sizing {missing}"
+
+
+# @spec TXG-MODEL-002
+def test_models_keep_the_state_group_layout_apart_from_the_bound_views(models_dir):
+    """The state-group layout and the state layer's bound views are separate
+    state: core's extension rebinds the views while the layout stays
+    unchanged."""
+    for tla in specs(models_dir):
+        names = {normalized(n) for n in variables(tla.read_text())}
+        if "stategrouplayout" in names:
+            assert "boundviews" in names, (
+                f"{tla.name} models the state-group layout but not the bound "
+                "views as separate state"
+            )
+            return
+    pytest.fail("no model declares the state-group layout as a variable")
+
+
+# @spec TXG-MODEL-002
+def test_models_have_cores_extension_of_the_kv_cache(models_dir):
+    """Core's extension under the extensible KV cache, after post-warmup
+    verification and before any scheduled step, is an action of the
+    capture-lifecycle model."""
+    found = [
+        name
+        for tla in specs(models_dir)
+        for name in definitions(tla.read_text())
+        if "extend" in normalized(name)
+    ]
+    assert found, "no model defines an action for core's extension of the KV cache"
+
+
+# @spec TXG-MODEL-010
+def test_the_measured_and_uncharged_cases_are_separate_state(models_dir):
+    """A serving capture with no profiling capture before it is reported as
+    measured under the extensible KV cache and as uncharged with it off: the
+    measured report is a variable of its own beside the uncharged one, not
+    the aggregate comparison's reading of the serving total."""
+    for tla in specs(models_dir):
+        names = {normalized(n) for n in variables(tla.read_text())}
+        if "uncharged" in names:
+            measured = [n for n in names if "measured" in n and n != "servmeasured"]
+            assert measured, (
+                f"{tla.name} has no variable for the measured-memory report "
+                "beside the uncharged one"
+            )
+            return
+    pytest.fail("no model declares the uncharged-memory report")
+
+
+# @spec TXG-MODEL-010
+def test_the_unprofiled_serving_invariant_explains_both_cases(models_dir):
+    """The header of the checked model citing TXG-MODEL-010 explains the
+    measured case under the extensible KV cache and the uncharged case with
+    it off."""
+    paragraphs = []
+    for tla in specs(models_dir):
+        if not checked_names(tla.with_suffix(".cfg").read_text()):
+            continue
+        head = header(tla.read_text())
+        paragraphs += [
+            p for p in re.split(r"\n\\\*\s{2}(?=\S)", head) if "TXG-MODEL-010" in p
+        ]
+    assert paragraphs, "no checked model cites TXG-MODEL-010"
+    text = " ".join(paragraphs).lower()
+    for word in ("measured", "extensible", "uncharged"):
+        assert re.search(rf"\b{word}\b", text), (
+            f"the TXG-MODEL-010 invariant's explanation does not name {word!r}",
+            text,
+        )
 
 
 # @spec TXG-MODEL-002, TXG-MODEL-006

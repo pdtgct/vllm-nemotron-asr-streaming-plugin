@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pass/fail rules and record checks of the transaction-graph tier 5
-qualification and calibration (TXG-QUAL-*, TXG-CAL-003).
+qualification and calibration (TXG-QUAL-*, TXG-CAL-001 to TXG-CAL-003).
 
 These are the measurement harness's decision arithmetic, written once so the
 preregistered run and its CPU tests use the same code: the restricted startup
-every qualifying engine runs under (TXG-QUAL-001, -010, -021, -025), the step
-rule (TXG-QUAL-013, -014), the ``U_api`` procedure and gain (TXG-QUAL-016,
--017), the void rule (TXG-QUAL-005), the frozen preregistration
-(TXG-QUAL-018), the choice of ``N`` (TXG-QUAL-025, -027), and the required
-contents of the qualification and calibration records (TXG-QUAL-019, -020,
-TXG-CAL-003). Times are milliseconds.
+every qualifying engine runs under and the KV-cache sizing beside it
+(TXG-QUAL-001, -010, -021, -025), the step rule (TXG-QUAL-013, -014), the
+``U_api`` procedure and gain (TXG-QUAL-016, -017), the void rule
+(TXG-QUAL-005), the frozen preregistration (TXG-QUAL-018), the choice of
+``N`` (TXG-QUAL-025, -027), the exactness runs' test-only headroom
+(TXG-QUAL-029), and the required contents of the qualification and
+calibration records (TXG-QUAL-001, -019, -020, TXG-CAL-001 to -003). Times
+are milliseconds.
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ import statistics
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+from support.txg_api import NOT_APPLICABLE, Sizing, sizing_settings
 
 #: Step-rule legs: 2 warm-up and 21 counted steps (TXG-QUAL-013).
 WARMUP, COUNTED = 2, 21
@@ -29,29 +33,64 @@ TIER5_FLOOR = 63
 COVERAGE = 0.99
 
 # ---------------------------------------------------------------------------
-# The restricted startup of every qualifying engine
+# The restricted startup of every qualifying engine, and its KV-cache sizing
 
 #: Core's graph-memory estimate (enabled for the step rule, the installed
 #: engine checks and the fit of TXG-QUAL-025).
 ESTIMATE_ENV = "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"
 
 
-def restricted_startup(
-    max_num_seqs: int, *, max_num_active_seqs: int | None = None
-) -> dict[str, Any]:
+def restricted_startup() -> dict[str, Any]:
     """The ``AsyncEngineArgs`` keywords of the restricted startup
-    (TXG-CFG-017 to TXG-CFG-019) under the fixed block count the
-    qualification uses (TXG-QUAL-001, -010, -021): synchronous scheduling,
-    ``cudagraph_mode`` and compilation mode NONE, and
-    ``--num-gpu-blocks-override`` the admission limit plus one. ``B_hook``
-    keeps these settings, the block count included; only
-    ``transaction_graph_populations`` differs."""
-    limit = max_num_seqs if max_num_active_seqs is None else max_num_active_seqs
+    (TXG-CFG-017, TXG-CFG-018): synchronous scheduling and an explicit NONE
+    ``cudagraph_mode`` and compilation mode. It names no KV-cache setting:
+    the sizing is :func:`kv_cache_sizing`'s, core's default (the extensible
+    KV cache) unless a spec names a fixed block count or budget
+    (TXG-QUAL-001). ``B_hook`` keeps these settings and the run's sizing;
+    only ``transaction_graph_populations`` differs."""
     return {
         "async_scheduling": False,
         "enable_prefix_caching": False,
         "compilation_config": {"cudagraph_mode": "NONE", "mode": 0},
-        "num_gpu_blocks_override": int(limit) + 1,
+    }
+
+
+def kv_cache_sizing(
+    sizing: str = Sizing.EXTENSIBLE,
+    *,
+    blocks: int | None = None,
+    budget: int | None = None,
+) -> dict[str, Any]:
+    """The ``AsyncEngineArgs`` keywords of a KV-cache sizing
+    (``txg_api.Sizing``): none for core's default, the extensible KV cache,
+    which a serve command without KV-cache options selects;
+    ``enable_extensible_kv_cache`` false for a profiled budget;
+    ``num_gpu_blocks_override`` or ``kv_cache_memory_bytes`` for a fixed
+    block count or budget, each of which turns the extensible KV cache
+    off."""
+    settings = sizing_settings(sizing, blocks=blocks, budget=budget)
+    if sizing == Sizing.EXTENSIBLE:
+        return {}
+    if sizing == Sizing.PROFILED:
+        return {"enable_extensible_kv_cache": False}
+    if sizing == Sizing.BLOCK_COUNT:
+        return {"num_gpu_blocks_override": int(settings["num_gpu_blocks_override"])}
+    return {"kv_cache_memory_bytes": int(settings["kv_cache_memory_bytes"])}
+
+
+def estimate_startup(
+    max_num_seqs: int, *, max_num_active_seqs: int | None = None
+) -> dict[str, Any]:
+    """The restricted startup under the fixed block count of the checks that
+    need core's graph-memory estimate (the step rule, the estimate check and
+    the first A40 run; TXG-QUAL-010, -020, -021): ``--num-gpu-blocks-override``
+    the admission limit plus one, with the estimate enabled
+    (:func:`estimate_enabled`). A fixed block count gives the option-on and
+    option-off engines the same page count."""
+    limit = max_num_seqs if max_num_active_seqs is None else max_num_active_seqs
+    return {
+        **restricted_startup(),
+        **kv_cache_sizing(Sizing.BLOCK_COUNT, blocks=int(limit) + 1),
     }
 
 
@@ -64,7 +103,10 @@ def fit_startup(max_num_seqs: int) -> dict[str, Any]:
     """TXG-QUAL-025's "fits": both captures and their transient peaks
     succeed under ``--num-gpu-blocks-override`` ``max_num_seqs + 1`` with
     core's graph-memory estimate enabled (:func:`estimate_enabled`)."""
-    return restricted_startup(max_num_seqs)
+    return {
+        **restricted_startup(),
+        **kv_cache_sizing(Sizing.BLOCK_COUNT, blocks=int(max_num_seqs) + 1),
+    }
 
 
 def served_run_n(
@@ -327,6 +369,8 @@ FROZEN_PARAMETERS = (
     "u1_audio",
     "u1_plan",
     "u1_procedure",
+    "exactness_headroom",
+    "exactness_headroom_margin",
 )
 
 
@@ -395,10 +439,15 @@ CALIBRATION_IDENTITY = (
     "geometry",
     "segment_arms",
     "scheduling_mode",
+    "kv_cache_sizing",
     "max_num_seqs",
     "max_num_batched_tokens",
     "transaction_graph_populations",
 )
+#: The KV-cache sizings a calibration runs under, each giving its own record
+#: (TXG-CAL-001, TXG-CAL-002): core's default and the step rule's fixed
+#: ``--num-gpu-blocks-override``. No record applies at another sizing.
+CALIBRATION_SIZINGS = (Sizing.EXTENSIBLE, Sizing.BLOCK_COUNT)
 CALIBRATION_FIELDS = (
     "audio",
     "snapshot_rule",
@@ -416,10 +465,15 @@ CALIBRATION_FIELDS = (
 
 def missing_capture_figures(record: Mapping[str, Any]) -> list[str]:
     """TXG-QUAL-019: each capture's call, transaction, per-kind and per-cell
-    figures and transient peak."""
+    figures and transient peak. Under core's default KV-cache sizing no
+    profiling capture runs and the record marks its figures not applicable
+    (TXG-MEM-006, TXG-QUAL-001); the serving capture always runs."""
     missing = []
     for capture in ("profiling", "serving"):
-        figures = record.get(capture) or {}
+        figures = record.get(capture)
+        if capture == "profiling" and figures == NOT_APPLICABLE:
+            continue
+        figures = figures or {}
         missing += [f"{capture}.{k}" for k in CAPTURE_FIGURES if k not in figures]
         for cell in figures.get("cells", ()):
             if "growth" not in cell:
@@ -443,6 +497,15 @@ def missing_first_run_figures(
                 continue
             if run.get("max_num_seqs") != 64:
                 missing.append(f"run lookahead={lookahead} N={n}: max_num_seqs")
+            if run.get("kv_cache_sizing") != Sizing.BLOCK_COUNT:
+                missing.append(
+                    f"run lookahead={lookahead} N={n}: a fixed "
+                    "--num-gpu-blocks-override"
+                )
+            if run.get("estimate_enabled") is not True:
+                missing.append(
+                    f"run lookahead={lookahead} N={n}: core's graph-memory estimate"
+                )
             for capture in ("profiling", "serving"):
                 figures = run.get(capture) or {}
                 missing += [
@@ -466,3 +529,127 @@ def missing_calibration_fields(record: Mapping[str, Any]) -> list[str]:
     identity = record.get("identity") or {}
     missing += [f"identity.{k}" for k in CALIBRATION_IDENTITY if k not in identity]
     return missing
+
+
+def missing_calibration_records(records: Iterable[Mapping[str, Any]]) -> list[str]:
+    """TXG-CAL-001, TXG-CAL-002: one complete record per KV-cache sizing of
+    :data:`CALIBRATION_SIZINGS`, each naming its sizing in its identity and
+    holding U(1) and the ladder on and off."""
+    by_sizing: dict[Any, list[Mapping[str, Any]]] = {}
+    for record in records:
+        sizing = (record.get("identity") or {}).get("kv_cache_sizing")
+        by_sizing.setdefault(sizing, []).append(record)
+    missing = []
+    for sizing in CALIBRATION_SIZINGS:
+        found = by_sizing.pop(sizing, [])
+        if len(found) != 1:
+            missing.append(f"{len(found)} records under {sizing}, not 1")
+            continue
+        record = found[0]
+        missing += [f"{sizing}: {k}" for k in missing_calibration_fields(record)]
+        ladder = record.get("ladder") or {}
+        missing += [
+            f"{sizing}: ladder.{arm}" for arm in ("on", "off") if arm not in ladder
+        ]
+    missing += [f"a record under {sizing!r}" for sizing in by_sizing]
+    return missing
+
+
+# ---------------------------------------------------------------------------
+# The record of every run (TXG-QUAL-001)
+
+#: What the record of every qualification run, option on and ``B_hook``
+#: alike, holds: its KV-cache sizing and each capture layout's page count;
+#: under the extensible KV cache also the state group's final bound count,
+#: read by the driver's instrumentation after core's extension.
+RUN_RECORD_FIELDS = ("kv_cache_sizing", "capture_page_counts")
+
+
+def missing_run_record_fields(identity: Mapping[str, Any]) -> list[str]:
+    """TXG-QUAL-001: the fields a run's record (the driver's ``identity``)
+    lacks. The final bound count is a number under the extensible KV cache
+    and is not required otherwise."""
+    missing = [k for k in RUN_RECORD_FIELDS if identity.get(k) is None]
+    counts = identity.get("capture_page_counts") or {}
+    if "serving" not in counts:
+        missing.append("capture_page_counts.serving")
+    if identity.get("kv_cache_sizing") == Sizing.EXTENSIBLE and not isinstance(
+        identity.get("final_bound_count"), int
+    ):
+        missing.append("final_bound_count")
+    return missing
+
+
+# ---------------------------------------------------------------------------
+# The exactness runs' test-only headroom (TXG-QUAL-029)
+
+#: The allocator figures the record of an exactness run under the
+#: extensible KV cache holds: the torch memory limit core logs when it sizes
+#: the cache, and ``torch.cuda.memory_reserved`` and ``max_memory_reserved``
+#: before and after the detached copy.
+HEADROOM_FIGURES = (
+    "torch_memory_limit",
+    "memory_reserved_before",
+    "max_memory_reserved_before",
+    "memory_reserved_after",
+    "max_memory_reserved_after",
+)
+
+
+def headroom_utilization(
+    copy_bytes: int, margin_bytes: int, device_total_bytes: int
+) -> float:
+    """The ``--gpu-memory-utilization`` that leaves the preregistered
+    headroom (the detached copy's bytes plus a stated margin) outside what
+    core may use: below 1.0, and never a fixed ``--kv-cache-memory-bytes``,
+    which would turn the extensible KV cache off."""
+    headroom = int(copy_bytes) + int(margin_bytes)
+    if headroom <= 0 or headroom >= int(device_total_bytes):
+        raise ValueError(
+            f"a headroom of {headroom} bytes does not fit a device of "
+            f"{device_total_bytes} bytes"
+        )
+    return (int(device_total_bytes) - headroom) / int(device_total_bytes)
+
+
+def headroom_problems(reply: Mapping[str, Any]) -> list[str]:
+    """TXG-QUAL-029's checks of an exactness run's reply (the driver's
+    ``spec``, ``identity`` and ``exactness_memory``). The device-level
+    context (``nvidia-smi``, ``torch.cuda.mem_get_info``) is recorded and
+    read by no check."""
+    problems = []
+    spec = reply.get("spec") or {}
+    identity = reply.get("identity") or {}
+    settings = identity.get("settings") or {}
+    headroom = spec.get("headroom") or {}
+    if identity.get("kv_cache_sizing") != Sizing.EXTENSIBLE:
+        problems.append("the run is not under the extensible KV cache")
+    if "kv_cache_memory_bytes" in settings:
+        problems.append("the headroom came from a fixed --kv-cache-memory-bytes")
+    utilization = settings.get("gpu_memory_utilization")
+    if not isinstance(utilization, float) or not 0.0 < utilization < 1.0:
+        problems.append(f"--gpu-memory-utilization {utilization!r} is not below 1.0")
+    for name in ("copy_bytes", "margin_bytes"):
+        if not isinstance(headroom.get(name), int):
+            problems.append(f"the preregistered headroom has no {name}")
+    memory = reply.get("exactness_memory") or {}
+    problems += [
+        f"the record has no {name}" for name in HEADROOM_FIGURES if name not in memory
+    ]
+    copied = memory.get("copy_bytes")
+    if not isinstance(copied, int):
+        problems.append("the record has no copy_bytes")
+    elif (
+        isinstance(headroom.get("copy_bytes"), int) and copied > headroom["copy_bytes"]
+    ):
+        problems.append(
+            f"the detached copy took {copied} bytes, more than the "
+            f"preregistered {headroom['copy_bytes']}"
+        )
+    return problems
+
+
+def served_figure_runs(replies: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The runs a served memory, capacity or latency figure may come from:
+    those without the exactness runs' headroom (TXG-QUAL-029)."""
+    return [r for r in replies if not (r.get("spec") or {}).get("headroom")]

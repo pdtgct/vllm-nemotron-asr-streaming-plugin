@@ -33,8 +33,8 @@ Configuration module (imports no vLLM; TXG-CFG-012)
   ``.max_num_batched_tokens`` (``None`` while unresolved, TXG-CFG-015),
   ``.max_num_active_seqs`` (``None`` when unset: the admission limit is then
   ``max_num_seqs``, TXG-CFG-005, TXG-CFG-020) and ``.async_scheduling``
-  (TXG-CFG-017); ``vllm_config.cache_config.num_gpu_blocks_override`` and
-  ``.kv_cache_memory_bytes`` (TXG-CFG-005, TXG-CFG-019);
+  (TXG-CFG-017); ``vllm_config.cache_config.num_gpu_blocks_override``
+  (TXG-CFG-005);
   ``vllm_config.compilation_config.cudagraph_mode`` and ``.mode`` (``None``
   while unset; NONE is a mode whose value is 0, TXG-CFG-018); the geometry
   through ``lookahead.served_lookahead(hf_config)`` (REG-LA-001).
@@ -97,6 +97,13 @@ Transaction module (``nemotron_asr.advance``)
 * The phase functions of ``advance_model_rows`` (TXG-TXN-006, TXG-TXN-007):
   :data:`PHASES`, each a module-level function of ``advance`` looked up by
   name at call time (so a spy installed on the module sees the call).
+* The structural preflight's capture-only mode (TXG-CAP-017): the keyword
+  :data:`CAPTURE_ONLY_KEYWORD` of ``prepare_model_rows`` and of the
+  preflight itself, ``advance._structural_preflight(plan, n_ids, n_embeds,
+  *, capture_only=False)``, which returns the composed CPU index tensor and
+  raises ``ValueError`` naming the first structural defect. Only a capture
+  call's cell programs pass it, through ``prepare_model_rows``;
+  ``advance_model_rows`` has no such parameter.
 * ``CommitPlan.queue_counts``: the device ``int32`` ``(P,)`` remaining-count
   view (FILE-QC-001, TXG-QC-001, TXG-QC-002).
 """
@@ -155,13 +162,25 @@ class Record:
 
     Per capture (``PROFILING``, ``SERVING``): ``CALL_TOTAL``, ``TXN_TOTAL``,
     ``KIND_TOTALS`` (``{"chunk": int, "echo": int}``), ``CELLS`` (capture
-    order, each ``{"geometry", "kind", "count", "growth"}``), ``PEAK`` and
-    ``SECONDS``. At the top level: ``IDENTITY`` (the configuration identity,
+    order, each ``{"geometry", "kind", "count", "growth"}``), ``PEAK``,
+    ``SECONDS`` and ``PAGE_COUNT`` (the page count of the capture's
+    state-group layout, the first dimension of its component tensors;
+    TXG-OBS-003). At the top level: ``IDENTITY`` (the configuration identity,
     including the value of ``transaction_graph_populations``), the margin
     figures (``MARGIN``, ``FREE_BEFORE``, ``FREE_AFTER``, ``CHARGE``),
     ``ABSORBED``, ``EFFECTIVE``, ``REQUIRED``, ``REASON``, ``RAN``,
-    ``BUDGET``, the allocator settings (``ALLOC_CONF``, ``CUBLAS``),
+    ``SIZING`` (the KV-cache sizing, named as TXG-MEM-010 names it, with its
+    value: see :data:`SIZING_NAMES`), ``FINAL_BOUND_COUNT`` (under the
+    extensible KV cache, the first dimension of the views the state layer
+    reported at core's extension, TXG-LIFE-009; a field separate from the
+    page counts), the allocator settings (``ALLOC_CONF``, ``CUBLAS``),
     ``VERSIONS`` and ``VERIFICATION_SECONDS``.
+
+    A field that only a profiling capture produces (``PROFILING``'s figures,
+    ``MARGIN``, ``FREE_BEFORE``, ``FREE_AFTER``, ``CHARGE``, ``ABSORBED``)
+    holds :data:`NOT_APPLICABLE` when no profiling capture ran, as
+    ``FINAL_BOUND_COUNT`` does under every other KV-cache sizing
+    (TXG-MEM-006, TXG-OBS-003): never zero, never ``None``.
     """
 
     RECORD = "capture_record"
@@ -173,6 +192,7 @@ class Record:
     CELLS = "cells"
     PEAK = "transient_peak"
     SECONDS = "capture_seconds"
+    PAGE_COUNT = "page_count"
     IDENTITY = "configuration_identity"
     MARGIN = "margin_bytes"
     FREE_BEFORE = "margin_free_before"
@@ -183,15 +203,71 @@ class Record:
     REQUIRED = "profiling_required"
     REASON = "profiling_reason"
     RAN = "profiling_ran"
-    BUDGET = "budget_setting"
+    SIZING = "kv_cache_sizing"
+    FINAL_BOUND_COUNT = "final_bound_count"
     ALLOC_CONF = "PYTORCH_CUDA_ALLOC_CONF"
     CUBLAS = "CUBLAS_WORKSPACE_CONFIG"
     VERSIONS = ("torch_version", "cuda_version", "driver_version")
     VERIFICATION_SECONDS = "verification_seconds"
 
 
+#: The marking of a capture-record field that does not apply to this
+#: worker's startup (TXG-MEM-006, TXG-OBS-003): a value no reader can take
+#: for a measurement.
+NOT_APPLICABLE = "not applicable"
+
+
+class Sizing:
+    """Core's KV-cache sizings (the specs' preamble), as the tests choose
+    them. The extensible KV cache is core's default on CUDA: neither fixed
+    setting, and ``enable_extensible_kv_cache`` on. A profiled budget is
+    ``--no-enable-extensible-kv-cache`` with neither fixed setting. Either
+    fixed setting (``--num-gpu-blocks-override``,
+    ``--kv-cache-memory-bytes``) turns the extensible KV cache off."""
+
+    EXTENSIBLE = "extensible"
+    PROFILED = "profiled"
+    BLOCK_COUNT = "block_count"
+    BUDGET = "budget"
+    ALL = (EXTENSIBLE, PROFILED, BLOCK_COUNT, BUDGET)
+
+
+def sizing_settings(
+    sizing: str, *, blocks: int | None = None, budget: int | None = None
+) -> dict[str, Any]:
+    """The cache settings of ``sizing``: ``num_gpu_blocks_override``,
+    ``kv_cache_memory_bytes`` and ``enable_extensible_kv_cache``.
+    ``blocks`` is required for :attr:`Sizing.BLOCK_COUNT` and ``budget``
+    for :attr:`Sizing.BUDGET`; neither is accepted for another sizing, so a
+    test sets an override only where its spec names one."""
+    if sizing not in Sizing.ALL:
+        raise ValueError(f"unknown KV-cache sizing {sizing!r}")
+    if (blocks is not None) != (sizing == Sizing.BLOCK_COUNT):
+        raise ValueError(f"blocks={blocks!r} does not fit the sizing {sizing!r}")
+    if (budget is not None) != (sizing == Sizing.BUDGET):
+        raise ValueError(f"budget={budget!r} does not fit the sizing {sizing!r}")
+    return {
+        "num_gpu_blocks_override": blocks,
+        "kv_cache_memory_bytes": budget,
+        "enable_extensible_kv_cache": sizing == Sizing.EXTENSIBLE,
+    }
+
+
+#: How a message or a record names each KV-cache sizing (TXG-MEM-010,
+#: TXG-OBS-003): the information, not the wording.
+SIZING_NAMES = {
+    Sizing.EXTENSIBLE: r"(?i)extensible",
+    Sizing.PROFILED: r"(?i)profiled",
+    Sizing.BLOCK_COUNT: r"num_gpu_blocks_override|--num-gpu-blocks-override",
+    Sizing.BUDGET: r"kv_cache_memory_bytes|--kv-cache-memory-bytes",
+}
+
+
 #: ``advance_model_rows``'s phase functions, in order (TXG-TXN-006).
 PHASES = ("prepare_model_rows", "model_rows_body", "commit_model_rows")
+
+#: The keyword of the structural preflight's capture-only mode (TXG-CAP-017).
+CAPTURE_ONLY_KEYWORD = "capture_only"
 
 #: The model attribute holding the transaction-graph binding.
 BINDING_ATTRIBUTE = "_transaction_graph_binding"
@@ -315,3 +391,17 @@ def phase_function(name: str) -> Any:
             "advance_model_rows is not split into prepare, body and commit)"
         )
     return getattr(advance, name)
+
+
+def structural_preflight() -> Any:
+    """``advance._structural_preflight`` (TXG-CAP-017). Fails, not errors,
+    when the preflight takes no capture-only keyword."""
+    import inspect
+
+    fn = advance_module()._structural_preflight
+    if CAPTURE_ONLY_KEYWORD not in inspect.signature(fn).parameters:
+        raise AssertionError(
+            f"the structural preflight takes no {CAPTURE_ONLY_KEYWORD!r} "
+            "keyword (TXG-CAP-017's capture-only mode is not implemented)"
+        )
+    return fn

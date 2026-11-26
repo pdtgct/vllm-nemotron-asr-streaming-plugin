@@ -3466,20 +3466,44 @@ def test_a_required_but_absent_profiling_capture_fails_at_entry(hook):
     ), message
 
 
-_NOT_REQUIRED = {
-    "fixed budget": {"kv_cache_memory_bytes": 1 << 30},
-    "estimate off": {"estimate": False},
+#: Startups that require no profiling capture with the extensible KV cache
+#: off: the segment graphs are charged nowhere (``hook`` keyword arguments,
+#: then the reason the WARNING names).
+_UNCHARGED = {
+    "fixed budget": ({"kv_cache_memory_bytes": 1 << 30}, "kv_cache_memory_bytes"),
+    "estimate off": ({"estimate": False}, "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"),
+}
+
+#: Startups under the effective extensible KV cache, which core sizes from the
+#: device memory left after the captures whatever the budget or estimate
+#: setting: a profiled budget, the estimate disabled, and a budget that a
+#: startup plan sets after construction with the extensible KV cache left on.
+_MEASURED = {
+    "extensible KV cache": {},
+    "extensible, estimate off": {"estimate": False},
+    "extensible, startup-plan budget": {"kv_cache_memory_bytes": 1 << 30},
 }
 
 
-@pytest.mark.parametrize("case", [*_NOT_REQUIRED, "extensible KV cache"])
+def _plugin_records(captured_logs, level):
+    return [
+        r
+        for r in captured_logs.records
+        if r.levelno == level and r.name.startswith("vllm_nemotron_asr_streaming")
+    ]
+
+
+@pytest.mark.parametrize("case", list(_UNCHARGED))
 # @spec REG-MEM-023, REG-MEM-027
 def test_an_unrequired_profiling_capture_warns_once_after_capture(
     hook, captured_logs, case
 ):
-    env = hook(**_NOT_REQUIRED.get(case, {}))
-    if case == "extensible KV cache":
-        env.vllm_config.cache_config.enable_extensible_kv_cache = True
+    """With the extensible KV cache off and either a fixed budget or the
+    estimate disabled, one WARNING says that the segment graphs were not
+    charged to the budget, with the reason and their retained graph
+    memory."""
+    settings, reason = _UNCHARGED[case]
+    env = hook(**settings)
     env.runner.profile_run(core_embeds=False)
     pool(env)
     _capture(env, profile_only=False)
@@ -3487,20 +3511,48 @@ def test_an_unrequired_profiling_capture_warns_once_after_capture(
     assert len(env.graphs.captured()) == expected
     warnings = [
         r
-        for r in captured_logs.records
-        if r.levelno == logging.WARNING
-        and r.name.startswith("vllm_nemotron_asr_streaming")
-        and re.search(r"budget|charg", r.getMessage(), re.I)
+        for r in _plugin_records(captured_logs, logging.WARNING)
+        if re.search(r"budget|charg", r.getMessage(), re.I)
     ]
     assert len(warnings) == 1, [r.getMessage() for r in warnings]
     message = warnings[0].getMessage()
     assert _names_amount(message, expected * env.fake.per_segment_graph), message
-    reason = {
-        "fixed budget": "kv_cache_memory_bytes",
-        "estimate off": "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
-        "extensible KV cache": "extensible",
-    }[case]
     assert reason.lower() in message.lower(), message
+
+
+@pytest.mark.parametrize("case", list(_MEASURED))
+# @spec REG-MEM-023, REG-MEM-027
+def test_an_unrequired_profiling_capture_under_the_extensible_kv_cache_is_measured(
+    hook, captured_logs, case
+):
+    """The effective extensible KV cache is checked before the budget and the
+    estimate setting: whatever they are, one INFO line says that core sizes
+    the KV cache from the device memory left after the captures, with the
+    reason and the segment graphs' retained graph memory, and no WARNING
+    says that they were not charged."""
+    env = hook(**_MEASURED[case])
+    env.vllm_config.cache_config.enable_extensible_kv_cache = True
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    _capture(env, profile_only=False)
+    expected = expected_entries(env)
+    assert len(env.graphs.captured()) == expected
+    uncharged = [
+        r.getMessage()
+        for r in _plugin_records(captured_logs, logging.WARNING)
+        if re.search(r"not charged|budget must|charg", r.getMessage(), re.I)
+    ]
+    assert uncharged == [], uncharged
+    measured = [
+        r.getMessage()
+        for r in _plugin_records(captured_logs, logging.INFO)
+        if re.search(r"(?i)after the captures", r.getMessage())
+    ]
+    assert len(measured) == 1, measured
+    message = measured[0]
+    assert re.search(r"(?i)extensible", message), message
+    assert re.search(r"(?i)sizes? the kv cache|kv cache[^.]{0,40}siz", message), message
+    assert _names_amount(message, expected * env.fake.per_segment_graph), message
 
 
 # ---------------------------------------------------------------------------
@@ -3816,6 +3868,12 @@ def test_a_profiling_dummy_step_capture_failure_names_the_capture_and_remedies(
     _release(error)
 
 
+#: A lower ``--gpu-memory-utilization`` offered as a remedy.
+_LOWER_UTILIZATION = re.compile(
+    r"(?i)\b(lower|smaller)\b[^;.]{0,24}--gpu-memory-utilization"
+)
+
+
 @pytest.mark.parametrize(
     ("profile_only", "budget", "extra"),
     [
@@ -3855,6 +3913,35 @@ def test_a_hook_capture_failure_discards_the_call_and_names_the_remedies(
     assert ("cuda.stream.synchronize", name) in env.fake.events, (
         "the capture stream was not synchronized"
     )
+    _release(error)
+
+
+# @spec REG-MEM-017
+def test_a_serving_capture_failure_under_the_extensible_kv_cache_names_its_sizing(
+    hook,
+):
+    """Under the extensible KV cache the serving capture precedes core's
+    sizing of the KV cache, so no lower ``--gpu-memory-utilization`` is a
+    remedy; the budget setting the error names is the extensible KV cache,
+    as the sizing function that REG-MEM-023 and TXG-MEM-019 share names it.
+    No profiling capture runs (core runs no estimate)."""
+    env = hook()
+    env.vllm_config.cache_config.enable_extensible_kv_cache = True
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    env.graphs.fail_capture_after = len(env.graphs.captures) + 1
+    env.graphs.captures_completed = len(env.graphs.captures)
+    error = h.call_with(
+        _capture, env, profile_only=False, stream=_stream(env, "serving")
+    )
+    assert error is not None
+    _assert_failure_message(error, env)
+    message = str(error)
+    assert re.search(r"(?i)extensible", message), message
+    assert not _LOWER_UTILIZATION.search(message), message
+    env.graphs.disarm()
+    gc.collect()
+    assert env.graphs.captured() == [] and env.graphs.live_graphs() == 0
     _release(error)
 
 

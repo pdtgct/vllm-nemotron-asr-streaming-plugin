@@ -2,20 +2,27 @@
 """Tier 5 pass/fail checks that run on an A40 (``gpu``).
 
 Every engine runs the restricted startup (``txgcap_qual.restricted_startup``:
-``--no-async-scheduling``, ``-cc.cudagraph_mode none -cc.mode none`` and a
-fixed ``--num-gpu-blocks-override`` of the admission limit plus one) with
-core's graph-memory estimate enabled, unless a check varies one of them;
-``B_hook`` is the same settings with ``transaction_graph_populations``
-absent, its block count or budget setting included (TXG-QUAL-001).
+``--no-async-scheduling`` and ``-cc.cudagraph_mode none -cc.mode none``) with
+core's graph-memory estimate enabled, under core's default KV-cache sizing
+(the extensible KV cache), unless a check names another sizing
+(``txgcap_qual.kv_cache_sizing``); ``B_hook`` is the same settings with
+``transaction_graph_populations`` absent, its KV-cache sizing included
+(TXG-QUAL-001). The checks that need core's graph-memory estimate run under a
+fixed ``--num-gpu-blocks-override`` of the admission limit plus one
+(``txgcap_qual.estimate_startup``).
 
 Installed-engine checks (``card``: the published checkpoint named by
 ``NEMOTRON_CARD_DIR``): startup refusals, each naming its remedy
-(TXG-QUAL-023), the uncharged WARNING under a fixed
-``--kv-cache-memory-bytes`` and the required-but-suppressed profiling capture
-(TXG-QUAL-022), core's graph-memory estimate against ``B_hook`` under the
-fixed block count (TXG-QUAL-021), and one ``U_api`` leg of each arm through
-``AsyncLLM`` (TXG-QUAL-016; the qualifying brackets are preregistered runs of
-the same driver mode). Each
+(TXG-QUAL-023), and startup accepted under every KV-cache sizing; the
+uncharged WARNING under a fixed ``--kv-cache-memory-bytes`` and the
+required-but-suppressed profiling capture (TXG-QUAL-022); core's
+graph-memory estimate against ``B_hook`` under the fixed block count
+(TXG-QUAL-021); the block-0 capture under each of the three sizings with one
+stream and each file served alone equal to ``B_hook``'s under the same
+sizing (TXG-QUAL-028, through the qualification driver's ``alone`` mode); an
+exactness run's test-only headroom and its allocator record (TXG-QUAL-029);
+and one ``U_api`` leg of each arm through ``AsyncLLM`` (TXG-QUAL-016; the
+qualifying brackets are preregistered runs of the same driver mode). Each
 engine runs in a fresh child process with its engine core and worker in that
 process (``support.engine_child``: ``LLMEngine`` with
 ``VLLM_ENABLE_V1_MULTIPROCESSING=0``; ``AsyncLLM`` always runs the engine core
@@ -51,17 +58,26 @@ from support import txg_api
 from support import txg_conditions as c
 from support import txgcap_harness as t
 from support import txgcap_qual as q
-from support.txg_api import Record
+from support.txg_api import Record, Sizing
 
 pytestmark = [pytest.mark.gpu, pytest.mark.engine]
 
 N = 64
 
 
-def engine_settings(**overrides: Any) -> dict[str, Any]:
+def engine_settings(
+    sizing: str = Sizing.EXTENSIBLE,
+    *,
+    blocks: int | None = None,
+    budget: int | None = None,
+    **overrides: Any,
+) -> dict[str, Any]:
     """The ``AsyncEngineArgs`` keywords of the hook configuration under the
-    restricted startup with the option at ``N`` (``hf`` entries and settings
-    set to ``...`` are removed: an unset setting)."""
+    restricted startup with the option at ``N`` and the KV-cache sizing
+    ``sizing``, core's default unless named (under a fixed block count,
+    ``blocks`` or the admission limit plus one; under a fixed budget,
+    ``budget``; ``hf`` entries and settings set to ``...`` are removed: an
+    unset setting)."""
     card = os.environ.get("NEMOTRON_CARD_DIR")
     if not card:
         pytest.skip("NEMOTRON_CARD_DIR not set")
@@ -77,7 +93,12 @@ def engine_settings(**overrides: Any) -> dict[str, Any]:
         max_model_len=4096,
         max_num_seqs=N,
         hf_overrides=hf,
-        **q.restricted_startup(N),
+        **q.restricted_startup(),
+        **q.kv_cache_sizing(
+            sizing,
+            blocks=(blocks or N + 1) if sizing == Sizing.BLOCK_COUNT else None,
+            budget=budget,
+        ),
     )
     settings.update(overrides)
     return {k: v for k, v in settings.items() if v is not ...}
@@ -122,17 +143,20 @@ REFUSALS: dict[str, tuple[dict[str, Any], tuple[re.Pattern[str], ...]]] = {
     "above-p-max": (dict(hf={t.OPTION: [N + 1]}), ()),
     # TXG-CFG-005: fewer than the admission limit plus one blocks.
     "block-override-small": (
-        dict(num_gpu_blocks_override=8, hf={t.OPTION: [8]}),
+        dict(sizing=Sizing.BLOCK_COUNT, blocks=8, hf={t.OPTION: [8]}),
         (c.BLOCKS_OVERRIDE,),
     ),
-    "block-override-n": (dict(num_gpu_blocks_override=N), (c.BLOCKS_OVERRIDE,)),
+    "block-override-n": (
+        dict(sizing=Sizing.BLOCK_COUNT, blocks=N),
+        (c.BLOCKS_OVERRIDE,),
+    ),
     "eager-encoder": (dict(hf={"encoder_execution_arm": "eager"}), (ARMS,)),
     "dense-graphed-encoder": (
         dict(hf={"encoder_execution_arm": "dense-graphed"}),
         (ARMS,),
     ),
     "eager-decoder": (dict(hf={"decode_dispatch_arm": "compact-eager"}), (ARMS,)),
-    # The restricted startup (TXG-CFG-017 to TXG-CFG-019).
+    # The restricted startup (TXG-CFG-017 and TXG-CFG-018).
     "async-scheduling": (dict(async_scheduling=True), (c.NO_ASYNC_SCHEDULING,)),
     "async-scheduling-unset": (dict(async_scheduling=...), (c.NO_ASYNC_SCHEDULING,)),
     **{
@@ -157,20 +181,22 @@ REFUSALS: dict[str, tuple[dict[str, Any], tuple[re.Pattern[str], ...]]] = {
         dict(compilation_config={"cudagraph_mode": "NONE"}),
         (c.RUNNER_MODES_NONE,),
     ),
-    "no-block-count-or-budget": (
-        dict(num_gpu_blocks_override=...),
-        (c.BLOCKS_OVERRIDE, c.KV_BYTES),
-    ),
-    "zero-budget": (
-        dict(num_gpu_blocks_override=..., kv_cache_memory_bytes=0),
-        (c.BLOCKS_OVERRIDE, c.KV_BYTES),
-    ),
     # TXG-CFG-020: a population above the admission limit
-    # --max-num-active-seqs sets (the block count holds that limit).
+    # --max-num-active-seqs sets.
     "above-admission-limit": (
-        dict(max_num_active_seqs=N // 2, num_gpu_blocks_override=N + 1),
+        dict(max_num_active_seqs=N // 2),
         (c.ACTIVE_SEQS,),
     ),
+}
+
+#: Every KV-cache sizing core offers, each a valid startup with the option on
+#: under the restricted startup (TXG-QUAL-001; no setting of the sizing is a
+#: condition of TXG-QUAL-023's refusals).
+SIZINGS = {
+    "extensible": dict(sizing=Sizing.EXTENSIBLE),
+    "profiled": dict(sizing=Sizing.PROFILED),
+    "block-count": dict(sizing=Sizing.BLOCK_COUNT),
+    "budget": dict(sizing=Sizing.BUDGET, budget=8 << 30),
 }
 
 
@@ -181,9 +207,13 @@ def refusal(case: str, settings: dict[str, Any]) -> str:
 
 
 @pytest.mark.card
+@pytest.mark.parametrize("sizing", list(SIZINGS))
 # @spec TXG-QUAL-001, TXG-QUAL-023
-def test_the_valid_hook_configuration_starts_configuration():
-    create_config(engine_args())
+def test_the_valid_hook_configuration_starts_configuration(sizing):
+    """The option under the restricted startup configures under every
+    KV-cache sizing: core's default (no KV-cache option), a profiled budget,
+    a fixed block count and a fixed budget."""
+    create_config(engine_args(**SIZINGS[sizing]))
 
 
 @pytest.mark.card
@@ -243,18 +273,27 @@ def _run(settings: dict[str, Any], *, patch=None, reads=()) -> dict[str, Any]:
 
 #: The engine runs of this module's checks, by name. The conftest starts the
 #: selected ones before any test runs (``support.engine_child.prestart``).
-#: Every run but ``fixed-budget`` holds the fixed block count of the
-#: restricted startup; ``fixed-budget`` holds a fixed KV budget instead
-#: (TXG-CFG-019, TXG-QUAL-022).
+#: ``fixed-budget`` holds a fixed KV budget (TXG-QUAL-022); the runs that
+#: need core's graph-memory estimate (the required-but-suppressed profiling
+#: capture, TXG-QUAL-022; the estimate check, TXG-QUAL-021) hold a fixed
+#: block count of the admission limit plus one.
 ENGINE_RUNS = {
     "fixed-budget": lambda: _run(
-        engine_settings(kv_cache_memory_bytes=8 << 30, num_gpu_blocks_override=...),
+        engine_settings(Sizing.BUDGET, budget=8 << 30),
         reads=("record",),
     ),
-    "suppressed-profiling": lambda: _run(engine_settings(), patch="suppress-profiling"),
-    "b-hook-1": lambda: _run(engine_settings(hf={t.OPTION: ...}), reads=("estimate",)),
-    "b-hook-2": lambda: _run(engine_settings(hf={t.OPTION: ...}), reads=("estimate",)),
-    "option-on": lambda: _run(engine_settings(), reads=("estimate", "record")),
+    "suppressed-profiling": lambda: _run(
+        engine_settings(Sizing.BLOCK_COUNT), patch="suppress-profiling"
+    ),
+    "b-hook-1": lambda: _run(
+        engine_settings(Sizing.BLOCK_COUNT, hf={t.OPTION: ...}), reads=("estimate",)
+    ),
+    "b-hook-2": lambda: _run(
+        engine_settings(Sizing.BLOCK_COUNT, hf={t.OPTION: ...}), reads=("estimate",)
+    ),
+    "option-on": lambda: _run(
+        engine_settings(Sizing.BLOCK_COUNT), reads=("estimate", "record")
+    ),
 }
 
 
@@ -289,6 +328,8 @@ def test_a_fixed_budget_logs_the_uncharged_warning_with_its_figures(tmp_path):
 @pytest.mark.installed_engine("suppressed-profiling")
 # @spec TXG-QUAL-022
 def test_a_suppressed_required_profiling_capture_fails_startup(tmp_path):
+    """Under a fixed block count with core's estimate enabled the profiling
+    capture is required (TXG-MEM-007); suppressing it fails startup."""
     reply = engine("suppressed-profiling", tmp_path)
     assert not reply["ok"], "startup succeeded without the required estimate"
     error = reply["error"]
@@ -324,6 +365,199 @@ def test_cores_estimate_charges_the_profiling_transaction_total(tmp_path, capsys
             f"transaction {transaction} KV budget difference "
             f"{kv - min(b[1] for b in baseline)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Block-0 capture under each KV-cache sizing (TXG-QUAL-028) and the exactness
+# runs' headroom (TXG-QUAL-029), through the qualification driver
+
+
+def run_driver(spec: dict[str, Any], tmp_path: Path, name: str) -> dict[str, Any]:
+    """One qualification driver process (``support.txg_qual_driver``) for
+    ``spec``; returns its reply."""
+    path, out = tmp_path / f"{name}-spec.json", tmp_path / f"{name}-out.json"
+    path.write_text(json.dumps(spec))
+    tests = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(tests), env.get("PYTHONPATH", "")) if p
+    )
+    subprocess.run(
+        [sys.executable, "-m", "support.txg_qual_driver", str(path), str(out)],
+        cwd=tests,
+        env=env,
+        timeout=3600,
+        check=False,
+    )
+    return json.loads(out.read_text())
+
+
+#: TXG-QUAL-028's server: ``N`` and ``max_num_seqs`` (the check concerns the
+#: capture rule and served equality, which no ``N`` changes; a small ``N``
+#: keeps the twelve engine processes of the check short).
+ALONE_N = 8
+
+
+def driver_spec(lookahead: int, sizing: str, *, option: bool) -> dict[str, Any]:
+    card = os.environ.get("NEMOTRON_CARD_DIR")
+    if not card:
+        pytest.skip("NEMOTRON_CARD_DIR not set")
+    hf = {"num_lookahead_tokens": lookahead}
+    if option:
+        hf[t.OPTION] = [ALONE_N]
+    spec = {
+        "mode": "alone",
+        "card": card,
+        "max_model_len": 8192,
+        "max_num_seqs": ALONE_N,
+        "lookahead": lookahead,
+        "hf_overrides": hf,
+        "kv_cache_sizing": sizing,
+        "seed": 20261126,
+        "alone_utterances": 2,
+    }
+    corpus = os.environ.get("TXG_QUAL_CORPUS")
+    if corpus:
+        spec["corpus"] = corpus
+    else:
+        # Seeded noise stands in for test-clean where no corpus is named;
+        # the A40 round names LibriSpeech test-clean.
+        spec["synthetic_lengths"] = [48000, 40000, 56000, 30000, 64000, 52000]
+    return spec
+
+
+def _fits(view: list[Any], recorded: list[Any]) -> bool:
+    """TXG-LIFE-009's fit: the same address, page shape, strides and dtype,
+    and a first dimension at most the recorded one."""
+    address, shape, strides, dtype = view
+    r_address, r_shape, r_strides, r_dtype = recorded
+    return (
+        address == r_address
+        and shape[1:] == r_shape[1:]
+        and strides == r_strides
+        and dtype == r_dtype
+        and shape[0] <= r_shape[0]
+    )
+
+
+def _signature_fallbacks(reply: dict[str, Any]) -> int:
+    return int(reply["result"]["fallbacks"].get("signature", 0))
+
+
+def _transcripts(reply: dict[str, Any]) -> list[list[int]]:
+    return [
+        [t["tokens"] for t in item["transcripts"].values()]
+        for item in reply["result"]["items"]
+    ]
+
+
+@pytest.mark.card
+@pytest.mark.parametrize(
+    "sizing", [Sizing.EXTENSIBLE, Sizing.PROFILED, Sizing.BLOCK_COUNT]
+)
+@pytest.mark.parametrize("lookahead", [0, 1], ids=["80ms", "160ms"])
+# @spec TXG-QUAL-028, TXG-QUAL-001, TXG-CAP-005, TXG-LIFE-009, TXG-MEM-018
+def test_block_0_capture_serves_alone_equal_to_b_hook_under_each_sizing(
+    tmp_path, lookahead, sizing
+):
+    """Under core's default sizing the serving capture runs while the
+    extensible KV cache has committed only its minimum blocks, core's
+    extension binds views that fit the recorded layout and leaves the binding
+    unlatched, and the measured-memory INFO line appears; under a profiled
+    budget the profiling capture runs over a one-block profiling KV cache;
+    under a fixed block count both captures pass. Under each sizing one
+    stream and each of TXG-QUAL-004's files, each alone on the idle server,
+    replay cells with no ``signature`` fallback and produce ``B_hook``'s
+    transcripts under the same sizing."""
+    on = run_driver(driver_spec(lookahead, sizing, option=True), tmp_path, "on")
+    assert on["ok"], on.get("traceback")
+    off = run_driver(driver_spec(lookahead, sizing, option=False), tmp_path, "off")
+    assert off["ok"], off.get("traceback")
+    for reply in (on, off):
+        record = reply["identity"]
+        assert q.missing_run_record_fields(record) == [], record
+        assert record["kv_cache_sizing"] == sizing
+    probes = on["probes"]
+    captures = probes["captures"]
+    record = on["capture_record"][Record.RECORD]
+    # Every capture row names block 0 (TXG-CAP-005): the capture-only plans
+    # of each capture that ran, ``2N`` cell programs each.
+    rows = probes["capture_rows"]
+    for name in captures:
+        assert len(rows.get(name, ())) >= 2 * ALONE_N, (name, rows)
+        assert all(blocks == [0] for blocks in rows[name]), (name, rows[name])
+    if sizing == Sizing.EXTENSIBLE:
+        assert "profiling" not in captures, "a profiling capture ran"
+        assert captures["serving"]["num_committed_blocks"] in (1, 2), captures
+        extension = probes["extension"]
+        assert extension is not None and "error" not in extension, extension
+        assert extension["latched"] is False, extension
+        recorded = captures["serving"]["views"]
+        assert set(extension["views"]) == set(recorded)
+        for name, view in extension["views"].items():
+            assert _fits(view, recorded[name]), (name, view, recorded[name])
+        info = [
+            message
+            for level, message in probes["records"]
+            if level == "INFO" and re.search(r"(?i)after the captures", message)
+        ]
+        assert len(info) == 1, probes["records"]
+        assert not [m for level, m in probes["records"] if "not charged" in m], (
+            "the measured startup logged the uncharged WARNING"
+        )
+        assert record[Record.FINAL_BOUND_COUNT] == on["identity"]["final_bound_count"]
+    elif sizing == Sizing.PROFILED:
+        assert record[Record.PROFILING][Record.PAGE_COUNT] == 1, record
+        assert "profiling" in captures and "serving" in captures
+    else:
+        assert set(captures) == {"profiling", "serving"}
+        assert record[Record.PROFILING][Record.PAGE_COUNT] == ALONE_N + 1
+    assert on["result"]["replays"] > 0, "no cell replayed"
+    assert _signature_fallbacks(on) == 0, on["result"]["fallbacks"]
+    assert _transcripts(on) == _transcripts(off)
+
+
+@pytest.mark.card
+# @spec TXG-QUAL-029, TXG-QUAL-003
+def test_an_exactness_run_leaves_its_headroom_and_records_the_allocator(tmp_path):
+    """A short ``Q``/``M`` exactness run under the extensible KV cache with a
+    preregistered headroom of the detached copy's bytes plus a margin, left
+    through ``--gpu-memory-utilization`` below 1.0: its record holds core's
+    logged torch memory limit and the allocator readings around the copy,
+    and passes TXG-QUAL-029's checks; it is no source of a served figure."""
+    card = os.environ.get("NEMOTRON_CARD_DIR")
+    if not card:
+        pytest.skip("NEMOTRON_CARD_DIR not set")
+    n = 4
+    spec = {
+        "mode": "qm",
+        "card": card,
+        "max_model_len": 82513,
+        "max_num_seqs": n,
+        "lookahead": 0,
+        "hf_overrides": {"num_lookahead_tokens": 0, t.OPTION: [n]},
+        "kv_cache_sizing": Sizing.EXTENSIBLE,
+        "compare": True,
+        "seed": 3,
+        "concurrencies": [n],
+        "steps": 20,
+        "m_steps": 20,
+        "synthetic_lengths": [24000] * 16,
+        # Preregistered (TXG-QUAL-018): the copy's bytes bound the views up
+        # to the final committed block count, which the extensible KV cache
+        # sizes from what the headroom leaves (about half an A40's memory
+        # each); the margin is stated.
+        "headroom": {"copy_bytes": 22 << 30, "margin_bytes": 2 << 30},
+    }
+    reply = run_driver(spec, tmp_path, "exactness")
+    assert reply["ok"], reply.get("traceback")
+    assert q.headroom_problems(reply) == [], reply["exactness_memory"]
+    memory = reply["exactness_memory"]
+    assert memory["torch_memory_limit"] > 0
+    assert memory["copies"] > 0
+    assert q.served_figure_runs([reply]) == []
+    result = reply["result"]
+    assert result["mismatches"] == 0, result
 
 
 # ---------------------------------------------------------------------------

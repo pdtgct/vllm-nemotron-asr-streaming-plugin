@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Split equivalence of the option-off transaction and its exactness
-obligations (TXG-EQ-002, TXG-EQ-006 to TXG-EQ-010).
+obligations (TXG-EQ-002, TXG-EQ-006 to TXG-EQ-010), and the CPU part of
+TXG-EQ-003.
 
 These run the option-off transaction on composed steps
 (``support.txg_transaction``): row fixtures from real steps of the runnable
 synthetic card, each row on its own block. TXG-EQ-002 runs on CPU
 (``engine``) and on CUDA (``gpu``). The covered-step equivalences
-(TXG-EQ-001, TXG-EQ-003 to TXG-EQ-005) are in ``test_equivalence_gpu.py``.
+(TXG-EQ-001, TXG-EQ-003 to TXG-EQ-005) are in ``test_equivalence_gpu.py``;
+TXG-EQ-003's sub-plans (``txg_transaction.replay_set``: fresh rows over
+sentinel recycled pages, continuing rows over live pages distinct from the
+null page, mixed rows at counts of 2 or more) also run here through each
+cell's body on CPU (``support.txg_eager``), which is what a replay of the
+captured cell computes; the graph itself is the ``gpu`` leg's.
 
 Cost: the bounded enumeration of TXG-EQ-002 runs about 14,000 option-off
 transactions per geometry and endpointing setting (about 50 minutes on CPU in
@@ -502,3 +508,83 @@ def test_160_ms_decode_reads_at_most_two_encoder_frames(txn_env):
     )
     env.run(env.compose(chunk_rows_160(env)), decode_resolver=resolver)
     assert widths and all(w <= L + 1 == 2 for w in widths), widths
+
+
+# ---------------------------------------------------------------------------
+# TXG-EQ-003's sub-plans on CPU
+
+#: ``N`` of TXG-EQ-003's CPU leg: every count from 1 to ``N`` of each kind.
+EQ003_N = 3
+
+
+@pytest.mark.engine
+@pytest.mark.parametrize("count", range(1, EQ003_N + 2))
+@pytest.mark.parametrize("kind", ["chunk", "echo"])
+# @spec TXG-EQ-003
+def test_the_replay_set_has_fresh_sentinel_continuing_live_and_mixed_rows(
+    txn_env, kind, count
+):
+    """At every count, one sub-plan of fresh rows whose recycled pages hold
+    sentinel patterns, one of continuing rows whose pages hold nonzero state
+    distinct from the null page, and, at counts of 2 or more, one that mixes
+    them; every row's block, the row order and the file mask differ from the
+    capture rows (all on block 0, alternating fresh and file bits)."""
+    env = txn_env(0)
+    sub_plans = tx.replay_set(env, kind, count, seed=count)
+    expected = ["fresh", "continuing"] + (["mixed"] if count >= 2 else [])
+    assert [label.rsplit("-", 1)[1] for label, _ in sub_plans] == expected
+    for label, step in sub_plans:
+        plan = step.plan
+        blocks = plan.state_indices_p.tolist()
+        assert 0 not in blocks and blocks == sorted(blocks, reverse=True), blocks
+        assert bool(plan.is_chunk.all()) is (kind == "chunk"), label
+        fresh = (~plan.has_initial_states_p).tolist()
+        if label.endswith("fresh"):
+            assert all(fresh), label
+        elif label.endswith("continuing"):
+            assert not any(fresh), label
+        else:
+            assert any(fresh) and not all(fresh), label
+        for is_fresh, block, fixture in zip(fresh, blocks, step.fixtures, strict=True):
+            page = step.pools.page(block)
+            if is_fresh:
+                assert any(
+                    not tx.same_bits(page[name], fixture.page[name]) for name in page
+                ), (label, block, "the recycled page holds no sentinel")
+            else:
+                assert tx.holds_live_state(step.pools, block), (label, block)
+        if count >= 2:
+            assert set(plan.is_file.tolist()) == {True, False}, label
+
+
+@pytest.fixture
+def eq003_cells(on_cpu, monkeypatch):
+    """An option-on CPU environment at ``N = max_num_seqs = EQ003_N`` whose
+    cells compute (``txg_eager.build_covered``)."""
+    from support import txg_eager as eager
+
+    run = on_cpu(n=EQ003_N, max_num_seqs=EQ003_N)
+    return eager.build_covered(monkeypatch, run)
+
+
+@pytest.mark.engine
+@pytest.mark.parametrize("kind", ["chunk", "echo"])
+# @spec TXG-EQ-003, TXG-MASK-001
+def test_each_cell_equals_its_fresh_continuing_and_mixed_sub_plans(eq003_cells, kind):
+    """For the same cell at every count from 1 to ``N``, the replay (its
+    body, run eagerly) of each sub-plan of TXG-EQ-003's replay set equals the
+    option-off transaction of the same sub-plan bit for bit: outputs,
+    statuses, progress, remaining queue counts and every page."""
+    steps = eq003_cells
+    env = steps.env
+    failures = []
+    for count in range(1, EQ003_N + 1):
+        before = len(steps.cells.runs)
+        sub_plans = tx.replay_set(env, kind, count, seed=count)
+        for label, step in sub_plans:
+            problems = steps.compare(step)
+            if problems:
+                failures.append((label, problems))
+        ran = steps.cells.runs[before:]
+        assert ran == [(env.geometry, kind, count)] * len(sub_plans), ran
+    assert not failures, failures

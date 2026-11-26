@@ -565,7 +565,8 @@ def test_every_cells_warm_ups_and_capture_read_nothing_on_the_host(
     from vllm_nemotron_asr_streaming.nemotron_asr import state_scatter
 
     advance = api.advance_module()
-    run = on_cpu(n=3, max_num_seqs=3)
+    # Both captures: a fixed block count with core's estimate enabled.
+    run = on_cpu(n=3, max_num_seqs=3, sizing=api.Sizing.BLOCK_COUNT)
     env, core = run.env, run.core
     core.prepare()
     core.bind_profiling()

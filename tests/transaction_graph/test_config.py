@@ -7,10 +7,12 @@ checks return TXG-CFG-016's state-layer condition only for a core without
 it; ``api.config_errors`` passes that capability (``state_group_layouts``,
 default the target core's). The configuration doubles
 (``support.txg_fakes.engine_config``) meet the restricted startup by default
-(TXG-CFG-017 to TXG-CFG-019): synchronous scheduling, ``cudagraph_mode`` and
-compilation mode NONE, and ``num_gpu_blocks_override`` the admission limit
-plus one. A test that violates one condition therefore sees exactly that
-condition.
+(TXG-CFG-017 and TXG-CFG-018): synchronous scheduling, ``cudagraph_mode``
+and compilation mode NONE, under core's default KV-cache sizing, the
+extensible KV cache (neither ``num_gpu_blocks_override`` nor
+``kv_cache_memory_bytes``). A test that violates one condition therefore
+sees exactly that condition; a test sets a fixed block count or budget only
+where its spec names one.
 
 CPU tests on configuration doubles (``support.txg_fakes``), except the
 callers of TXG-CFG-011 and TXG-CFG-016, which use the stage 1 build
@@ -161,7 +163,6 @@ def test_no_condition_while_off(value, state_group_layouts):
     config = engine_config(
         hf,
         enforce_eager=True,
-        num_gpu_blocks_override=None,
         async_scheduling=None,
         cudagraph_mode=None,
         compilation_mode=None,
@@ -220,13 +221,7 @@ def test_an_entry_above_max_num_seqs_is_refused_by_both_bounds():
     ``max_num_seqs`` (TXG-CFG-020): both conditions are returned. The
     batching limit is engine configuration that ``largest_population`` does
     not see, so only the configuration check refuses this value."""
-    errors = errors_for(
-        [65],
-        max_num_seqs=64,
-        max_num_batched_tokens=8192,
-        num_gpu_blocks_override=None,
-        kv_cache_memory_bytes=1 << 30,
-    )
+    errors = errors_for([65], max_num_seqs=64, max_num_batched_tokens=8192)
     assert len(errors) == 2, errors
     admission = [e for e in errors if cond.is_admission_condition(e)]
     assert len(admission) == 1, errors
@@ -271,16 +266,11 @@ def test_every_accepted_value_yields_its_largest_entry():
 )
 def test_unresolved_limits_bound_nothing(limits, value, refused):
     """At the configuration hook an unresolved limit bounds nothing; the
-    other conditions still apply. A fixed KV budget keeps the block-count
-    condition (TXG-CFG-005) out of the comparison."""
+    other conditions still apply. Under core's default KV-cache sizing no
+    block count is fixed, so the block-count condition (TXG-CFG-005) takes
+    no part."""
     seqs, tokens = limits
-    errors = errors_for(
-        value,
-        max_num_seqs=seqs,
-        max_num_batched_tokens=tokens,
-        num_gpu_blocks_override=None,
-        kv_cache_memory_bytes=1 << 30,
-    )
+    errors = errors_for(value, max_num_seqs=seqs, max_num_batched_tokens=tokens)
     assert bool(mentioning(errors, KEY)) is refused, errors
 
 
@@ -331,13 +321,7 @@ def test_the_admission_limit_from_max_num_seqs_is_named():
 def test_an_unknown_admission_limit_bounds_nothing():
     """Before ``max_num_seqs`` is resolved and with ``max_num_active_seqs``
     unset, the configuration hook does not know the limit."""
-    errors = errors_for(
-        [512],
-        max_num_seqs=None,
-        max_num_batched_tokens=None,
-        num_gpu_blocks_override=None,
-        kv_cache_memory_bytes=1 << 30,
-    )
+    errors = errors_for([512], max_num_seqs=None, max_num_batched_tokens=None)
     assert errors == [], errors
 
 
@@ -348,8 +332,6 @@ def test_a_set_max_num_active_seqs_bounds_before_max_num_seqs_is_resolved():
         max_num_seqs=None,
         max_num_batched_tokens=None,
         max_num_active_seqs=8,
-        num_gpu_blocks_override=None,
-        kv_cache_memory_bytes=1 << 30,
     )
     admission = [e for e in errors if cond.is_admission_condition(e)]
     assert len(admission) == 1, errors
@@ -574,7 +556,7 @@ def test_the_hook_conditions_are_not_repeated_beside_the_runner_mode_one(
 
 
 # ---------------------------------------------------------------------------
-# The restricted startup (TXG-CFG-017 to TXG-CFG-019)
+# The restricted startup (TXG-CFG-017 and TXG-CFG-018)
 
 
 # @spec TXG-CFG-017, TXG-CFG-003
@@ -643,35 +625,54 @@ def test_core_none_modes_are_accepted_and_others_refused():
     assert "FULL_AND_PIECEWISE" in error, error
 
 
-# @spec TXG-CFG-019, TXG-CFG-003
-@pytest.mark.parametrize("budget", [None, 0], ids=["unset", "zero"])
-def test_neither_a_block_count_nor_a_kv_budget_is_refused(budget):
-    """The pool condition: an explicit block count or KV budget, which turns
-    core's extensible KV cache off; remedies a ``--num-gpu-blocks-override``
-    of at least the admission limit plus one or a positive
-    ``--kv-cache-memory-bytes``."""
-    error = only(
-        errors_for(
-            max_num_seqs=64, num_gpu_blocks_override=None, kv_cache_memory_bytes=budget
-        )
-    )
-    assert cond.is_pool_condition(error), error
-    assert cond.found(cond.EXTENSIBLE, error), error
-    assert cond.shows_number(error, 65), error  # the admission limit plus one
+#: Every KV-cache sizing core offers, as the configuration checks see it:
+#: core's default, the extensible KV cache; a profiled budget with it off; a
+#: zero budget, which core reads as unset; a fixed block count of the
+#: admission limit plus one (TXG-CFG-005); a fixed budget; and a startup
+#: plan's budget, which core sets with the extensible KV cache left on.
+SIZINGS = {
+    "extensible": api.sizing_settings(api.Sizing.EXTENSIBLE),
+    "profiled": api.sizing_settings(api.Sizing.PROFILED),
+    "zero-budget": dict(kv_cache_memory_bytes=0, enable_extensible_kv_cache=False),
+    "block-count": api.sizing_settings(api.Sizing.BLOCK_COUNT, blocks=65),
+    "budget": api.sizing_settings(api.Sizing.BUDGET, budget=1 << 30),
+    "startup-plan": dict(
+        kv_cache_memory_bytes=1 << 30, enable_extensible_kv_cache=True
+    ),
+}
 
 
-# @spec TXG-CFG-019
-def test_a_positive_kv_budget_meets_the_pool_condition():
-    """A fixed budget's block count is known only at the serving capture,
-    where the pool-access check compares it (TXG-CAP-008)."""
-    assert (
-        errors_for(
-            max_num_seqs=64,
-            num_gpu_blocks_override=None,
-            kv_cache_memory_bytes=1 << 30,
-        )
-        == []
-    )
+@pytest.mark.parametrize("sizing", list(SIZINGS))
+# @spec TXG-CFG-003
+def test_every_kv_cache_sizing_meets_the_restricted_startup(sizing):
+    """The restricted startup is synchronous scheduling and an explicit NONE
+    runner and compilation mode, under every KV-cache sizing core offers:
+    each capture addresses only block 0, which core backs at every capture,
+    so neither an explicit block count nor a KV budget is a condition."""
+    assert errors_for(max_num_seqs=64, **SIZINGS[sizing]) == []
+
+
+@pytest.mark.parametrize("sizing", list(SIZINGS))
+@pytest.mark.parametrize(
+    "unmet, check",
+    [
+        ({"async_scheduling": None}, cond.NO_ASYNC_SCHEDULING),
+        ({"async_scheduling": True}, cond.NO_ASYNC_SCHEDULING),
+        ({"cudagraph_mode": GraphMode.FULL}, cond.RUNNER_MODES_NONE),
+        ({"compilation_mode": None}, cond.RUNNER_MODES_NONE),
+    ],
+    ids=["scheduling-unset", "async", "graph-full", "compile-unset"],
+)
+# @spec TXG-CFG-017, TXG-CFG-018, TXG-CFG-003
+def test_the_restricted_startup_refuses_under_every_kv_cache_sizing(
+    sizing, unmet, check
+):
+    """Under each sizing, an unmet scheduling or runner-mode setting is
+    refused with its own remedy, and the refusal is the only condition: no
+    KV-cache sizing is one."""
+    error = only(errors_for(max_num_seqs=64, **SIZINGS[sizing], **unmet))
+    assert cond.found(check, error), error
+    assert not cond.is_sizing_condition(error), error
 
 
 # ---------------------------------------------------------------------------
@@ -717,8 +718,8 @@ def test_the_state_layer_condition_is_its_own_entry():
 # @spec TXG-CFG-003, TXG-CFG-011
 def test_every_violated_condition_is_returned():
     """Each violated condition is its own entry, naming the option: here
-    every condition but the block count's (the pool condition is its
-    alternative), ten in all."""
+    every condition but the block count's (no block count is fixed), nine in
+    all, none of them a KV-cache sizing."""
     from support.txg_fakes import _ABSENT
 
     errors = errors_for(
@@ -732,17 +733,13 @@ def test_every_violated_condition_is_returned():
         async_scheduling=None,
         cudagraph_mode=None,
         compilation_mode=None,
-        num_gpu_blocks_override=None,
     )
-    assert len(errors) == 10, errors
+    assert len(errors) == 9, errors
     for error in errors:
         assert KEY in error, error
-    for check in (
-        cond.is_state_layer_condition,
-        cond.is_admission_condition,
-        cond.is_pool_condition,
-    ):
+    for check in (cond.is_state_layer_condition, cond.is_admission_condition):
         assert len([e for e in errors if check(e)]) == 1, (check.__name__, errors)
+    assert not [e for e in errors if cond.is_sizing_condition(e)], errors
     for needle in (
         "[0, 70]",
         "num_lookahead_tokens",

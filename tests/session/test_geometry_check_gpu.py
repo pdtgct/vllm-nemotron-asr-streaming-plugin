@@ -6,10 +6,10 @@ another geometry) at the server's geometry and at others.
 
 The server runs at 160 ms (``num_lookahead_tokens`` 1), with transaction graphs
 off (``--enforce-eager``) and on (the hook configuration with
-``transaction_graph_populations`` under the restricted startup, TXG-CFG-017 to
-TXG-CFG-019: synchronous scheduling, explicit ``cudagraph_mode`` and
-compilation mode NONE, and a block count of the admission limit plus one;
-TXG-CFG-006 serves them only at 80 and 160 ms). The target core admits each
+``transaction_graph_populations`` under the restricted startup, TXG-CFG-017
+and TXG-CFG-018: synchronous scheduling and explicit ``cudagraph_mode`` and
+compilation mode NONE, at core's default KV-cache sizing; TXG-CFG-006 serves
+them only at 80 and 160 ms). The target core admits each
 stream when ``AsyncLLM.generate`` is given an input generator; there is no
 admission argument, and a failed request ends with finish reason ``error``
 through the model state's ``take_failed_requests`` (REG-MS-003, REG-MS-004).
@@ -51,7 +51,6 @@ ARMS = {
         enforce_eager=False,
         compilation_config={"mode": "none", "cudagraph_mode": "none"},
         max_num_seqs=4,
-        num_gpu_blocks_override=5,
         hf_overrides={
             "num_lookahead_tokens": SERVER_RIGHT_CONTEXT,
             "transaction_graph_populations": [4],

@@ -318,7 +318,10 @@ A fixed `--kv-cache-memory-bytes` changes this. Core takes the budget as given a
 the model's execution memory nor the segment graphs (nor transaction graphs). Leave room for the
 segment graphs and the execution memory. In the hook configuration, the startup log then carries a
 WARNING with the uncharged bytes. The same WARNING appears when core's graph-memory estimate is
-disabled (`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`).
+disabled (`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`) with the extensible KV cache off. Under the
+extensible KV cache, core's default on CUDA, core sizes the KV cache from the memory left after
+the capture, whatever the budget or estimate setting, and the startup log reports the same bytes
+as measured in an INFO line.
 
 ### Refused settings
 
@@ -381,17 +384,29 @@ On the target core the option starts only under a restricted startup, which the 
 | Setting | Why |
 | --- | --- |
 | `--no-async-scheduling` | the baseline and the qualification run synchronously, and the worker's call order under asynchronous scheduling is unverified with cells; an unset value means asynchronous scheduling and is refused |
-| `-cc.cudagraph_mode none -cc.mode none`, both explicit | a mode that core reduces to NONE only later sizes core's profiling KV cache differently, and the qualification covers explicit NONE only; an unset mode is refused |
-| `--num-gpu-blocks-override` of at least the admission limit plus one, or a positive `--kv-cache-memory-bytes` that holds that many state pages | either turns core's extensible KV cache off. Without one, core's profiling KV cache holds too few state pages for the profiling capture, and the extensible KV cache backs only its first blocks when the serving capture runs and grows without refreshing the state pages' layout. The admission limit is `--max-num-active-seqs`, or `--max-num-seqs` when it is unset; core refuses fewer state pages than requests that can be active, but only after both captures, so the plugin checks the count first |
+| `-cc.cudagraph_mode none -cc.mode none`, both explicit | the qualification covers explicit NONE only: a mode that core reduces to NONE only when it initializes the KV cache leaves the runner capturing nothing, as explicit NONE does, but no transaction-graph run has shown its served equality; an unset mode is refused |
 
+The option starts under every KV-cache sizing core offers: core's default, the extensible KV
+cache; a profiled budget with `--no-enable-extensible-kv-cache`; a fixed
+`--num-gpu-blocks-override`; and a fixed `--kv-cache-memory-bytes`. Every capture addresses only
+block 0 of the state pages, the one page core backs at every capture, and the cells reach each
+held page by its block ID when they replay. The command fixes the block count:
 `--num-gpu-blocks-override 65` holds the null block and one page for each of the 64 requests that
-`--max-num-seqs 64` lets be active. Core refuses a smaller count when it builds its scheduler,
-after both captures, so the plugin refuses an override below the admission limit plus one at
-startup; to run a smaller override, lower the admission limit with it. Under the override, core
-still runs its graph-memory estimate, over a profiling KV cache of 65 blocks. A fixed
-`--kv-cache-memory-bytes` runs no estimate
-([Memory and the startup log](#memory-and-the-startup-log)), and must hold at least the
-admission limit plus one state pages.
+`--max-num-seqs 64` lets be active. No KV-cache sizing, core's default included, carries a
+verified claim on the target core (below).
+
+The state pages must number at least the admission limit plus one (`--max-num-active-seqs`, or
+`--max-num-seqs` when it is unset). Core refuses fewer when it builds its scheduler, after the
+captures, so the plugin refuses an override below that count at startup; to run a smaller
+override, lower the admission limit with it. Under a fixed or profiled budget the plugin refuses
+a smaller page count when the serving capture first reads the state pages, before it captures any
+cell. Under the extensible KV cache the final count is known only after the capture, and core's
+scheduler refuses a count that is too small ([Troubleshooting](#troubleshooting)). Under the
+override, core still runs its graph-memory estimate, over a profiling KV cache of 65 blocks, and
+under a profiled budget with the extensible KV cache off, over a profiling KV cache of one block.
+A fixed `--kv-cache-memory-bytes` runs no estimate, and under core's default sizing core sizes
+the KV cache after the captures, from the memory they leave
+([Memory and the startup log](#memory-and-the-startup-log)).
 
 `transaction_graph_populations` lists distinct step populations. Each is an integer from 1 to
 `min(max_num_seqs, max_num_batched_tokens)` and at most core's admission limit
@@ -421,16 +436,23 @@ at 80 ms (99.10 %; serving capture 832 MiB call total, 268 MiB transaction total
 
 A fixed `--kv-cache-memory-bytes` must leave room for the transaction graphs and the segment
 graphs. Core does not charge them under a fixed budget, and the startup log reports the uncharged
-bytes in a WARNING. A budget that holds fewer state pages than the admission limit plus one fails
-startup when the serving capture first reads the state pages, before it captures any cell; the
-remedies are a larger `--kv-cache-memory-bytes` or a lower admission limit, never a smaller budget.
-Under `--num-gpu-blocks-override`, core's graph-memory estimate charges the profiling capture, and
-startup fails if the serving capture retains more than the profiling capture.
+bytes in a WARNING. Under core's default KV-cache sizing, the extensible KV cache, core runs no
+estimate: it sizes the KV cache after the captures, from the device memory they leave, and the
+startup log reports the graph totals as measured in an INFO line, a budget that a startup plan
+sets there included. A fixed or profiled budget that holds fewer state pages than the admission
+limit plus one fails startup when the serving capture first reads the state pages, before it
+captures any cell; the remedies are a larger `--kv-cache-memory-bytes`, a larger
+`--num-gpu-blocks-override`, under a profiled budget a larger `--gpu-memory-utilization`, or a
+lower admission limit, never a smaller budget. Under `--num-gpu-blocks-override`, and under a
+profiled budget with the extensible KV cache off, core's graph-memory estimate charges the
+profiling capture, and startup fails if the serving capture retains more than the profiling
+capture.
 
 Each capture logs one INFO line with the cells, `N`, the call and transaction totals, the transient
 peak and the capture time. Post-warmup verification logs one INFO line when it passes. Shutdown
 logs one INFO line with replays, split steps and fallbacks by reason. Startup captures the `2N`
-cells twice, in addition to the segment graphs' two captures. On the A40 with the state-pool build,
+cells twice when core's graph-memory estimate runs, in addition to the segment graphs' two
+captures, and once otherwise. On the A40 with the state-pool build,
 each capture took about 70 to 74 s. If startup exceeds `VLLM_ENGINE_READY_TIMEOUT_S` (default
 600 s), raise it ([Operations](#engine-ready-timeout)).
 
@@ -440,8 +462,8 @@ each capture took about 70 to 74 s. If startup exceeds `VLLM_ENGINE_READY_TIMEOU
   (lookahead 0 or 1). The published card's default, 320 ms, and 560 and 1120 ms are refused, with
   the remedy `num_lookahead_tokens` 0 or 1.
 - `N` is bounded by `max_num_seqs`, by `max_num_batched_tokens` and by core's admission limit
-  (`--max-num-active-seqs`). The block count, whether set by `--num-gpu-blocks-override` or
-  derived from `--kv-cache-memory-bytes`, must be at least the admission limit plus one.
+  (`--max-num-active-seqs`). A fixed block count or budget, when set, must hold at least the
+  admission limit plus one state pages.
 - Startup outside the restricted startup is refused, naming each unmet setting and its remedy.
 - Steps with more than `N` CHUNK rows (`chunk-uncovered`) or more than `N` other rows
   (`echo-uncovered`) run without transaction graphs and are counted.
@@ -639,13 +661,14 @@ The plugin logs these lines at startup, among core's own lines:
 | INFO | `Nemotron segment graphs: <runner> runner, <capture>; encoder_execution_arm ..., decode_dispatch_arm ...; geometry ... (lookahead ...); max_num_seqs ...; retained ..., capture time ... s` | each segment-graph capture |
 | INFO | `Nemotron graphed arms run eagerly on <device>, a platform or device without static graphs` | graphed arms requested on a device that cannot capture graphs |
 | WARNING | `Serving lookahead <r> (<ms>), a geometry the checkpoint does not declare` | lookahead 1 on the published card |
-| WARNING | `Nemotron segment graphs were not charged to the budget` | the hook configuration with a fixed budget or core's estimate disabled |
+| WARNING | `Nemotron segment graphs were not charged to the budget` | the hook configuration with the extensible KV cache off and either a fixed budget or core's estimate disabled; under the extensible KV cache an INFO line reports the same figures as measured, because core sizes the KV cache from the memory left after the capture |
 | WARNING | `Complete-file requests for language <code> cannot be mapped to a prompt row` | each language that needs a `language_locales` entry |
 | INFO | `Nemotron transaction graphs (...): the <capture> capture captured <n> cells ...` | each transaction-graph capture, with the call and transaction totals, the transient peak and the capture time |
 | INFO | `Nemotron transaction graphs (...): post-warmup verification passed for <n> cells ...` | after warmup, with transaction graphs on |
 
-In the hook configuration, each segment-graph capture runs twice: a profiling capture, which core's
-graph-memory estimate charges, and a serving capture. At shutdown with transaction graphs on, the
+In the hook configuration with core's graph-memory estimate running, each segment-graph capture
+runs twice: a profiling capture, which the estimate charges, and a serving capture. Under core's
+default KV-cache sizing and under a fixed budget it runs once, as the serving capture. At shutdown with transaction graphs on, the
 plugin logs one INFO line with replays, split steps and fallbacks by reason.
 
 ### Readiness checks
@@ -678,7 +701,8 @@ file limits against these at startup; its deployment guide states the rules.
 
 `VLLM_ENGINE_READY_TIMEOUT_S` (default 600 s) bounds how long the API server waits for the engine to
 become ready. Graph capture counts against it. With transaction graphs on, startup captures `2N`
-cells twice in addition to the segment graphs' two captures, and on the state-pool build the tier 5
+cells twice when core's graph-memory estimate runs, in addition to the segment graphs' two
+captures, and once otherwise; on the state-pool build the tier 5
 servers were ready 179 to 221 s after launch. If startup exceeds the timeout, raise it.
 
 ## Troubleshooting
@@ -727,9 +751,14 @@ With transaction graphs on, these conditions are also refused. Each refusal name
 | state layer | the core's `ModelState` lacks the state-group layout accessor `state_group_layouts` | remove `transaction_graph_populations`, or install the target core |
 | scheduling | `async_scheduling` is on or unset (unset means asynchronous on the target core) | `--no-async-scheduling` |
 | runner modes | `cudagraph_mode` or the compilation mode is not an explicit NONE | `-cc.cudagraph_mode none -cc.mode none` |
-| pool | neither `--num-gpu-blocks-override` nor a positive `--kv-cache-memory-bytes` | `--num-gpu-blocks-override` of at least the admission limit plus one, or a `--kv-cache-memory-bytes` that holds that many state pages |
 | block count | `--num-gpu-blocks-override` minus 1 is below core's admission limit or a population; core would refuse it only after both captures | `--num-gpu-blocks-override` of at least the admission limit plus one, or a lower admission limit with the largest population at most it |
 | admission limit | a population above core's admission limit (`--max-num-active-seqs`, or `--max-num-seqs` when it is unset) | a largest population of at most the limit, or a larger `--max-num-active-seqs` (at most `--max-num-seqs`) or none |
+
+Under core's default KV-cache sizing, a state page count below the admission limit plus one is
+refused by core's scheduler after the captures with "Lower max_num_seqs or enlarge the cache",
+even when `--max-num-active-seqs` sets the limit. The startup log's measured graph-memory line,
+logged before it, gives the graph totals. The remedies are a lower admission limit, a smaller
+largest population, a larger `--gpu-memory-utilization`, or transaction graphs off.
 
 If startup times out during graph capture, raise `VLLM_ENGINE_READY_TIMEOUT_S`.
 
@@ -810,10 +839,9 @@ Each item names a limit this manual states, the trigger that lifts it and what c
 - **Frontend streaming on the target core.** The session factory is not available there. Trigger:
   the session factory runs on core's automatic admission. Change: Builds and compatibility records
   a stage 2 commit, and Clients gains the frontend's streaming examples.
-- **Transaction graphs beyond the restricted startup.** Trigger: core sizes its profiling KV cache
-  for a model-state capture and keeps the state pages' layout current when its extensible KV
-  cache grows, and the qualification covers the reduced modes and asynchronous scheduling.
-  Change: the restricted startup's rows leave the Transaction graphs section.
+- **Transaction graphs beyond the restricted startup.** Trigger: the qualification covers the
+  reduced modes and asynchronous scheduling. Change: the restricted startup's rows leave the
+  Transaction graphs section.
 - **The transcription route's guards and terminal forms.** Trigger: a build the plugin targets
   carries vllm#67144 and vllm#67151. Change: Limits and the support boundary drops the
   partial-text and inactive-guard limits for that build.

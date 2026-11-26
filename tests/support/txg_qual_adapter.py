@@ -23,9 +23,10 @@ that core bound and captured over. Per step, as core's
    current stream), and calls ``postprocess_state``, which waits for the
    step's commit event, then ``take_failed_requests``.
 
-Each request holds one block, which the driver assigns at the request's
-first step (``Blocks``), keeps until its terminal finish and reuses only
-after that; the block reaches the model state as the request's
+Each request holds one block below the final committed block count
+(:attr:`QualAdapter.final_committed_blocks`), which the driver assigns at the
+request's first step (``Blocks``), keeps until its terminal finish and reuses
+only after that; the block reaches the model state as the request's
 ``block_ids``. The lifecycle calls run outside any timer: the monitor times
 only the transaction call.
 
@@ -45,13 +46,17 @@ progress and remaining queue counts through a proxy commit sink, and, with
 ``compare``, runs the option-off transaction of every covered or declined
 step on a detached copy of the pools taken before the call: new storage with
 the same resident layout, test-only storage outside REG-STATE-003 and
-TXG-CAP-013. The reference receives no view of the serving pools, so it can
-neither read nor write them; the monitor checks that, and compares rows,
-status, progress, queue counts and every page bit for bit (TXG-QUAL-003).
-The pool copy, the option-off reference, the checks and the comparison are
-outside the timer. ``force_off`` makes ``execute`` decline without
-counting, so the forward runs the option-off transaction (the step rule's
-OFF legs).
+TXG-CAP-013, limited to the pages below the final committed block count
+(the state layer's bound views; ``txg_transaction.layout_clone`` copies the
+bytes the views cover, not their whole storage). The reference receives no
+view of the serving pools, so it can neither read nor write them; the
+monitor checks that, and compares rows, status, progress, queue counts and
+every page bit for bit (TXG-QUAL-003). With ``memory``, it records
+``torch.cuda.memory_reserved`` and ``max_memory_reserved`` before and after
+each copy and the copy's bytes (TXG-QUAL-029). The pool copy, the option-off
+reference, the checks and the comparison are outside the timer.
+``force_off`` makes ``execute`` decline without counting, so the forward
+runs the option-off transaction (the step rule's OFF legs).
 """
 
 from __future__ import annotations
@@ -107,10 +112,16 @@ class QualAdapter:
     """See the module docstring. ``model`` and ``state`` are the worker's
     own objects; the state layer's views are read where core bound them."""
 
-    def __init__(self, *, vllm_config: Any, model: Any, state: Any) -> None:
+    def __init__(
+        self, *, vllm_config: Any, model: Any, state: Any, runner: Any = None
+    ) -> None:
         self.vllm_config = vllm_config
         self.model = model
         self.state = state
+        #: Core's model runner, when the adapter has one: its live
+        #: ``kv_cache_config`` holds the final committed block count after
+        #: core's extension.
+        self.runner = runner
         self.layer = model._persistent_state_layer
         if getattr(self.layer, "kv_cache", None) is None or not len(
             self.layer.kv_cache
@@ -136,7 +147,12 @@ class QualAdapter:
     def from_worker(cls, worker: Any) -> QualAdapter:
         runner = runner_of(worker)
         state = runner.model_state
-        return cls(vllm_config=runner.vllm_config, model=state.model, state=state)
+        return cls(
+            vllm_config=runner.vllm_config,
+            model=state.model,
+            state=state,
+            runner=runner,
+        )
 
     # -- the state layer --------------------------------------------------------
 
@@ -147,8 +163,24 @@ class QualAdapter:
 
     @property
     def capacity(self) -> int:
-        """The bound block count, the null block included."""
+        """The bound block count, the null block included: the first
+        dimension of the state layer's bound views."""
         return int(self.views[0].shape[0])
+
+    @property
+    def final_committed_blocks(self) -> int:
+        """The final committed block count, the null block included, read
+        now (after core's extension under the extensible KV cache): the
+        smaller of the bound views' first dimension and the block count of
+        core's live ``kv_cache_config``, which the extension updates in
+        place. Every block the driver assigns, and every page its detached
+        copies hold, is below it (TXG-QUAL-003, TXG-QUAL-026)."""
+        bound = self.capacity
+        config = getattr(self.runner, "kv_cache_config", None)
+        committed = getattr(config, "num_blocks", None)
+        if isinstance(committed, int) and committed > 0:
+            return min(bound, committed)
+        return bound
 
     @property
     def page_bytes(self) -> int:
@@ -584,11 +616,24 @@ class TransactionMonitor:
     restores. ``calls`` holds the current step's transaction calls."""
 
     def __init__(
-        self, model: Any, *, compare: bool = False, check_off: bool = False
+        self,
+        model: Any,
+        *,
+        compare: bool = False,
+        check_off: bool = False,
+        final_blocks: int | None = None,
+        memory: bool = False,
     ) -> None:
         import importlib
 
         self.model = model
+        #: The final committed block count: a copy of views with more pages
+        #: is reported as a problem (TXG-QUAL-003).
+        self.final_blocks = final_blocks
+        #: Record the allocator around each copy (TXG-QUAL-029).
+        self.memory = memory
+        #: ``{"copy_bytes", "memory_reserved_before", ...}`` per copy.
+        self.copy_readings: list[dict[str, int]] = []
         self.advance = importlib.import_module(ADVANCE_MODULE)
         self.binding = getattr(model, BINDING_ATTRIBUTE, None)
         self.compare = compare
@@ -624,6 +669,51 @@ class TransactionMonitor:
     def begin_step(self) -> None:
         self.calls = []
         self._declined = None
+
+    def _copy(self, kwargs: dict[str, Any], call: Call) -> tx.Pools:
+        """The detached copy of the step's pools (TXG-QUAL-003), with the
+        allocator read around it when ``memory`` is set (TXG-QUAL-029)."""
+        live = tx.pools_of(kwargs)
+        if self.final_blocks is not None:
+            over = sorted(d for d in live.first_dimensions() if d > self.final_blocks)
+            if over:
+                call.problems.append(
+                    f"pool views of {over} pages exceed the final committed "
+                    f"block count {self.final_blocks}: the copy is not limited "
+                    "to the committed pages"
+                )
+        reading: dict[str, int] = {}
+        if self.memory and self.cuda:
+            torch.cuda.synchronize()
+            reading["memory_reserved_before"] = int(torch.cuda.memory_reserved())
+            reading["max_memory_reserved_before"] = int(
+                torch.cuda.max_memory_reserved()
+            )
+        copy = live.clone()
+        if self.memory:
+            if self.cuda:
+                torch.cuda.synchronize()
+                reading["memory_reserved_after"] = int(torch.cuda.memory_reserved())
+                reading["max_memory_reserved_after"] = int(
+                    torch.cuda.max_memory_reserved()
+                )
+            reading["copy_bytes"] = copy.storage_bytes()
+            self.copy_readings.append(reading)
+        return copy
+
+    def memory_summary(self) -> dict[str, Any]:
+        """The first copy's allocator readings and the largest copy and
+        reservation over the run (TXG-QUAL-029)."""
+        if not self.copy_readings:
+            return {}
+        first = dict(self.copy_readings[0])
+        first["copy_bytes"] = max(r["copy_bytes"] for r in self.copy_readings)
+        for name in ("max_memory_reserved_before", "max_memory_reserved_after"):
+            values = [r[name] for r in self.copy_readings if name in r]
+            if values:
+                first[name] = max(values)
+        first["copies"] = len(self.copy_readings)
+        return first
 
     # -- the reference -------------------------------------------------------------
 
@@ -689,7 +779,7 @@ class TransactionMonitor:
             return None
         call = Call(kind="execute")
         self.calls.append(call)
-        before = tx.pools_of(kwargs).clone() if self.compare else None
+        before = self._copy(kwargs, call) if self.compare else None
         if self.compare:
             call.plan = plan
             call.input_ids = input_ids.clone()
@@ -720,7 +810,7 @@ class TransactionMonitor:
         declined = self._declined
         self._declined = None
         if declined is None and self.check_off and not self.force_off:
-            declined = (tx.pools_of(kwargs).clone(), call)
+            declined = (self._copy(kwargs, call), call)
         if declined is not None:
             call.plan = plan
             call.input_ids = input_ids.clone()

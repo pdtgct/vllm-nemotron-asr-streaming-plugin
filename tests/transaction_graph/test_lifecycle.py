@@ -5,9 +5,15 @@ CPU tests (``engine``) hold an option-on model state through the stated
 fake-capture seam of ``support.txgcap_harness`` (``FakeCuda`` for core's CUDA
 surface, ``FakeGraphRuntime`` for segment graphs) and call the hooks in
 core's order (``support.core_order.CoreOrder``); they pin ordering,
-inventory, release and refusal behaviour. ``gpu`` tests run the same
-lifecycle on CUDA with core's ``graph_capture`` stream and graph pools and
-read the allocator.
+inventory, release and refusal behaviour. The lifecycle includes the
+profiling capture, which core runs only for its graph-memory estimate, so a
+test runs a fixed ``--num-gpu-blocks-override`` with the estimate enabled
+(the HLD's choice for the checks that need the estimate; TXG-LIFE-004 names
+the override's profiling KV cache) unless it names another KV-cache sizing:
+core's default, the extensible KV cache, for its extension
+(TXG-LIFE-009), or a profiled budget for core's one-block profiling KV
+cache. ``gpu`` tests run the same lifecycle on CUDA with core's
+``graph_capture`` stream and graph pools and read the allocator.
 """
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ from __future__ import annotations
 import gc
 import inspect
 import logging
+import re
 import weakref
 
 import pytest
@@ -23,9 +30,34 @@ from support import model_harness as h
 from support import txgcap_harness as t
 from support.fake_cuda import FakeCuda
 from support.isolation import ran_in_child
-from support.txg_api import Record
+from support.txg_api import Record, Sizing
 
 pytestmark = pytest.mark.engine
+
+
+@pytest.fixture
+def on_cpu(on_cpu):
+    """The shared ``on_cpu`` under a fixed block count unless the test names
+    a sizing or a budget (module docstring)."""
+
+    def build(**kwargs):
+        if "sizing" not in kwargs and not kwargs.get("kv_cache_memory_bytes"):
+            kwargs["sizing"] = Sizing.BLOCK_COUNT
+        return on_cpu(**kwargs)
+
+    return build
+
+
+@pytest.fixture
+def on_cuda(on_cuda):
+    """The shared ``on_cuda`` under a fixed block count unless the test
+    names a sizing (module docstring)."""
+
+    def build(**kwargs):
+        kwargs.setdefault("sizing", Sizing.BLOCK_COUNT)
+        return on_cuda(**kwargs)
+
+    return build
 
 
 def names_since(env, mark):
@@ -209,10 +241,11 @@ def test_profiling_capture_runs_segments_warm_up_cells_then_the_margin(on_cpu):
     assert env.fake.live_margins() == 1, "the margin was not held after the call"
     pools = {e[1][1] for e in env.events[mark:] if e[0] == "cuda.graph.capture_begin"}
     assert pools == {"profiling-pool"}, pools
-    # Over the profiling pools: core's profiling KV cache, which holds
-    # num_gpu_blocks_override blocks under the restricted startup.
+    # Over block 0 of the profiling pools: core's profiling KV cache, which
+    # holds num_gpu_blocks_override blocks when that is set. Every scatter
+    # row of the call, the warm-up's and the capture rows', names block 0.
     blocks = env.vllm_config.cache_config.num_gpu_blocks_override
-    assert blocks is not None, "the environment is not the restricted startup"
+    assert blocks is not None, "the environment sets no block count"
     assert {
         shape[0]
         for _, layouts in t.component_layouts(env.state)
@@ -221,6 +254,38 @@ def test_profiling_capture_runs_segments_warm_up_cells_then_the_margin(on_cpu):
     profiling_pool = h.pool_tensor(core.profiling_bindings)
     warmed = [env.events[mark + i][1] for i in warmups]
     assert all(t.within(profiling_pool, c["pool"]) for c in warmed), warmed
+    rows = [e[1] for e in env.events[mark:] if e[0] == "scatter"]
+    assert rows and all(set(c["pages"]) == {0} for c in rows), rows
+
+
+# @spec TXG-LIFE-004
+def test_profiling_capture_over_one_block_under_a_profiled_budget(on_cpu):
+    """Under a profiled budget with the extensible KV cache off, core's
+    minimal profiling KV cache holds one block under the explicit NONE
+    runner mode that TXG-CFG-018 requires: the profiling capture runs the
+    segment graphs, the scatter warm-up and every profiling cell over block
+    0 of that one-block cache into the pool core passes, then allocates the
+    charged margin."""
+    run = on_cpu(n=2, sizing=Sizing.PROFILED)
+    env, core = run.env, run.core
+    core.prepare()
+    core.bind_profiling()
+    assert {
+        shape[0]
+        for _, layouts in t.component_layouts(env.state)
+        for _, shape, *_ in layouts
+    } == {1}, "core's profiling KV cache under explicit NONE holds one block"
+    mark = len(env.events)
+    error = h.call_with(core.profiling_capture)
+    assert error is None, t.text(error)
+    names = names_since(env, mark)
+    segments, cells = segment_captures(names), cell_begins(names)
+    warmups = scatter_warmups(env, mark)
+    assert segments and warmups and len(cells) == 2 * env.n
+    assert max(segments) < min(warmups) < min(cells)
+    assert first(names, "cuda.margin.allocate") > max(cells)
+    pools = {e[1][1] for e in env.events[mark:] if e[0] == "cuda.graph.capture_begin"}
+    assert pools == {"profiling-pool"}, pools
 
 
 # @spec TXG-LIFE-005
@@ -511,6 +576,126 @@ def test_bindings_before_the_serving_capture_take_no_part_in_the_comparison(on_c
     core.bind_serving()  # other pages, before the serving capture
     core.serving_capture()
     core.post_warmup()
+
+
+def _served_extensible(on_cpu, *, final, capacity=t.CAPACITY, extra=0, **kwargs):
+    """An option-on environment under core's default KV-cache sizing, the
+    extensible KV cache, through ``post_warmup``: the serving capture over a
+    layout of ``capacity`` pages (the reservation capacity), then core's
+    extension binding views of ``final`` pages over the same storage. With
+    ``extra``, the serving cache's allocation holds ``extra`` pages beyond
+    the bound views, so ``final`` may exceed the captured page count."""
+    run = on_cpu(n=2, sizing=Sizing.EXTENSIBLE, capacity=capacity, **kwargs)
+    env, core = run.env, run.core
+    core.prepare()
+    core.bind_serving(t.narrow_pool(core.bindings(capacity + extra), capacity))
+    core.serving_capture()
+    core.post_warmup()
+    error = h.call_with(core.extend, final)
+    return env, core, error
+
+
+@pytest.mark.parametrize("final", [t.CAPACITY, 5, 3], ids=["all", "5", "3"])
+# @spec TXG-LIFE-009
+def test_cores_extension_with_no_more_pages_changes_nothing(on_cpu, final):
+    """Under the extensible KV cache core binds the state layer's views again
+    after post-warmup verification and before the first request, over the
+    same pages with the final page count, at most the layout's page count:
+    the views fit the layout the serving capture recorded, so the binding
+    changes nothing, latches nothing and recaptures nothing, and the worker
+    serves."""
+    from support import txg_api
+
+    env, core, error = _served_extensible(on_cpu, final=final)
+    binding = txg_api.binding_of(env.model)
+    assert error is None, ("core's extension latched the binding", t.text(error))
+    assert binding.failed is False
+    assert t.fake_graph_count(env) == 2 * env.n, "the extension recaptured"
+    assert int(t.state_layer_of(env).num_blocks) == final
+    core.step(t.stream_unit(env, "s1"))
+
+
+# @spec TXG-LIFE-009
+def test_a_binding_of_more_pages_than_the_serving_capture_read_latches(on_cpu):
+    """Views over the same address with more pages than the layout the
+    serving capture recorded do not fit: the cells' captured bounds do not
+    cover them, so the binding latches and raises (worker-fatal)."""
+    from support import txg_api
+
+    env, core, error = _served_extensible(on_cpu, final=t.CAPACITY + 2, extra=2)
+    assert error is not None, "a binding of more pages than captured was accepted"
+    assert txg_api.binding_of(env.model).failed is True
+    later = h.call_with(core.step, t.stream_unit(env, "s1"))
+    assert later is not None and t.FRESH_ENGINE.search(t.text(later)), later
+
+
+def _no_binding_report(env):
+    """The state layer's bindings stop reaching the transaction-graph
+    binding, so a test of a later rule sees core's extension without the
+    binding's comparison (TXG-LIFE-009 is tested above)."""
+    t.state_layer_of(env).bind_observer = None
+
+
+# @spec TXG-CELL-004, TXG-EXEC-001
+def test_steps_after_an_extension_to_fewer_pages_replay_with_no_signature_fallback(
+    on_cpu,
+):
+    """A step's resident-pool views after core's extension have the captured
+    address, page shape, strides and dtype and fewer pages: each fits the
+    cell's entry, so the step's signature equals the cell's and the cell
+    replays, with no fallback of reason ``signature``. The binding's report
+    of the extension is cut, so the signature rule alone decides."""
+    from support import txg_api
+
+    run = on_cpu(n=2, sizing=Sizing.EXTENSIBLE)
+    env, core = run.env, run.core
+    core.startup(extend=False)
+    _no_binding_report(env)
+    core.extend(5)
+    replays = sum(t.counter(env, "replays").values())
+    core.step(t.stream_unit(env, "s1"))
+    assert sum(t.counter(env, "replays").values()) == replays + 1, (
+        "the covered step after the extension did not replay its cell",
+        t.fallback_reasons(env),
+    )
+    signature = [k for k in t.fallback_reasons(env) if k[0] == "signature"]
+    assert signature == [], t.fallback_reasons(env)
+    assert txg_api.binding_of(env.model).failed is False
+
+
+# @spec TXG-CELL-004
+def test_a_step_view_with_more_pages_than_the_cell_falls_back_on_signature(on_cpu):
+    """A resident-pool view with more pages than the cell captured does not
+    fit the cell's entry (the captured bounds do not cover the extra pages):
+    the step falls back with reason ``signature``. The binding's report is
+    cut, so the signature rule alone decides."""
+    run = on_cpu(n=2, sizing=Sizing.EXTENSIBLE)
+    env, core = run.env, run.core
+    core.prepare()
+    core.bind_serving(t.narrow_pool(core.bindings(t.CAPACITY + 2), t.CAPACITY))
+    core.serving_capture()
+    core.post_warmup()
+    _no_binding_report(env)
+    core.extend(t.CAPACITY + 2)
+    core.step(t.stream_unit(env, "s1"))
+    signature = [k for k in t.fallback_reasons(env) if k[0] == "signature"]
+    assert signature, ("a view of more pages matched the cell", t.fallback_reasons(env))
+
+
+# @spec TXG-EXEC-010, REG-STATE-003
+def test_a_slot_at_or_above_the_extended_count_is_refused_on_the_host(on_cpu):
+    """After core's extension the rows' slots are bounded on the host by the
+    bound views' first dimension, the final count, never by the state-group
+    layout's page count (the reservation capacity): a request on slot 5
+    after an extension to 5 pages is refused before any page is read, while
+    slot 4 serves."""
+    env, core, error = _served_extensible(on_cpu, final=5)
+    assert error is None, t.text(error)
+    core.step(t.stream_unit(env, "s4"), handles={"s4": 4})
+    refused = h.call_with(core.step, t.stream_unit(env, "s5"), handles={"s5": 5})
+    assert refused is not None, "a slot at the extended count was accepted"
+    message = t.text(refused)
+    assert "5" in message and re.search(r"(?i)slot|block", message), message
 
 
 # ---------------------------------------------------------------------------

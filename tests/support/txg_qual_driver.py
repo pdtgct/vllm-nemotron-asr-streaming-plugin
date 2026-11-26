@@ -4,13 +4,30 @@
 
 One process per run: ``python -m support.txg_qual_driver SPEC.json OUT.json``
 (``PYTHONPATH`` naming ``tests``). Every engine runs the restricted startup
-under a fixed ``--num-gpu-blocks-override`` with core's graph-memory estimate
-enabled (``txgcap_qual.restricted_startup``; TXG-QUAL-001, -010); ``B_hook``
-is the same settings with ``transaction_graph_populations`` absent. The
+(``txgcap_qual.restricted_startup``) with core's graph-memory estimate
+enabled, under the run's KV-cache sizing (:func:`run_sizing`): core's
+default, the extensible KV cache, except the step rule, which runs under a
+fixed ``--num-gpu-blocks-override`` (TXG-QUAL-001, -010), and a spec that
+names another (``kv_cache_sizing``, ``num_gpu_blocks_override``,
+``kv_cache_memory_bytes``). ``B_hook`` is the same settings, the sizing
+included, with ``transaction_graph_populations`` absent. The
 transaction-level modes start one engine in this process (``LLMEngine`` with
 ``VLLM_ENABLE_V1_MULTIPROCESSING=0``, so the engine core and its worker live
 here) and drive the worker through ``support.txg_qual_adapter.QualAdapter``
-(TXG-QUAL-026). Every pass/fail decision is ``support.txgcap_qual``'s.
+(TXG-QUAL-026), assigning blocks below the final committed block count. Every
+pass/fail decision is ``support.txgcap_qual``'s.
+
+The reply records, for every run, the KV-cache sizing, each capture
+layout's page count and the final bound count the driver reads after
+core's extension (``identity``; TXG-QUAL-001), and the startup probes
+(``probes``: the plugin's INFO and WARNING lines, core's logged torch
+memory limit, and, under the extensible KV cache, the committed block count
+at the serving capture and the state layer's views at that capture and after
+core's extension; TXG-QUAL-028). A spec with ``headroom`` (``copy_bytes``,
+``margin_bytes``, preregistered) runs an exactness run under the extensible
+KV cache with that headroom left free through ``--gpu-memory-utilization``
+and records the allocator around the detached copies
+(``exactness_memory``; TXG-QUAL-029).
 
 Modes (``spec["mode"]``):
 
@@ -25,7 +42,12 @@ Modes (``spec["mode"]``):
   the option-off transaction (TXG-QUAL-007).
 * ``steprule``: the step rule for one population (TXG-QUAL-010 to -014);
   its first composition at population 1 is also the calibration run's U(1)
-  (TXG-CAL-001).
+  (TXG-CAL-001), which the calibration runs once under the step rule's fixed
+  block count and once with ``kv_cache_sizing`` ``"extensible"``, core's
+  default (TXG-CAL-001, -002).
+* ``alone``: TXG-QUAL-028's served part: one stream served alone, then each
+  of TXG-QUAL-004's files transcribed alone on the idle server
+  (:func:`run_alone`), with their transcripts and the fallbacks by reason.
 * ``uapi``: one leg of ``U_api`` (TXG-QUAL-016) in a multiprocess engine
   (``AsyncLLM``): repeats 0 to 3, each a fresh stream opened with
   ``AsyncLLM.generate`` and an input generator that yields the plugin
@@ -45,6 +67,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import statistics
 import sys
 import time
@@ -762,6 +785,108 @@ class Workload:
 
 
 # ---------------------------------------------------------------------------
+# One request alone (TXG-QUAL-028)
+
+
+class AloneWorkload(Workload):
+    """One stream (``file`` ``None``) or one file alone on an otherwise idle
+    server: it runs until that request finishes and admits nothing after
+    it."""
+
+    def __init__(
+        self,
+        ctx: Any,
+        *,
+        name: str,
+        seed: int,
+        clips: Clips,
+        file: tuple[str, np.ndarray] | None = None,
+    ) -> None:
+        self._file = file
+        self._admitted = False
+        super().__init__(
+            ctx,
+            name=name,
+            n_streams=0 if file is not None else 1,
+            n_files=1 if file is not None else 0,
+            steps=0,
+            seed=seed,
+            clips=clips,
+        )
+
+    def _admit_files(self) -> None:
+        if self._file is None or self._admitted:
+            return
+        self._admitted = True
+        name, samples = self._file
+        self.counter += 1
+        req_id = f"{self.name}-f0-{self.counter}"
+        self.file_slots[0] = FileItem(req_id, name, samples)
+        if samples.shape[0] == 0:
+            self.zero_files.add(req_id)
+
+    def finished(self) -> bool:
+        streams = all(s is None or s.retired for s in self.streams)
+        files = all(f is not None and f.done for f in self.file_slots)
+        return streams and files
+
+
+def run_alone(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
+    """TXG-QUAL-028's served part: one stream served alone, as TXG-QUAL-024
+    serves it, then each of TXG-QUAL-004's files transcribed alone on the
+    idle server (leading and trailing silence, a whole number of chunks,
+    zero samples, shorter than one chunk, then ``alone_utterances``
+    test-clean utterances, default 1), each its own request run to its end.
+    Returns each item's transcripts and step counts, and the fallbacks by
+    reason and the cell replays over the whole mode (zero while transaction
+    graphs are off)."""
+    from support import txg_api
+
+    seed = int(spec["seed"])
+    clips = ctx.corpus.clips(seed)
+
+    def replays() -> int:
+        reading = txg_api.counters(ctx.model)
+        return int(sum(dict(reading["counters"]["replays"]).values())) if reading else 0
+
+    before, replayed = _fallbacks(ctx.model), replays()
+    runs = [AloneWorkload(ctx, name="alone-stream", seed=seed, clips=clips)]
+    files = special_files(ctx.requests, clips)
+    for index in range(4 + int(spec.get("alone_utterances", 1))):
+        runs.append(
+            AloneWorkload(
+                ctx, name=f"alone-file{index}", seed=seed, clips=clips, file=next(files)
+            )
+        )
+    items = []
+    for run in runs:
+        run.run()
+        run.close()
+        summary = run.summary()
+        items.append(
+            {
+                key: summary[key]
+                for key in (
+                    "name",
+                    "steps",
+                    "covered_steps",
+                    "fallback_steps",
+                    "failed_rows",
+                    "transcripts",
+                )
+            }
+        )
+    after = _fallbacks(ctx.model)
+    grown: dict[str, int] = {}
+    for key, value in after.items():
+        delta = value - before.get(key, 0)
+        if delta:
+            reason = key[0] if isinstance(key, tuple) else str(key)
+            grown[reason] = grown.get(reason, 0) + delta
+    return {"items": items, "fallbacks": grown, "replays": replays() - replayed}
+
+
+# ---------------------------------------------------------------------------
 # Forced fallbacks (TXG-QUAL-007)
 
 
@@ -1309,17 +1434,48 @@ class Context(SimpleNamespace):
     pass
 
 
+def run_sizing(spec: dict[str, Any]) -> str:
+    """The run's KV-cache sizing (``txg_api.Sizing``): the spec's
+    ``kv_cache_sizing``; else a fixed block count or budget when the spec
+    names one; else a fixed block count for the step rule (TXG-QUAL-010) and
+    core's default, the extensible KV cache, for every other mode
+    (TXG-QUAL-001)."""
+    from support.txg_api import Sizing
+
+    if spec.get("kv_cache_sizing"):
+        sizing = str(spec["kv_cache_sizing"])
+        if sizing not in Sizing.ALL:
+            raise ValueError(f"unknown KV-cache sizing {sizing!r}")
+        return sizing
+    if spec.get("kv_cache_memory_bytes"):
+        return Sizing.BUDGET
+    if spec.get("num_gpu_blocks_override") or spec.get("mode") == "steprule":
+        return Sizing.BLOCK_COUNT
+    return Sizing.EXTENSIBLE
+
+
 def engine_settings(spec: dict[str, Any]) -> dict[str, Any]:
     """The run's ``AsyncEngineArgs`` keywords: the restricted startup under
-    a fixed ``--num-gpu-blocks-override`` (the admission limit plus one
-    unless the spec names one; TXG-QUAL-001, -010). ``B_hook`` is the same
-    spec with ``transaction_graph_populations`` absent from
-    ``hf_overrides``: its block count or budget setting is the option-on
-    run's."""
+    the run's KV-cache sizing (:func:`run_sizing`); under a fixed block count
+    ``--num-gpu-blocks-override`` is the spec's, or the admission limit plus
+    one. ``B_hook`` is the same spec with ``transaction_graph_populations``
+    absent from ``hf_overrides``: its KV-cache sizing is the option-on run's.
+    A spec with ``headroom`` (TXG-QUAL-029) also sets the
+    ``--gpu-memory-utilization`` that leaves the preregistered headroom free
+    of a device of ``device_total_bytes``; it is refused with any sizing but
+    the extensible KV cache."""
     from support import txgcap_qual as q
+    from support.txg_api import Sizing
 
     max_num_seqs = int(spec["max_num_seqs"])
     active = spec.get("max_num_active_seqs")
+    limit = max_num_seqs if active is None else int(active)
+    sizing = run_sizing(spec)
+    blocks = budget = None
+    if sizing == Sizing.BLOCK_COUNT:
+        blocks = int(spec.get("num_gpu_blocks_override") or limit + 1)
+    elif sizing == Sizing.BUDGET:
+        budget = int(spec["kv_cache_memory_bytes"])
     settings = dict(
         model=spec["card"],
         config_format="nemotron_asr_streaming",
@@ -1329,15 +1485,25 @@ def engine_settings(spec: dict[str, Any]) -> dict[str, Any]:
         max_num_seqs=max_num_seqs,
         enforce_eager=bool(spec.get("enforce_eager", False)),
         hf_overrides=dict(spec["hf_overrides"]),
-        **q.restricted_startup(
-            max_num_seqs, max_num_active_seqs=None if active is None else int(active)
-        ),
+        **q.restricted_startup(),
+        **q.kv_cache_sizing(sizing, blocks=blocks, budget=budget),
     )
     if active is not None:
         settings["max_num_active_seqs"] = int(active)
-    if spec.get("num_gpu_blocks_override"):
-        settings["num_gpu_blocks_override"] = int(spec["num_gpu_blocks_override"])
     settings.update(spec.get("engine_extra") or {})
+    headroom = spec.get("headroom")
+    if headroom:
+        if sizing != Sizing.EXTENSIBLE or "kv_cache_memory_bytes" in settings:
+            raise ValueError(
+                "the exactness runs' headroom is left through "
+                "--gpu-memory-utilization under the extensible KV cache, never "
+                "a fixed --kv-cache-memory-bytes (TXG-QUAL-029)"
+            )
+        settings["gpu_memory_utilization"] = q.headroom_utilization(
+            int(headroom["copy_bytes"]),
+            int(headroom["margin_bytes"]),
+            int(spec["device_total_bytes"]),
+        )
     return settings
 
 
@@ -1353,9 +1519,201 @@ def _worker(worker: Any) -> Any:
     return worker
 
 
+class StartupProbes:
+    """Readings taken while the engine starts in this process (TXG-QUAL-001,
+    TXG-QUAL-028, TXG-QUAL-029): the plugin's log lines at INFO and above
+    (``records``); core's logged torch memory limit (``torch_memory_limit``,
+    bytes); at each capture's entry (``captures``, by ``"profiling"`` and
+    ``"serving"``) the extensible KV cache's committed block count (``None``
+    when it is off) and the state layer's bound views; per capture, the
+    sorted distinct block IDs of every capture-only row plan
+    (``capture_rows``); and after core's extension (``extension``) the same
+    views, the committed and configured block counts and the binding's
+    latch. A view is plain values ``[address, shape, strides, dtype]``."""
+
+    TORCH_LIMIT = re.compile(r"Torch may reserve up to ([0-9.]+) GiB")
+
+    def __init__(self) -> None:
+        self.records: list[list[str]] = []
+        self.torch_memory_limit: int | None = None
+        self.captures: dict[str, dict[str, Any]] = {}
+        #: Per capture, the block IDs of each capture-only plan the cell
+        #: programs pass to ``prepare_model_rows`` (TXG-CAP-005, -017).
+        self.capture_rows: dict[str, list[list[int]]] = {}
+        self.extension: dict[str, Any] | None = None
+        self._in_capture: str | None = None
+        self._runners: list[Any] = []
+
+    def install(self) -> StartupProbes:
+        import logging
+
+        probes = self
+
+        class Plugin(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                probes.records.append([record.levelname, record.getMessage()])
+
+        class Core(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                found = probes.TORCH_LIMIT.search(record.getMessage())
+                if found:
+                    probes.torch_memory_limit = int(float(found.group(1)) * (1 << 30))
+
+        plugin = logging.getLogger("vllm_nemotron_asr_streaming")
+        plugin.addHandler(Plugin(logging.INFO))
+        if plugin.getEffectiveLevel() > logging.INFO:
+            plugin.setLevel(logging.INFO)
+        core = logging.getLogger("vllm")
+        core.addHandler(Core(logging.INFO))
+        if core.getEffectiveLevel() > logging.INFO:
+            core.setLevel(logging.INFO)
+        self._wrap_core()
+        return self
+
+    @staticmethod
+    def views(state: Any) -> dict[str, list[Any]]:
+        layer = state.model._persistent_state_layer
+        return {
+            name: [
+                int(view.data_ptr()),
+                list(view.shape),
+                list(view.stride()),
+                str(view.dtype),
+            ]
+            for name, view in layer.component_pools.items()
+        }
+
+    def _committed(self) -> int | None:
+        for runner in self._runners:
+            cache = getattr(runner, "extensible_kv_cache", None)
+            if cache is not None:
+                return int(cache.num_committed_blocks)
+        return None
+
+    def _wrap_core(self) -> None:
+        from vllm.v1.worker import gpu_worker
+        from vllm.v1.worker.gpu import model_runner
+
+        from vllm_nemotron_asr_streaming.nemotron_asr.model_state_v2 import (
+            NemotronASRModelState,
+        )
+
+        probes = self
+        init = model_runner.GPUModelRunner.__init__
+
+        def runner_init(runner: Any, *args: Any, **kwargs: Any) -> None:
+            init(runner, *args, **kwargs)
+            probes._runners.append(runner)
+
+        model_runner.GPUModelRunner.__init__ = runner_init
+        capture = NemotronASRModelState.capture_cudagraphs
+
+        def capture_cudagraphs(state: Any, *args: Any, **kwargs: Any) -> Any:
+            name = "profiling" if kwargs.get("profile_only") else "serving"
+            if name not in probes.captures:
+                probes.captures[name] = {
+                    "num_committed_blocks": probes._committed(),
+                    "views": probes.views(state),
+                }
+            probes._in_capture = name
+            try:
+                return capture(state, *args, **kwargs)
+            finally:
+                probes._in_capture = None
+
+        NemotronASRModelState.capture_cudagraphs = capture_cudagraphs
+        from support.txg_api import CAPTURE_ONLY_KEYWORD, advance_module
+
+        advance = advance_module()
+        prepare = advance.prepare_model_rows
+
+        def prepare_model_rows(*args: Any, **kwargs: Any) -> Any:
+            if probes._in_capture is not None and kwargs.get(CAPTURE_ONLY_KEYWORD):
+                plan = args[3] if len(args) > 3 else kwargs.get("plan")
+                blocks = sorted({int(b) for b in plan.state_indices_p.tolist()})
+                probes.capture_rows.setdefault(probes._in_capture, []).append(blocks)
+            return prepare(*args, **kwargs)
+
+        advance.prepare_model_rows = prepare_model_rows
+        extend = gpu_worker.Worker.extend_kv_cache
+
+        def extend_kv_cache(worker: Any, num_blocks: int) -> None:
+            reading: dict[str, Any] = {"num_blocks": int(num_blocks)}
+            probes.extension = reading
+            try:
+                extend(worker, num_blocks)
+            except BaseException as error:
+                reading["error"] = f"{type(error).__name__}: {error}"
+                raise
+            finally:
+                runner = worker.model_runner
+                state = runner.model_state
+                binding = getattr(state.model, "_transaction_graph_binding", None)
+                reading["latched"] = None if binding is None else bool(binding.failed)
+                reading["views"] = probes.views(state)
+                reading["num_committed_blocks"] = probes._committed()
+                config = getattr(runner, "kv_cache_config", None)
+                reading["kv_cache_config_blocks"] = getattr(config, "num_blocks", None)
+
+        gpu_worker.Worker.extend_kv_cache = extend_kv_cache
+
+    def page_counts(self) -> dict[str, int]:
+        """Each capture layout's page count, as the instrumentation read it:
+        the first dimension of the views bound at the capture's entry."""
+        return {
+            name: int(next(iter(reading["views"].values()))[1][0])
+            for name, reading in self.captures.items()
+            if reading["views"]
+        }
+
+    def reply(self) -> dict[str, Any]:
+        return {
+            "records": self.records,
+            "torch_memory_limit": self.torch_memory_limit,
+            "captures": self.captures,
+            "capture_rows": self.capture_rows,
+            "extension": self.extension,
+        }
+
+
+def device_context() -> dict[str, Any]:
+    """Device-level memory figures, recorded as context only and used by no
+    check (TXG-QUAL-029): ``torch.cuda.mem_get_info`` and ``nvidia-smi``'s
+    used and total memory."""
+    import subprocess
+
+    import torch
+
+    out: dict[str, Any] = {}
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        out["mem_get_info"] = [int(free), int(total)]
+    try:
+        out["nvidia_smi"] = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        out["nvidia_smi"] = f"unavailable: {error}"
+    return out
+
+
 def start(spec: dict[str, Any]) -> tuple[Any, Any]:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ.update(engine_env(spec))
+    if spec.get("headroom") and not spec.get("device_total_bytes"):
+        import torch
+
+        spec["device_total_bytes"] = int(
+            torch.cuda.get_device_properties(0).total_memory
+        )
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.llm_engine import LLMEngine
 
@@ -1389,6 +1747,7 @@ def identity(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
         "max_num_batched_tokens": int(
             ctx.adapter.vllm_config.scheduler_config.max_num_batched_tokens
         ),
+        **run_record(ctx, spec),
         "state_capacity": int(ctx.capacity),
         "state_page_bytes": ctx.adapter.page_bytes,
         "locale_row": ctx.requests.locale_row,
@@ -1397,6 +1756,48 @@ def identity(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
         "git_head": os.environ.get("TXG_QUAL_PLUGIN_HEAD"),
     }
     return out
+
+
+def run_record(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
+    """TXG-QUAL-001's fields of the run's record, read after core's
+    extension: the KV-cache sizing, the effective cache values, each capture
+    layout's page count (the capture record's), and the state group's final
+    bound count, the first dimension of the state layer's bound views, which
+    is a field separate from the page counts (``None`` unless the extensible
+    KV cache is on)."""
+    from support import txg_api
+    from support.txg_api import Record, Sizing
+
+    cache = ctx.adapter.vllm_config.cache_config
+    sizing = run_sizing(spec)
+    counts: dict[str, Any] = {}
+    reading = capture_record(ctx.model) or {}
+    record = reading.get(Record.RECORD) or {}
+    for capture in (Record.PROFILING, Record.SERVING):
+        figures = record.get(capture)
+        if isinstance(figures, dict) and Record.PAGE_COUNT in figures:
+            counts[capture] = figures[Record.PAGE_COUNT]
+    probes = getattr(ctx, "probes", None)
+    if not counts and probes is not None:
+        # Option off (B_hook): the instrumentation's reading of the views
+        # bound at each capture.
+        counts.update(probes.page_counts())
+    return {
+        "kv_cache_sizing": sizing,
+        "effective_cache": {
+            "num_gpu_blocks_override": getattr(cache, "num_gpu_blocks_override", None),
+            "kv_cache_memory_bytes": getattr(cache, "kv_cache_memory_bytes", None),
+            "enable_extensible_kv_cache": getattr(
+                cache, "enable_extensible_kv_cache", None
+            ),
+        },
+        "capture_page_counts": counts,
+        "final_bound_count": int(ctx.adapter.capacity)
+        if sizing == Sizing.EXTENSIBLE
+        else None,
+        "final_committed_blocks": int(ctx.adapter.final_committed_blocks),
+        "plugin_final_bound_count": record.get(txg_api.Record.FINAL_BOUND_COUNT),
+    }
 
 
 def capture_record(model: Any) -> dict[str, Any] | None:
@@ -1436,16 +1837,25 @@ def build_context(spec: dict[str, Any], engine: Any, worker: Any) -> Context:
     adapter = QualAdapter.from_worker(worker)
     model = adapter.model
     corpus = corpus_of(spec)
+    final = adapter.final_committed_blocks
+    monitor = TransactionMonitor(
+        model,
+        compare=bool(spec.get("compare")),
+        final_blocks=final,
+        memory=bool(spec.get("headroom")),
+    )
     return Context(
         spec=spec,
         engine=engine,
         adapter=adapter,
         model=model,
-        monitor=TransactionMonitor(model, compare=bool(spec.get("compare"))).install(),
+        monitor=monitor.install(),
         requests=Requests(model, lookahead=int(spec["lookahead"]), engine=engine),
         corpus=corpus,
-        capacity=adapter.capacity,
-        blocks=Blocks(adapter.capacity),
+        # Blocks and copies stay below the final committed block count
+        # (TXG-QUAL-003, TXG-QUAL-026).
+        capacity=final,
+        blocks=Blocks(final),
         free_next=[],
         counter=0,
     )
@@ -1513,6 +1923,8 @@ def run_mode(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
         }
     if mode == "fallback":
         return run_fallbacks(ctx, n)
+    if mode == "alone":
+        return run_alone(ctx, spec)
     if mode == "steprule":
         out = []
         for k, e in spec["compositions"]:
@@ -1550,19 +1962,36 @@ def main(spec_path: str, out_path: str) -> int:
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0 if reply["ok"] else 1)
+    probes = None
     try:
+        probes = StartupProbes().install()
         engine, worker = start(spec)
         reply["ready_s"] = round(time.time() - t0, 2)
         ctx = build_context(spec, engine, worker)
+        ctx.probes = probes
         reply["identity"] = identity(ctx, spec)
         reply["capture_record"] = capture_record(ctx.model)
+        if spec.get("headroom"):
+            reply["exactness_memory"] = {"context_before": device_context()}
         reply["first_counted_at"] = time.time()
         reply["result"] = _plain(run_mode(ctx, spec))
         reply["counters_after"] = capture_record(ctx.model)
+        if spec.get("headroom"):
+            # TXG-QUAL-029: the allocator figures the checks read, and the
+            # device-level figures as context only.
+            reply["exactness_memory"].update(
+                {
+                    "torch_memory_limit": probes.torch_memory_limit,
+                    **ctx.monitor.memory_summary(),
+                    "context_after": device_context(),
+                }
+            )
         reply["ok"] = True
     except BaseException as error:  # noqa: BLE001 - reported in the reply
         reply["error"] = {"type": type(error).__name__, "message": str(error)}
         reply["traceback"] = traceback.format_exc()
+    if probes is not None:
+        reply["probes"] = _plain(probes.reply())
     reply["elapsed_s"] = round(time.time() - t0, 2)
     if "ctx" in locals():
         reply["direct_files"] = ctx.requests.direct_files

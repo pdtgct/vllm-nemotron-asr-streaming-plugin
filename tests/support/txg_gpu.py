@@ -12,9 +12,14 @@ environment's ``core`` (``support.txgcap_harness.TxgCoreOrder``, a
 accessor) takes it through core's startup order with ``graph_capture``'s
 stream and core's graph pools; ``build_option_on`` runs that startup unless
 ``startup=False``. The configuration meets the restricted startup
-(TXG-CFG-017 to TXG-CFG-019): synchronous scheduling, ``cudagraph_mode`` and
-compilation mode NONE, and ``num_gpu_blocks_override`` the state pools' block
-count, at least the admission limit plus one.
+(TXG-CFG-017, TXG-CFG-018: synchronous scheduling, ``cudagraph_mode`` and
+compilation mode NONE) under the KV-cache sizing ``sizing``
+(``txg_api.Sizing``), core's default, the extensible KV cache, unless a test
+names another: a test sets a fixed block count or budget only where its spec
+names one. Under the extensible KV cache the startup runs no profiling
+capture and follows ``post_warmup`` with core's extension
+(``TxgCoreOrder.extend``); under a fixed block count the override is the
+state pools' block count, at least the admission limit plus one.
 
 ``GpuEnv.compare`` installs a spy on the binding's ``execute`` (see
 ``support.txg_api``): every covered step is also run as the option-off
@@ -45,8 +50,9 @@ import torch
 from support import model_harness as h
 from support import txg_api as api
 from support import txg_transaction as tx
+from support.txg_api import Sizing, sizing_settings
 from support.txg_fakes import RecordingSink
-from support.txgcap_harness import TxgCoreOrder
+from support.txgcap_harness import TxgCoreOrder, set_cache
 
 KEY = api.KEY
 
@@ -164,8 +170,10 @@ class GpuEnv:
         max_num_seqs: int | None = None,
         events: h.Events | None = None,
         advance: h.AdvanceSpy | None = None,
+        sizing: str = Sizing.EXTENSIBLE,
     ) -> None:
         self.vllm_config = vllm_config
+        self.sizing = sizing
         self.model = model
         self.state = state
         self.runner = runner
@@ -207,6 +215,7 @@ class GpuEnv:
             max_num_seqs=self.max_num_seqs,
             events=self.events,
             advance=self.advance,
+            sizing=self.sizing,
         )
 
     def shutdown(self) -> None:
@@ -324,15 +333,17 @@ class GpuEnv:
                 final.bias[blank].copy_(original)
 
 
-def set_block_count(vllm_config: Any, blocks: int) -> None:
-    """``--num-gpu-blocks-override blocks``, the restricted startup's block
-    count (TXG-CFG-005, TXG-CFG-019), set on the built configuration without
-    re-running its validators."""
-    cache = vllm_config.cache_config
-    try:
-        cache.num_gpu_blocks_override = blocks
-    except Exception:  # noqa: BLE001 - validated dataclass
-        object.__setattr__(cache, "num_gpu_blocks_override", blocks)
+def set_sizing(
+    vllm_config: Any,
+    sizing: str,
+    *,
+    blocks: int | None = None,
+    budget: int | None = None,
+) -> None:
+    """The KV-cache sizing ``sizing`` (``txg_api.Sizing``) on the built
+    configuration, without re-running its validators: the cache values of
+    ``txg_api.sizing_settings``."""
+    set_cache(vllm_config, **sizing_settings(sizing, blocks=blocks, budget=budget))
 
 
 def build_option_on(
@@ -345,8 +356,11 @@ def build_option_on(
     max_num_active_seqs: int | None = None,
     populations: Sequence[int] | None = None,
     capacity: int | None = None,
+    sizing: str = Sizing.EXTENSIBLE,
+    blocks: int | None = None,
+    budget: int | None = None,
     startup: bool = True,
-    profile: bool = True,
+    profile: bool | None = None,
     verify: bool = True,
     overrides: dict[str, Any] | None = None,
     monkeypatch: Any = None,
@@ -355,11 +369,22 @@ def build_option_on(
     (``N = P_max``); ``max_num_active_seqs`` sets the admission limit
     (``--max-num-active-seqs``; unset, it is ``max_num_seqs``). The weights
     are seeded, so every environment of a test has the same model.
-    ``startup`` runs ``core.startup(profiling=profile, verify=verify)``."""
+    ``capacity`` is the page count of every serving state pool the core
+    order binds (the reservation capacity under the extensible KV cache);
+    under :attr:`Sizing.BLOCK_COUNT` the override is ``blocks``, ``capacity``
+    unless given, set before the configuration is built so core's and the
+    plugin's configuration hooks see it; :attr:`Sizing.BUDGET` takes
+    ``budget``. ``startup`` runs ``core.startup(profiling=profile,
+    verify=verify)``: ``profile`` ``None`` runs the profiling capture exactly
+    when core's estimate runs under the sizing."""
     patches = monkeypatch or pytest.MonkeyPatch()
     events = h.Events()
     advance = h.AdvanceSpy(events).install(patches)
     max_num_seqs = max_num_seqs or n
+    capacity = capacity or max_num_seqs + 4
+    assert capacity >= max_num_seqs + 1, "the pools hold the admission limit plus one"
+    if sizing == Sizing.BLOCK_COUNT and blocks is None:
+        blocks = capacity
     card = h.write_runnable_card(tmp_path / "card")
     vllm_config = h.build_vllm_config(
         card,
@@ -374,6 +399,7 @@ def build_option_on(
         },
         device="cuda",
         enforce_eager=False,
+        num_gpu_blocks_override=blocks if sizing == Sizing.BLOCK_COUNT else None,
     )
     if max_num_active_seqs is not None:
         scheduler = vllm_config.scheduler_config
@@ -381,9 +407,9 @@ def build_option_on(
             scheduler.max_num_active_seqs = max_num_active_seqs
         except Exception:  # noqa: BLE001 - validated dataclass
             object.__setattr__(scheduler, "max_num_active_seqs", max_num_active_seqs)
-    capacity = capacity or max_num_seqs + 4
-    assert capacity >= max_num_seqs + 1, "the pools hold the admission limit plus one"
-    set_block_count(vllm_config, capacity)
+    # A fixed budget and a profiled budget are set on the built
+    # configuration: ``model_harness.build_vllm_config`` takes neither.
+    set_sizing(vllm_config, sizing, blocks=blocks, budget=budget)
     torch.manual_seed(0)
     model = h.build_model(vllm_config)
     state = h.build_model_state(vllm_config, model)
@@ -398,6 +424,7 @@ def build_option_on(
         max_num_seqs=max_num_seqs,
         events=events,
         advance=advance,
+        sizing=sizing,
     )
     if monkeypatch is None:
         env._patches = patches

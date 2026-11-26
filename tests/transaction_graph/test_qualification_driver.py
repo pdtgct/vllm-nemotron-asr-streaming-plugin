@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU checks of the tier 5 qualification driver and its adapter
 (``support.txg_qual_driver``, ``support.txg_qual_adapter``; TXG-QUAL-002,
--003, -004, -007, -011, -026) on the runnable synthetic card with
+-003, -004, -007, -011, -026, -028) on the runnable synthetic card with
 transaction graphs off. They check the driver's own mechanics (the adapter's
-step lifecycle on the state layer, block assignment, pacing, prefix targets,
-snapshot and restore, the detached reference), not any tier 5 figure; the
-qualifying runs are A40 runs of the same code.
+step lifecycle on the state layer, block assignment below the final
+committed block count, pacing, prefix targets, snapshot and restore, the
+detached reference and its bound, the requests run alone), not any tier 5
+figure; the qualifying runs are A40 runs of the same code.
+
+A state pool bound with fewer pages than its storage holds
+(``txgcap_harness.narrow_pool``) stands for the views core binds after its
+extensible KV cache grows: the final committed block count's pages over a
+reservation that spans more.
 """
 
 from __future__ import annotations
@@ -17,7 +23,13 @@ import torch
 from support import model_harness as h
 from support import txg_qual_driver as d
 from support import txg_transaction as tx
-from support.txg_qual_adapter import QualAdapter, TransactionMonitor, detached_problems
+from support import txgcap_harness as t
+from support.txg_qual_adapter import (
+    Call,
+    QualAdapter,
+    TransactionMonitor,
+    detached_problems,
+)
 
 pytestmark = pytest.mark.engine
 
@@ -323,3 +335,127 @@ def test_a_run_uses_the_served_q_convention_for_clips_and_offsets(off_cpu):
     for slot, stream in enumerate(run.streams):
         assert stream.utt == ctx.corpus.ids[perm[slot]]
         assert abs((stream.arrivals[0] - c) - rng.uniform(0.0, c)) < 1e-12
+
+
+# ---------------------------------------------------------------------------
+# The final committed block count (TXG-QUAL-003, TXG-QUAL-026)
+
+PAGE = 4096
+
+
+def narrowed_pools(pages: int = 8, storage_pages: int = 12) -> tx.Pools:
+    """Pool views of ``pages`` pages over a storage of ``storage_pages``,
+    laid out as a strided resident pool (two views per page)."""
+    storage = torch.zeros(storage_pages, PAGE, dtype=torch.int8)
+    half = PAGE // 2
+    return tx.Pools(
+        {
+            "h_pool": storage[:pages, :half].view(torch.float32),
+            "channel_pools": [storage[:pages, half:]],
+            "time_pools": [],
+            "len_pools": [],
+        }
+    )
+
+
+# @spec TXG-QUAL-003
+def test_the_detached_copy_holds_only_the_pages_below_the_final_committed_count():
+    """The copy of views of the final committed count's pages, over a
+    storage that spans more (the reservation), holds those pages' bytes and
+    no more, keeps each view's layout and alignment, and equals the live
+    views bit for bit."""
+    live = narrowed_pools(pages=8, storage_pages=12)
+    for _, view in live.flat():
+        view.copy_(torch.randint(-100, 100, view.shape).to(view.dtype))
+    copy = live.clone()
+    assert copy.storage_bytes() <= 8 * PAGE + 512, copy.storage_bytes()
+    assert copy.storage_bytes() < 12 * PAGE
+    assert copy.first_dimensions() == {8}
+    assert live.differences(copy) == []
+    assert detached_problems(copy, live) == []
+    for (_, a), (_, b) in zip(live.flat(), copy.flat(), strict=True):
+        assert (a.shape, a.stride(), a.dtype) == (b.shape, b.stride(), b.dtype)
+        assert a.data_ptr() % 512 == b.data_ptr() % 512
+
+
+# @spec TXG-QUAL-003
+def test_a_copy_of_views_above_the_final_committed_count_is_a_problem(off_cpu):
+    """Views that keep more pages than the final committed block count (a
+    layout core's extension leaves at the reservation's page count) are
+    reported: the copy would not be limited to the committed pages."""
+    env = off_cpu(right_context=0, max_num_seqs=4)
+    pools = narrowed_pools(pages=8)
+    monitor = TransactionMonitor(env.model, compare=True, final_blocks=6)
+    call = Call(kind="execute")
+    copy = monitor._copy(pools.kwargs(), call)
+    assert any("final committed" in p for p in call.problems), call.problems
+    within = TransactionMonitor(env.model, compare=True, final_blocks=8)
+    call = Call(kind="execute")
+    within._copy(pools.kwargs(), call)
+    assert call.problems == [], call.problems
+    assert copy.first_dimensions() == {8}
+
+
+# @spec TXG-QUAL-026, TXG-QUAL-003
+def test_the_adapter_reads_the_final_committed_block_count(off_cpu):
+    """After a binding of fewer pages than the storage holds, the adapter's
+    final committed block count is the bound views' first dimension, or
+    core's live ``kv_cache_config`` count when that is smaller; every block
+    the driver assigns is below it."""
+    from types import SimpleNamespace
+
+    env = off_cpu(right_context=0, max_num_seqs=4)
+    env.runner.profile_run(core_embeds=False)
+    reservation = h.real_bindings(h.model_spec(env.model), capacity=12)
+    env.runner.bind_pool(t.narrow_pool(reservation, 8))
+    adapter = QualAdapter(vllm_config=env.vllm_config, model=env.model, state=env.state)
+    assert adapter.capacity == 8 and adapter.final_committed_blocks == 8
+    live_config = SimpleNamespace(kv_cache_config=SimpleNamespace(num_blocks=6))
+    core = QualAdapter(
+        vllm_config=env.vllm_config,
+        model=env.model,
+        state=env.state,
+        runner=live_config,
+    )
+    assert core.final_committed_blocks == 6
+    blocks = d.Blocks(core.final_committed_blocks)
+    taken = [blocks.take(f"r{i}") for i in range(5)]
+    assert sorted(taken) == [1, 2, 3, 4, 5] and max(taken) < 6
+    with pytest.raises(RuntimeError):
+        blocks.take("r5")
+
+
+# ---------------------------------------------------------------------------
+# Requests alone (TXG-QUAL-028)
+
+
+# @spec TXG-QUAL-028
+def test_the_alone_mode_runs_one_stream_and_each_file_to_its_end(off_cpu):
+    """One stream served alone, then each of TXG-QUAL-004's files alone (the
+    four special files and one utterance), each its own request on an
+    otherwise idle server; each item's transcript is recorded for the
+    comparison with ``B_hook``."""
+    env = off_cpu(right_context=0, max_num_seqs=4)
+    ctx = context(env, lengths=(3000, 2600, 4100, 3300, 2900, 3100, 2700))
+    try:
+        result = d.run_alone(ctx, {"seed": 5, "alone_utterances": 1})
+    finally:
+        ctx.monitor.uninstall()
+    names = [item["name"] for item in result["items"]]
+    assert names == ["alone-stream", *(f"alone-file{i}" for i in range(5))]
+    kinds = [
+        next(iter(item["transcripts"].values()))["utt"].split(":")[0]
+        for item in result["items"][1:]
+    ]
+    assert kinds == [
+        "silence-padded",
+        "whole-chunks",
+        "zero-samples",
+        "short",
+        "utterance",
+    ]
+    for item in result["items"]:
+        assert len(item["transcripts"]) == 1, item
+        assert item["steps"] >= 1 and item["failed_rows"] == 0, item
+    assert result["fallbacks"] == {} and result["replays"] == 0
+    assert not ctx.blocks.held, "a request was left live"

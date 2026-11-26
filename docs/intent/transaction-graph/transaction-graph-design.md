@@ -21,19 +21,25 @@ vllm#67583's model-state capture hook (`capture_cudagraphs`), into core's graph 
 capture stream, while core's runner captures no graph over the forward (its resolved
 `cudagraph_mode` is NONE). The model keeps
 no graph pool and no memory admission of its own. On the target core the option starts only
-under a restricted startup: synchronous scheduling, an explicit NONE runner and compilation mode,
-and an explicit block count or KV budget (Configuration checks).
+under a restricted startup: synchronous scheduling and an explicit NONE runner and compilation
+mode (Configuration checks).
 
 **Interface.** The rules of this design use the target core's state layer, `pdtgct/vllm` at
 `cbf13fed4a` (the `registration` design, State-slot access): the state layer's views, which core
 binds through `MambaBase.bind_kv_cache` and the layer exposes as `component_pools`, views of the
-bound storage that the layer drops when core rebinds and in `clear_cudagraphs` (REG-STATE-018); core's
-state-group layout accessor, `ModelState.state_group_layouts`, which core sets after it binds a
-KV cache and before `initialize_kv_cache` and `capture_cudagraphs`, and clears when it releases
-that cache; the model state's step classification (REG-MEM-001) and its record of each request's
-slot (REG-STATE-002); and the model state's failure channel `take_failed_requests` (REG-MS-003,
-REG-MS-004). Core keeps a held request's page at its block ID and address until the request's
-terminal finish, so a cell may address a page by block ID.
+bound storage that the layer drops when core rebinds and in `clear_cudagraphs` (REG-STATE-018);
+the model state's step classification (REG-MEM-001) and its record of each request's slot
+(REG-STATE-002); the model state's failure channel `take_failed_requests` (REG-MS-003,
+REG-MS-004); and core's state-group layout accessor, `ModelState.state_group_layouts`, which core
+sets after it binds a KV cache and before `initialize_kv_cache` and `capture_cudagraphs`, keeps
+unchanged until it releases that cache (its growth rebinds the layer's views over the same pages
+with no more pages than the layout's *page count*, the first dimension of its tensors), and
+clears on release (`vllm/v1/worker/gpu/model_states/interface.py`); at every capture core
+guarantees memory behind block 0, the only page it guarantees backed, and under the extensible
+KV cache other pages may have no memory until it backs every page it can assign, before the
+first request. Core keeps a held request's page at its block ID and address until the request's
+terminal finish, so a cell may address a page by block ID. A cell therefore addresses only
+block 0 at capture and reaches each held page by the block ID the step arena carries.
 
 **Evidence.** The quantitative figures in this design are unpublished project measurements; the
 tier 2 and tier 5 results published with the plugin replace them. A whole-transaction prototype
@@ -126,24 +132,23 @@ cells.
 
 With the option on, the configuration must satisfy every condition below. A failure of a
 transaction-graph-specific condition (Populations, Admission limit, Block count, Geometry, Native
-burst, Segment arms, `enforce_eager` in Runner, State layer, Scheduling, Runner modes and Pool) is
-a configuration error that names `transaction_graph_populations`, the condition, the rejected
+burst, Segment arms, `enforce_eager` in Runner, State layer, Scheduling and Runner modes) is a
+configuration error that names `transaction_graph_populations`, the condition, the rejected
 value and the remedy. The shared runner and platform conditions are reported as `registration` states them
-(REG-ENG-005, REG-ENG-006). Scheduling, Runner modes and Pool form the **restricted startup**.
+(REG-ENG-005, REG-ENG-006). Scheduling and Runner modes form the **restricted startup**.
 
 | Condition | Rule |
 | --- | --- |
 | Populations | A list of `int` values (not `bool`), distinct, each in `1 … min(max_num_seqs, max_num_batched_tokens)`. A limit core has not yet resolved when the configuration hook runs bounds nothing there; model-state construction applies the full bound. |
 | Admission limit | Every entry is at most the number of requests core's scheduler admits into RUNNING: `max_num_active_seqs` when set (`--max-num-active-seqs`), otherwise `max_num_seqs`. Core never schedules a step with more rows than that, so a larger entry declares a population that can never run and cells that can never replay. Remedies: a largest population of at most the limit, or a larger `--max-num-active-seqs` (at most `max_num_seqs`) or none. Bounded as Populations is when the configuration hook runs before the limit is resolved. |
-| Block count | Under `num_gpu_blocks_override`, `override − 1` (the non-null pages) is at least the admission limit, and so at least every entry. Core's scheduler refuses to start when the cache holds fewer state pages (`num_blocks − 1`, at one block per request) than requests that can be active, but core builds it after both captures, so an override of `N + 1` with `N` below the limit would capture `2N` cells twice and then fail. Remedies: a `--num-gpu-blocks-override` of at least the admission limit plus one, or a lower admission limit with the largest population at most it. Before the limit is resolved, the configuration hook compares the override with the entries only. Under a fixed `kv_cache_memory_bytes` the block count is known only at the serving capture, where the pool-access check makes the same comparison (Rules of the capture call). |
+| Block count | Under `num_gpu_blocks_override`, `override − 1` (the non-null pages) is at least the admission limit, and so at least every entry. Core's scheduler refuses to start when the cache holds fewer state pages (`num_blocks − 1`, at one block per request) than requests that can be active, but core builds it after both captures, so an override of `N + 1` with `N` below the limit would capture `2N` cells twice and then fail. Remedies: a `--num-gpu-blocks-override` of at least the admission limit plus one, or a lower admission limit with the largest population at most it. Before the limit is resolved, the configuration hook compares the override with the entries only. Under every other KV-cache sizing (a fixed `kv_cache_memory_bytes`, a profiled budget, or the extensible KV cache) the page count is known only at the serving capture, where the pool-access check makes the same comparison with the layout's page count (Rules of the capture call); under the extensible KV cache that count is the reservation capacity, and core's scheduler, built after the extension, refuses a final count too small for the requests that can be active, naming a lower `--max-num-seqs` or a larger cache (`vllm/v1/core/sched/scheduler.py:155-170`). |
 | Geometry | The server's one geometry, as `registration` resolves it at startup (the `num_lookahead_tokens` override, else the checkpoint's default lookahead), is lookahead 0 or 1 (80 or 160 ms). Lookahead 3 (320 ms), the published checkpoint's default, is refused with the remedy `num_lookahead_tokens` 0 or 1. When `served_lookahead` raises, the condition carries its message. |
 | Native burst | `experimental_native_burst` is false or absent. |
 | Segment arms | The arms the model will run are the default arms: `encoder_execution_arm` `eager-graphed` and `decode_dispatch_arm` `dense-graphed`, configured or written by card translation (REG-CARD-008). An unset key resolves to an eager arm (`eager` encoder, `compact-eager` decoder) and is refused. Every other arm is refused as well, the `dense-graphed` encoder included, which `registration` also refuses under the hook configuration (REG-ENG-005); a non-empty `chunk_bucket_graph_populations` is refused there by `registration`, not by this function. |
 | Runner | `enforce_eager` off. The hook configuration's `cudagraph_mode`, compilation-mode and platform conditions are `registration`'s (the `registration` design, Runner configurations), which it validates (REG-ENG-005 in the configuration hook, REG-ENG-006 at model-state construction); this function does not repeat those conditions. |
 | State layer | The running core's `ModelState` defines `state_group_layouts`, as the target core does. The cells bake in state-page addresses, which the model reads from that accessor at capture (Rules of the capture call). Refused on a core without it (remedy: remove `transaction_graph_populations`). |
 | Scheduling | `async_scheduling` is `False` (remedy `--no-async-scheduling`). An unset value is refused, because the target core resolves it to asynchronous scheduling. `B_hook` and the qualification run synchronously, and the worker's call order under asynchronous scheduling is unverified with cells. |
-| Runner modes | `cudagraph_mode` and the compilation mode are NONE: requested explicitly in the configuration hook (an unset mode is refused), and NONE as core's configuration build left them at construction (remedy `-cc.cudagraph_mode none -cc.mode none`). A mode that core reduces to NONE only when it initializes the KV cache sizes core's profiling KV cache differently (the `registration` design, Runner configurations), and the qualification covers explicit NONE only. This condition narrows the hook configuration's; it does not replace it. |
-| Pool | `num_gpu_blocks_override` is set, or `kv_cache_memory_bytes` is positive (remedy: a `--num-gpu-blocks-override` of at least the admission limit plus one, or a `--kv-cache-memory-bytes` that holds that many state pages). Either setting turns core's extensible KV cache off. Core's minimal profiling KV cache holds `min(max_num_seqs, max_cudagraph_capture_size) or 1` blocks, one block under an explicit NONE, while a profiling capture needs `N` capture-row pages beside the null page; under `num_gpu_blocks_override` that cache holds the override's block count, and under a fixed `kv_cache_memory_bytes` core runs no profiling capture. The extensible KV cache, on by default on CUDA, backs only its first one or two blocks when the serving capture runs, so capture rows would read unbacked pages, and its growth rebinds the views without refreshing `state_group_layouts`. |
+| Runner modes | `cudagraph_mode` and the compilation mode are NONE: requested explicitly in the configuration hook (an unset mode is refused), and NONE as core's configuration build left them at construction (remedy `-cc.cudagraph_mode none -cc.mode none`). The qualification covers explicit NONE only. A mode that core reduces to NONE only when it initializes the KV cache leaves the runner capturing nothing, as explicit NONE does, but no transaction-graph run has shown its served equality (Future roadmap). This condition narrows the hook configuration's; it does not replace it. |
 
 **`--enforce-eager`.** Core runs no capture hook under `--enforce-eager`, so the option on
 with `--enforce-eager` is refused, naming both. Once the option is the default, the default
@@ -172,8 +177,9 @@ That is the hook configuration with `-cc.cudagraph_mode none`, `-cc.mode none` a
 `--no-async-scheduling` (no `--enforce-eager`), with
 the default segment arms captured through the hook (`eager-graphed` encoder at every CHUNK count
 from 1 to `max_num_seqs`, `dense-graphed` decoder at its tiers), no CHUNK-bucket graphs, native
-burst off, and the same geometry, batching limits, dtype, device and budget setting (the same
-`--num-gpu-blocks-override` or `--kv-cache-memory-bytes` of the restricted startup), so the option
+burst off, and the same geometry, batching limits, dtype, device and KV-cache sizing (core's
+extensible KV cache, a profiled budget with it off, the same `--num-gpu-blocks-override`, or the
+same `--kv-cache-memory-bytes`), so the option
 changes exactly one setting. `B_hook` is defined by these runner flags, not by the README's default
 serve command, which may run under `--enforce-eager` until the hook configuration meets tier 2.
 
@@ -459,9 +465,13 @@ The null page is the page of block `null_block_id` (vLLM's `NULL_BLOCK_ID`, bloc
 component pool. Core allocates the KV cache zeroed and allocates the null block to no request, so
 the null page starts as zero bytes. The model keeps it that way: structural preflight refuses the null block ID
 for a real row, the row plan's CUDA-graph padding entries never enter the body, a predicated
-scatter stores only rows with a zero status and only to their own pages, capture rows use pages
-`1 … k`, and the scatter warm-up's rows are rejected. No transaction, cell replay or capture
+scatter stores only rows with a zero status and only to their own pages, and capture rows and
+the scatter warm-up's row name block 0 and are rejected. No transaction, cell replay or capture
 therefore stores to it (TXG-MASK-007), which makes it the zero initial state fresh rows gather.
+Block 0 is also the only page core guarantees backed at every capture (Capture procedure). An
+extension that remaps or defragments the KV cache maps fresh zeroed blocks before any request
+holds a page (`vllm/v1/worker/extensible_kv_cache.py:195-218,531-534`), so block 0 keeps zero
+bytes across it.
 That read-only gather is the one access outside the rows' own pages that `registration`'s state
 access rule permits (REG-STATE-003). A cell bakes the null block ID into its gather, so the ID is
 part of the cell's signature.
@@ -565,7 +575,11 @@ page's block ID (Null page), lazily bound encoder buffers (chunk cells), the car
 layouts of the step arena, static inputs and step outputs. It also covers the two row classes the
 cells exclude (Endpoint arguments): whether any of the cell's rows carries an endpoint policy
 (`endpoint_policy`) and whether any is a forced-EOU candidate (`forced_eou`), both false at
-capture. The host computes it before the upload.
+capture. For the resident pool layouts, a step's view matches the cell's entry when it *fits*
+that entry: the same address, page shape (every dimension after the first), strides and dtype, and
+a first dimension no larger. The extensible KV cache's growth rebinds the views over the same
+pages with no more pages than the cell captured, which fit; a view with more pages, another
+address or other strides does not. The host computes it before the upload.
 
 Callables compare by `(id(__self__), id(__func__))` for a bound method and `id` otherwise. The
 dense decode binding caches one callable per graph key and the encoder binding one transition per
@@ -590,20 +604,32 @@ Capturing one cell runs, on core's capture stream, an eager reference of the bod
 that the transaction rejects (so no page is stored), three warm-ups with the nested bindings
 running eagerly (Flat capture), the capture, and one validation replay. The cell is published only
 if the replay's outputs equal the reference's bit for bit and, in every component pool, the null
-page and the cell's capture-row pages equal bit for bit the call's snapshot of them: a host copy
-of pages `0 … N` taken once, at the start of the call's transaction-graph part (before the scatter
-warm-up). Because the comparison is with that snapshot, a store by the scatter warm-up, the
+page equals bit for bit the call's snapshot of it: a host copy of block 0 of every component pool,
+taken once, at the start of the call's transaction-graph part (before the scatter warm-up). Because the comparison is with that snapshot, a store by the scatter warm-up, the
 reference or a warm-up fails the check as well as a store by the replay. The pages are compared
 before the outputs: fresh capture rows gather the null page, so a store to it also changes the
-outputs, and the check reports the store. A cell at count `k` has
-`k` capture rows, which use non-null free pages `1 … k`. Under a fixed block count the populations
-bound (`N ≤ num_gpu_blocks_override − 1`) guarantees them in both pools; under a fixed budget,
-core's rule that the state group holds a page for every request that can be active guarantees them
-when `N` is at most that limit (`max_num_active_seqs`, by default `max_num_seqs`). The call checks
-the block count either way (Rules of the capture call). A CHUNK capture row carries a zero envelope header (`ROW_STATUS_ENVELOPE`); an echo capture
+outputs, and the check reports the store. A cell at count `k` has `k` capture rows, every one naming
+block 0, the null page, the only page core guarantees backed at every capture; the pages of held
+requests may then have no memory, so no part of a capture call reads or writes any page but
+block 0. The capture rows' plan passes the structural preflight in its capture-only mode, which
+requires every row to name the null block ID and the live set to be empty, and waives, for those
+rows, exactly three row checks: the refusal of the null block ID for a real row, of a block ID
+named by two rows, and of a block ID outside the live set. It keeps every other check, among them
+the bounds of each row's block ID against the pool and the validation of the live set, which an
+empty live set passes. A scheduled step's plan never takes that mode: `prepare_model_rows`
+receives it only from a capture call's cell programs, and `advance_model_rows` and `execute` do
+not pass it. A CHUNK capture row carries a zero envelope header (`ROW_STATUS_ENVELOPE`); an echo capture
 row carries the stream carrier token (`ROW_STATUS_ROLE_MISMATCH`). Capture rows carry the server's
 geometry and alternate their fresh and file bits, so the self-check exercises both arms of every
-select. Each capture row's rejection depends on its header or token alone, never on the content
+select whose arms differ when every row names block 0 (the initial book row against the gathered
+one, the file selects). The initial-state index's two arms both name block 0 there, and a cell
+that baked a page address instead of reading the arena's block IDs would read and write block 0
+on every replay, which the self-check cannot see either. Both defects are left to the replay
+oracles: TXG-EQ-003 replays the same captured cell, at every count, once on a sub-plan of fresh
+rows whose recycled pages hold sentinel patterns and once on a sub-plan of continuing rows whose
+pages hold nonzero state distinct from the null page, and, at every count of 2 or more, on a
+sub-plan that mixes the two; TXG-QUAL-003 compares every qualification step, pages included, with
+the option-off transaction. Each capture row's rejection depends on its header or token alone, never on the content
 of the page it gathers; the eager reference launches the nested segment graphs while the warm-ups and capture run
 them eagerly, so it also compares the two nested paths. The self-check covers rejected rows only;
 exactness for accepted rows rests on Split equivalence and Qualification, at both geometries,
@@ -611,8 +637,8 @@ including every case of Exactness obligations for masked rows and Lookahead rows
 
 Before the first cell of a capture call, a scatter warm-up launches, for each component pool and
 each projected resident-pool view a transaction passes to the kernel, one row with a rejected
-status that names the first non-null free page; the kernel's status predicate returns before it
-reads the page ID or any resident address.
+status that names block 0; the kernel's status predicate returns before it reads the page ID or
+any resident address.
 
 Cells are captured largest first: chunk cells from `N` down to 1, then echo cells from `N` down
 to 1. Memory that a larger cell's capture allocated and freed is then available to the smaller
@@ -664,10 +690,10 @@ replay-cell oracle).
 | Hook | Transaction-graph behaviour |
 | --- | --- |
 | `needs_cudagraph_capture()` | True exactly when the platform is CUDA and the configuration selects a hook-captured graph: the `eager-graphed` encoder, the `dense-graphed` decoder or the option on (REG-MEM-019). Configuration only, the same value for the model state's lifetime. Under `--enforce-eager` the runner does not ask. |
-| `prepare_execution_memory()` | Called once before the profiling forward pass, before core binds any state page, in both runner configurations. This component allocates nothing there: its buffers belong to the captures, which the estimate charges. |
+| `prepare_execution_memory()` | Called once before the profiling forward pass, before core binds any state page, in both runner configurations. This component allocates nothing there: its buffers belong to the captures, which core's estimate charges when it runs and core's reading of free memory after the captures charges under the extensible KV cache. |
 | profiling forward pass | Runs under the hook configuration too, as the profiling dummy step that the model state's `prepare_inputs` classifies (REG-MEM-001); `registration` runs its profile transaction there, on the first profiling dummy step only (REG-MEM-016), over model-owned storage, at the maximum shape. It is a dummy step, so it never calls `execute` and is never counted as a fallback. No cell is captured or replayed. |
-| core's KV-cache binding and `initialize_kv_cache` | Core binds the state layer's views (`bind_kv_cache`) and sets `state_group_layouts` before `initialize_kv_cache`: first for its profiling KV cache, when its estimate runs, then for the serving KV cache. This component records nothing there; each capture call reads the layout itself (Rules of the capture call). Core clears the layout when it releases the profiling KV cache, after `clear_cudagraphs`. A binding after the serving capture follows Repeated bindings. |
-| `capture_cudagraphs(profile_only=True)` | Runs only when core's estimate runs. The profiling capture: segment graphs, the scatter warm-up, every cell, then the charged margin (Graph memory), over the profiling pools, which under the restricted startup hold `num_gpu_blocks_override` blocks, into the pool core passes (the estimate's throwaway pool). A fixed `kv_cache_memory_bytes` runs no profiling capture. |
+| core's KV-cache binding and `initialize_kv_cache` | Core binds the state layer's views (`bind_kv_cache`) and sets `state_group_layouts` before `initialize_kv_cache`: first for its profiling KV cache, when its estimate runs, then for the serving KV cache. This component records nothing there; each capture call reads the layout itself (Rules of the capture call). Core clears the layout when it releases the profiling KV cache, after `clear_cudagraphs`. Under the extensible KV cache core binds the serving views again after `post_warmup` and before the first request, with no more pages, over the same base and strides (Repeated bindings). A binding after the serving capture follows Repeated bindings. |
+| `capture_cudagraphs(profile_only=True)` | Runs only when core's estimate runs (a profiled budget or a fixed block count, with the extensible KV cache off). The profiling capture: segment graphs, the scatter warm-up, every cell, then the charged margin (Graph memory), over block 0 of the profiling pools, which hold the override's block count when it is set, otherwise `min(max_num_seqs, max_cudagraph_capture_size) or 1` blocks (one block under the explicit NONE the restricted startup requires), into the pool core passes (the estimate's throwaway pool). A fixed `kv_cache_memory_bytes` runs no profiling capture. |
 | `clear_cudagraphs()` | Releases every graph, buffer, signature, recorded layout and the margin the profiling capture created, this component's part before the segment graphs. It keeps the capture record, whose profiling totals are host integers. Core calls it also when the profiling capture raised or was never reached, so it tolerates nothing captured. In the same call the model state drops the state layer's views (`registration`, REG-STATE-018), so when the call returns the plugin's objects hold the profiling KV cache only through the references core installed and clears in its teardown (the layer's `kv_cache` and the model state's `_state_group_layouts`), and after that teardown nothing of the plugin's keeps it allocated. |
 | `capture_cudagraphs(profile_only=False)` | Runs whenever `needs_cudagraph_capture()` is true and `enforce_eager` is off. Its entry checks run first, in this order: Ordering, A second serving capture, `registration`'s segment-graph entry check (REG-MEM-024), then whether a profiling capture was required (When core's estimate does not run). The serving capture: the same procedure, without the margin, over the serving pools, into core's global graph pool; then the memory comparison. Records the plain-value pool layout for post-warmup verification. |
 | `post_warmup()` | Called once per run of the worker's warmup; at startup after the serving capture and before the worker serves. Post-warmup verification. Allocates no device memory and replays nothing. |
@@ -685,16 +711,18 @@ and the transaction-graph parts of the other hooks do nothing.
   transaction-graph part starts by checking it: exactly one layout, holding exactly the state
   layer; each of the layer's component tensors the layer's bound view of the same name and
   position (core builds the layout from the views it bound, `get_state_group_layouts` in
-  `vllm/v1/worker/utils.py`); and at least the admission limit plus one blocks, the count core's
-  scheduler requires once it is built after the captures, which is at least `N + 1`. A failed
-  check is a failure of the pool-access phase (Capture failure messages). Under the restricted
-  startup the block-count part can fail only under a fixed `kv_cache_memory_bytes`, whose block
-  count no configuration check knows; under `num_gpu_blocks_override` the Block count condition
-  has already refused a smaller override. The layout grants no slot ownership and authorizes
+  `vllm/v1/worker/utils.py`); and, in the serving capture only, that the layout's page count is
+  at least the admission limit plus one, the count core's scheduler requires once it is built
+  after the captures, which is at least `N + 1`. The profiling capture makes no page-count check:
+  its cells need block 0 alone, and its page count is not the serving count. A failed check is a
+  failure of the pool-access phase (Capture failure messages). The block-count part can fail
+  under every KV-cache sizing except a fixed block count, which the Block count condition has
+  already checked; under the extensible KV cache the layout's page count is the reservation
+  capacity, so a final count below the limit is left to core's scheduler. The layout grants no slot ownership and authorizes
   no store to any page, the null page included; capture, warm-ups and the self-check run only
-  rejected rows and write only binding-owned memory. Core documents the layout as valid only until
-  its next bind or release of the KV cache, so the call keeps no layout object and no tensor taken
-  from it, only plain values (address, shape, strides, dtype per component).
+  rejected rows and write only binding-owned memory. The call keeps no layout object and no tensor
+  taken from it after it returns, only plain values (address, shape, strides, dtype per
+  component, and in the serving capture the page count).
 - **Stream and pool.** Every capture in the call runs on the `stream` core passes, inside
   `vllm.compilation.cudagraph_pool.capture_pool` with the `graph_pool` core passes. Each cell owns
   a `torch.cuda.CUDAGraph`; the model creates no stream and no pool of its own.
@@ -735,7 +763,11 @@ these warmed domains:
   argument's device, dtype, page size, strides and launch configuration and on whether its pointer
   is 16-byte aligned; the row count is its grid. The scatter receives only the pools' fixed views:
   the component pools and the projected resident-pool views over them, whose addresses, and so
-  whose alignment, are the same at warm-up, capture and serving. The scatter warm-up launches
+  whose alignment, are the same at warm-up, capture and serving; after the extensible KV cache
+  grows, a fallback step passes views of no more pages over the same addresses, which select the
+  same kernel specialization, because the kernel specializes on the page size, the page stride,
+  the dtype, the device and the pointer alignment, not on the page count (`state_scatter.py:121-144`).
+  The scatter warm-up launches
   every component pool and every projected view a transaction passes, and each cell's eager
   reference launches the views its kind's body passes, so every argument a scheduled step passes,
   covered or fallback, was launched before core enables JIT monitoring. The scatter's record of
@@ -751,7 +783,8 @@ The claim excludes first-use costs the monitors do not observe, such as lazy CUD
 A test runs each reachable fallback class (`chunk-uncovered`, `echo-uncovered`, and `signature`
 with the fields `endpoint_policy` and `forced_eou` among its cases) after startup under
 `jit_monitor_mode` `error` and requires no monitored compilation, and compares the scatter's
-host-side `(address, shape, strides, dtype)` arguments with those launched at startup.
+host-side arguments with those launched at startup by address, page shape, strides and dtype,
+with a first dimension no larger.
 
 ### A second serving capture
 
@@ -768,16 +801,31 @@ unreachable in a supported configuration.
 
 ### Repeated bindings
 
-Core binds the state layer's views again when its extensible KV cache grows, which the restricted
-startup turns off. `registration` also refuses sleep mode, whose wake path recaptures the model
-state's graphs (`recapture_model_state_graphs`), a second serving capture that the entry checks
-would refuse. No rebinding after the serving capture therefore happens while the option is on;
-the check below is defensive. When core binds the views after a serving capture was attempted, the state layer
-reports them to the binding. A binding whose plain-value layout equals the one the serving capture
-recorded is a verified no-op; a different layout latches the binding and is worker-fatal, because
-the cells bake in the captured addresses. This comparison reconciles the cells with core's rule
-that a layout is valid only until the next bind. The profiling KV cache's binding takes no part in
-it.
+Core binds the state layer's views again when its extensible KV cache grows: once, after
+post-warmup verification and before the first request, over the same pages with the final page
+count, which is at most the layout's page count; for a layout that is not block-compact it binds
+nothing (`vllm/v1/worker/extensible_kv_cache.py:489-578`). When core binds the views after a
+serving capture was attempted, the state layer reports them to the binding. Views that fit the
+layout the serving capture recorded (the same address, page shape, strides and dtype per
+component, and a first dimension at most the recorded page count) change nothing: the cells
+address held pages by block ID, every block ID the scheduler assigns is below the bound count,
+and the bound count is at most the captured extent. Views that do not fit latch the binding and
+are worker-fatal, because the cells bake in the captured addresses. The comparison uses the plain
+values the serving capture recorded; the binding does not read the accessor outside a capture
+call. `registration` refuses sleep mode, whose wake path recaptures the model state's graphs, a
+second serving capture that the entry checks would refuse. The profiling KV cache's binding takes
+no part in the comparison. A row's slot is checked on the host against the bound views' first
+dimension (`registration`, REG-STATE-003), never against the layout's page count, because a
+cell's in-graph gathers carry no bound below the captured page count; for a layout that is not
+block-compact the bound views keep the reservation's page count, and core's scheduler, which
+assigns only block IDs below the final count, is then the only bound. That reliance is an
+assumption on core's contract with a narrow reach: the persistent-state backend declares no
+supported layouts, so core takes its default preference, whose first entry, LBNHC, is
+block-compact (`vllm/v1/attention/backends/utils.py:226-235,426`); only `VLLM_KV_CACHE_LAYOUT` set
+to LHBNC or BHLNC selects a layout that the extension leaves at the reservation's page count. The
+model state holds the runner's live `kv_cache_config`, whose `num_blocks` the extension updates
+in place (`vllm/v1/worker/gpu/model_runner.py:717-718,899`;
+`vllm/v1/worker/extensible_kv_cache.py:535`).
 
 ## Graph memory
 
@@ -798,7 +846,9 @@ them itself. Each capture call records:
 - the call's **transient peak**: the allocator's peak reserved bytes over the call, with peak
   statistics reset at its start, less the reserved bytes at its start. The reset is process-wide;
   core reads peak statistics only inside its `memory_profiling` window, which has exited when
-  either capture hook runs.
+  either capture hook runs;
+- the page count of the call's state-group layout (the profiling KV cache's, and the serving KV
+  cache's).
 
 The transient peak is incremental allocator memory. It is a different quantity from a device's
 total memory in use (`nvidia-smi` `memory.used`, weights and every other process allocation
@@ -807,15 +857,22 @@ included), which Fit analysis reports from measurement.
 Per-cell figures are diagnostic: under shared-pool reuse a cell's growth depends on the cells
 captured before it, and no rule compares cells. The record also holds `PYTORCH_CUDA_ALLOC_CONF`
 (including `expandable_segments`), `CUBLAS_WORKSPACE_CONFIG` and the PyTorch, CUDA and driver
-versions.
+versions. The figures only a profiling capture produces (its totals, `m`, `r`, the readings
+around the margin and the absorbed rounding) are marked not applicable, never zero, when none ran
+(TXG-MEM-006, TXG-OBS-003). Under the extensible KV cache the record also holds the final bound
+count, the first dimension of the views reported at the extension (TXG-LIFE-009), as a field
+separate from the capture layout's page count.
 
 ### When core's estimate runs
 
 Core subtracts from the budget what its profiling capture window retains, read when the hook
-returns. Under the restricted startup core runs its estimate only with a fixed block count
-(`num_gpu_blocks_override`), and its profiling KV cache then holds that many blocks, the serving
-page count. The profiling capture runs the serving capture's procedure on the same cells, over
-those profiling pools, and then allocates a **charged margin**: one device
+returns. Core runs its estimate under a profiled budget or a fixed block count with the
+extensible KV cache off. Its profiling KV cache holds the override's block count when one is set,
+otherwise `min(max_num_seqs, max_cudagraph_capture_size) or 1` blocks, one block under the
+explicit NONE the restricted startup requires. The profiling capture runs the serving capture's
+procedure on the same cells over block 0 of those pools; a cell's allocations depend on its rows,
+not on the pools' page count, so the comparison of the two calls does not depend on that count.
+The profiling capture then allocates a **charged margin**: one device
 buffer of `m` bytes, held until `clear_cudagraphs`. The model reads free memory immediately before
 and after allocating it, under the convention of Measurement (capture stream synchronized,
 unused cached blocks released); the drop is the margin's **retained charge** `r`, which allocator
@@ -847,12 +904,21 @@ model state is constructed: a persisted startup plan sets `kv_cache_memory_bytes
 determination, and the engine can disable the extensible KV cache. A profiling capture is
 **required** (the predicate of REG-MEM-027) exactly when the effective `kv_cache_memory_bytes` is
 unset or 0 (core's own truthiness test), the estimate is enabled (`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` not 0) and
-the effective extensible-KV-cache setting is off; the option already requires CUDA. With the
-option on the extensible KV cache is off throughout (Pool), so an absence has one of two reasons:
-a fixed budget, or the estimate disabled under a fixed block count. The capture record holds those
-effective values and the resulting reason. Tests cover an applied startup plan (an expected
-absence, logged as a fixed budget).
-- **Expected absence** (not required). The serving capture logs one WARNING: the transaction
+the effective extensible-KV-cache setting is off; the option already requires CUDA. An absence
+has one of three reasons, checked in this order: the extensible KV cache, under which core runs
+no estimate and sizes the KV cache from the free memory it reads after the captures and
+`post_warmup` (`vllm/v1/worker/gpu_worker.py:1308-1321`), so the graphs are charged by that
+reading, whatever the budget or estimate setting (a startup plan sets `kv_cache_memory_bytes`
+with the extensible KV cache left on, `vllm/v1/worker/gpu_worker.py:742`,
+`vllm/v1/worker/startup_plan.py:146-175`, and core still measures); with the extensible KV cache
+off, a fixed budget (`--kv-cache-memory-bytes` or a startup plan); or, with it off, the estimate
+disabled under a profiled budget or a fixed block count. The capture record holds those effective
+values and the resulting reason. Tests cover an applied startup plan with the extensible KV cache
+off (an expected absence, logged as a fixed budget) and with it on (a measured absence).
+- **Measured absence** (the effective extensible KV cache on). The serving capture logs one INFO
+  line: core sizes the KV cache from the memory left after the captures, which includes the
+  transaction graphs and segment graphs; the call, transaction and per-kind totals.
+- **Expected absence** (not required, the extensible KV cache off). The serving capture logs one WARNING: the transaction
   graphs and segment graphs were not charged to the budget; the reason (the fixed budget value
   and whether a startup plan set it, or the estimate's setting); the call, transaction and
   per-kind totals; and that the budget must leave room for them.
@@ -874,12 +940,15 @@ its value and `N`; the capture (profiling, before the state pages are planned, o
 phase that failed (pool access, binding-buffer allocation, scatter warm-up, a cell's eager
 reference, warm-ups, capture or validation replay, or the margin allocation); the failing cell
 (geometry label, kind, count) only when the phase belongs to a cell; the totals retained so far
-and the transient peak; the budget setting (a block count fixed at the given
-`num_gpu_blocks_override`, with the estimate enabled or disabled, or a budget fixed at the given
-`kv_cache_memory_bytes`); the allocator settings; and the remedy for its case:
-- pool access with too few blocks, in either capture: a block count or budget that holds at least
-  the admission limit plus one state pages (a larger `--kv-cache-memory-bytes`, or a larger
-  `--num-gpu-blocks-override`), or a lower admission limit with the largest population at most
+and the transient peak; the KV-cache sizing (the extensible KV cache, with its page count; a
+block count fixed at the given `num_gpu_blocks_override`, with the estimate enabled or disabled; a
+budget fixed at the given `kv_cache_memory_bytes`; or a profiled budget with the extensible KV
+cache off, with the estimate enabled or disabled); the allocator settings; and the remedy for its
+case:
+- pool access with too few pages, in the serving capture: a block count or budget that holds at
+  least the admission limit plus one state pages (a larger `--kv-cache-memory-bytes`, a larger
+  `--num-gpu-blocks-override`, or a larger `--gpu-memory-utilization` under a profiled budget or
+  the extensible KV cache), or a lower admission limit with the largest population at most
   it; never a smaller budget, which would hold fewer pages still;
 - pool access that finds core's state-group layout contract broken (a layout count other than
   one, a layout that does not hold exactly the state layer, or a component tensor that is not the
@@ -894,7 +963,11 @@ and the transient peak; the budget setting (a block count fixed at the given
 - serving capture, fixed budget, in a later phase: a `--kv-cache-memory-bytes` smaller by at
   least the projected remainder (per kind with at least one cell captured in the call, the mean
   growth of those cells times its cells not yet captured, stated as an estimate; for a kind with
-  no captured cell the estimate is stated as unavailable), or a profiling-capture remedy.
+  no captured cell the estimate is stated as unavailable), or a profiling-capture remedy;
+- serving capture under a profiled budget or the extensible KV cache, in a later phase: a
+  profiling-capture remedy, or, under a profiled budget, a lower `--gpu-memory-utilization`, which
+  helps only when the allocated state pages leave too little device memory for the capture's
+  transient peak, which core's estimate does not charge.
 
 The serving-over-profiling failure names both call totals, `m`, `r`, the excess and the
 allocator settings, and gives as remedies a fixed `--kv-cache-memory-bytes` that leaves room for
@@ -903,8 +976,8 @@ option off.
 
 ### Temporary profiling pool
 
-Core allocates its profiling KV cache before the profiling capture; under the restricted startup
-it holds `num_gpu_blocks_override` blocks, the serving page count. When the device cannot hold it,
+Core allocates its profiling KV cache before the profiling capture: the override's block count
+when it is set, otherwise one block under the explicit NONE the restricted startup requires. When the device cannot hold it,
 the allocation's own exception fails startup and core calls neither `capture_cudagraphs` nor
 `clear_cudagraphs`. The target core names no model option in that failure, in a capture failure or
 in a planned-capacity failure; the model's own capture line and capture-failure messages name the
@@ -927,9 +1000,11 @@ that arena's previous upload (Step arena).
 fails startup. The model checks, in order, against the values recorded at the serving capture,
 using only plain values and host state:
 
-1. the plain-value layout of the state layer's currently bound views (`component_pools`: address,
-   shape, strides and dtype per component, in the layer's order), and the pools' device against
-   the encoder parameters' device;
+1. whether the state layer's currently bound views fit the layout the serving capture recorded
+   (Repeated bindings), and the pools' device against the encoder parameters' device; core runs
+   `post_warmup` before the extension (`vllm/v1/worker/gpu_worker.py:1275`,
+   `vllm/v1/engine/core.py:424`), so the views are then the captured ones, and the fit rule makes
+   verification and the binding check one comparison;
 2. the projected resident layout (per transaction role: component pool, byte offset, shape,
    strides, dtype), which catches a projection that swaps two same-shaped roles;
 3. that all `2N` cells hold their graphs, and the callable identities;
@@ -1027,8 +1102,8 @@ Startup memory under the option has two constraints: the retained memory, which 
 budget, and each capture's transient peak, which must fit beside everything resident at that
 capture. The measured reference is `B_hook`'s segment graphs, on an A40 (45 GiB usable) under
 `--enforce-eager`, where the model captures them once, itself (unpublished project measurement).
-The hook configuration captures them twice, profiling and serving, and is unmeasured. The peak
-column is the sampled whole-device `memory.used` maximum during startup, weights included, not
+The hook configuration captures them twice, profiling and serving, when core's estimate runs,
+and once otherwise; it is unmeasured. The peak column is the sampled whole-device `memory.used` maximum during startup, weights included, not
 the incremental transient peak of Measurement:
 
 | Geometry | `max_num_seqs` | Retained (core's charge) | Peak device memory in use | Startup |
@@ -1089,7 +1164,10 @@ a stream count belongs to its consumer (Open Questions).
   CHUNK step on an otherwise idle engine.
 - **The calibration run** is a preregistered microbenchmark in a fresh process at the
   configuration being calibrated, using the step rule's procedure with a one-row plan: 2 warm-up
-  and 21 counted steps per arm, option on (the chunk cell at 1) and off. Its frozen record holds
+  and 21 counted steps per arm, option on (the chunk cell at 1) and off. U(1) and the ladder are
+  measured at core's default sizing as well as under the step rule's fixed override, each in its
+  own record; a calibration applies only at the sizing in its identity (TXG-CAL-001 to
+  TXG-CAL-003). Its frozen record holds
   the audio (utterance ID and chunk index), the snapshot rule, the plan and the procedure. The run
   also records the step-time ladder `t(P)` on and off from the step rule's compositions.
 - **Served replay fraction.** The fraction of steps that replayed in the served `Q` run at
@@ -1097,7 +1175,8 @@ a stream count belongs to its consumer (Open Questions).
 - **Output.** One record: the configuration identity, U(1) on and off, the ladder, the served
   replay fraction, the device and the date. The identity covers the checkpoint revision, plugin
   version, core build, device model, dtype, the process constants (Process constants), geometry,
-  segment arms, scheduling mode, `max_num_seqs`, `max_num_batched_tokens` and the option's value.
+  segment arms, scheduling mode, the KV-cache sizing, `max_num_seqs`, `max_num_batched_tokens`
+  and the option's value.
   A consumer applies the option-on figures only to an engine with the same identity and only when
   the served replay fraction measured at that identity is 1; a fraction from another scheduling
   or precision configuration does not qualify. Otherwise it uses the option-off figures.
@@ -1105,9 +1184,15 @@ a stream count belongs to its consumer (Open Questions).
 ## Qualification
 
 The HLD's tier 5 is met separately at 80 ms and at 160 ms, on an A40 at FP32, on the stage 1
-build, under the restricted startup. Every option-on/off comparison is against `B_hook`. Runs that
-need core's graph-memory estimate (the step rule, the fit choice of `N`, the estimate check below)
-use a fixed `--num-gpu-blocks-override` with the estimate enabled.
+build, under the restricted startup and core's default KV-cache sizing (the extensible KV cache).
+Every option-on/off comparison is against `B_hook`. Runs that need core's graph-memory estimate
+(the step rule, the fit choice of `N`, the estimate check below) use a fixed
+`--num-gpu-blocks-override` with the estimate enabled. The record of every run, option on and
+`B_hook`, holds the KV-cache sizing, each capture layout's page count and, under the extensible
+KV cache, the final bound count read after the extension; that the option changes exactly one
+setting (Option-off baseline) refers to the runner flags, and the engines' final counts are
+reported, not equated. The qualification driver copies the state layer's bound views and assigns
+slots only below the final committed count (TXG-QUAL-003, TXG-QUAL-026).
 
 ### Workloads
 
@@ -1120,7 +1205,9 @@ use a fixed `--num-gpu-blocks-override` with the estimate enabled.
   by each step's measured option-on duration and, when no stream has a schedulable unit, jumps to
   the next arrival. Each step holds every stream with a schedulable unit (a chunk, a label drain,
   an echo, a FLUSH), so mixed steps arise from the pacing. The driver runs every step replayed and
-  as the option-off transaction on a detached copy of the pools taken before the step, and
+  as the option-off transaction on a detached copy of the state layer's bound views
+  (`component_pools`), limited to the pages below the final committed block count, taken before
+  the step, and
   compares outputs, statuses, progress, remaining counts and every page. The replayed step runs on
   the serving pools, whose addresses its graphs hold; the copy is test-only storage that the serving
   rules (REG-STATE-003, TXG-CAP-013) do not govern, and the reference never touches the serving
@@ -1137,7 +1224,8 @@ use a fixed `--num-gpu-blocks-override` with the estimate enabled.
   it with no model-state call, and a removal would retire a running file at once (REG-STATE-016),
   after which its addition would raise (REG-STATE-012). It executes on the runner stream, then
   calls `postprocess_state`, which waits for the step's commit event, and `take_failed_requests`
-  before the next step. The adapter assigns each request one block at its first step, keeps it
+  before the next step. The adapter assigns each request one block below the final committed
+  block count at its first step, keeps it
   until the request's terminal finish and reuses it only after that, as core's allocator does, and
   delivers a stream's next turn as core does (its compacted prompt, `num_computed_tokens` 1). No
   replay, restore or store runs outside a step run this way. The lifecycle calls, the pool copy
@@ -1189,6 +1277,16 @@ fallbacks of any kind. Both served runs also record zero fallbacks. Every zero-f
 scoped to plugin-packed input: a direct engine client can send a foreign-geometry row, which
 planning fails, an endpoint policy or a scheduled EOU token, which falls back, or a multi-token
 row, which planning fails and whose step falls back.
+
+Under the extensible KV cache the detached copy is a PyTorch allocation under the cap core sets
+after sizing the cache, `memory_reserved` plus what stays free after the extension
+(`vllm/v1/worker/extensible_kv_cache.py:684-699`). The run reserves a fixed, preregistered
+headroom of the copy's bytes (the bound views up to the final committed count) plus a stated
+margin through a `--gpu-memory-utilization` below 1.0, never a fixed budget, which would turn the
+extensible KV cache off; the record holds core's logged torch memory limit and
+`torch.cuda.memory_reserved` and `max_memory_reserved` before and after the copy, with
+`nvidia-smi` and `mem_get_info` as context only; served figures come from runs without the
+headroom (TXG-QUAL-029).
 
 ### Step rule
 
@@ -1269,6 +1367,16 @@ procedure, input generator and rules; and U(1)'s audio, plan and procedure. A ch
   for the two engines is reported, not bounded, because transient peaks also differ.
 - Under a fixed budget the startup log carries the uncharged-memory WARNING with the figures; with
   the profiling capture suppressed where the configuration requires it, startup fails.
+- An installed-engine check under the extensible KV cache shows the serving capture with only
+  core's minimum blocks backed, the extension's binding accepted without a latch, the
+  measured-memory INFO line (When core's estimate does not run), steps after the extension
+  replaying cells with no `signature` fallback, and transcripts equal to `B_hook`'s; a second arm
+  under a profiled budget with the extensible KV cache off shows the profiling capture over a
+  one-block profiling KV cache; a third arm under a fixed `--num-gpu-blocks-override` shows both
+  captures over block 0 passing. Block-0 capture has no GPU evidence under any sizing until these
+  arms run. The round that runs these arms also runs `registration`'s REG-STATE-019 arm with
+  transaction graphs on and its REG-ENG-032 arm with transaction graphs on under the hook
+  configuration.
 - Each refusal refuses its configuration: the option under `--enforce-eager`, at a geometry other
   than 80 or 160 ms, with native burst at 160 ms (at 80 ms the lookahead check refuses it first),
   every other row of Configuration checks (each unmet restricted-startup condition with its
@@ -1293,7 +1401,9 @@ change. It models one worker with a small `N` and bounded steps:
 - **Actions:** every hook call of the Capture lifecycle table, in core's startup order, with
   core's binding of the profiling and of the serving KV cache's views, the state-group layout set
   at each binding and cleared when core releases the profiling KV cache after `clear_cudagraphs`,
-  a binding after the serving capture with an equal and with a changed layout (Repeated bindings),
+  a binding after the serving capture with views that fit the recorded layout (an equal one, and
+  the extensible KV cache's growth with no more pages) and with views that do not fit (Repeated
+  bindings),
   the pool-access check able to fail, each
   cell capture able to fail, the memory comparison able to overrun, `clear_cudagraphs` also after
   a failed or skipped capture, a second serving capture attempt after a successful and after a
@@ -1304,16 +1414,18 @@ change. It models one worker with a small `N` and bounded steps:
   reservation, scatter and stage each able to fail, as one nondeterministic choice per declined
   step); a step before post-warmup verification, after whose propagated error the engine may die;
   all-failed bypass steps on an unlatched worker, before and after verification, and on a latched
-  worker; cleanup-only steps; dummy steps; and, as nondeterministic choices, the restricted
-  startup's fixed block count or fixed budget, whether a profiling capture is required (including
-  a budget fixed by a startup plan after construction; the extensible KV cache stays off) and
-  whether it runs.
+  worker; cleanup-only steps; dummy steps; and, as nondeterministic choices, the KV-cache sizing
+  (the extensible KV cache, a profiled budget with it off, a fixed block count, a fixed budget),
+  whether a profiling capture is required (none under the extensible KV cache, a startup plan's
+  budget there included; with it off, including a budget fixed by a startup plan after
+  construction) and whether it runs.
 - **Invariants:** no replay outside a scheduled step after a passed verification, other than a
   capture's validation replay of rejected rows inside its own capture call; no step replay over
   profiling pools; nothing this component derived from the profiling pools (cells, buffers,
   signatures, recorded layouts), the margin included, retained after `clear_cudagraphs`, and the
   state-group layout read only inside a capture call; at most one serving capture; a serving capture with no profiling capture
-  before it is either reported uncharged because none was required or fails startup; a serving
+  before it is reported as measured under the extensible KV cache, as uncharged when the
+  extensible KV cache is off and none was required, or fails startup; a serving
   overrun fails startup; each reservation, a covered step's or a declined step's option-off one,
   is resolved by exactly one successful stage or one cancel (a stage that raised before
   publication leaves it cancellable, a cancel after a successful stage is a no-op) and is left
@@ -1333,12 +1445,13 @@ change. It models one worker with a small `N` and bounded steps:
 The checked models carry the target core's lifecycle above. `CaptureLifecycle.tla` models core's
 binding of the profiling and serving KV caches with the state-group layout set and cleared, the
 profiling cache released after `clear_cudagraphs` on both the success and the failure path, the
-pool-access check of the capture call (a layout contract break, and too few blocks under a fixed
-budget), and a rebinding after the serving capture (an equal layout changes nothing; a changed layout
-latches), with the startup's fixed block count or fixed budget in place of the extensible KV cache.
-Its invariants include that the layout is read only inside a capture call, for that call's own KV
+pool-access check of the capture call (a layout contract break, and too few pages in the serving
+capture under every sizing but a fixed block count), the extension under the extensible KV cache
+after `post_warmup`, which rebinds the views while the accessor's layout stays unchanged and
+which serving waits for, accepted, and a binding whose views do not fit, latched. Its invariants include that the layout is read only inside a capture call, for that call's own KV
 cache, and held by no object between calls. `SplitStep.tla` classifies dummy steps as
-`prepare_inputs` does and latches a rebinding with a changed layout. Per-request failure delivery
+`prepare_inputs` does, accepts a binding of no more pages between steps and latches a binding
+whose views do not fit. Per-request failure delivery
 through `take_failed_requests` is outside both models.
 
 ## User documents
@@ -1346,17 +1459,22 @@ through `take_failed_requests` is outside both models.
 This component owns the option's sections of the user manual (`docs/manual.md`) and of
 `docs/evidence.md`. The manual's section gives a serve command that runs the hook configuration
 (no `--enforce-eager`) under the restricted startup (`-cc.cudagraph_mode none -cc.mode none
---no-async-scheduling` and a `--num-gpu-blocks-override` of at least the admission limit plus
-one) with the default
-segment arms, `num_lookahead_tokens` 0 or 1 and `transaction_graph_populations` in
+--no-async-scheduling`) with core's default KV-cache sizing, the default segment arms, `num_lookahead_tokens` 0 or 1 and `transaction_graph_populations` in
 `--hf-overrides`, a `--max-model-len` that covers the geometry (`registration`, REG-ENG-010), at
-the `--max-num-seqs`, block count and `N` that the tier 5 run verified to fit the A40. It states that a fixed budget must leave room for the graphs, which the startup log
-reports; the limits (one geometry per server, 80 or 160 ms; `N` bounded by `max_num_seqs` and the
-admission limit `--max-num-active-seqs`; a block count or budget that holds at least the
-admission limit plus one state pages; steps beyond `N` CHUNK or other rows, and steps with a
+the `--max-num-seqs` and `N` that the tier 5 run verified to fit the A40. It states that a fixed
+budget must leave room for the graphs, which the startup log reports, and that under core's
+default sizing the KV cache is sized after the captures, from the memory they leave; the limits (one geometry per server, 80 or 160 ms; `N` bounded by `max_num_seqs` and the
+admission limit `--max-num-active-seqs`; a fixed block count or budget, when set, that holds at
+least the admission limit plus one state pages; steps beyond `N` CHUNK or other rows, and steps with a
 multi-token row, run option-off and are counted; refused under `--enforce-eager`,
 with native burst, and outside the restricted startup, each setting with its reason); that the server needs a frontend release that opens streams by locale only;
-and the tier each claim met, with its build. The evidence document's section states the measured
+and the tier each claim met, with its build. Its troubleshooting text states that under core's
+default KV-cache sizing, a state page count below the admission limit plus one is refused by
+core's scheduler after the captures with "Lower max_num_seqs or enlarge the cache", even when
+`--max-num-active-seqs` sets the limit; the startup log's measured graph-memory line, logged
+before it, gives the graph totals, and the remedies are a lower admission limit, a smaller
+largest population, a larger `--gpu-memory-utilization`, or transaction graphs off. The evidence
+document's section states the measured
 graph memory, transient peaks and capture time with the build, device, geometry and `N`, and the
 `(K, E)` histogram `N` was chosen from.
 
@@ -1396,8 +1514,8 @@ Each sibling owner applies its own; this list does not change their documents.
   `state_group_layouts` a conditional row; `transaction_graphs_on` for every on/off decision
   (TXG-CFG-014); the one measurement implementation both parts call (REG-MEM-027); the restricted
   startup's exceptions to the accepted scheduling and runner modes (REG-ENG-001, REG-ENG-011,
-  REG-ENG-026) and remedies (REG-ENG-005); the state layer's report of a binding after the
-  serving capture (TXG-LIFE-009); the state layer's view lifetime, by reference to the bound
+  REG-ENG-026) and remedies (REG-ENG-005); the state layer's report of every binding after the
+  serving capture, which the binding accepts when the views fit (TXG-LIFE-009); the state layer's view lifetime, by reference to the bound
   storage and dropped in `clear_cudagraphs` (REG-STATE-018); and the failure at planning of a
   multi-token row, with every other row at its own token positions (REG-STATE-014).
 - **`session`:** SESS-FAC-004, SESS-OPEN-001/002, SESS-MODEL-002 and SESS-RT-001: the factory's
@@ -1464,18 +1582,21 @@ not set; and a frontend release that opens streams by locale only.
 | Host inputs | One step arena with a section per kind, one upload, double-buffered pinned host side | One arena per cell (two uploads); per-call staging; captured host-to-device copies | One upload per step; captured copies replay a frozen source; per-call staging adds launches |
 | Static inputs and outputs | Shared step-level buffers (Step arena, static inputs and step outputs) | Per-cell buffers with a host-side permutation; reordering the plan CHUNK-first | One buffer set; outputs stay in core's row order with no extra kernels |
 | Capture order | Largest first, chunk cells then echo cells, on core's one stream and pool | Smallest first; interleaved kinds; a stream per cell | Freed graph-pool blocks are reusable only on the stream that allocated them, and a larger capture's freed intermediates fit a smaller one |
-| Masked-scatter alignment | Every resident-pool argument a step passes after startup equals, in address, shape, strides and dtype, one launched by the serving capture's scatter warm-up or a cell's eager reference; the warm-up launches the component pools and the projected views, and its record includes alignment | Padding the state layout so that every view is 16-byte aligned; an aligned base pointer plus an element offset in the Triton kernel | The pools' views have fixed addresses, so warm-up, capture and serving share one alignment specialization whatever a view's offset; padding every component would change the model's state layout and break the projection that reads adjacent scalar fields (the replay book, the frontend counters) as one matrix, for no correctness gain; changing the kernel's addressing would change the option-off transaction's kernel without measured need. Padding remains a measured optimization (Deferred 10) |
-| Graph-memory accounting | Core's estimate through the profiling capture; no model pool | A model-owned admission inventory and graph pool | Core's estimate already measures the same graphs before planning; a model admission needs its own fit rule and release check |
+| Capture rows' page | Every capture row names block 0 | Pages `1 … k`; model-owned scratch pages; asking core to back `N + 1` pages before the model-state capture | Core guarantees memory only behind block 0 at every capture, so pages `1 … k` may have no memory. Model-owned scratch pages, which core permits, would need a per-step copy of every row's state between the scratch and its page. Core keeps its capture rule because backing pages before capture conflicts with its warmup releasing blocks before capture. The capture rows are rejected, so naming one page `k` times stores nothing, and a predication defect stores to block 0, where the self-check catches it. With every capture row on block 0 the self-check does not separate the initial-state index's arms or detect a baked page address; TXG-EQ-003's fresh and continuing replays of the same cell at every count (sentinel fresh pages, nonzero continuing pages) and its mixed-freshness replays at every count of 2 or more, and TXG-QUAL-003's per-step comparison, detect both |
+| Preflight of capture rows | A capture-only mode of the structural preflight, passed only by a capture call's cell programs through `prepare_model_rows`, that requires every row to name the null block ID and an empty live set, and waives exactly three row checks (the null block ID for a real row, a block ID named twice, a block ID outside the live set) while keeping the bounds and the live-set validation | Drop those refusals for every plan; a second preflight function for capture rows; distinct block IDs below the page count | Dropping the refusals removes the protection real plans need. A second function would duplicate every other structural check. Distinct IDs would read unbacked pages. Requiring the null block ID in every row keeps the mode from naming a live page; `advance_model_rows`'s interface (TXG-TXN-007) is unchanged |
+| Masked-scatter alignment | Every resident-pool argument a step passes after startup fits one launched by the serving capture's scatter warm-up or a cell's eager reference (address, page shape, strides, dtype, and a first dimension no larger); the warm-up launches the component pools and the projected views, and its record includes alignment | Padding the state layout so that every view is 16-byte aligned; an aligned base pointer plus an element offset in the Triton kernel | The pools' views have fixed addresses, so warm-up, capture and serving share one alignment specialization whatever a view's offset; padding every component would change the model's state layout and break the projection that reads adjacent scalar fields (the replay book, the frontend counters) as one matrix, for no correctness gain; changing the kernel's addressing would change the option-off transaction's kernel without measured need. Padding remains a measured optimization (Deferred 10). The kernel does not specialize on the page count, so the extension's views, of no more pages, select the warmed specialization |
+| Graph-memory accounting | Core's accounting: its estimate through the profiling capture when it runs, or, under the extensible KV cache, its reading of free memory after the serving capture; no model pool | A model-owned admission inventory and graph pool | Core's estimate, or its reading after capture, already measures the same graphs before it sizes the state pages; a model admission needs its own fit rule and release check |
 | Profiling capture content | The serving capture's procedure and cells over the profiling pools, plus the charged margin | A synthetic upper bound; extrapolation from one cell | The same procedure gives the same allocation sequence; extrapolation is unsound because cells do not share memory predictably |
 | Serving against profiling | Aggregate call totals; startup fails when the serving total exceeds the profiling total, which includes one flat charged margin | A per-cell margin; a per-cell inequality; a warning only; an uncharged tolerance | Rounding arises per allocator segment over the whole call, so a per-cell margin overcharges at large `N` and undercharges at small `N`; per-cell growth is order-dependent under reuse; a warning serves with uncharged memory where core estimated; an uncharged tolerance hides real overruns. The margin is memory core charges, so the strict comparison still bounds serving memory |
-| Missing profiling capture | Required from the effective cache configuration at the serving capture (When core's estimate does not run); otherwise logged as uncharged | Allow every absence; refuse the option under a fixed budget | An unexplained absence means core skipped a charge the configuration promises; refusing fixed budgets would break every such deployment once the option is default-on |
-| Startup on the target core | A restricted startup: synchronous scheduling, an explicit NONE runner and compilation mode, and a `--num-gpu-blocks-override` of at least the admission limit plus one or a positive `--kv-cache-memory-bytes`; every other startup refused, naming each unmet condition and its remedy; lifted when core sizes its profiling KV cache and its extensible KV cache for a model-state capture over state pages (Future roadmap) | Refuse the option until core changes; capture the profiling cells over `N + 1` model-owned scratch pages freed before the hook returns; accept every startup | Under the restricted startup the cells capture over core's own pages in both captures with no plugin mechanism beyond configuration checks, and every setting it needs exists in core. Scratch pages would address only the profiling KV cache: the extensible KV cache would still back only its first blocks at the serving capture, and the capture procedure, capture rows, scatter warm-up, pool access and profiling lifecycle (TXG-CAP-004 to TXG-CAP-006, TXG-CAP-008, TXG-LIFE-004) and their models would change for a gap that core can close. Under core's defaults the profiling capture has one page and the serving capture would read unbacked pages |
+| Missing profiling capture | Required from the effective cache configuration at the serving capture; logged as measured whenever the effective extensible KV cache is on, otherwise as uncharged | Treat the extensible KV cache as uncharged; require the estimate by turning the extensible KV cache off | Under the extensible KV cache core reads free memory after the captures and sizes the cache from it, so "uncharged" would misreport the budget; turning the cache off re-imposes a startup setting the default serve command lacks |
+| Startup on the target core | A restricted startup of synchronous scheduling and an explicit NONE runner and compilation mode, under every KV-cache sizing core offers; every other startup refused, naming each unmet condition and its remedy | Also require a `--num-gpu-blocks-override` or a positive `--kv-cache-memory-bytes`; capture the cells over model-owned scratch pages; accept every startup | Core guarantees memory behind block 0 at every capture and keeps the layout's base, strides and page count until release, so a capture over block 0 is valid under every sizing and needs no setting a serve command without KV-cache options lacks. Core permits a capture over model-owned scratch pages, but every step would then copy each row's state between the scratch and its page. Asynchronous scheduling and the reduced runner modes have no transaction-graph evidence |
 | Pool source at capture | Core's accessor `ModelState.state_group_layouts`, checked against the state layer's bound views, keeping only plain values | The state layer's own views (`component_pools`), which hold the same tensors | The accessor is core's contract that a held page keeps its block ID and address until terminal finish, and core sets it only while a KV cache is bound. The layer holds its views by reference to the bound storage and drops them when core rebinds, when the bound object changes and in `clear_cudagraphs` (`registration`, REG-STATE-018), so both name the same tensors at a capture; the identity check keeps the two in agreement |
+| A binding after the serving capture | Accept views that fit the recorded layout; latch on any other | Exact equality; reading the accessor at each binding; ignoring later bindings | Exact equality latches at the extensible KV cache's growth, which binds no more pages over the same base, and fewer when the final count is below the capacity. The accessor is read only inside capture calls (TXG-CAP-008), and core keeps the layout fixed, so a read would return the recorded values. Ignoring bindings would miss a pool moved to another address |
 | Option-off body regression | Tier 5 rests on the option-on/off comparisons of one body (TXG-QUAL-002 to TXG-QUAL-006); no check compares the option-off step time with a commit from before the phase split | A preregistered non-regression check of the option-off step time against the newest commit whose `advance_model_rows` is not composed of prepare, body and commit functions; rebasing that commit onto the target core | That commit runs only on the state-pool core, which the plugin refuses (REG-002), so the check cannot run on the target core. Rebasing it would time a body that no release ships on a core it never ran on. Its result on the state-pool core stays in `docs/evidence.md` as a historical record |
 | Feed-to-park client path | `AsyncLLM.generate` with an input generator of packer-built `StreamingInput` units, in a multiprocess engine | The session factory's `feed`; an `LLM.generate` arm | The factory is not available on the target core (HLD, Approach, section 2). An input generator is the client path the target core offers and the one core's `/v1/realtime` uses. `LLM.generate` takes complete prompts only, so an `LLM` arm can time only a whole one-unit request, not a feed into an open stream (Future roadmap) |
 | Steps with a multi-token row | The step falls back with reason `multi-token`; the option-off transaction places every row by its token positions | Cells and static inputs addressed by token position; failing every request of the step | Planning fails the multi-token row, and only a direct engine client produces one. Token-position addressing in the cells would size the static inputs by `max_num_batched_tokens` and change the arena and every cell for a step that plugin-packed input never produces. Failing the whole step would fail requests that did nothing wrong |
 | Populations above the admission limit | Refused (TXG-CFG-020) | Accepted; `N` clamped to the limit | Core schedules at most the admission limit's rows per step, so cells above it are captured, charged and never replayed. Clamping would capture an inventory other than the one declared, without telling the operator |
-| Block count under the restricted startup | At least the admission limit plus one: refused in the configuration hook under `num_gpu_blocks_override` (TXG-CFG-005), and checked at pool access under a fixed `kv_cache_memory_bytes` (TXG-CAP-008) | At least `N + 1`, the capture's own need; leave the check to core's scheduler | Core builds its scheduler, which refuses fewer state pages than requests that can be active, only after both captures, so a count between `N + 1` and the admission limit would capture `2N` cells twice and then fail with core's message. Checking the capture's need alone passes a configuration that cannot serve |
+| Block count | At least the admission limit plus one: refused in the configuration hook under `num_gpu_blocks_override` (TXG-CFG-005), and checked against the layout's page count at the serving capture's pool access under every other sizing (TXG-CAP-008); no check at the profiling capture | At least `N + 1`; a check at both captures; a check of the final count after the extension; leave every check to core's scheduler | Core builds its scheduler after the captures, so a count between `N + 1` and the limit would capture `2N` cells, twice when core's estimate runs, and then fail with core's message. The profiling cache holds one block under a profiled budget with the extensible KV cache off and the explicit NONE the restricted startup requires (core's default sizing runs no profiling capture), and its count is not the serving count, so a check there would refuse every profiled startup. Under the extensible KV cache the final count is known only after the one capture; the state layer's binding report at the extension could check it, but core's scheduler refuses a final count too small itself, with a message that names the remedy (`vllm/v1/core/sched/scheduler.py:166-170`), and only one capture has run by then |
 | Pool-access remedy | For too few blocks, a larger block count or budget, or a lower admission limit (TXG-MEM-017); for a break of core's state-group layout contract, no configuration remedy (TXG-CAP-008) | TXG-MEM-013's smaller `--kv-cache-memory-bytes`; the remedies of TXG-MEM-011 to TXG-MEM-013 for every pool-access failure | A block-count failure means the budget holds too few state pages, and a smaller budget holds fewer still. TXG-MEM-013 answers a serving capture that ran out of device memory after pool access. A layout count other than one, or a component tensor that is not the layer's bound view, is a break of core's contract that no setting changes, so a configuration remedy would direct the operator to the wrong cause |
 | Pages of rejected fresh rows | Initialized before the transaction whether or not the row is rejected; preservation starts after initialization (Fresh rows) | Initialize only the rows that commit; preserve a rejected fresh row's recycled contents | The body finds a per-row rejection on the device, after the initialization has run, so initializing only committed rows would need every rejection on the host before the step. Preserving recycled contents would leave an earlier request's state in a page that the rejected request holds |
 | Qualification adapter's call order | Core's runner order: finished requests removed first, then each request delivered as `NewRequestData` in `scheduled_new_reqs` (a new request or a stream's next turn) removed and at once added; a cached request gets neither call (TXG-QUAL-026) | All removals, then all additions; a removal and an addition for every scheduled request | With all removals first, the next request's removal retires a continuing request's pending removal (REG-STATE-011), and the model state then refuses that request's continuing turn (REG-STATE-012), so the adapter would not drive the model state as core does. Core makes no model-state call for a cached request; a removal there would retire a running file at once (REG-STATE-016), and the addition after it would raise (REG-STATE-012), failing every file at its second step |
@@ -1492,13 +1613,14 @@ not set; and a frontend release that opens streams by locale only.
 | All-failed bypass and verification | The bypass checks the latch only; an unlatched all-failed step takes it whether or not post-warmup verification passed | Requiring verification before the bypass, as `execute` does | Verification protects cell replay; the bypass replays no cell and reserves nothing, so a guard would make the option raise where the option-off path succeeds |
 | Failure recovery | Worker-fatal latch; engine restart; tested end to end | Roll back pages; retry option-off after a launch error | The launches scatter, so partial mutation is unknowable; rollback needs hot-path snapshots of every touched page |
 | Signature mismatch | Count, warn once per field, run option-off | Recapture on demand; raise | Recapture needs uncharged memory and stalls; the option-off transaction is the exact reference |
+| The pools field of a cell's signature | A step's view matches the cell's entry when it fits it | Exact equality; dropping the first dimension | Exact equality sends every step after an extension that shrinks the page count to a `signature` fallback. Dropping the first dimension would accept a view with more pages than the cell captured, which the captured bounds do not cover |
 | Process constants | Worker-fatal on change | Part of the signature | Every cell and the segment graphs were captured under the same settings, so a fallback would be stale too |
 | Post-warmup check | Plain-value layout, graph presence, identities, buffer addresses, constants; no replay and no device allocation, the projected layout re-derived over one host shadow page | A validation replay; a first-step check | `post_warmup` runs outside any step, and each cell's capture already ran its validation replay; a first-step check lets the engine report ready before a mismatch is found |
 | Qualification workload | Independently paced streams and files at the transaction level, replayed and option-off per step, with preregistered parameters and minimum case coverage, plus served runs | Phase-aligned schedules with filler rows | Aligned schedules produce steps serving never produces and hide mixed steps; the transaction-level driver keeps the page-by-page comparison; minimum coverage stops a run from passing without the cases it must exercise |
 | Step-rule plans | One recorded plan per composition, replayed from one restored snapshot | Timing free-running steps; a plan sequence advanced across steps | Free-running steps differ between legs, so medians would compare different work; an advancing sequence cannot sustain 23 steps of label drains or FLUSH rows on fixed slots |
 | Step-rule inventory | The deployed inventory under a fixed block count with core's estimate enabled; a reduced inventory is diagnostic only | Capture only the cells the legs replay | A pass on an inventory that cannot start says nothing about the deployed engine; the inventory changes memory, capture order and pool reuse |
 | Step rule groups | One-kind CHUNK steps at 1, 31, 63 and split steps at 31, 63 with preregistered compositions, each group passing on its own | One pooled rule over all steps | Pooling could hide a regression of the second launch behind one-kind gains |
-| Calibration identity | Includes the process constants, scheduling and batching limits, the option's value and a served replay fraction measured at that identity | Model and device only | An option-on figure would misstate capacity on an engine whose steps fall back or that schedules or computes differently |
+| Calibration identity | Includes the process constants, scheduling and batching limits, the KV-cache sizing, the option's value and a served replay fraction measured at that identity | Model and device only | An option-on figure would misstate capacity on an engine whose steps fall back or that schedules or computes differently |
 
 ## Open Questions & Future Decisions
 
@@ -1546,17 +1668,22 @@ not set; and a frontend release that opens streams by locale only.
 ## Future roadmap
 
 - **Transaction graphs beyond the restricted startup.** On the target core the option needs
-  synchronous scheduling, an explicit NONE runner and compilation mode, and an explicit block count
-  or KV budget (Configuration checks). Triggers: for the Pool condition, core sizes its profiling
-  KV cache for a model state that captures over state pages (a page for every sequence beside the
-  null block, or a minimum the model state names), and backs the state group's pages before the
-  model-state capture or refreshes `state_group_layouts` when its extensible KV cache grows,
-  documenting that base addresses and strides stay fixed there; for Runner modes and Scheduling,
-  the qualification run at the reduced modes and with asynchronous scheduling. Shape: each
-  condition is dropped when its trigger fires; Repeated bindings then covers an extension, the
-  capture record names the profiling KV cache's block count, and `B_hook` and the qualification
-  specs take the new settings. The `registration` design's Future roadmap item 8 holds the same
-  item.
+  synchronous scheduling and an explicit NONE runner and compilation mode (Configuration checks).
+  Triggers: for Runner modes, a transaction-graph run with the option on under each reduced mode
+  that core resolves to NONE (an unset mode, FULL_DECODE_ONLY, PIECEWISE and FULL_AND_PIECEWISE
+  under `VLLM_COMPILE`), with exactness and served transcripts equal to `B_hook`'s; for
+  Scheduling, the qualification under asynchronous scheduling. Shape: each condition is dropped
+  when its trigger fires, and `B_hook` and the qualification specs take the new settings. The
+  `registration` design's Future roadmap item 8 holds the same item.
+- **Calibration across KV-cache sizings.** A calibration applies only at its own sizing. Trigger:
+  the U(1) and ladder of the default sizing and of the step rule's fixed override agree within the
+  preregistered noise. Shape: a preregistered transfer rule in TXG-CAL-003, and TXG-DEF-002
+  applies a record across the two sizings.
+- **Sleep mode with transaction graphs.** Core keeps the layout across sleep and wake and
+  recaptures model-state graphs once after a full wake with no state held. Trigger:
+  `registration` accepts sleep mode. Shape: `clear_cudagraphs` releases the serving cells, and the
+  entry check of A second serving capture admits that one recapture; the cells capture over
+  block 0 as at startup.
 - **More geometries, encoder arms, endpoint policies.** Deferred items 4 to 6 above. Trigger: each
   item's exactness and latency evidence at the geometry or arm. Shape: new cells with their own
   warm-up domains and qualification rows.

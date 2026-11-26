@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Counters, capture record and log lines with transaction graphs on, on
-CUDA (TXG-OBS-001 to TXG-OBS-008, TXG-CFG-002)."""
+CUDA (TXG-OBS-001 to TXG-OBS-008, TXG-CFG-002).
+
+The environments run core's default KV-cache sizing, the extensible KV
+cache, which runs no profiling capture, unless a test names a fixed block
+count, under which core's estimate runs both captures."""
 
 from __future__ import annotations
 
 import logging
+import re
 
 import pytest
 from support import txg_api as api
 from support import txg_gpu as g
+from support.txg_api import NOT_APPLICABLE, SIZING_NAMES, Sizing
 
 pytestmark = [pytest.mark.gpu, pytest.mark.engine]
 
@@ -78,49 +84,96 @@ def test_reader_returns_the_same_reading_through_each_holder(on_cuda, holder):
     assert api.counters(obj) == api.counters(env.model)
 
 
-# @spec TXG-OBS-003, TXG-CFG-002
-def test_capture_record_holds_the_identity_and_figures(on_cuda):
+FIGURES = (
+    api.Record.CALL_TOTAL,
+    api.Record.TXN_TOTAL,
+    api.Record.KIND_TOTALS,
+    api.Record.CELLS,
+    api.Record.PEAK,
+    api.Record.SECONDS,
+    api.Record.PAGE_COUNT,
+)
+#: The fields only a profiling capture produces (TXG-MEM-006).
+PROFILING_ONLY = (
+    api.Record.MARGIN,
+    api.Record.FREE_BEFORE,
+    api.Record.FREE_AFTER,
+    api.Record.CHARGE,
+    api.Record.ABSORBED,
+)
+
+
+@pytest.mark.parametrize("sizing", [Sizing.EXTENSIBLE, Sizing.BLOCK_COUNT])
+# @spec TXG-OBS-003, TXG-CFG-002, TXG-MEM-006
+def test_capture_record_holds_the_identity_and_figures(on_cuda, sizing):
+    """For each capture that ran, its figures and its state-group layout's
+    page count; the KV-cache sizing; under the extensible KV cache the final
+    bound count after core's extension, separate from the page counts, and
+    the profiling-only fields marked not applicable; under a fixed block
+    count the margin's figures and no final bound count."""
     R = api.Record
-    env = on_cuda(startup=True, lookahead=0, n=N, populations=[1, 3, N])
+    env = on_cuda(startup=True, lookahead=0, n=N, populations=[1, 3, N], sizing=sizing)
     record = api.counters(env.model)[R.RECORD]
     assert "[1, 3, 4]" in repr(record[R.IDENTITY]), record[R.IDENTITY]
-    for capture in (R.PROFILING, R.SERVING):
+    ran = (R.SERVING,) if sizing == Sizing.EXTENSIBLE else (R.PROFILING, R.SERVING)
+    for capture in ran:
         figures = record[capture]
-        for key in (
-            R.CALL_TOTAL,
-            R.TXN_TOTAL,
-            R.KIND_TOTALS,
-            R.CELLS,
-            R.PEAK,
-            R.SECONDS,
-        ):
+        for key in FIGURES:
             assert key in figures, (capture, key)
+        assert figures[R.PAGE_COUNT] == env.capacity, (capture, figures)
     for key in (
-        R.MARGIN,
-        R.CHARGE,
         R.EFFECTIVE,
         R.RAN,
-        R.BUDGET,
+        R.SIZING,
+        R.FINAL_BOUND_COUNT,
         R.ALLOC_CONF,
         R.CUBLAS,
         R.VERIFICATION_SECONDS,
         *R.VERSIONS,
+        *PROFILING_ONLY,
     ):
         assert key in record, key
+    assert re.search(SIZING_NAMES[sizing], str(record[R.SIZING])), record[R.SIZING]
+    if sizing == Sizing.EXTENSIBLE:
+        assert record[R.RAN] is False
+        assert record[R.PROFILING] == NOT_APPLICABLE or all(
+            record[R.PROFILING][k] == NOT_APPLICABLE
+            for k in (R.CALL_TOTAL, R.TXN_TOTAL, R.KIND_TOTALS)
+        ), record[R.PROFILING]
+        for key in PROFILING_ONLY:
+            assert record[key] == NOT_APPLICABLE, (key, record[key])
+        # The views core bound at its extension, as the state layer reported
+        # them: a field of its own.
+        assert record[R.FINAL_BOUND_COUNT] == env.core.final_count
+    else:
+        assert record[R.RAN] is True
+        for key in (R.MARGIN, R.CHARGE):
+            assert isinstance(record[key], int), (key, record[key])
+        assert record[R.FINAL_BOUND_COUNT] == NOT_APPLICABLE
     same_cells = on_cuda(startup=True, lookahead=0, n=N, populations=[N])
     assert set(same_cells.binding.cells) == set(env.binding.cells)
 
 
+@pytest.mark.parametrize("sizing", [Sizing.EXTENSIBLE, Sizing.BLOCK_COUNT])
 # @spec TXG-OBS-004, TXG-OBS-005
 def test_capture_and_verification_log_one_info_line_each(
-    tmp_path, single_process_dist, caplog, monkeypatch
+    tmp_path, single_process_dist, caplog, monkeypatch, sizing
 ):
+    """One INFO line per capture that ran: the serving capture alone under
+    the extensible KV cache, both under a fixed block count."""
     caplog.set_level(logging.INFO)
-    env = g.build_option_on(tmp_path, lookahead=0, n=N, monkeypatch=monkeypatch)
+    env = g.build_option_on(
+        tmp_path, lookahead=0, n=N, sizing=sizing, monkeypatch=monkeypatch
+    )
+    ran = ("serving",) if sizing == Sizing.EXTENSIBLE else ("profiling", "serving")
     try:
         for name in ("profiling", "serving"):
             lines = info_lines(caplog, name, str(2 * N), api.KEY)
-            assert len(lines) == 1, (name, [r.getMessage() for r in caplog.records])
+            expected = 1 if name in ran else 0
+            assert len(lines) == expected, (
+                name,
+                [r.getMessage() for r in caplog.records],
+            )
         assert len(info_lines(caplog, "verification", "pass")) == 1
     finally:
         env.shutdown()
@@ -184,9 +237,9 @@ def _multiprocess_reader_run() -> dict:
             api.KEY: [N],
         },
         gpu_memory_utilization=0.3,
-        # the restricted startup (TXG-CFG-017 to TXG-CFG-019): synchronous
-        # scheduling, runner modes NONE and a fixed block count
-        **q.restricted_startup(N),
+        # the restricted startup (TXG-CFG-017 and TXG-CFG-018): synchronous
+        # scheduling and runner modes NONE, at core's default KV-cache sizing
+        **q.restricted_startup(),
     )
     # A callable sent through collective_rpc is pickled, which core allows
     # only with insecure serialization on.

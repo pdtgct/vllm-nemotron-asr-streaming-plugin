@@ -2,13 +2,15 @@
 """The tier 5 decision rules (``support.txgcap_qual``) on hand-made figures:
 each biconditional at and across its boundary, the void rule and seed list,
 the preregistration freeze, the ``U_api`` procedure, the restricted startup
-of every qualifying engine, and the choice of ``N`` (TXG-QUAL-001, -005,
--010, -013, -014, -016 to -018, -025, -027). CPU only; no vLLM."""
+of every qualifying engine and its KV-cache sizing, the record of every run,
+the exactness runs' headroom, and the choice of ``N`` (TXG-QUAL-001, -005,
+-010, -013, -014, -016 to -018, -025, -027, -029). CPU only; no vLLM."""
 
 from __future__ import annotations
 
 import pytest
 from support import txgcap_qual as q
+from support.txg_api import NOT_APPLICABLE, Sizing
 
 
 def leg(median: float, spread: float = 0.0) -> list[float]:
@@ -225,6 +227,25 @@ def test_the_frozen_record_names_the_adapter_and_every_procedure():
     assert not [k for k in q.FROZEN_PARAMETERS if "body" in k]
 
 
+# @spec TXG-QUAL-018, TXG-QUAL-029
+def test_the_frozen_record_holds_the_exactness_headroom_and_its_margin():
+    """The exactness runs' test-only headroom and its margin are frozen with
+    the rest of the run, so a change after the first counted sample voids
+    the run."""
+    complete = {"parameters": {k: "x" for k in q.FROZEN_PARAMETERS}}
+    for name in ("exactness_headroom", "exactness_headroom_margin"):
+        assert name in q.FROZEN_PARAMETERS, name
+        record = {"parameters": dict(complete["parameters"])}
+        del record["parameters"][name]
+        assert q.missing_frozen_parameters(record) == [name]
+    params = {"exactness_headroom": 1 << 30, "exactness_headroom_margin": 1 << 28}
+    record = {"frozen_at": 1.0, "parameters": dict(params)}
+    run = {"first_counted_at": 2.0, "parameters": dict(params)}
+    assert q.frozen_before_counting(record, run) is True
+    changed = run | {"parameters": params | {"exactness_headroom_margin": 0}}
+    assert q.frozen_before_counting(record, changed) is False
+
+
 # @spec TXG-QUAL-018
 def test_the_adapter_identity_is_its_source_digest():
     from support import txg_qual_adapter as adapter
@@ -268,47 +289,249 @@ def test_the_served_run_uses_the_largest_accepted_n_when_it_fits():
     assert q.served_run_n(64, 64, {64: False}) is None
 
 
+#: The KV-cache settings of core's ``AsyncEngineArgs``.
+KV_SETTINGS = ("num_gpu_blocks_override", "kv_cache_memory_bytes")
+
+
 # @spec TXG-QUAL-025
 def test_fits_means_both_captures_under_max_num_seqs_plus_one_with_the_estimate():
     settings = q.fit_startup(64)
     assert settings["num_gpu_blocks_override"] == 65
     assert q.estimate_enabled() == {q.ESTIMATE_ENV: "1"}
     assert "kv_cache_memory_bytes" not in settings
+    assert {k: v for k, v in settings.items() if k not in KV_SETTINGS} == (
+        q.restricted_startup()
+    )
 
 
-# @spec TXG-QUAL-001, TXG-QUAL-010
-def test_every_qualifying_engine_runs_the_restricted_startup_with_a_fixed_block_count():
-    settings = q.restricted_startup(64)
+# @spec TXG-QUAL-001
+def test_the_restricted_startup_names_no_kv_cache_setting():
+    """The restricted startup is synchronous scheduling and an explicit NONE
+    runner and compilation mode (TXG-CFG-017, TXG-CFG-018) and nothing else:
+    every qualifying engine runs at core's default KV-cache sizing, the one a
+    serve command without KV-cache options selects, unless a spec names a
+    fixed block count or budget."""
+    settings = q.restricted_startup()
     assert settings["async_scheduling"] is False
     assert settings["compilation_config"] == {"cudagraph_mode": "NONE", "mode": 0}
+    for name in (*KV_SETTINGS, "enable_extensible_kv_cache"):
+        assert name not in settings, name
+    assert q.kv_cache_sizing() == {}, "core's default sizing sets an option"
+
+
+@pytest.mark.parametrize(
+    "sizing, kwargs, expected",
+    [
+        (Sizing.EXTENSIBLE, {}, {}),
+        (Sizing.PROFILED, {}, {"enable_extensible_kv_cache": False}),
+        (Sizing.BLOCK_COUNT, {"blocks": 65}, {"num_gpu_blocks_override": 65}),
+        (Sizing.BUDGET, {"budget": 8 << 30}, {"kv_cache_memory_bytes": 8 << 30}),
+    ],
+)
+# @spec TXG-QUAL-001
+def test_each_kv_cache_sizing_has_its_own_settings(sizing, kwargs, expected):
+    assert q.kv_cache_sizing(sizing, **kwargs) == expected
+    with pytest.raises(ValueError):
+        q.kv_cache_sizing(sizing, blocks=65 if "blocks" not in kwargs else None)
+
+
+# @spec TXG-QUAL-010, TXG-QUAL-020, TXG-QUAL-021
+def test_the_checks_that_need_the_estimate_run_a_fixed_block_count():
+    """The step rule, the first A40 run and the estimate check keep a fixed
+    ``--num-gpu-blocks-override`` of the admission limit plus one with core's
+    estimate enabled."""
+    settings = q.estimate_startup(64)
     assert settings["num_gpu_blocks_override"] == 65
     assert "kv_cache_memory_bytes" not in settings
     # the admission limit, not max_num_seqs, fixes the block count
-    limited = q.restricted_startup(64, max_num_active_seqs=32)
+    limited = q.estimate_startup(64, max_num_active_seqs=32)
     assert limited["num_gpu_blocks_override"] == 33
+
+
+def _spec(**overrides):
+    key = "transaction_graph_populations"
+    return {
+        "card": "/card",
+        "max_model_len": 4096,
+        "max_num_seqs": 64,
+        "hf_overrides": {"num_lookahead_tokens": 0, key: [64]},
+    } | overrides
 
 
 # @spec TXG-QUAL-001, TXG-QUAL-010
 def test_the_driver_runs_b_hook_with_the_same_settings_and_the_estimate():
     """``B_hook`` differs from the option-on run only by the absent key: the
-    block count included (TXG-QUAL-001); every run enables core's
-    graph-memory estimate (TXG-QUAL-010)."""
+    KV-cache sizing included (TXG-QUAL-001); every run enables core's
+    graph-memory estimate (TXG-QUAL-010). The workload runs at core's default
+    sizing; the step rule under a fixed block count."""
     from support import txg_qual_driver as d
 
-    key = "transaction_graph_populations"
-    on = {
-        "card": "/card",
-        "max_model_len": 4096,
-        "max_num_seqs": 64,
-        "hf_overrides": {"num_lookahead_tokens": 0, key: [64]},
+    for mode, sizing in (("qm", Sizing.EXTENSIBLE), ("steprule", Sizing.BLOCK_COUNT)):
+        on = _spec(mode=mode)
+        off = on | {"hf_overrides": {"num_lookahead_tokens": 0}}
+        a, b = d.engine_settings(on), d.engine_settings(off)
+        assert {k: v for k, v in a.items() if k != "hf_overrides"} == {
+            k: v for k, v in b.items() if k != "hf_overrides"
+        }, mode
+        assert d.run_sizing(on) == d.run_sizing(off) == sizing, mode
+        assert a["async_scheduling"] is False
+        assert d.engine_env(on)[q.ESTIMATE_ENV] == "1"
+        if sizing == Sizing.EXTENSIBLE:
+            assert not set(KV_SETTINGS) & set(a), a
+        else:
+            assert a["num_gpu_blocks_override"] == 65
+    named = d.engine_settings(_spec(mode="qm", num_gpu_blocks_override=80))
+    assert named["num_gpu_blocks_override"] == 80
+    assert d.run_sizing(_spec(kv_cache_sizing=Sizing.PROFILED)) == Sizing.PROFILED
+
+
+# @spec TXG-QUAL-001
+def test_the_record_of_every_run_holds_its_sizing_page_counts_and_final_count():
+    """Option on and ``B_hook`` alike: the KV-cache sizing, each capture
+    layout's page count and, under the extensible KV cache, the final bound
+    count read after core's extension."""
+    extensible = {
+        "kv_cache_sizing": Sizing.EXTENSIBLE,
+        "capture_page_counts": {"serving": 4096},
+        "final_bound_count": 1800,
     }
-    off = on | {"hf_overrides": {"num_lookahead_tokens": 0}}
-    a, b = d.engine_settings(on), d.engine_settings(off)
-    assert {k: v for k, v in a.items() if k != "hf_overrides"} == {
-        k: v for k, v in b.items() if k != "hf_overrides"
+    assert q.missing_run_record_fields(extensible) == []
+    assert q.missing_run_record_fields(extensible | {"final_bound_count": None}) == [
+        "final_bound_count"
+    ]
+    fixed = {
+        "kv_cache_sizing": Sizing.BLOCK_COUNT,
+        "capture_page_counts": {"profiling": 65, "serving": 65},
+        "final_bound_count": None,
     }
-    assert a["num_gpu_blocks_override"] == 65 and a["async_scheduling"] is False
-    assert d.engine_env(on)[q.ESTIMATE_ENV] == "1"
+    assert q.missing_run_record_fields(fixed) == []
+    assert "kv_cache_sizing" in q.missing_run_record_fields(
+        {k: v for k, v in fixed.items() if k != "kv_cache_sizing"}
+    )
+    assert "capture_page_counts.serving" in q.missing_run_record_fields(
+        fixed | {"capture_page_counts": {"profiling": 65}}
+    )
+
+
+# ---------------------------------------------------------------------------
+# The exactness runs' headroom (TXG-QUAL-029)
+
+
+def _headroom_reply(**changes):
+    copy, margin, total = 10 << 30, 1 << 30, 48 << 30
+    reply = {
+        "spec": {"headroom": {"copy_bytes": copy, "margin_bytes": margin}},
+        "identity": {
+            "kv_cache_sizing": Sizing.EXTENSIBLE,
+            "settings": {
+                "gpu_memory_utilization": q.headroom_utilization(copy, margin, total)
+            },
+        },
+        "exactness_memory": {
+            "torch_memory_limit": 20 << 30,
+            "memory_reserved_before": 4 << 30,
+            "max_memory_reserved_before": 5 << 30,
+            "memory_reserved_after": 14 << 30,
+            "max_memory_reserved_after": 15 << 30,
+            "copy_bytes": 9 << 30,
+            "context_before": {"mem_get_info": [1, 2], "nvidia_smi": "1, 2"},
+        },
+    }
+    for path, value in changes.items():
+        node = reply
+        *parents, leaf = path.split(".")
+        for name in parents:
+            node = node[name]
+        if value is ...:
+            del node[leaf]
+        else:
+            node[leaf] = value
+    return reply
+
+
+# @spec TXG-QUAL-029
+def test_the_headroom_is_left_through_gpu_memory_utilization_below_one():
+    utilization = q.headroom_utilization(10 << 30, 1 << 30, 48 << 30)
+    assert utilization == (48 - 11) / 48
+    for copy, margin in ((48 << 30, 0), (0, 0)):
+        with pytest.raises(ValueError):
+            q.headroom_utilization(copy, margin, 48 << 30)
+
+
+# @spec TXG-QUAL-029
+def test_the_driver_refuses_a_headroom_outside_the_extensible_kv_cache():
+    from support import txg_qual_driver as d
+
+    headroom = {"copy_bytes": 10 << 30, "margin_bytes": 1 << 30}
+    spec = _spec(mode="qm", headroom=headroom, device_total_bytes=48 << 30)
+    settings = d.engine_settings(spec)
+    assert 0.0 < settings["gpu_memory_utilization"] < 1.0
+    assert not set(KV_SETTINGS) & set(settings), settings
+    for named in (
+        {"kv_cache_memory_bytes": 8 << 30},
+        {"num_gpu_blocks_override": 65},
+        {"kv_cache_sizing": Sizing.PROFILED},
+    ):
+        with pytest.raises(ValueError):
+            d.engine_settings(spec | named)
+
+
+@pytest.mark.parametrize(
+    "changes, problem",
+    [
+        ({}, None),
+        ({"identity.kv_cache_sizing": Sizing.BLOCK_COUNT}, "extensible"),
+        ({"identity.settings.kv_cache_memory_bytes": 8 << 30}, "kv-cache-memory"),
+        ({"identity.settings.gpu_memory_utilization": 1.0}, "below 1.0"),
+        ({"exactness_memory.torch_memory_limit": ...}, "torch_memory_limit"),
+        ({"exactness_memory.max_memory_reserved_after": ...}, "max_memory_reserved"),
+        ({"exactness_memory.copy_bytes": 11 << 30}, "more than the preregistered"),
+        ({"spec.headroom.margin_bytes": ...}, "margin_bytes"),
+    ],
+)
+# @spec TXG-QUAL-029
+def test_an_exactness_run_records_the_allocator_around_the_copy(changes, problem):
+    problems = q.headroom_problems(_headroom_reply(**changes))
+    if problem is None:
+        assert problems == [], problems
+    else:
+        assert any(problem in p for p in problems), (problem, problems)
+
+
+# @spec TXG-QUAL-029
+def test_the_device_level_figures_are_read_by_no_check():
+    """``nvidia-smi`` and ``torch.cuda.mem_get_info`` are context only: the
+    checks give the same verdict without them or with absurd values."""
+    reply = _headroom_reply()
+    assert q.headroom_problems(reply) == []
+    reply["exactness_memory"]["context_before"] = {"mem_get_info": [0, 0]}
+    assert q.headroom_problems(reply) == []
+    del reply["exactness_memory"]["context_before"]
+    assert q.headroom_problems(reply) == []
+
+
+# @spec TXG-QUAL-029
+def test_no_served_figure_comes_from_a_run_with_the_headroom():
+    served = {"spec": {"mode": "qm"}}
+    exactness = _headroom_reply()
+    assert q.served_figure_runs([served, exactness]) == [served]
+
+
+# @spec TXG-QUAL-019, TXG-QUAL-001
+def test_the_capture_figures_check_accepts_a_capture_that_did_not_run():
+    """At core's default sizing no profiling capture runs and the record
+    marks it not applicable; the serving capture's figures are still
+    required."""
+    figures = {
+        "call_total": 1,
+        "transaction_total": 1,
+        "kind_totals": {"chunk": 1, "echo": 1},
+        "cells": [{"growth": 1}],
+        "transient_peak": 1,
+    }
+    record = {"profiling": NOT_APPLICABLE, "serving": figures}
+    assert q.missing_capture_figures(record) == []
+    assert q.missing_capture_figures({"profiling": NOT_APPLICABLE}) != []
 
 
 # @spec TXG-QUAL-025

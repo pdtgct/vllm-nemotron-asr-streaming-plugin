@@ -51,22 +51,40 @@ def _run(tmp_path, settings, patch, **request):
     return reply
 
 
-@pytest.mark.parametrize("runner", ["enforce-eager", "hook"])
+#: Transaction graphs on under the hook configuration and the restricted
+#: startup (TXG-CFG-017 and TXG-CFG-018), at 160 ms, with no KV-cache option:
+#: the extensible KV cache at its default.
+TXG_ON = {
+    **HOOK,
+    "hf_overrides": {
+        "num_lookahead_tokens": 1,
+        "transaction_graph_populations": [4],
+    },
+}
+
+#: REG-ENG-032's arms: ``--enforce-eager`` with transaction graphs off (the
+#: option is refused there, TXG-CFG-009), and the hook configuration with
+#: them off and on.
+_STARTUPS = {"enforce-eager": EAGER, "hook": HOOK, "hook-transaction-graphs": TXG_ON}
+
+
+@pytest.mark.parametrize("runner", list(_STARTUPS))
 # @spec REG-ENG-032
 def test_startup_adds_no_request_before_the_first_client_request(tmp_path, runner):
-    """Transaction graphs off and the extensible KV cache at its default: the
-    model declines synthetic warmup (REG-TASK-004), so startup completes with
-    no request reaching the model state's ``add_request``."""
-    settings = _settings(**(EAGER if runner == "enforce-eager" else HOOK))
-    reply = _run(tmp_path, settings, "record-add-request")
+    """The extensible KV cache at its default: the model declines synthetic
+    warmup (REG-TASK-004), so startup completes with no request reaching the
+    model state's ``add_request``, transaction graphs' captures and core's
+    extension of the cache included."""
+    reply = _run(tmp_path, _settings(**_STARTUPS[runner]), "record-add-request")
     assert reply["reads"]["add_requests"] == []
 
 
 #: REG-STATE-019's two arms, both with core's graph-memory estimate running
 #: and the extensible KV cache off.
 _ARMS = {
-    # transaction graphs on under the restricted startup (TXG-CFG-017 to
-    # TXG-CFG-019) at 160 ms: core's state-group layout and profiling cells
+    # transaction graphs on under the restricted startup (TXG-CFG-017 and
+    # TXG-CFG-018) and a fixed block count at 160 ms: core's state-group
+    # layout and profiling cells
     "block-count-override": {
         **HOOK,
         "num_gpu_blocks_override": 5,

@@ -265,54 +265,75 @@ def _no_state_layer_refusal(message: str) -> None:
     assert c.state_layer_refusals(message) == [], message
 
 
-#: TXG-CFG-019's pool condition: an explicit block count or KV budget.
-_POOL_CONDITION = re.compile(r"num_gpu_blocks_override|num-gpu-blocks-override")
+#: The KV-cache sizings construction sees, as core's built configuration
+#: holds them (``txg_api.Sizing``): core's default, the extensible KV cache;
+#: a profiled budget with it off; a block count of the admission limit plus
+#: one (``max_num_seqs`` 2, TXG-CFG-005); a fixed budget.
+_SIZINGS = {
+    "extensible": dict(enable_extensible_kv_cache=True),
+    "profiled": dict(enable_extensible_kv_cache=False),
+    "block-count": dict(num_gpu_blocks_override=3, enable_extensible_kv_cache=False),
+    "budget": dict(kv_cache_memory_bytes=1 << 30, enable_extensible_kv_cache=False),
+}
 
 
+def _sized(config, sizing):
+    """``config`` under the KV-cache sizing ``sizing``, set as core sets the
+    effective cache values (``support.txgcap_harness.set_cache``)."""
+    from support import txgcap_harness as t
+
+    values = {"num_gpu_blocks_override": None, "kv_cache_memory_bytes": None}
+    t.set_cache(config, **{**values, **_SIZINGS[sizing]})
+    return config
+
+
+@pytest.mark.parametrize("sizing", list(_SIZINGS))
 @pytest.mark.parametrize("stage", ["model", "model-state"])
-# @spec REG-ENG-006, REG-VAL-008, REG-018, TXG-CFG-016, TXG-CFG-019
+# @spec REG-ENG-006, REG-VAL-008, REG-018, TXG-CFG-016, TXG-CFG-003, TXG-CFG-011
 def test_construction_accepts_transaction_graphs_under_the_restricted_startup(
-    stages, stage
+    stages, stage, sizing
 ):
     """On the target core (``ModelState.state_group_layouts`` defined), with
     synchronous scheduling, explicit ``cudagraph_mode`` and compilation mode
-    NONE, a block count of the admission limit plus one and a population
-    within the limit, construction accepts transaction graphs."""
+    NONE and a population within the admission limit, construction accepts
+    transaction graphs under every KV-cache sizing core offers."""
     settings = {"hf": {"transaction_graph_populations": [2]}}
-
-    def restricted(config):
-        config.cache_config.num_gpu_blocks_override = 3  # max_num_seqs 2, + 1
-        return config
-
     if stage == "model":
-        config = restricted(stages.config(right_context=0, **settings))
+        config = _sized(stages.config(right_context=0, **settings), sizing)
         stages.model(config)
     else:
-        config = restricted(stages.config(right_context=0))
+        config = _sized(stages.config(right_context=0), sizing)
         model = stages.model(config)
         stages.apply(config, **settings)
         stages.state(config, model)
 
 
+@pytest.mark.parametrize("sizing", list(_SIZINGS))
 @pytest.mark.parametrize("stage", ["model", "model-state"])
-# @spec REG-ENG-006, REG-VAL-008, TXG-CFG-016, TXG-CFG-019, TXG-CFG-011
+# @spec REG-ENG-006, REG-VAL-008, TXG-CFG-016, TXG-CFG-017, TXG-CFG-011
 def test_construction_refuses_transaction_graphs_outside_the_restricted_startup(
-    stages, stage
+    stages, stage, sizing
 ):
-    """Without an explicit block count or KV budget (TXG-CFG-019) the
-    construction refuses, naming that condition, and refuses nothing for the
-    state layer itself."""
-    settings = {"hf": {"transaction_graph_populations": [2]}}
+    """Asynchronous scheduling (TXG-CFG-017) is refused at construction under
+    every KV-cache sizing, naming that condition; nothing is refused for the
+    KV-cache sizing or for the state layer itself."""
+    from support import txg_conditions as c
+
+    settings = {
+        "hf": {"transaction_graph_populations": [2]},
+        "async_scheduling": True,
+    }
     if stage == "model":
-        config = stages.config(right_context=0, **settings)
+        config = _sized(stages.config(right_context=0, **settings), sizing)
         message = _refusal(stages.model, config)
     else:
-        config = stages.config(right_context=0)
+        config = _sized(stages.config(right_context=0), sizing)
         model = stages.model(config)
         stages.apply(config, **settings)
         message = _refusal(stages.state, config, model)
-    assert _POOL_CONDITION.search(message), message
     assert rc.TRANSACTION_GRAPH_KEY in message, message
+    assert c.found(c.NO_ASYNC_SCHEDULING, message), message
+    assert not c.is_sizing_condition(message), message
     _no_state_layer_refusal(message)
 
 

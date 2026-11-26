@@ -10,7 +10,9 @@ the per-operation precision setting)
 and one model-internal seam, the dense decode binding's per-key callable
 cache (``_decode_fns``), for the callable-identity check. The projected
 resident layout per role (check 2) is exercised only through its effect in
-``gpu`` tests: no public operation swaps two same-shaped roles.
+``gpu`` tests: no public operation swaps two same-shaped roles. The tests
+run under core's default KV-cache sizing, the extensible KV cache, whose
+serving capture is the only capture.
 """
 
 from __future__ import annotations
@@ -43,6 +45,28 @@ def perturb_layout(monkeypatch, env):
         )
     else:
         monkeypatch.setattr(layer, "component_pools", pools)
+
+
+def _set_component_pools(monkeypatch, layer, pools):
+    if isinstance(getattr(type(layer), "component_pools", None), property):
+        monkeypatch.setattr(
+            type(layer), "component_pools", property(lambda self: pools)
+        )
+    else:
+        monkeypatch.setattr(layer, "component_pools", pools)
+
+
+def views_of(env, pages):
+    """The state layer's bound views narrowed, or widened over the same
+    storage, to ``pages`` pages: the same address, page shape, strides and
+    dtype, another first dimension."""
+    layer = t.state_layer_of(env)
+    views = {}
+    for name, view in layer.component_pools.items():
+        views[name] = view.as_strided(
+            (pages, *view.shape[1:]), view.stride(), view.storage_offset()
+        )
+    return layer, views
 
 
 def perturb_cells(monkeypatch, env):
@@ -119,6 +143,39 @@ def test_checks_run_in_order_and_report_the_first_mismatch(on_cpu, monkeypatch, 
     message = t.text(error).lower()
     assert any(w in message for w in PERTURBATIONS[first][1]), message
     assert "fp32_precision" not in message, "a later check reported first"
+
+
+# @spec TXG-VER-001
+def test_bound_views_of_fewer_pages_over_the_captured_layout_verify(
+    on_cpu, monkeypatch
+):
+    """Views with the recorded address, page shape, strides and dtype and a
+    first dimension below the recorded page count fit the layout the serving
+    capture recorded, as the views core binds when its extensible KV cache
+    grows do: verification passes and the worker serves."""
+    env, core = captured(on_cpu(n=2))
+    layer, views = views_of(env, t.CAPACITY - 3)
+    _set_component_pools(monkeypatch, layer, views)
+    error = h.call_with(core.post_warmup)
+    assert error is None, ("views that fit failed verification", t.text(error))
+
+
+# @spec TXG-VER-001, TXG-VER-002
+def test_bound_views_of_more_pages_than_recorded_fail_verification(on_cpu, monkeypatch):
+    """Views with more pages than the recorded page count do not fit:
+    verification fails, names the pool layout and latches."""
+    run = on_cpu(n=2)
+    env, core = run.env, run.core
+    core.prepare()
+    core.bind_serving(t.narrow_pool(core.bindings(t.CAPACITY + 2), t.CAPACITY))
+    core.serving_capture()
+    layer, views = views_of(env, t.CAPACITY + 2)
+    _set_component_pools(monkeypatch, layer, views)
+    error = h.call_with(core.post_warmup)
+    assert error is not None, "views of more pages than recorded verified"
+    assert "layout" in t.text(error).lower(), t.text(error)
+    later = h.call_with(core.step, t.stream_unit(env, "s1"))
+    assert later is not None and t.FRESH_ENGINE.search(t.text(later)), later
 
 
 # @spec TXG-VER-001

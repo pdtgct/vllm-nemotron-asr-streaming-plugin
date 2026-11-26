@@ -57,6 +57,7 @@ from support import model_harness as h
 from support import txg_api
 from support.core_order import CoreOrder
 from support.fake_cuda import MARGIN_BYTES, FakeCuda, FakeStream
+from support.txg_api import Sizing, sizing_settings
 
 OPTION = "transaction_graph_populations"
 LOOKAHEADS = (0, 1, 3, 6, 13)
@@ -66,11 +67,10 @@ DEFAULT_ARMS = {
     "decode_dispatch_arm": "dense-graphed",
 }
 FRESH_ENGINE = re.compile(r"fresh engine", re.IGNORECASE)
-#: The block count of every state pool a CPU environment's ``CoreOrder``
-#: binds, and its ``num_gpu_blocks_override`` under the restricted startup.
+#: The page count of every serving state pool a CPU environment's
+#: ``CoreOrder`` binds: the reservation capacity under the extensible KV
+#: cache, and ``num_gpu_blocks_override`` under a fixed block count.
 CAPACITY = 8
-#: ``build_on_cpu``'s default block-count setting: the restricted startup's.
-RESTRICTED = object()
 
 
 # ---------------------------------------------------------------------------
@@ -692,14 +692,151 @@ def bound_views(env: Any) -> tuple[Any, ...]:
     return tuple(state_layer_of(env).kv_cache)
 
 
+def kv_cache_sizing(vllm_config: Any) -> str:
+    """The KV-cache sizing (``txg_api.Sizing``) a configuration's effective
+    cache values select, the extensible KV cache checked first: a startup
+    plan's ``kv_cache_memory_bytes`` set with the extensible KV cache on
+    leaves it on (TXG-MEM-018)."""
+    cache = vllm_config.cache_config
+    if getattr(cache, "enable_extensible_kv_cache", False):
+        return Sizing.EXTENSIBLE
+    if getattr(cache, "kv_cache_memory_bytes", None):
+        return Sizing.BUDGET
+    if getattr(cache, "num_gpu_blocks_override", None) is not None:
+        return Sizing.BLOCK_COUNT
+    return Sizing.PROFILED
+
+
+def estimate_runs(vllm_config: Any) -> bool:
+    """Whether core runs its graph-memory estimate, and with it the
+    profiling capture (``vllm/v1/worker/gpu_worker.py``): the extensible KV
+    cache off, no fixed budget (``kv_cache_memory_bytes`` unset or 0) and
+    ``VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS`` not 0. A test's own reading
+    of core, independent of the plugin's predicate."""
+    import vllm.envs as envs
+
+    cache = vllm_config.cache_config
+    return (
+        not getattr(cache, "enable_extensible_kv_cache", False)
+        and not getattr(cache, "kv_cache_memory_bytes", None)
+        and bool(envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS)
+    )
+
+
+def narrow_pool(bindings: Any, pages: int) -> Any:
+    """The first ``pages`` pages of a state pool, as a pool of its own over
+    the same storage (``base`` is the whole pool): what core binds when it
+    binds views of fewer pages than its allocation holds."""
+    pool = h.core_bindings(bindings)
+    base = getattr(pool, "base", pool)
+    assert 0 < pages <= base.capacity, (pages, base.capacity)
+    return SimpleNamespace(
+        layout=base.layout, capacity=pages, tensor=base.tensor[:pages], base=base
+    )
+
+
 class TxgCoreOrder(CoreOrder):
     """``CoreOrder`` whose bindings follow core's state-group layout accessor
     (:func:`follow_state_group_layouts`) and whose ``clear`` is followed by
     core's release of the profiling KV cache
-    (:func:`release_profiling_layouts`)."""
+    (:func:`release_profiling_layouts`), under the configuration's KV-cache
+    sizing:
+
+    * the profiling KV cache holds ``num_gpu_blocks_override`` blocks when
+      that is set, otherwise ``min(max_num_seqs, max_cudagraph_capture_size)
+      or 1`` blocks, one under the explicit NONE runner mode
+      (``vllm/v1/worker/gpu/cudagraph_utils.py``; TXG-LIFE-004);
+    * ``startup`` runs the profiling capture only when core's estimate runs
+      (:func:`estimate_runs`), and under the extensible KV cache follows
+      ``post_warmup`` with core's extension (:meth:`extend`).
+    """
 
     def __init__(self, runner: Any, **kwargs: Any) -> None:
         super().__init__(follow_state_group_layouts(runner), **kwargs)
+        #: The page count of the views :meth:`extend` bound, once it ran.
+        self.final_count: int | None = None
+
+    @property
+    def vllm_config(self) -> Any:
+        return self.runner.vllm_config
+
+    def estimate_runs(self) -> bool:
+        return estimate_runs(self.vllm_config)
+
+    def extensible(self) -> bool:
+        return kv_cache_sizing(self.vllm_config) == Sizing.EXTENSIBLE
+
+    def profiling_capacity(self) -> int:
+        """The block count of core's profiling KV cache."""
+        cache = self.vllm_config.cache_config
+        override = getattr(cache, "num_gpu_blocks_override", None)
+        if override is not None:
+            return int(override)
+        sizes = getattr(
+            self.vllm_config.compilation_config, "max_cudagraph_capture_size", None
+        )
+        seqs = int(self.vllm_config.scheduler_config.max_num_seqs)
+        return min(seqs, int(sizes or 0)) or 1
+
+    def bindings(self, capacity: int | None = None) -> Any:
+        """A fresh state pool of ``capacity`` pages (the serving capacity
+        unless given)."""
+        bindings = h.real_bindings(
+            h.model_spec(self.runner.model),
+            capacity=self.capacity if capacity is None else capacity,
+            device=self.device.type,
+        )
+        return h.BindingsSpy(bindings) if self.spy else bindings
+
+    def bind_profiling(self, bindings: Any = None) -> Any:
+        """Core's profiling KV cache, of :meth:`profiling_capacity` blocks
+        unless ``bindings`` are given."""
+        if bindings is None:
+            bindings = self.bindings(self.profiling_capacity())
+        return super().bind_profiling(bindings)
+
+    def extend(self, final: int | None = None) -> Any:
+        """Core's extension of the extensible KV cache after
+        ``post_warmup`` and before the first request
+        (``vllm/v1/worker/extensible_kv_cache.py``, ``extend_kv_cache``):
+        ``bind_kv_cache`` alone over the same storage with ``final`` pages
+        (the serving pool's whole allocation unless given), with no
+        ``initialize_kv_cache`` and no new state-group layout. ``final`` above
+        the bound views' page count binds views of more pages than the
+        serving capture read (a pool from :func:`narrow_pool`). Returns the
+        bindings, now the serving ones."""
+        pool = h.core_bindings(self.serving_bindings)
+        base = getattr(pool, "base", pool)
+        final = base.capacity if final is None else final
+        extended = narrow_pool(base, final)
+        h.state_layer_of(self.runner.model).bind_kv_cache(extended.tensor)
+        config = getattr(self.state, "kv_cache_config", None)
+        if config is not None and hasattr(config, "num_blocks"):
+            config.num_blocks = final
+        self.runner.bindings = self.serving_bindings = extended
+        self.final_count = final
+        return extended
+
+    def startup(
+        self,
+        *,
+        profiling: bool | None = None,
+        warmup: bool = False,
+        verify: bool = True,
+        extend: bool | None = None,
+    ) -> Any:
+        """``CoreOrder.startup`` under the configuration's sizing:
+        ``profiling`` defaults to whether core's estimate runs, and
+        ``extend`` to whether the extensible KV cache is on and ``verify``
+        ran ``post_warmup``."""
+        if profiling is None:
+            profiling = self.estimate_runs()
+        bindings = super().startup(profiling=profiling, warmup=warmup, verify=verify)
+        if extend is None:
+            extend = verify and self.extensible()
+        if extend:
+            bindings = self.extend()
+        return bindings
 
     def clear(self) -> None:
         super().clear()
@@ -783,19 +920,46 @@ def build_on_cpu(
     right_context: int = 0,
     max_num_seqs: int = 2,
     max_num_active_seqs: int | None = None,
+    sizing: str | None = None,
     kv_cache_memory_bytes: int | None = None,
-    num_gpu_blocks_override: Any = RESTRICTED,
+    num_gpu_blocks_override: int | None = None,
     capacity: int = CAPACITY,
-    extensible_kv_cache: bool | None = False,
 ) -> SimpleNamespace:
     """Transaction graphs on (``N = n``) through the fake-capture seam, under
-    the restricted startup (TXG-CFG-017 to TXG-CFG-019): synchronous
-    scheduling, an explicit NONE runner and compilation mode, and, unless
-    ``kv_cache_memory_bytes`` fixes a budget, ``num_gpu_blocks_override``
-    set to ``capacity``, the block count of every state pool the
-    environment's ``CoreOrder`` binds (core's profiling and serving KV caches
-    both hold the override's blocks, TXG-LIFE-004). ``max_num_active_seqs``
-    sets the admission limit below ``max_num_seqs``."""
+    the restricted startup (TXG-CFG-017, TXG-CFG-018: synchronous
+    scheduling, an explicit NONE runner and compilation mode) and the
+    KV-cache sizing ``sizing`` (``txg_api.Sizing``). The sizing is core's
+    default, the extensible KV cache, unless ``kv_cache_memory_bytes`` fixes
+    a budget, ``num_gpu_blocks_override`` a block count, or ``sizing`` names
+    another; a test sets a fixed setting only where its spec names one.
+    Under :attr:`Sizing.BLOCK_COUNT` the override is
+    ``num_gpu_blocks_override``, ``capacity`` unless given.
+
+    Every serving state pool the environment's ``CoreOrder`` binds holds
+    ``capacity`` pages (the reservation capacity under the extensible KV
+    cache); its profiling KV cache holds the override's blocks under a fixed
+    block count, otherwise one block (:class:`TxgCoreOrder`, TXG-LIFE-004).
+    ``max_num_active_seqs`` sets the admission limit below
+    ``max_num_seqs``."""
+    if sizing is None:
+        sizing = (
+            Sizing.BUDGET
+            if kv_cache_memory_bytes
+            else Sizing.BLOCK_COUNT
+            if num_gpu_blocks_override is not None
+            else Sizing.EXTENSIBLE
+        )
+    blocks = budget = None
+    if sizing == Sizing.BLOCK_COUNT:
+        blocks = num_gpu_blocks_override
+        if blocks is None:
+            blocks = capacity
+    elif num_gpu_blocks_override is not None:
+        raise ValueError(f"num_gpu_blocks_override under the sizing {sizing!r}")
+    if sizing == Sizing.BUDGET:
+        budget = kv_cache_memory_bytes
+    elif kv_cache_memory_bytes:
+        raise ValueError(f"kv_cache_memory_bytes under the sizing {sizing!r}")
     events = h.Events()
     spies = _common_spies(monkeypatch, events)
     vllm_config = h.build_vllm_config(
@@ -805,11 +969,7 @@ def build_on_cpu(
         overrides=dict(DEFAULT_ARMS),
     )
     _hook_configuration(vllm_config, [n] if populations is None else populations)
-    if num_gpu_blocks_override is RESTRICTED:
-        num_gpu_blocks_override = None if kv_cache_memory_bytes else capacity
-    set_cache(vllm_config, kv_cache_memory_bytes=kv_cache_memory_bytes)
-    set_cache(vllm_config, num_gpu_blocks_override=num_gpu_blocks_override)
-    set_cache(vllm_config, enable_extensible_kv_cache=extensible_kv_cache)
+    set_cache(vllm_config, **sizing_settings(sizing, blocks=blocks, budget=budget))
     set_scheduler(vllm_config, max_num_active_seqs=max_num_active_seqs)
     monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
     _set_env_attr(monkeypatch, "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", True)
@@ -832,6 +992,7 @@ def build_on_cpu(
         if max_num_active_seqs is None
         else max_num_active_seqs,
         capacity=capacity,
+        sizing=sizing,
         n=n,
         capture_stream=fake.new_stream(name="core-capture"),
         **vars(spies),
@@ -857,7 +1018,9 @@ def on_cpu(monkeypatch: Any, tmp_path: Any, **kwargs: Any) -> SimpleNamespace:
 def set_cache(vllm_config: Any, **values: Any) -> None:
     """Set effective cache values as core does after construction (a startup
     plan's ``kv_cache_memory_bytes``; the engine disabling the extensible KV
-    cache), without re-running the configuration's validators."""
+    cache), without re-running the configuration's validators. The CPU
+    platform resolves the extensible KV cache off, so a CPU environment sets
+    its sizing here."""
     cache = vllm_config.cache_config
     for key, value in values.items():
         try:
@@ -896,15 +1059,18 @@ def set_estimate(monkeypatch: Any, enabled: bool) -> None:
 
 def is_scatter_warmup(call: dict[str, Any]) -> bool:
     """Whether a ``ScatterSpy`` entry has the shape of a transaction-graph
-    scatter warm-up launch: one row naming page 1 with a rejected (nonzero)
-    status (TXG-CAP-006, TXG-LIFE-004). The default encoder's one-row
-    profile transaction also names page 1, of model-owned scratch, but
-    commits its row (status 0). A count-1 cell's eager reference, warm-ups
-    and capture also launch one rejected row naming page 1, so a caller that
-    needs the warm-up alone bounds its window before the first cell."""
+    scatter warm-up launch: one executed row with a rejected (nonzero)
+    status (TXG-CAP-006, TXG-LIFE-004), whatever page it names, so that a
+    test locates the warm-up by its shape and checks its page (block 0)
+    where its spec states it. The default encoder's one-row profile
+    transaction commits its row (status 0). A count-1 cell's eager
+    reference, warm-ups and capture also launch one rejected row, so a
+    caller that needs the warm-up alone bounds its window before the first
+    cell. The kernel-specialization warm-up (``warmup_masked_page_scatter``,
+    logged as ``"warmup"``) is not one."""
     return (
-        call["rows"] == 1
-        and call["pages"] == [1]
+        call["fn"] == "execute"
+        and call["rows"] == 1
         and all(s != 0 for s in call["status"])
     )
 
@@ -1220,3 +1386,185 @@ def row_bits(plan: Any) -> tuple[list[bool], list[bool]]:
     if fresh is None:
         raise AssertionError("RowPlan has no per-row is_fresh vector (TXG-TXN-010)")
     return [bool(v) for v in fresh.tolist()], [bool(v) for v in plan.is_file.tolist()]
+
+
+# ---------------------------------------------------------------------------
+# Block accesses (TXG-CAP-018)
+
+#: Calls that read no tensor data: metadata, and views (classified after the
+#: call by aliasing, below).
+_METADATA = frozenset(
+    {
+        "__get__",
+        "data_ptr",
+        "size",
+        "stride",
+        "dim",
+        "ndimension",
+        "numel",
+        "nelement",
+        "element_size",
+        "storage_offset",
+        "untyped_storage",
+        "is_contiguous",
+        "__len__",
+        "get_device",
+        "is_pinned",
+        "is_floating_point",
+        "is_complex",
+        "_is_view",
+    }
+)
+#: In-place calls: the result aliases the input, and the call writes it.
+_IN_PLACE = frozenset({"__setitem__", "copy_", "index_put_", "fill_", "zero_"})
+#: Calls that address the first argument's dimension ``dim`` by an index
+#: tensor: ``(position of dim, position of the index)``, as positional
+#: arguments after the tensor.
+_INDEXED = {
+    "index_select": (0, 1),
+    "index_copy_": (0, 1),
+    "index_copy": (0, 1),
+    "index_add_": (0, 1),
+    "index_add": (0, 1),
+    "index_fill_": (0, 1),
+    "gather": (0, 1),
+    "scatter_": (0, 1),
+    "scatter": (0, 1),
+}
+
+
+def _tensors(value: Any) -> list[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [t for item in value for t in _tensors(item)]
+    if isinstance(value, dict):
+        return [t for item in value.values() for t in _tensors(item)]
+    return []
+
+
+class BlockAccesses(torch.overrides.TorchFunctionMode):
+    """Records which blocks of one state pool every torch call in its
+    context reads or writes (TXG-CAP-018): a CPU reading of "addresses only
+    block 0", over the pool's backing storage.
+
+    ``pool`` is the backing tensor core allocated (``[blocks, 1, 1, page]``
+    bytes; ``model_harness.StatePool.tensor``); every view the plugin makes
+    of it (the state layer's component pools, the projected resident-pool
+    views, slices of either) shares its storage. A call that creates a view
+    or reads metadata addresses nothing; a call that indexes a pool view
+    along its first dimension by an index tensor addresses the blocks of the
+    rows it names; any other call that takes a pool view (a copy, a
+    comparison, an elementwise operation, a reduction) addresses every block
+    the view spans. ``accesses`` lists ``(call name, sorted blocks)``; it
+    holds no tensor.
+    """
+
+    def __init__(self, pool: torch.Tensor) -> None:
+        super().__init__()
+        self._storage = pool.untyped_storage().data_ptr()
+        self._base = pool.data_ptr()
+        self._page = int(pool.stride(0)) * pool.element_size()
+        self._blocks = int(pool.shape[0])
+        self.accesses: list[tuple[str, tuple[int, ...]]] = []
+
+    def _aliases(self, tensor: torch.Tensor) -> bool:
+        try:
+            return tensor.untyped_storage().data_ptr() == self._storage
+        except Exception:  # noqa: BLE001 - a tensor without storage
+            return False
+
+    def _span(self, tensor: torch.Tensor, start: int | None = None) -> set[int]:
+        """The blocks a view spans (from byte ``start`` when given)."""
+        if tensor.numel() == 0:
+            return set()
+        size = tensor.element_size()
+        first = tensor.data_ptr() - self._base if start is None else start
+        low = high = 0
+        for extent, stride in zip(tensor.shape, tensor.stride(), strict=True):
+            reach = (extent - 1) * stride * size
+            low, high = low + min(0, reach), high + max(0, reach)
+        return set(
+            range(
+                (first + low) // self._page, (first + high + size - 1) // self._page + 1
+            )
+        )
+
+    def _rows(self, tensor: torch.Tensor, index: Any) -> set[int]:
+        """The blocks of the rows ``index`` names along the view's first
+        dimension."""
+        values = torch.as_tensor(index).reshape(-1)
+        if values.dtype == torch.bool:
+            values = values.nonzero().reshape(-1)
+        rows = tensor[0] if tensor.dim() > 1 else tensor[:1]
+        first = tensor.data_ptr() - self._base
+        step = int(tensor.stride(0)) * tensor.element_size()
+        blocks: set[int] = set()
+        for value in {int(v) for v in values.tolist()}:
+            value = value + tensor.shape[0] if value < 0 else value
+            blocks |= self._span(rows, start=first + value * step)
+        return blocks
+
+    def _key_rows(self, tensor: torch.Tensor, key: Any) -> set[int] | None:
+        """The rows an indexing key names by an index tensor in the first
+        dimension; ``None`` for a basic key (a view)."""
+        head = key[0] if isinstance(key, tuple) and key else key
+        if isinstance(head, torch.Tensor) or (
+            isinstance(head, list) and head and not isinstance(head[0], slice)
+        ):
+            return self._rows(tensor, head)
+        return None
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):  # noqa: ANN001
+        kwargs = kwargs or {}
+        name = getattr(func, "__name__", str(func))
+        result = func(*args, **kwargs)
+        if name in _METADATA:
+            return result
+        pooled = [t for t in _tensors((args, kwargs)) if self._aliases(t)]
+        if not pooled:
+            return result
+        if (
+            name not in _IN_PLACE
+            and isinstance(result, torch.Tensor)
+            and self._aliases(result)
+        ):
+            return result  # a view, or a no-op such as ``cpu()`` on CPU
+        blocks: set[int] = set()
+        target = args[0] if args and isinstance(args[0], torch.Tensor) else None
+        if target is not None and self._aliases(target):
+            if name in ("__getitem__", "__setitem__"):
+                rows = self._key_rows(target, args[1])
+                if rows is None and name == "__setitem__":
+                    rows = self._span(target[args[1]])
+                if rows is not None:
+                    blocks |= rows
+                    pooled = [t for t in pooled if t is not target]
+            elif name in ("index_put_", "index_put"):
+                blocks |= self._key_rows(target, tuple(args[1])) or self._span(target)
+                pooled = [t for t in pooled if t is not target]
+            elif name in _INDEXED:
+                dim = args[1] if len(args) > 1 else kwargs.get("dim")
+                index = args[2] if len(args) > 2 else kwargs.get("index")
+                if dim == 0 and index is not None:
+                    blocks |= self._rows(target, index)
+                    pooled = [t for t in pooled if t is not target]
+        if name == "embedding" and len(args) > 1 and self._aliases(args[1]):
+            blocks |= self._rows(args[1], args[0])
+            pooled = [t for t in pooled if t is not args[1]]
+        for tensor in pooled:
+            blocks |= self._span(tensor)
+        self.accesses.append((name, tuple(sorted(blocks))))
+        return result
+
+    def blocks(self) -> set[int]:
+        """Every block any recorded call addressed."""
+        return {block for _, touched in self.accesses for block in touched}
+
+    def outside(self, allowed: set[int]) -> list[tuple[str, tuple[int, ...]]]:
+        """The recorded calls that addressed a block outside ``allowed``."""
+        return [
+            (name, touched)
+            for name, touched in self.accesses
+            if not set(touched) <= allowed
+        ]

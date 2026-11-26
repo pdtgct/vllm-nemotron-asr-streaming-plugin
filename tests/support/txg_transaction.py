@@ -96,6 +96,16 @@ def config_name(config: tuple[str, bool, bool]) -> str:
 _BASE_ALIGNMENT = 512
 
 
+def _view_end(tensor: torch.Tensor) -> int:
+    """The byte just past the last element ``tensor`` views, counted from
+    the start of its storage."""
+    size = tensor.element_size()
+    if tensor.numel() == 0:
+        return tensor.storage_offset() * size
+    last = sum((n - 1) * stride for n, stride in zip(tensor.shape, tensor.stride()))
+    return (tensor.storage_offset() + last) * size + size
+
+
 def layout_clone(tensors: Sequence[torch.Tensor], *, zero: bool = False) -> list:
     """Copies of ``tensors`` that keep the resident layout: each distinct
     storage is copied once, with its base address at the same offset modulo
@@ -105,14 +115,24 @@ def layout_clone(tensors: Sequence[torch.Tensor], *, zero: bool = False) -> list
     and pointer alignment of the original (a new address), so the masked
     scatter receives a specialization startup warmed (TXG-CAP-013); a plain
     ``Tensor.clone`` of a strided resident view is contiguous and does not.
-    ``zero`` zeroes the copies instead of copying the bytes."""
+    ``zero`` zeroes the copies instead of copying the bytes.
+
+    Each storage's copy holds only the bytes up to the end of the last view
+    over it, not the whole storage: under the extensible KV cache the bound
+    views hold the final committed block count while their storage may span
+    the reservation, so a copy of the views is limited to the pages below
+    the final committed count (TXG-QUAL-003, TXG-QUAL-029)."""
     copies: dict[tuple[Any, int], tuple[torch.Tensor, int]] = {}
+    spans: dict[tuple[Any, int], int] = {}
+    for tensor in tensors:
+        key = (tensor.device, tensor.untyped_storage().data_ptr())
+        spans[key] = max(spans.get(key, 0), _view_end(tensor))
     out = []
     for tensor in tensors:
         storage = tensor.untyped_storage()
         key = (tensor.device, storage.data_ptr())
         if key not in copies:
-            nbytes = storage.nbytes()
+            nbytes = spans[key]
             raw = torch.empty(
                 nbytes + _BASE_ALIGNMENT, dtype=torch.uint8, device=tensor.device
             )
@@ -166,6 +186,20 @@ class Pools:
     def zeros(self) -> Pools:
         """Zeroed pools over new storage with the same resident layout."""
         return self._rebuilt(zero=True)
+
+    def storage_bytes(self) -> int:
+        """The bytes of the distinct storages the pools view (for a copy
+        :meth:`clone` made, the copy's own bytes, alignment slack
+        included)."""
+        seen: dict[tuple[Any, int], int] = {}
+        for _, t in self.flat():
+            storage = t.untyped_storage()
+            seen[(t.device, storage.data_ptr())] = storage.nbytes()
+        return sum(seen.values())
+
+    def first_dimensions(self) -> set[int]:
+        """The first dimension (the page count) of every pool view."""
+        return {int(t.shape[0]) for _, t in self.flat()}
 
     def flat(self) -> Iterator[tuple[str, torch.Tensor]]:
         for name, value in self.tensors.items():
@@ -620,6 +654,60 @@ class TransactionEnv:
                     (positions, self.run(step, rows=positions, pools=merged_pools))
                 )
         return compare_merge(whole, parts, merged_pools, step.population)
+
+
+#: The sentinel patterns TXG-EQ-003's fresh rows' recycled pages hold.
+SENTINELS = ("nan", "inf", "-inf", "random")
+
+
+def holds_live_state(pools: Pools, block: int) -> bool:
+    """Whether ``block`` holds nonzero state that differs from the null page
+    (block 0) in at least one pool."""
+    page, null = pools.page(block), pools.page(0)
+    differs = any(not same_bits(page[name], null[name]) for name in page)
+    nonzero = any(
+        bool(t.detach().contiguous().view(torch.uint8).any()) for t in page.values()
+    )
+    return differs and nonzero
+
+
+def replay_set(
+    env: TransactionEnv, kind: str, count: int, *, seed: int = 0
+) -> list[tuple[str, Step]]:
+    """TXG-EQ-003's one-kind sub-plans for the cell of ``kind`` (``"chunk"``
+    or ``"echo"``) at ``count``: one of ``count`` fresh rows whose recycled
+    pages hold sentinel patterns (:data:`SENTINELS`), one of ``count``
+    continuing rows whose pages hold nonzero state that differs from the
+    null page, and, at ``count`` of 2 or more, one that mixes continuing and
+    fresh rows. The rows alternate stream and file fixtures and take blocks
+    in descending order from the top of the pool, so their block indices,
+    row order and masks differ from the cell's capture rows (every one on
+    block 0, alternating fresh and file bits). A continuing fixture whose
+    page holds no such state fails the call."""
+    row_kind = "chunk" if kind == "chunk" else "other"
+    blocks = list(range(env.capacity - 1, env.capacity - 1 - count, -1))
+    assert count >= 1 and min(blocks) > 0, "the pool set has too few blocks"
+    shapes = [("fresh", [True] * count), ("continuing", [False] * count)]
+    if count >= 2:
+        shapes.append(("mixed", [i % 2 == 1 for i in range(count)]))
+    out = []
+    for label, freshness in shapes:
+        fixtures = [
+            env.accepted((row_kind, fresh, i % 2 == 1))
+            for i, fresh in enumerate(freshness)
+        ]
+        step = env.compose(fixtures, blocks=blocks)
+        for i, (fresh, block) in enumerate(zip(freshness, blocks, strict=True)):
+            if fresh:
+                pattern = SENTINELS[(seed + i) % len(SENTINELS)]
+                step.pools.fill_page(block, pattern, seed=seed + i)
+            elif not holds_live_state(step.pools, block):
+                raise AssertionError(
+                    f"the continuing {fixtures[i].name} fixture's page holds no "
+                    "nonzero state distinct from the null page"
+                )
+        out.append((f"{kind}-{count}-{label}", step))
+    return out
 
 
 def compare_merge(

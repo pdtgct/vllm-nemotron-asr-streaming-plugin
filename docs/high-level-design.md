@@ -112,22 +112,24 @@ and then, always, over the serving state pages. The
 plugin keeps no graph pool of its own. The option runs without `--enforce-eager` and is refused
 with it, because core runs no capture hook under `--enforce-eager`; the outer runner still
 captures nothing (`cudagraph_mode` NONE). In its first release the option is offered at the
-80 ms and 160 ms geometries, and it is off by default. The cells bake in state-page addresses,
-which the model reads at capture from the target core's state-group layout accessor. On the
-target core the option starts only under a *restricted startup*: synchronous scheduling
-(`--no-async-scheduling`), explicit `-cc.cudagraph_mode none -cc.mode none`, and either
-`--num-gpu-blocks-override` or `--kv-cache-memory-bytes`, both of
-which turn core's extensible KV cache off. Every other startup with the option on is refused,
-naming each unmet condition and its remedy. Either setting must give at least the admission limit
-plus one blocks: core's scheduler refuses fewer state pages than requests that can be active, and
-core builds it only after the model's captures, so the plugin refuses a smaller override at
-startup, and a smaller budget when the serving capture first reads the state pages, with a larger
-budget or a lower admission limit as the remedy. Every declared population is at most the
-admission limit. Without an explicit block count or budget, core's
-minimal profiling KV cache holds too few state pages for the profiling capture (one block under
-an explicit NONE), and the extensible KV cache backs only its first blocks at the serving capture
-and grows without refreshing the layout; the restriction lifts when core closes both gaps and the
-qualification covers the other settings (Future roadmap).
+80 ms and 160 ms geometries, and it is off by default. The cells bake in the state pages' base
+addresses, which the model reads at capture from the target core's state-group layout accessor:
+at every capture a cell addresses only block 0, the only page core guarantees backed then, and it
+reaches each held page at replay by the block ID the step carries; core keeps the layout's base,
+strides and page count until it releases the KV cache, so the extensible KV cache's growth needs
+no recapture. On the target core the option starts only under a *restricted startup*:
+synchronous scheduling (`--no-async-scheduling`) and explicit `-cc.cudagraph_mode none -cc.mode
+none`. Every other startup with the option on is refused, naming each unmet condition and its
+remedy. The option runs under every KV-cache sizing core offers. The state pages must number at
+least the admission limit plus one: core's scheduler refuses fewer state pages than requests that
+can be active, and core builds it only after the model's captures, so the plugin refuses a
+smaller `--num-gpu-blocks-override` at startup, and a smaller page count under a fixed or
+profiled budget when the serving capture first reads the state pages, with a larger block count
+or budget, or a lower admission limit, as the remedy. Under the extensible KV cache the count is
+known only after the captures, and core's scheduler refuses a count too small for the requests
+that can be active, naming a lower `--max-num-seqs` or a larger cache as the remedy. Every
+declared population is at most the admission limit. The restriction lifts when the qualification
+covers asynchronous scheduling and the reduced runner modes (Future roadmap).
 
 ### 5. Graphed segments by default
 
@@ -157,8 +159,14 @@ serve command therefore sets `--max-num-seqs` to a value the tier 2 measurement 
 the A40 at the default geometry; until that measurement exists, the README may carry an interim
 value, marked interim and unpublished, that qualifies neither runner configuration (the
 `registration` design). The model logs the segment graphs' retained memory and capture
-time, `max_num_seqs` and the geometry when it captures them: before core plans capacity under
-`--enforce-eager` and when core runs its graph-memory estimate, and after it otherwise. A capture that cannot
+time, `max_num_seqs` and the geometry when it captures them: under `--enforce-eager`, on the
+profiling dummy step, before core plans capacity; under the hook configuration with the
+extensible KV cache on, whatever the budget or estimate setting, at the one serving capture,
+before core sizes the KV cache from the memory left after the captures; under the hook
+configuration with the extensible KV cache off and core's graph-memory estimate running, at the
+profiling capture before core plans capacity and at the serving capture after it; and under the
+hook configuration with the extensible KV cache off and either a fixed budget or the estimate
+disabled, at the serving capture after core plans capacity. A capture that cannot
 allocate fails startup with the model's message, naming those figures and a complete remedy: a
 smaller `max_num_seqs`, or the overrides that select the eager arms together with the runner
 setting they need (`--enforce-eager`, with transaction graphs and CHUNK-bucket graphs off). A later capacity failure is core's
@@ -353,8 +361,12 @@ the leaf designs cite them where they depend on them.
   (the `registration` design, Engine settings). #67583 divides this between two hooks, and the
   model keeps them apart:
   long-lived working memory outside any graph is allocated in `prepare_execution_memory`, which
-  every profiled budget counts; graphs captured through `capture_cudagraphs` are counted only by
-  core's graph-memory estimate, which runs only with a profiled budget and the estimate enabled.
+  every profiled budget counts; graphs captured through `capture_cudagraphs` are counted by core's
+  graph-memory estimate, which runs only with a profiled budget, the estimate enabled and the
+  extensible KV cache off, or, under the extensible KV cache, by core's reading of free memory
+  after the captures, from which it sizes the KV cache, whatever the budget or estimate setting;
+  with the extensible KV cache off and either a fixed budget or the estimate disabled, core counts
+  them nowhere.
   Under `--enforce-eager` the `registration` design settles where the model captures its own
   graphs, using only the permitted model-adapter dependencies.
 - **The hook's capture lifecycle.** With the graph-memory estimate running, core first captures
@@ -366,13 +378,20 @@ the leaf designs cite them where they depend on them.
   plugin's objects hold the profiling state pages only through the references that core installed and
   clears in its teardown of the profiling KV cache (the state layer's `kv_cache` and the model
   state's `_state_group_layouts`), so after that teardown no object of the plugin keeps those pages
-  allocated (the `registration` design, REG-STATE-018). Core locks the workspace after the
-  serving capture, so all workspace-backed memory is sized by the time that capture returns.
+  allocated (the `registration` design, REG-STATE-018). Under the extensible KV cache core runs
+  no estimate and captures once, over the serving KV cache while it has backed only its minimum
+  blocks; it then runs `post_warmup`, reads the free memory and extends the cache, rebinding the
+  state layer's views over the same pages with the final page count, while the state-group layout
+  keeps its page count, base and strides until release, so the graphs stay valid with no
+  recapture. With the extensible KV cache off and either a fixed budget or the estimate disabled,
+  core captures once, after it plans the state pages. Core locks the workspace after the serving
+  capture, so all workspace-backed memory is sized by the time that capture returns.
 - **Graph memory is charged before capacity is fixed when core estimates it.** The default
   segment graphs retain about 2.3 GiB at 64 rows and 17.4 GiB at 128 at the 320 ms geometry
   under `--enforce-eager`, and
-  capture's transient use is far larger (Approach, section 5). Transaction graphs bake in
-  resident state-page addresses and retain more: the prototype's nine homogeneous cells retained
+  capture's transient use is far larger (Approach, section 5). Transaction graphs bake in the
+  state pages' base addresses, capturing over block 0 and reaching held pages by block ID at
+  replay (Approach, section 4), and retain more: the prototype's nine homogeneous cells retained
   about 2 GB, and under the split each chunk cell repeats the encoder's intermediates beside the
   segment graphs kept for fallback (the encoder's share at 64 rows was about 1.6 GiB at 160 ms),
   so their memory, and tier 5's fit on
@@ -382,16 +401,22 @@ the leaf designs cite them where they depend on them.
   retains more than its profiling capture fails startup. Under `--enforce-eager` the segment
   graphs are captured on the profiling dummy step, inside the profiled budget (Model-owned
   execution memory), and this constraint does not apply to them.
-  When the model captures through the hook and core does not run its estimate (a budget fixed
-  through `--kv-cache-memory-bytes`, the estimate disabled, or a platform without it), core
-  subtracts no graph memory from the budget, so the budget must leave room. The model then logs
-  that its graphs were not charged and the graph memory the serving capture retained, and a
-  serving capture that cannot allocate fails startup with a message naming the option or segment
-  arm, the graph whose capture failed (its cell, or its geometry, count or tier), the graph memory
-  captured so far, and the budget setting. The plugin refuses the CuMem allocator and sleep mode
-  (`registration`'s REG-ENG-003). Under the restricted startup of transaction graphs (Approach,
-  section 4) both cases arise: a fixed block count leaves core's estimate running, over a
-  profiling KV cache of that many blocks, and a fixed `--kv-cache-memory-bytes` runs none.
+  Core charges hook-captured graph memory in one of two ways: through its estimate, before it
+  plans the state pages, or, under the extensible KV cache, through its reading of free memory
+  after the captures, before it sizes the KV cache. When it does neither (the extensible KV cache
+  off and either a budget fixed through `--kv-cache-memory-bytes` or a startup plan, or the
+  estimate disabled or unavailable), core subtracts no graph memory from the budget, so the budget
+  must leave room; the model then logs that its graphs were not charged and the graph memory the
+  serving capture retained. Under the extensible KV cache the model logs the same figures as
+  measured, a startup plan's budget there included. A serving capture that cannot allocate fails
+  startup with a message naming the option or segment arm, the graph whose capture failed (its
+  cell, or its geometry, count or tier), the graph memory captured so far, and the KV-cache
+  sizing. The plugin refuses the CuMem allocator and sleep mode (`registration`'s REG-ENG-003).
+  With transaction graphs on, every sizing arises: the extensible KV cache (measured after the
+  captures); a profiled budget with it off and the estimate enabled (the estimate over a
+  profiling KV cache of exactly one block, since the restricted startup's explicit NONE leaves
+  core no capture sizes); a fixed block count (the estimate, when enabled, over a profiling KV
+  cache of that many blocks); and a fixed `--kv-cache-memory-bytes` (no estimate).
 - **Engine surface.** Session operations use only `AsyncLLM` / `EngineClient` public and
   RFC-proposed calls, never `engine_core` or scheduler internals. The model adapter's own
   dependencies (model-state interface, the state layer's `MambaSpec` and manager configuration,
@@ -468,14 +493,14 @@ the leaf designs cite them where they depend on them.
 | Session factory on the target core | Not available: the factory keeps its stream-admission design and `create_session_factory` refuses on the target core; core's routes serve the model; the factory's port is a separate change (Future roadmap) | Port the factory to core's automatic admission in the same change as the model: the session's engine binding, ownership, retirement and error contract all change with it, so one change would redesign two components at once, while the model's port is usable on its own through core's routes |
 | Frontend coupling | Structural protocol plus an entry-point group owned by the frontend; neither package imports the other | A shared interface package: a third release to coordinate for a small protocol |
 | Whole-step graph replay | A `transaction-graph` component in this repository, designed against #67583's model-state capture hook; an unpublished whole-transaction prototype on an earlier in-tree copy of the model is its measured evidence base, not its source | Import the prototype's modules from a vLLM build: they are in no core proposal, and core would carry model code. Transplant the prototype's patches: they target an in-tree copy of the model that has diverged from this one, and they carry a model-owned memory admission that the hook makes unnecessary |
-| Graph-memory accounting | Core's graph-memory estimate, through the capture hook: the profiling capture over core's minimal profiling KV cache, then the serving capture into core's graph pool | A model-owned admission inventory and graph pool, retained through the profiling window and checked against the serving capture: core's estimate already measures the same graphs before planning, and the inventory needs its own fit rule and release check. Extrapolating from one captured cell: unsound, because cells do not share memory predictably |
+| Graph-memory accounting | Core's own accounting, through the capture hook: its graph-memory estimate (the profiling capture over core's minimal profiling KV cache, then the serving capture into core's graph pool) when it runs, or, under the extensible KV cache, its reading of free memory after the serving capture, from which it sizes the KV cache | A model-owned admission inventory and graph pool, retained through the profiling window and checked against the serving capture: core's estimate, or its reading after capture, already measures the same graphs before it sizes the state pages, and the inventory needs its own fit rule and release check. Extrapolating from one captured cell: unsound, because cells do not share memory predictably |
 | Served geometry | One per server, any of the five implemented geometries, fixed at startup; the checkpoint's default lookahead unless `num_lookahead_tokens` overrides it | A served set with a cadence chosen per stream: every geometry is warmed and captured, multiplying graph memory and startup time (the default segment graphs retain about 2.3 GiB at 64 rows at 320 ms, and capture takes about a minute), and a model loaded in Hugging Face Transformers already fixes its lookahead the same way. Only the card's four lookaheads: drops the tested 160 ms geometry. A fixed plugin default such as 160 ms: overrides what the checkpoint declares |
 | Transaction graphs by geometry | First release: the 80 and 160 ms geometries; cells are keyed by geometry so that more geometries add cells, not a redesign | All five at once: the 320 to 1120 ms geometries have no exactness or latency evidence for transactions the replay accepts; they are needed for default-on and follow as measured increments |
-| Transaction graphs on the target core | Offered under the restricted startup (Approach, section 4), each unmet condition refused with its remedy, until core's profiling and extensible KV caches support a model-state capture over state pages | Refuse the option until core changes: every setting the restricted startup needs already exists in core. Capture the profiling cells over model-owned scratch pages: it addresses only the profiling KV cache, not the extensible KV cache at the serving capture, and changes the capture and lifecycle design for a gap core can close. Accept every startup: under core's defaults the profiling capture has one state page and the serving capture would read unbacked pages |
+| Transaction graphs on the target core | Offered under the restricted startup (Approach, section 4): synchronous scheduling and explicit NONE modes, under every KV-cache sizing, with every capture over block 0 | Refuse the option until the qualification covers every KV-cache sizing: the KV-cache sizings need no exactness qualification of their own, because the cells address the same block IDs under each, and tier 5 checks startup and served equality at the default sizing. Capture over model-owned scratch pages: core permits a capture over memory the model owns, but every step would then copy each row's state between the scratch and its page. Require an explicit block count or budget: core's capture rule makes the default sizing safe for the cells, and a serve command without KV-cache options sets neither |
 | Steps that mix CHUNK and other rows under transaction graphs | Split by kind: a chunk graph at the step's CHUNK count and an echo graph at its other rows' count, two launches under one reservation; freshness and file membership are per-row masks | One graph per exact (row count, CHUNK count): one launch, but P + 1 graphs per row count (98 for counts 1, 31 and 63; about 594 for 1 to 33). Pad the other rows into a chunk graph: changes the encoder's batch dimension, so bitwise equality is unlikely. Run mixed steps without transaction graphs: if streams are paced independently and 90 % of rows are CHUNK, an illustrative estimate puts about 57 %, 81 % and 97 % of steps at 8, 16 and 32 rows as mixed, so under that assumption the option would cover few steps (the served mix is unmeasured) |
 | Default segment execution | `eager-graphed` encoder and `dense-graphed` decoder: the fastest pair measured, with equal transcripts (in this plugin on A40 at 320 ms and 64 rows, median final latency about 416 → 163 ms and p95 789 → 243 ms in one light run; on the in-tree copy, on A100 at 160 ms and 64 streams under overload, encoder graphs with the batch-folded convolution cut regular service time about 52 %, without per-component attribution; the decoder graphs cut median final latency 58 % on A100 with 4 streams at 160 ms and the eager encoder, and 2 to 5 times on A40 with 32 streams at 560 and 1120 ms); bounded by `max_num_seqs`, which the serve command sets | The eager arms: the slowest measured pair, kept as the reference. The compiled `dense-graphed` encoder: lower host time per call, but its serving result was mixed (median response time rose). The `compact-eager` decoder: beaten by `dense-graphed` |
 | Whole-file rows under transaction graphs | Run as rows of the stream roles REPLAY, CHUNK and FLUSH, in the same cells, with the file-specific selects captured in every cell and chosen by a per-row file mask; the `transaction-graph` design proves each against the option-off transaction of the same row plan | Leave file rows uncovered: every step a file shares with streams would run option-off, so streams lose the saving whenever a file is in flight. Separate file cells: more cells and graph memory for device work that is already the streams' |
-| Graph memory when core does not estimate it | Allowed: the budget must leave room, the model logs the uncharged graph memory, and an allocation failure in the serving capture fails startup with the figures | Refuse the option under a fixed budget: a default-on option would then break every deployment that fixes its budget |
+| Graph memory that core neither estimates nor measures | Allowed: with the extensible KV cache off and either a fixed budget or the estimate disabled, the budget must leave room, the model logs the uncharged graph memory, and an allocation failure in the serving capture fails startup with the figures; under the extensible KV cache, which measures after the captures, the model logs the graph memory as measured | Refuse the option under a fixed budget: a default-on option would then break every deployment that fixes its budget |
 
 ### Same model, two implementations
 
@@ -527,7 +552,9 @@ runs on neither build until then, so no leg that drives it through a real engine
    on stage 1):
    - the graphs are captured through #67583's capture hook with `cudagraph_mode` NONE, without
      `--enforce-eager` and without a model-owned graph pool, under the restricted startup
-     (Approach, section 4), which the option-off runs share;
+     (Approach, section 4) and core's default KV-cache sizing, which the option-off runs share;
+     the checks that need core's graph-memory estimate run under a fixed
+     `--num-gpu-blocks-override` with the estimate enabled;
    - "option-off" below means the same engine configuration with only the option changed: both
      runs use the hook configuration with the default segment graphs (Approach, section 5);
    - the model captures a chunk cell and an echo cell at every count up to the largest declared
@@ -555,12 +582,19 @@ runs on neither build until then, so no leg that drives it through a real engine
      improves by its own pre-registered rule, given in the `transaction-graph` design;
    - the `transaction-graph` design's calibration measures U(1), the step time one admitted
      stream adds at the served geometry, from which admission computes how many streams fit a
-     step, with the option on and with it off, and records the option as part of the
-     configuration it calibrated;
+     step, with the option on and with it off, and records the option and the KV-cache sizing as
+     part of the configuration it calibrated, at core's default sizing and at the step rule's
+     fixed block count, applying no calibration across sizings;
    - each cell's graph memory is measured and reported; an installed-engine check shows that
      core's estimate charged the profiling capture before the state pages were planned and that
-     the serving capture retained no more; under a fixed budget the startup log reports the
-     uncharged graph memory; each refusal in Constraints refuses its configuration (the option
+     the serving capture retained no more; an installed-engine check under the extensible KV
+     cache shows the serving capture over block 0 while core has backed only its minimum blocks,
+     the plugin's binding check accepting core's extension, with no recapture and the option still
+     on, later steps replaying the cells, and transcripts equal to the option-off run's, and a
+     check under a profiled budget with the extensible KV cache off shows the profiling capture
+     over its one-block profiling KV cache; under a fixed budget the startup log reports the
+     uncharged graph memory, and under the extensible KV cache the measured graph memory; each
+     refusal in Constraints refuses its configuration (the option
      under `--enforce-eager`, at a geometry other than 80 or 160 ms, with native burst, outside the
      restricted startup, with a population above core's admission limit, with a
      `--num-gpu-blocks-override` below that limit plus one, on a core without
@@ -603,13 +637,11 @@ that retained more graph memory than that profiling capture.
 - **Runner-captured graphs.** Core capturing graphs over the model's forward, piecewise through
   breakable CUDA graphs or full. Trigger and shape: the `registration` design, Future roadmap
   items 5 to 7.
-- **Transaction graphs beyond the restricted startup.** The option needs synchronous scheduling,
-  an explicit NONE runner and compilation mode, and an explicit block count or KV budget on the
-  target core (Approach, section 4). Trigger: core sizes its profiling KV cache for a model state
-  that captures over state pages and keeps state pages backed and the layout current when its
-  extensible KV cache grows; the qualification covers the reduced modes and asynchronous
-  scheduling. Shape: the `registration` design, Future roadmap item 8, and the `transaction-graph`
-  design's Future roadmap.
+- **Transaction graphs beyond the restricted startup.** The option needs synchronous scheduling
+  and an explicit NONE runner and compilation mode on the target core (Approach, section 4).
+  Trigger: the qualification covers the reduced modes and asynchronous scheduling. Shape: the
+  `registration` design, Future roadmap item 8, and the `transaction-graph` design's Future
+  roadmap.
 - **Multi-unit rows.** A row that schedules several tokens, which only a direct engine client can
   send, fails its request alone (the `registration` design, REG-STATE-014). Trigger: a client or
   frontend needs to submit several units in one input. Shape and costs: the `registration`
