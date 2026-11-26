@@ -2,7 +2,7 @@
 """Factory construction, opening and ownership (SESS-FAC, SESS-OPEN, SESS-OWN).
 
 SESS-FAC-001 to SESS-FAC-003 are current obligations on the target core
-(``pdtgct/vllm`` at ``ddf6db2ab8``), where ``create_session_factory`` refuses
+(``pdtgct/vllm`` at ``de0b0bccdb``), where ``create_session_factory`` refuses
 the engine client. Every other test here covers the session factory on the
 stream-admission client path, which the session specs' scope separates from the
 target core's obligations (its port to core's admission is the session design's

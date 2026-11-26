@@ -3,7 +3,7 @@
 
 * unmarked: CPU tests needing only this package and its pure-Python modules.
 * ``engine``: CPU tests that import the stage 1 vLLM build, the target core
-  (``pdtgct/vllm`` at ``ddf6db2ab8``: RFC 1's state layer with vllm#67583's
+  (``pdtgct/vllm`` at ``de0b0bccdb``: RFC 1's state layer with vllm#67583's
   model-state hooks, on ``PYTHONPATH``). Skipped when no state-layer build
   imports.
 * ``gpu``: installed-engine tests on a CUDA device (``vllm serve`` with the

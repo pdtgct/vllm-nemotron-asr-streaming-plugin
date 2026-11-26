@@ -1209,7 +1209,7 @@ adding it here and to the import-time check.
 - Supported tasks, model-state hooks and `take_failed_requests`:
   `vllm/v1/worker/gpu/model_states/interface.py` (hooks from vllm#67583); graph-pool routing:
   `vllm/compilation/cudagraph_pool.py`.
-- The target core's state layer (`pdtgct/vllm` at `ddf6db2ab8`): the state-group layout accessor
+- The target core's state layer (`pdtgct/vllm` at `de0b0bccdb`): the state-group layout accessor
   `ModelState.state_group_layouts` in `vllm/v1/worker/gpu/model_states/interface.py`, with
   `StateGroupLayout` and `StateComponentLayout` in `vllm/v1/worker/utils.py`; the profiling KV
   cache's size in `vllm/v1/worker/gpu/cudagraph_utils.py` and the block-count override in

@@ -33,9 +33,9 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 
 ## Builds
 
-- Stage 1 (target core): `pdtgct/vllm` `pstate-impl-20261122` @ `ddf6db2ab8`, the persistent-state
+- Stage 1 (target core): `pdtgct/vllm` `pstate-impl-20261122` @ `de0b0bccdb`, the persistent-state
   layer with the #67583 model-state hooks. No tier has been met on it yet (Owed); the light round
-  below ran on its child `de0b0bccdb`, which changes no behaviour.
+  below ran on it.
 - State-pool build (historical; the baseline for retiring the state pool, with plugin `v0.1.0b2`):
   `pdtgct/vllm` `hook-build-20261114b` @ `9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee`
   (with #67583), precompiled wheel `191e5d5df2` (cu132), one NVIDIA A40 at FP32, card revision
@@ -96,10 +96,9 @@ retained 1.6 GiB.
 
 No tier is met by this round. It records measurements on stage 1 that the owed tiers build on.
 
-- Build: `pdtgct/vllm` `pstate-impl-20261122` @ `de0b0bccdb`, a child of `ddf6db2ab8` that adds
-  docstrings and stub tests only, with precompiled wheel `842f74fa8d` (cu132), torch 2.14.0+cu132;
-  plugin `feat/core-graphs-20261123` @ `2a55139`; card revision `ea30d66d`; one NVIDIA A40 at FP32;
-  2026-11-26. Evidence: `pdtgct/nemotron-omni-port`
+- Build: `pdtgct/vllm` `pstate-impl-20261122` @ `de0b0bccdb`, with precompiled wheel `842f74fa8d`
+  (cu132), torch 2.14.0+cu132; plugin `feat/core-graphs-20261123` @ `2a55139`; card revision
+  `ea30d66d`; one NVIDIA A40 at FP32; 2026-11-26. Evidence: `pdtgct/nemotron-omni-port`
   `experiments/2026-11-25-plugin-core-graphs-a40/`.
 - Served transcripts, 200 paced LibriSpeech test-clean utterances at 32 sessions on `/v1/realtime`,
   compared by utterance id, are equal in every comparison:

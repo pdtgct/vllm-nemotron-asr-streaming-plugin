@@ -167,6 +167,7 @@ def _multiprocess_reader_run() -> dict:
     from pathlib import Path
 
     from support import model_harness as h
+    from support import txgcap_qual as q
 
     card = h.write_runnable_card(Path(tempfile.mkdtemp(prefix="txg-obs-")) / "card")
     settings = dict(
@@ -182,10 +183,10 @@ def _multiprocess_reader_run() -> dict:
             "decode_dispatch_arm": "dense-graphed",
             api.KEY: [N],
         },
-        compilation_config={"mode": 0, "cudagraph_mode": "NONE"},
-        enable_prefix_caching=False,
-        async_scheduling=False,
         gpu_memory_utilization=0.3,
+        # the restricted startup (TXG-CFG-017 to TXG-CFG-019): synchronous
+        # scheduling, runner modes NONE and a fixed block count
+        **q.restricted_startup(N),
     )
     # A callable sent through collective_rpc is pickled, which core allows
     # only with insecure serialization on.

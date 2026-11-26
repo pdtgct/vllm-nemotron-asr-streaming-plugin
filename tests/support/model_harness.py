@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """The real model and model state on CPU, driven as core's model runner drives
-them on the target core, ``pdtgct/vllm`` at ``ddf6db2ab8``
+them on the target core, ``pdtgct/vllm`` at ``de0b0bccdb``
 (``vllm/v1/worker/gpu/model_runner.py``:
 ``execute_model``, ``_dummy_run``, ``profile_run``, ``_dummy_sampler_run``;
 ``vllm/model_executor/warmup/kernel_warmup.py`` for later profiling steps).

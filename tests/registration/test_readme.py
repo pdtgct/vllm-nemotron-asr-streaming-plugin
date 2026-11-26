@@ -51,20 +51,20 @@ def section(text: str, title: str) -> str:
 
 # @spec REG-DOC-001
 def test_readme_defines_stage_1(readme):
-    """Stage 1 is ``pdtgct/vllm`` at ``ddf6db2ab8`` alone: RFC 1's state
+    """Stage 1 is ``pdtgct/vllm`` at ``de0b0bccdb`` alone: RFC 1's state
     layer with vllm#67583's model-state hooks and the state-group layout
     accessor."""
     assert find(
         readme,
         "stage 1",
         "pdtgct/vllm",
-        "ddf6db2ab8",
+        "de0b0bccdb",
         "alone",
         "state layer",
         "67583",
         "ModelState.state_group_layouts",
     ), (
-        "no passage defines stage 1 as pdtgct/vllm at ddf6db2ab8 alone, with "
+        "no passage defines stage 1 as pdtgct/vllm at de0b0bccdb alone, with "
         "RFC 1's state layer, vllm#67583's hooks and the state-group layout accessor"
     )
 
@@ -278,7 +278,7 @@ def test_manual_limits_state_how_stage_1_realtime_refuses_a_stream(manual):
 def test_manual_builds_section_gives_each_build_with_its_commit(manual):
     builds = section(manual, "Builds and compatibility")
     stage_1 = [p for p in passages(builds) if re.search(r"stage 1", p, re.I)]
-    assert any("ddf6db2ab8" in p and "state_group_layouts" in p for p in stage_1), (
+    assert any("de0b0bccdb" in p and "state_group_layouts" in p for p in stage_1), (
         "the stage 1 build is not given with its commit"
     )
     rows = [line for line in builds.splitlines() if line.startswith("| Stage 2")]

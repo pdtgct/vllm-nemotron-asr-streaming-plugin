@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """The state layer and the model state's request bookkeeping on CPU, without
-weights, as the target core (``pdtgct/vllm`` at ``ddf6db2ab8``) drives them.
+weights, as the target core (``pdtgct/vllm`` at ``de0b0bccdb``) drives them.
 
 The model state is the real class, built as core builds it, over a model
 without weights whose few attributes the hooks read are set directly; its

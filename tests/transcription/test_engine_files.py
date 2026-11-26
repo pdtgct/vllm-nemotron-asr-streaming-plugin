@@ -210,55 +210,73 @@ async def transcribe_file(
     )
 
 
-class RecordingEngine:
-    """Engine client that records every token ID the engine emits.
-
-    The session factory checks ``generate``'s signature (SESS-FAC-003), so the
-    wrapper carries the real signature.
-    """
-
-    def __init__(self, engine) -> None:
-        import functools
-        import inspect
-
-        self._engine = engine
-        self.token_ids: list[int] = []
-
-        @functools.wraps(engine.generate)
-        async def generate(*args, **kwargs):
-            async for out in engine.generate(*args, **kwargs):
-                for completion in out.outputs:
-                    self.token_ids.extend(completion.token_ids)  # delta output
-                yield out
-
-        generate.__signature__ = inspect.signature(engine.generate)  # type: ignore[attr-defined]
-        self.generate = generate
-
-    def __getattr__(self, name):
-        return getattr(self._engine, name)
+@dataclass
+class StreamResult:
+    text: str
+    token_ids: list[int]
 
 
 async def transcribe_stream(
     engine,
     samples: np.ndarray,
     piece: int = 4000,
-    recorder: RecordingEngine | None = None,
-) -> str:
-    """Feed the same samples through a session at the server's geometry
-    (SESS-GEOM-001: ``open`` takes only a locale)."""
-    from vllm_nemotron_asr_streaming.session import create_session_factory
+    opened: asyncio.Event | None = None,
+) -> StreamResult:
+    """Feed the same samples as one stream on core's ``/v1/realtime`` path.
 
-    client = recorder if recorder is not None else engine
-    factory = create_session_factory(client, engine.model_config)
-    lease = await factory.open(locale=factory.default_locale)
-    try:
+    The steps are those of core's realtime serving: the model's
+    ``buffer_realtime_audio`` packs the audio, fed in pieces of ``piece``
+    samples, into units at the server's geometry and default locale
+    (SESS-GEOM-001) and closes with the final tail; core's renderer renders
+    each prompt; ``AsyncLLM.generate`` receives them as ``StreamingInput``
+    under the realtime route's sampling parameters, and each output's token
+    IDs go back on the hook's input queue. These are the units a session
+    sends for the same samples, with no ``update_locale``. The stream must end
+    with ``stop`` after its final tail, the normal close that a successful
+    flush requires. ``opened`` is set once core has admitted the stream:
+    core reads the input generator only after admission.
+    """
+    from vllm.engine.protocol import StreamingInput
+    from vllm.renderers.inputs.preprocess import parse_model_prompt
+    from vllm.sampling_params import RequestOutputKind, SamplingParams
+
+    from vllm_nemotron_asr_streaming.model import Nemotron3_5AsrStreamingForRNNT
+
+    model_config = engine.model_config
+    input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
+
+    async def audio():
         for start in range(0, len(samples), piece):
-            await lease.feed(samples[start : start + piece], on_accepted=lambda n: None)
-        text = await lease.flush()
-        await lease.finish()
-    finally:
-        await lease.release()
-    return text
+            yield samples[start : start + piece]
+
+    async def inputs():
+        if opened is not None:
+            opened.set()
+        hook = Nemotron3_5AsrStreamingForRNNT.buffer_realtime_audio
+        async for prompt in hook(audio(), input_stream, model_config):
+            parsed = parse_model_prompt(model_config, prompt)
+            (engine_input,) = await engine.renderer.render_cmpl_async([parsed])
+            yield StreamingInput(prompt=engine_input)
+
+    params = SamplingParams.from_optional(
+        temperature=0.0,
+        max_tokens=Nemotron3_5AsrStreamingForRNNT.realtime_max_tokens,
+        output_kind=RequestOutputKind.DELTA,
+        skip_clone=True,
+    )
+    text, token_ids, finish_reason = "", [], None
+    async for out in engine.generate(
+        prompt=inputs(), sampling_params=params, request_id=f"rt-{uuid.uuid4()}"
+    ):
+        if out.outputs:
+            completion = out.outputs[0]
+            text += completion.text
+            token_ids.extend(completion.token_ids)  # delta output
+            input_stream.put_nowait(list(completion.token_ids))
+        if out.finished:
+            finish_reason = out.outputs[0].finish_reason if out.outputs else None
+    assert finish_reason == "stop", finish_reason
+    return StreamResult(text, token_ids)
 
 
 def expected_chunks(n: int) -> tuple[int, int]:
@@ -316,7 +334,7 @@ def test_file_of_whole_chunks_equals_stream(run, engine):
     assert len(audio) == CHUNK * 8  # T = 0
     result = run(transcribe_file(engine, audio))
     assert result.finish_reason == "stop"
-    assert result.text == run(transcribe_stream(engine, audio))
+    assert result.text == run(transcribe_stream(engine, audio)).text
 
 
 # @spec FILE-ROW-004
@@ -325,7 +343,7 @@ def test_final_tail_equals_stream_final_tail(run, engine, tail):
     audio = load_audio(10.0)[: CHUNK * 6 + tail]
     result = run(transcribe_file(engine, audio))
     assert result.finish_reason == "stop"
-    assert result.text == run(transcribe_stream(engine, audio))
+    assert result.text == run(transcribe_stream(engine, audio)).text
 
 
 # @spec FILE-ROW-006
@@ -354,10 +372,9 @@ def test_file_label_sequence_equals_session(run, engine, n_samples):
     assert len(audio) == n_samples
     result = run(transcribe_file(engine, audio))
     assert result.finish_reason == "stop"
-    recorder = RecordingEngine(engine)
-    run(transcribe_stream(engine, audio, recorder=recorder))
+    stream = run(transcribe_stream(engine, audio))
     file_labels = [t for t in result.token_ids if t < blank]
-    stream_labels = [t for t in recorder.token_ids if t < blank]
+    stream_labels = [t for t in stream.token_ids if t < blank]
     assert file_labels  # speech: a nonempty label sequence on both paths
     assert file_labels == stream_labels
 
@@ -576,16 +593,26 @@ def test_file_and_stream_share_steps_without_changing_transcripts(run, engine):
     alone_stream = run(transcribe_stream(engine, stream_audio))
 
     async def together():
+        # Core refuses a stream's admission while running requests take the
+        # active limit (MAX_NUM_SEQS), whereas a file waits for a slot, so the
+        # stream is admitted first and the files then share its steps.
+        opened = asyncio.Event()
+        stream = asyncio.ensure_future(
+            transcribe_stream(engine, stream_audio, opened=opened)
+        )
+        admitted = asyncio.ensure_future(opened.wait())
+        await asyncio.wait({stream, admitted}, return_when=asyncio.FIRST_COMPLETED)
+        admitted.cancel()
         return await asyncio.gather(
             transcribe_file(engine, file_audio),
-            transcribe_stream(engine, stream_audio),
+            stream,
             transcribe_file(engine, file_audio),
         )
 
-    first, stream_text, second = run(together())
+    first, stream_result, second = run(together())
     assert first.finish_reason == second.finish_reason == "stop"
     assert first.text == second.text == alone_file.text
-    assert stream_text == alone_stream
+    assert stream_result.text == alone_stream.text
 
 
 # @spec FILE-ENG-005

@@ -1136,9 +1136,9 @@ def decide_composition(result: dict[str, Any], warmup: int) -> dict[str, Any]:
 
 
 def _u_api_reading(worker: Any) -> dict[str, Any]:
-    """The worker's replay and fallback counters as plain values, read on
-    the worker through ``AsyncLLM.collective_rpc`` (TXG-OBS-008). The worker
-    process imports this module, so its ``PYTHONPATH`` names ``tests``."""
+    """The worker's replay and fallback counters as plain values (TXG-OBS-008),
+    read on the worker through ``AsyncLLM.collective_rpc`` as the named worker
+    method of :class:`UApiReader`."""
     from support import txg_api
 
     reading = txg_api.counters(worker)
@@ -1149,6 +1149,24 @@ def _u_api_reading(worker: Any) -> dict[str, Any]:
         "replays": [[list(k), int(v)] for k, v in dict(counters["replays"]).items()],
         "fallbacks": int(sum(dict(counters["fallbacks"]).values())),
     }
+
+
+class UApiReader:
+    """The worker extension of a ``U_api`` leg (core's
+    ``--worker-extension-cls``, :data:`U_API_READER`): it gives the worker the
+    method ``u_api_reading``, so the leg reads the counters by name through
+    ``AsyncLLM.collective_rpc``. Core's message serializer sends a method name
+    but refuses a function unless insecure serialization is on, which the leg
+    does not set. The worker process imports this module, so its
+    ``PYTHONPATH`` names ``tests``."""
+
+    def u_api_reading(self) -> dict[str, Any]:
+        return _u_api_reading(self)
+
+
+#: The qualified name core resolves in the worker process (spelled out: the
+#: driver runs as ``__main__``).
+U_API_READER = "support.txg_qual_driver.UApiReader"
 
 
 def u_api_deltas(before: dict[str, Any], after: dict[str, Any]) -> dict[str, int]:
@@ -1195,7 +1213,7 @@ async def u_api_repeat(llm: Any, requests: Requests, samples: np.ndarray) -> dic
     unit = units[0]
 
     async def read() -> dict[str, Any]:
-        return (await llm.collective_rpc(_u_api_reading))[0]
+        return (await llm.collective_rpc("u_api_reading"))[0]
 
     before = await read()
     parked = asyncio.Event()
@@ -1250,7 +1268,9 @@ async def run_u_api_leg(spec: dict[str, Any]) -> dict[str, Any]:
 
     os.environ.update(engine_env(spec))
     register()
-    llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**engine_settings(spec)))
+    llm = AsyncLLM.from_engine_args(
+        AsyncEngineArgs(**engine_settings(spec), worker_extension_cls=U_API_READER)
+    )
     try:
         requests = Requests(
             SimpleNamespace(config=llm.model_config.hf_config),

@@ -7,7 +7,7 @@ admitted stream; a lease is the handle `open` returns for it.
 
 **Scope on the target core.** These specs hold two kinds of obligation:
 - **Current model-side and shared obligations**, conformance on the target core (`pdtgct/vllm` at
-  `ddf6db2ab8`): SESS-FAC-001 to SESS-FAC-003 (the entry point, and `create_session_factory`,
+  `de0b0bccdb`): SESS-FAC-001 to SESS-FAC-003 (the entry point, and `create_session_factory`,
   which refuses on the target core because its engine client has no stream-admission calls),
   Server geometry, Packer, Geometry check in the model, Core `/v1/realtime` and SESS-EP-001.
 - **The session factory on the stream-admission client path**, which the target core does not
