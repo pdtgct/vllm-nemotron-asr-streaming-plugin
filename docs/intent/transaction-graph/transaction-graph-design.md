@@ -519,9 +519,11 @@ resident pages equal the option-off transaction of the same row plan bit for bit
 chunk among continuing rows; a file's first step; a regular chunk; a silent chunk (no label:
 continuation emitted); a final tail with samples; an empty final tail (zero samples, `final_tail`
 set); a zero-sample file (first step is the empty tail, then end); a drain step; the end step as
-REPLAY and as FLUSH; an armed echo on a file CHUNK row; split steps whose CHUNK and echo rows each
-mix file and stream rows; and a fresh row that is not CHUNK, whether the protocol checks reject it
-or accept it as a park echo.
+REPLAY and as FLUSH; an armed echo on a file CHUNK row; and split steps whose CHUNK and echo rows
+each mix file and stream rows. A served step holds no fresh row that is not CHUNK for the protocol
+checks to judge: such a request fails at planning (`registration`, REG-STATE-015), so its row
+reaches the transaction only as a planned rejection (TXG-COV-010). The enumerated plans still cover
+every kind, fresh bit and file bit (Split equivalence, Tests).
 
 ### File samples
 
@@ -1150,8 +1152,7 @@ use a fixed `--num-gpu-blocks-override` with the estimate enabled.
 - **Minimum case coverage.** The record counts steps by case. `Q` at concurrency `N` needs at
   least 200 split steps and 50 steps with a fresh CHUNK row among continuing CHUNK rows; `M`
   needs at least 100 split steps containing a file row and at least one step of each case of
-  Exactness obligations for masked rows except the fresh non-CHUNK row, which the enumerated tests
-  cover. A run lacking a required case is void: it is reported, and the next seed of the
+  Exactness obligations for masked rows. A run lacking a required case is void: it is reported, and the next seed of the
   preregistered seed list runs; an exhausted seed list leaves qualification incomplete. Voiding
   covers missing coverage only: a mismatch or fallback in a void run is still a failure.
 - **Transaction-level pacing.** The driver omits engine overhead (scheduling, input preparation,

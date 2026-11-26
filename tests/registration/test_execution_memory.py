@@ -905,12 +905,15 @@ def assert_commits_clean(env, *, steps: int):
         assert all(status == 0 for status in statuses.values()), log
 
 
-def drain_to_park(env, ids, handles, *, watch: str = "s1", limit: int = 300):
-    """Cached steps, each fed the token the model emitted on the previous one,
-    until the ``watch`` row's decision is the park token (a legal park); returns
-    the next ``num_computed_tokens``."""
+def drain_to_park(
+    env, ids, handles, *, watch: str = "s1", limit: int = 300, start: int = 1
+):
+    """Cached steps from ``num_computed_tokens`` ``start`` (a first turn's
+    second position by default), each fed the token the model emitted on the
+    previous one, until the ``watch`` row's decision is the park token (a legal
+    park); returns the next ``num_computed_tokens``."""
     eos = int(env.config.eos_token_id)
-    position = 1
+    position = start
     while env.runner._sampled[watch] != eos:
         assert position < limit, "the turn never reached the park token"
         out = cached_step(env, ids, {r: position for r in ids}, handles=handles)
@@ -1444,6 +1447,36 @@ def test_a_request_caused_envelope_fault_fails_that_request_alone(build, fault):
     assert env.runner.failed_log == [{"bad"}]
     statuses, _ = env.runner.commit_log[-1]
     assert statuses.get("s1") == 0
+
+
+@pytest.mark.parametrize("fault", list(_REQUEST_FAULTS))
+# @spec REG-STATE-015
+def test_envelope_resolution_classifies_each_request_caused_fault(build, fault):
+    """Each of ``_REQUEST_FAULTS`` is also a request not shaped as the
+    processor builds it, so on the served path the shape rule fails its row
+    before envelope resolution judges it, and the test above checks only
+    that the row fails alone. Resolution still judges every row
+    (``resolve_row_envelope_header``): called directly on the row core
+    schedules, with the encoder inputs core schedules for it, each fault is
+    the request's (``RequestRowFault``), never core's contract fault."""
+    from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
+        RequestRowFault,
+        resolve_row_envelope_header,
+    )
+
+    make, encoder_inputs = _REQUEST_FAULTS[fault]
+    env = build()
+    bad = make(env)
+    assert _shape_fault(env, bad) is not None
+    with pytest.raises(RequestRowFault):
+        resolve_row_envelope_header(
+            scheduled_token_id=int(bad.prefill_token_ids[0]),
+            placeholder_id=int(env.config.audio_chunk_token_id),
+            num_computed_tokens=0,
+            mm_features=bad.mm_features,
+            scheduled_encoder_input_ids=encoder_inputs.get("bad", ()),
+            carrier_width=int(env.config.hidden_size),
+        )
 
 
 def _raised_in(error: BaseException) -> str:
@@ -2301,9 +2334,10 @@ _UNSHAPED_REQUESTS = {
 
 
 def _mixed_step(env, delivered, order: str):
-    """One real step of the delivered ``bad`` request beside the healthy
-    ``s1`` stream and ``f1`` file (``delivered`` maps each name to its
-    request and scheduled encoder inputs), ``bad`` first, last or alone; each
+    """One real step of the delivered ``bad`` request (slot 3) beside the
+    healthy ``s1`` stream (slot 1) and ``f1`` file (slot 2) (``delivered``
+    maps each name to its request and scheduled encoder inputs; slots and
+    inputs follow each request's own ID), ``bad`` first, last or alone; each
     feature has its own identifier. Returns the error the step raised."""
     names = {
         "bad first": ("bad", "s1", "f1"),
@@ -2313,11 +2347,14 @@ def _mixed_step(env, delivered, order: str):
     rows = tuple(delivered[name][0] for name in names)
     identifiers = [f.identifier for r in rows for f in r.mm_features]
     assert len(set(identifiers)) == len(identifiers)
+    slots = {"bad": 3, "s1": 1, "f1": 2}
     output = h.scheduler_output(
         new=rows,
-        handles={"bad": 3, "s1": 1, "f1": 2},
+        handles={delivered[name][0].req_id: slots[name] for name in names},
         encoder_inputs={
-            name: delivered[name][1] for name in names if delivered[name][1]
+            delivered[name][0].req_id: delivered[name][1]
+            for name in names
+            if delivered[name][1]
         },
     )
     return h.call_with(env.runner.real_step, output)
@@ -2589,6 +2626,91 @@ def test_requests_the_processor_and_core_build_pass_the_shape_rule_and_commit(
         assert list(request.prefill_token_ids)[1:] == [chunk]
         assert [f.mm_position.offset for f in request.mm_features] == [1]
     run(folded, "folded turns")
+
+
+#: A request ID core accepts that a truth test would mistake for no ID.
+EMPTY_ID = ""
+
+
+@pytest.mark.parametrize("order", ["bad first", "bad last", "alone"])
+@pytest.mark.parametrize("kind", ["stream", "file"])
+# @spec REG-STATE-022
+def test_a_request_id_is_any_string_core_accepts(build, kind, order):
+    """Core's ``add_request`` checks only that a request ID is a string, and
+    its msgpack decoder, encoder-input scheduling and ``NewRequestData`` keep
+    the ID a direct engine client sends, the empty string included. A stream
+    unit or a complete file with the empty ID, otherwise as the processor
+    builds it, sits first or last beside a healthy stream and a healthy file,
+    or alone in its step. The step does not raise, no request fails, every
+    row commits, and the empty-ID stream's encoder output is its own
+    envelope's encoding. On the head before this rule the transaction's
+    preflight raised for the whole step ("plan.request_ids must be nonempty
+    strings")."""
+    env = build(max_num_seqs=3)
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    made = stream(env, EMPTY_ID) if kind == "stream" else file(env, EMPTY_ID)
+    delivered = {
+        "bad": _through_core(made),
+        "s1": _through_core(stream(env, "s1")),
+        "f1": _through_core(file(env, "f1")),
+    }
+    assert delivered["bad"][0].req_id == EMPTY_ID
+    error = _mixed_step(env, delivered, order)
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [None]
+    statuses, failed = env.runner.commit_log[-1]
+    assert not failed and statuses.get(EMPTY_ID) == 0, statuses
+    if order != "alone":
+        _assert_healthy_rows_committed(env, delivered["s1"][0])
+    if kind == "stream":
+        (feature,) = delivered["bad"][0].mm_features
+        (own,) = env.model.embed_multimodal(audio=[feature.data["audio"].data])
+        cached = env.state.encoder_cache.encoder_outputs[feature.identifier]
+        assert torch.equal(cached, own)
+
+
+# @spec REG-STATE-022, REG-STATE-011, REG-STATE-016
+def test_an_empty_request_id_lives_through_turns_retirement_and_reuse(build):
+    """The empty ID through a request's whole life: a stream's first unit,
+    its park, its next unit folded into it by core's own scheduler (the
+    pending removal and the continuing ``add_request``), its park and its
+    finish; then a complete file under the same ID on the same slot, which
+    core may reuse once the stream has finished, to its end. Every step
+    commits with no row failed, and the stream keeps its admission
+    generation across the turn while the file gets a new one."""
+    env = build(max_num_seqs=3)
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    handles = {EMPTY_ID: 1}
+    first = stream(env, EMPTY_ID)
+    env.runner.real_step(h.scheduler_output(new=(first,), handles=handles))
+    generation = env.state._requests[EMPTY_ID].handle.generation
+    drain_to_park(env, [EMPTY_ID], handles, watch=EMPTY_ID)
+    turn, inputs = _core_folded_turn(
+        env, first, stream(env, EMPTY_ID, sequence=1, final=True)
+    )
+    assert turn.req_id == EMPTY_ID and int(turn.num_computed_tokens) == 1
+    output = h.scheduler_output(
+        new=(turn,), handles=handles, encoder_inputs={EMPTY_ID: inputs}
+    )
+    error = h.call_with(env.runner.real_step, output)
+    assert error is None, repr(error)
+    assert env.state._requests[EMPTY_ID].handle.generation == generation
+    # the folded turn's row is at position 1; its drains follow it
+    drain_to_park(env, [EMPTY_ID], handles, watch=EMPTY_ID, start=2)
+    env.runner.real_step(h.scheduler_output(finished=(EMPTY_ID,)))
+    # held pending removal until the model state's next call (REG-STATE-011)
+    assert env.state._pending_removal == EMPTY_ID
+    later = file(env, EMPTY_ID)
+    error = h.call_with(
+        env.runner.real_step, h.scheduler_output(new=(later,), handles=handles)
+    )
+    assert error is None, repr(error)
+    assert env.state._requests[EMPTY_ID].handle.generation > generation
+    drain_to_park(env, [EMPTY_ID], handles, watch=EMPTY_ID)
+    assert all(failed is None for failed in env.runner.failed_log)
+    assert_commits_clean(env, steps=len(env.runner.commit_log))
 
 
 def _masked(feature):

@@ -241,8 +241,7 @@ def u_api_gain(brackets: Sequence[Bracket]) -> bool:
 MIN_Q_SPLIT = 200
 MIN_Q_FRESH_AMONG_CONTINUING = 50
 MIN_M_SPLIT_WITH_FILE = 100
-#: TXG-EQ-004 cases a run of ``M`` must contain (the fresh non-CHUNK row is
-#: exempt).
+#: The cases of TXG-EQ-004, each of which a run of ``M`` must contain.
 EQ004_CASES = (
     "stream-first-chunk-among-continuing",
     "file-first-step",

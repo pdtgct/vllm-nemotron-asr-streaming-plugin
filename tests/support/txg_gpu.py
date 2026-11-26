@@ -635,20 +635,16 @@ class Driver:
         self.until_parked(ids)
         self.step(only=ids)
 
-    def special(self, req_id: str, token: int, *, fresh: bool = False) -> Any:
+    def special(self, req_id: str, token: int) -> Any:
         """A new request with no audio, whose scheduled token is ``token``,
         for the parked stream ``req_id``: a non-CHUNK row, as a direct engine
         stream client sends one (the planner refuses a non-CHUNK row of a
-        request it never saw a CHUNK of). With ``fresh`` the request's slot is
-        reissued at its next generation, so the row is a fresh non-CHUNK row.
-        The stream ends with this row (finished on the next step)."""
+        request it never saw a CHUNK of). The runner folds it into the parked
+        stream as core does, so the row continues the stream. The stream ends
+        with this row (finished on the next step)."""
         stream = self.streams[req_id]
         assert not stream.done and self.parked(req_id), f"{req_id} is not parked"
         stream.done = True
-        if fresh:
-            slot, generation = self.handles[req_id]
-            self._generation[slot] = generation + 1
-            self.handles[req_id] = (slot, generation + 1)
         return h.new_request(req_id, token)
 
     def run(self, steps: int, **kwargs) -> None:
@@ -685,7 +681,6 @@ def step_cases(record: StepRecord, env: GpuEnv, driver: Driver) -> set[str]:
     final = [bool(header[i, tx.H_FINAL]) for i in range(len(chunk))]
     samples = [int(header[i, tx.H_SAMPLES]) for i in range(len(chunk))]
     out = decisions(record.rows)
-    status = record.status.tolist()
     park, cont = int(config.eos_token_id), int(config.continuation_token_id)
     carrier = int(config.file_carrier_token_id)
     controls = {
@@ -739,10 +734,6 @@ def step_cases(record: StepRecord, env: GpuEnv, driver: Driver) -> set[str]:
         and any_(lambda i: not chunk[i] and not file[i])
     ):
         cases.add("split step mixing file and stream rows in both kinds")
-    if any_(lambda i: not chunk[i] and fresh[i] and status[i] != 0):
-        cases.add("fresh non-CHUNK row rejected")
-    if any_(lambda i: not chunk[i] and fresh[i] and status[i] == 0):
-        cases.add("fresh non-CHUNK row accepted as a park echo")
     # 160 ms cases (TXG-EQ-005)
     if any_(lambda i: chunk[i] and fresh[i] and final[i] and not file[i]):
         cases.add("one-chunk session")

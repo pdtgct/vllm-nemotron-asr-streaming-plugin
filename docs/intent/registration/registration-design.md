@@ -803,6 +803,14 @@ also raises for the configuration and lifecycle refusals of Engine settings and 
 planning fault that no list here names takes its class by the same test: it fails the request when
 the request's own prompt or multimodal items can cause it, and raises otherwise (REG-STATE-015).
 
+**Request identity.** A request's ID is also the client's: core's `add_request` checks only that it
+is a string, and its msgpack decoder and `NewRequestData` keep it as sent, the empty string
+included. The model state, the model and the transaction therefore accept any string as an ID and
+tell requests apart only by ID equality; no ID serves as a sentinel, a default or a truth value
+(REG-STATE-022). Core's scheduler holds one request per ID (`Scheduler.requests`; its `add_request`
+treats a known ID as that request's next input), so a step's IDs are distinct, and a repeated ID
+within one step is a fault of core's contract, which raises.
+
 `add_request` checks each request core delivers against the shape the processor builds
 (`request_shape_fault` in `nemotron_asr/plan.py`), and a stream CHUNK row's envelope header is
 resolved from the request's multimodal feature that overlaps the row's scheduled token

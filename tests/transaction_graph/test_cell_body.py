@@ -3,7 +3,7 @@
 transaction, the step static inputs, and no host read where a capture would
 run (TXG-EQ-001, TXG-EQ-004, TXG-EQ-005, TXG-CELL-001, TXG-EXEC-005,
 TXG-EXEC-007, TXG-EXEC-008, TXG-EXEC-009, TXG-TXN-002, TXG-CAP-001,
-TXG-CAP-004).
+TXG-CAP-004, TXG-FAIL-001).
 
 The fake-capture seam captures cells whose replay runs nothing, and every
 capture row is rejected, so neither says what a cell computes for an accepted
@@ -18,8 +18,9 @@ row. These tests run the function a cell captures
   resident page, the endpoint pages included, equal the option-off
   transaction of the same row plan on a copy of the pools, bit for bit. The
   plans are TXG-EQ-002's accepted plans of 1 to 4 rows (every assignment of
-  kind, fresh bit and file bit), its one-rejected-row plans, and TXG-EQ-004's
-  and TXG-EQ-005's cases. This covers the arena packing, the ``int64``
+  kind, fresh bit and file bit), its one-rejected-row plans, TXG-EQ-004's
+  and TXG-EQ-005's cases, and a fresh non-CHUNK row accepted as a park echo
+  and rejected. This covers the arena packing, the ``int64``
   vectors, the gathers by step position, the body with the endpoint
   arguments, the predicated scatters and the ``index_copy_`` of the outputs.
   What stays for CUDA is the graph itself.
@@ -252,14 +253,6 @@ def masked_row_cases(env, lookahead):
             file_drain,
         ],
         "interleaved split step": [drain, cont, file_drain, first],
-        "fresh non-CHUNK row accepted as a park echo": [
-            env.accepted(OF).but(token=park),
-            cont,
-        ],
-        "fresh non-CHUNK row rejected": [
-            env.accepted(OF).but(token=7, name="fresh-other-label"),
-            env.accepted(OFF).but(token=placeholder, name="fresh-file-placeholder"),
-        ],
         "oversized final tail": [
             cont.with_header(final=1.0, samples=float(full)).but(name="oversized-tail"),
             cont,
@@ -268,6 +261,27 @@ def masked_row_cases(env, lookahead):
     if armed:
         cases["armed echo on a file CHUNK row"] = [armed[0], cont]
     return cases
+
+
+def fresh_non_chunk_cases(env):
+    """``{case: fixtures}``: a fresh row that is not CHUNK, which the
+    transaction's protocol checks accept as a park echo or reject. A served
+    step never holds one for those checks to judge: a fresh request whose
+    row is not a CHUNK fails at planning (REG-STATE-015) and reaches the
+    transaction only as a planned rejection (TXG-COV-010). A row plan can
+    still hold one, so a covered step of it equals the option-off
+    transaction."""
+    cont = env.accepted(CC)
+    return {
+        "fresh non-CHUNK row accepted as a park echo": [
+            env.accepted(OF).but(token=env.park),
+            cont,
+        ],
+        "fresh non-CHUNK row rejected": [
+            env.accepted(OF).but(token=7, name="fresh-other-label"),
+            env.accepted(OFF).but(token=env.placeholder, name="fresh-file-placeholder"),
+        ],
+    }
 
 
 @pytest.mark.parametrize("lookahead", [0, 1], ids=["80ms", "160ms"])
@@ -297,10 +311,32 @@ def test_each_masked_row_case_equals_the_option_off_transaction(covered, lookahe
         "split step mixing file and stream rows in both kinds",
     ):
         assert all(s == 0 for s in statuses[case]), (case, statuses[case])
-    assert statuses["fresh non-CHUNK row accepted as a park echo"][0] == 0
-    assert all(s != 0 for s in statuses["fresh non-CHUNK row rejected"])
     assert statuses["oversized final tail"][0] != 0
     assert statuses["oversized final tail"][1] == 0
+
+
+@pytest.mark.parametrize("lookahead", [0, 1], ids=["80ms", "160ms"])
+# @spec TXG-EQ-001, TXG-FAIL-001
+def test_a_fresh_non_chunk_row_equals_the_option_off_transaction(covered, lookahead):
+    """``fresh_non_chunk_cases``: each covered step equals the option-off
+    transaction, the park echo is accepted beside a continuing CHUNK row, and
+    the transaction's per-row validation rejects the label and the stray
+    carrier."""
+    steps = covered(lookahead)
+    env = steps.env
+    cases = fresh_non_chunk_cases(env)
+    failures = []
+    statuses = {}
+    for case, fixtures in cases.items():
+        step = env.compose(fixtures)
+        problems = steps.compare(step)
+        if problems:
+            failures.append((case, [f.name for f in fixtures], problems))
+        statuses[case] = [int(s) for s in env.run(step).status.tolist()]
+    assert not failures, report(failures)
+    assert_only_covered(steps, len(cases))
+    assert statuses["fresh non-CHUNK row accepted as a park echo"] == [0, 0]
+    assert all(s != 0 for s in statuses["fresh non-CHUNK row rejected"])
 
 
 # @spec TXG-CELL-001, TXG-COV-012
@@ -597,7 +633,10 @@ def test_covered_steps_with_accepted_rows_read_nothing_on_the_host(
         return detector
 
     steps.cells.inside = inside
-    plans = list(masked_row_cases(env, lookahead).values())
+    plans = [
+        *masked_row_cases(env, lookahead).values(),
+        *fresh_non_chunk_cases(env).values(),
+    ]
     chunk, other = env.accepted(CC), env.accepted(OC)
     for k in range(0, N + 1):
         for e in range(0, N + 1 - k):

@@ -82,6 +82,46 @@ def stream_unit(state, req_id: str, slot: int):
     return h.with_slot(request, slot)
 
 
+def stream_units(state, req_id: str, slot: int, count: int):
+    """A fresh stream request shaped as the processor builds one (REG-STATE-015)
+    but carrying ``count`` units: ``count`` stream-carrier tokens, each with
+    its own unit's feature (its own identifier) on it, so that only the
+    scheduled window decides whether a row of it fails."""
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    units = [stream_unit(state, req_id, slot) for _ in range(count)]
+    features = [
+        dataclasses.replace(
+            unit.mm_features[0],
+            identifier=f"uuid-{req_id}-{index}",
+            mm_position=PlaceholderRange(offset=index, length=1),
+        )
+        for index, unit in enumerate(units)
+    ]
+    prompt = [int(state.model.config.audio_chunk_token_id)] * count
+    return dataclasses.replace(
+        units[0],
+        prompt_token_ids=prompt,
+        prefill_token_ids=prompt,
+        mm_features=features,
+    )
+
+
+def _shape_fault(state, request) -> str | None:
+    """The request-shape rule's verdict on ``request`` (REG-STATE-015)."""
+    from vllm_nemotron_asr_streaming.nemotron_asr.plan import request_shape_fault
+
+    config = state.model.config
+    return request_shape_fault(
+        request.prefill_token_ids,
+        request.mm_features,
+        num_computed_tokens=int(request.num_computed_tokens),
+        chunk_token_id=int(config.audio_chunk_token_id),
+        file_carrier_id=int(config.file_carrier_token_id),
+        carrier_width=int(config.hidden_size),
+    )
+
+
 # ---------------------------------------------------------------------------
 # State declaration
 
@@ -738,7 +778,13 @@ def test_a_position_past_the_prompt_is_a_sampled_non_chunk_token(state):
 
 # @spec REG-STATE-008, REG-STATE-014, REG-STATE-015
 def test_a_window_crossing_the_end_of_the_prompt_fails_the_row_at_planning(state):
-    state.add_request(0, sl.request("a", 3, tokens=(sl.STREAM_TOKEN, 9)))
+    """``a`` is shaped as the processor builds a stream (two carriers, each
+    with its unit's feature), so only its window fails it: two tokens from
+    position 1 of a two-token prompt. Its first token alone, at position 1,
+    is a clean CHUNK row."""
+    a = stream_units(state, "a", 3, 2)
+    assert _shape_fault(state, a) is None
+    state.add_request(0, a)
     # a stream's first unit: a fresh stream starts with a CHUNK row
     # (REG-STATE-015)
     state.add_request(1, stream_unit(state, "b", 4))
@@ -746,11 +792,18 @@ def test_a_window_crossing_the_end_of_the_prompt_fails_the_row_at_planning(state
     snapshot = sl.inputs(state, ("a", "b"), (1, 0), scheduled=(2, 1))
     assert snapshot.planning_failed == {"a"}
     assert [b.request_id for b in snapshot.bindings] == ["a", "b"]
+    sl.attn(state)
+    assert not sl.inputs(state, ("a", "b"), (1, 0)).planning_failed
 
 
 # @spec REG-STATE-014, REG-STATE-015
 def test_a_multi_token_row_fails_alone_at_planning(state):
-    state.add_request(0, sl.request("a", 3, tokens=(sl.STREAM_TOKEN,) * 4))
+    """``a`` is shaped as the processor builds a stream (four carriers, each
+    with its unit's feature), so only the row's three scheduled tokens fail
+    it; its first token alone is a clean CHUNK row."""
+    a = stream_units(state, "a", 3, 4)
+    assert _shape_fault(state, a) is None
+    state.add_request(0, a)
     # a stream's first unit: a fresh stream starts with a CHUNK row
     # (REG-STATE-015)
     state.add_request(1, stream_unit(state, "b", 4))
@@ -759,6 +812,8 @@ def test_a_multi_token_row_fails_alone_at_planning(state):
     assert not snapshot.dummy_run
     assert snapshot.planning_failed == {"a"}
     assert "b" not in snapshot.planning_failed
+    sl.attn(state)
+    assert not sl.inputs(state, ("a", "b"), (0, 0)).planning_failed
 
 
 # ---------------------------------------------------------------------------

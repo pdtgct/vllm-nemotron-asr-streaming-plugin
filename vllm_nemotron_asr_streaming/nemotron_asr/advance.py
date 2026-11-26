@@ -1931,6 +1931,7 @@ class HostStaging:
         return buf.to(device, non_blocking=True)
 
 
+# @spec REG-STATE-022
 def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Tensor:
     """PORT-STATE-007: whole-call structural validation, HOST-side
     over the plan's CPU authority tensors, before any page read.
@@ -2051,8 +2052,11 @@ def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Ten
         raise ValueError(
             f"plan.request_ids has {len(plan.request_ids)} entries, expected {n_real}"
         )
-    if any(not isinstance(req_id, str) or not req_id for req_id in plan.request_ids):
-        raise ValueError("plan.request_ids must be nonempty strings")
+    # REG-STATE-022: a request ID is any string core accepts, the empty
+    # string included; core holds one request per ID, so a step's IDs are
+    # distinct.
+    if any(not isinstance(req_id, str) for req_id in plan.request_ids):
+        raise ValueError("plan.request_ids must be strings")
     if len(set(plan.request_ids)) != len(plan.request_ids):
         raise ValueError("plan.request_ids must be unique within the call")
     if len(plan.bindings) != n_real:
@@ -2085,8 +2089,8 @@ def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Ten
     for row, binding in enumerate(plan.bindings):
         if not isinstance(binding, PreparedRowBinding):
             raise ValueError("plan.bindings must contain PreparedRowBinding")
-        if type(binding.request_id) is not str or not binding.request_id:
-            raise ValueError("binding request_id must be a nonempty string")
+        if type(binding.request_id) is not str:
+            raise ValueError("binding request_id must be a string")
         integer_fields = (
             binding.block_id,
             binding.admission_generation,

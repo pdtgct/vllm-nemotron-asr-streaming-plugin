@@ -37,14 +37,18 @@ def assert_all_equal(records, *, covered=True):
 
 
 def mixed_scenario(env, driver, *, silent_phase: bool = True):
-    """Streams, files and fresh non-CHUNK rows that exercise every case of
-    TXG-EQ-004 (see ``txg_gpu.step_cases``)."""
+    """Streams and files that exercise every case of TXG-EQ-004 (see
+    ``txg_gpu.step_cases``), and two streams that each end with a non-CHUNK
+    row as a direct engine stream client sends one (a park token and a
+    label). A fresh request whose row is not a CHUNK fails at planning
+    (REG-STATE-015), so no served step holds a fresh non-CHUNK row for the
+    transaction's protocol checks to judge."""
     chunk = tx.chunk_samples(env.lookahead)
     park, label = int(env.config.eos_token_id), 7
     d = driver
     d.add_stream("s1", [{}, {}, {}, {"samples": 600, "final": True}])
     d.add_file("f1", int(2.5 * chunk))
-    # Two streams whose slots are reissued below for the fresh non-CHUNK rows.
+    # Two streams that end below with a non-CHUNK row each.
     d.add_stream("p1", [{}, {}, {}, {}])
     d.add_stream("p2", [{}, {}, {}, {}])
     d.step()
@@ -57,8 +61,8 @@ def mixed_scenario(env, driver, *, silent_phase: bool = True):
     d.until_parked(["p1", "p2"])
     d.step(
         extra_new=[
-            d.special("p1", park, fresh=True),
-            d.special("p2", label, fresh=True),
+            d.special("p1", park),
+            d.special("p2", label),
         ]
     )
     d.run(120)
@@ -113,8 +117,6 @@ def test_each_masked_row_case_is_exact(on_cuda):
         "end step as FLUSH",
         "armed echo on a file CHUNK row",
         "split step mixing file and stream rows in both kinds",
-        "fresh non-CHUNK row rejected",
-        "fresh non-CHUNK row accepted as a park echo",
     }
     missing = required - seen
     assert not missing, f"the scenario never covered {sorted(missing)}"
