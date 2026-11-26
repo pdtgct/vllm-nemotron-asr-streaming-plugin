@@ -42,6 +42,7 @@ processor's field configuration when it is first called.
 from __future__ import annotations
 
 import functools
+import itertools
 import math
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field, fields
@@ -264,10 +265,10 @@ def feature_placement_fault(mm_features: Sequence[object]) -> str | None:
     request's features by offset, assuming that order, slice the encoder
     output by the mask's running count and merge the mask into the step's
     Boolean placement mask with a logical OR. The checks read only the
-    placement, never the item. A placement is the request's, not its item's, so a request whose
-    feature shares the item's identifier keeps that item's encoder output.
-    Every feature must have position metadata (core's decoder refuses a
-    feature without it)."""
+    placement, never the item. A placement is the request's, not its item's,
+    so a request whose feature shares the item's identifier keeps that item's
+    encoder output. Every feature must have position metadata (core's decoder
+    refuses a feature without it)."""
     previous_end = 0
     for index, feature in enumerate(mm_features):
         position = feature.mm_position
@@ -372,6 +373,108 @@ def encoder_item_fault(feature: object, *, carrier_width: int) -> str | None:
     return envelope_width_fault(
         int(item["audio"].data.shape[0]), carrier_width=carrier_width
     )
+
+
+def _item_of_kind_fault(
+    feature: object, kind: dict[str, torch.dtype], *, carrier_width: int
+) -> str | None:
+    """Why ``feature``'s item is not an item of ``kind`` (a stream unit's,
+    :data:`STREAM_ITEM_FIELDS`, or a file's, :data:`FILE_ITEM_FIELDS`) that
+    passes :func:`encoder_item_fault`, or ``None``."""
+    fault = encoder_item_fault(feature, carrier_width=carrier_width)
+    if fault is not None:
+        return fault
+    names = frozenset(feature.data.keys())
+    if names != frozenset(kind):
+        return f"audio item has fields {sorted(names)}, not {sorted(kind)}"
+    return None
+
+
+# @spec REG-STATE-015, FILE-PROMPT-003
+def request_shape_fault(
+    prompt: Sequence[int],
+    mm_features: Sequence[object],
+    *,
+    num_computed_tokens: int,
+    chunk_token_id: int,
+    file_carrier_id: int,
+    carrier_width: int,
+) -> str | None:
+    """Why a request, as core delivers it to the model state (its prompt,
+    ``num_computed_tokens`` and features), is not shaped as the model's
+    processor and core's session turns build it, or ``None``: the one rule
+    for the requests the model serves (REG-STATE-015).
+
+    The processor builds a stream unit's request from the session packer's
+    prompt, the stream-carrier token alone, with the unit's feature on it
+    (SESS-PACK-001), and a complete file's request from the file prompt, the
+    file-carrier token alone, with the file's feature on it (FILE-PROMPT-001,
+    FILE-PROMPT-003). Core folds a stream's later input into the stream as
+    its frontier token followed by the input, with ``num_computed_tokens`` 1
+    and the input's features moved past the frontier (REG-STATE-008). So a
+    request in the rule has its features placed as the processor places them
+    (:func:`feature_placement_fault`), and:
+
+    - a fresh request (``num_computed_tokens`` 0) whose first token is the
+      file carrier is a file: its prompt is that token alone, and its one
+      feature carries a file's item;
+    - any other request is a stream. A fresh stream's first token is the
+      stream carrier, so its first row is a CHUNK, which registers the
+      stream with the session registry. From ``num_computed_tokens`` on, no
+      position holds the file carrier, every stream-carrier token carries
+      exactly one feature, every feature sits on one, and each carries a
+      stream unit's item.
+
+    Every item must pass :func:`encoder_item_fault`. The rule refuses no
+    other token of a stream: a later position may hold a control token,
+    which the transaction's protocol checks judge (a forced EOU,
+    TXG-COV-012). It reads the prompt, the placements and the items'
+    metadata, never an item's values. A feature without position metadata
+    raises ``ValueError``: core's msgpack decoder refuses one, so only core
+    can deliver it."""
+    for index, feature in enumerate(mm_features):
+        if getattr(feature, "mm_position", None) is None:
+            raise ValueError(f"multimodal feature {index} has no position metadata")
+    placement = feature_placement_fault(mm_features)
+    if placement is not None:
+        return placement
+    start = int(num_computed_tokens)
+    chunk, file_carrier = int(chunk_token_id), int(file_carrier_id)
+    tokens = [int(token) for token in prompt]
+    if start == 0 and tokens[:1] == [file_carrier]:
+        if len(tokens) != 1:
+            return f"file prompt holds {len(tokens)} tokens, not its carrier alone"
+        if len(mm_features) != 1:
+            return f"file request carries {len(mm_features)} features, not one"
+        offset = int(mm_features[0].mm_position.offset)
+        if offset != 0:
+            return f"file feature at position {offset} is not on its carrier"
+        return _item_of_kind_fault(
+            mm_features[0], FILE_ITEM_FIELDS, carrier_width=carrier_width
+        )
+    if start == 0 and tokens[:1] != [chunk]:
+        return "a fresh stream request's first token is not the stream carrier"
+    rest = tokens[start:]
+    if file_carrier in rest:
+        position = start + rest.index(file_carrier)
+        return f"stream prompt holds the file carrier at position {position}"
+    carriers = [start + i for i, token in enumerate(rest) if token == chunk]
+    offsets = [int(feature.mm_position.offset) for feature in mm_features]
+    # Offsets increase (the placement rule), so the features sit one on each
+    # carrier exactly when the two position lists are equal.
+    for carrier, offset in itertools.zip_longest(carriers, offsets):
+        if carrier == offset:
+            continue
+        if offset is None or (carrier is not None and carrier < offset):
+            return f"stream carrier at position {carrier} carries no feature"
+        return f"multimodal feature at position {offset} is not on a stream carrier"
+    for index, feature in enumerate(mm_features):
+        fault = _item_of_kind_fault(
+            feature, STREAM_ITEM_FIELDS, carrier_width=carrier_width
+        )
+        if fault is not None:
+            return f"multimodal feature {index}: {fault}"
+    return None
 
 
 # @spec REG-STATE-015

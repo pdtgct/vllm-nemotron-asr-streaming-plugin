@@ -68,6 +68,20 @@ def file_request(state, req_id: str, slot: int, n_samples: int = 4000):
     return h.with_slot(request, slot)
 
 
+def stream_unit(state, req_id: str, slot: int):
+    """A stream's first unit at the server's geometry, as the session packer
+    and the model's processor build it: the stream-carrier token with the
+    unit's feature on it (SESS-PACK-001)."""
+    from support import model_harness as h
+
+    from vllm_nemotron_asr_streaming.lookahead import geometry_index, served_lookahead
+
+    config = state.model.config
+    envelope = h.stream_envelope(geometry=geometry_index(served_lookahead(config)))
+    request = h.new_request(req_id, int(config.audio_chunk_token_id), audio=envelope)
+    return h.with_slot(request, slot)
+
+
 # ---------------------------------------------------------------------------
 # State declaration
 
@@ -622,6 +636,40 @@ def test_add_request_with_prior_state_that_continues_nothing_raises(state, pendi
         state.add_request(0, bad)
 
 
+# @spec REG-STATE-012, REG-STATE-015, REG-STATE-016
+def test_core_continuing_a_retired_file_request_fails_it_at_planning(state):
+    """Core continues a file request only when a direct engine client opened
+    it as a stream. Core's ``remove_request`` retires the file, and its next
+    model-state call is the continuing ``add_request`` on the same slot: the
+    model state records the request, without its file buffer, and fails it at
+    planning instead of raising."""
+    state.add_request(0, file_request(state, "f", 2))
+    state.remove_request("f")
+    state.add_request(0, _compacted("f", 2, sl.STREAM_TOKEN))
+    assert "f" not in state.file_buffers._entries
+    assert "f" not in state._file_progress
+    sl.attn(state)
+    snapshot = sl.inputs(state, ("f",), (1,))
+    assert snapshot.planning_failed == {"f"}
+
+
+@pytest.mark.parametrize("after", ["another call", "on another slot"])
+# @spec REG-STATE-012, REG-STATE-016
+def test_a_retired_file_request_is_known_only_until_the_next_call(state, after):
+    """The retired file's ID and slot are kept only until the model state's
+    next call: a continuing ``add_request`` after another call, or on another
+    slot, continues no request and raises naming it."""
+    state.add_request(0, file_request(state, "f", 2))
+    state.remove_request("f")
+    slot = 2
+    if after == "another call":
+        state.remove_request("never-added")
+    else:
+        slot = 3
+    with pytest.raises(RuntimeError, match=sl.names_request("f")):
+        state.add_request(0, _compacted("f", slot, sl.STREAM_TOKEN))
+
+
 # @spec REG-STATE-016, FILE-BUF-003
 def test_remove_request_retires_a_file_request_within_the_call(state):
     state.add_request(0, file_request(state, "f", 2))
@@ -691,7 +739,9 @@ def test_a_position_past_the_prompt_is_a_sampled_non_chunk_token(state):
 # @spec REG-STATE-008, REG-STATE-014, REG-STATE-015
 def test_a_window_crossing_the_end_of_the_prompt_fails_the_row_at_planning(state):
     state.add_request(0, sl.request("a", 3, tokens=(sl.STREAM_TOKEN, 9)))
-    state.add_request(1, sl.request("b", 4))
+    # a stream's first unit: a fresh stream starts with a CHUNK row
+    # (REG-STATE-015)
+    state.add_request(1, stream_unit(state, "b", 4))
     sl.attn(state)
     snapshot = sl.inputs(state, ("a", "b"), (1, 0), scheduled=(2, 1))
     assert snapshot.planning_failed == {"a"}
@@ -701,7 +751,9 @@ def test_a_window_crossing_the_end_of_the_prompt_fails_the_row_at_planning(state
 # @spec REG-STATE-014, REG-STATE-015
 def test_a_multi_token_row_fails_alone_at_planning(state):
     state.add_request(0, sl.request("a", 3, tokens=(sl.STREAM_TOKEN,) * 4))
-    state.add_request(1, sl.request("b", 4))
+    # a stream's first unit: a fresh stream starts with a CHUNK row
+    # (REG-STATE-015)
+    state.add_request(1, stream_unit(state, "b", 4))
     sl.attn(state)
     snapshot = sl.inputs(state, ("a", "b"), (0, 0), scheduled=(3, 1))
     assert not snapshot.dummy_run

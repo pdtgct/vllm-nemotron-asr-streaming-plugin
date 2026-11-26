@@ -19,10 +19,11 @@ continues it (same slot, ``num_computed_tokens > 0``) replaces the turn, every
 other call retires the request first. A file request's ``remove_request``
 retires it within the call.
 
-A row whose request causes a planning fault (more than one scheduled token, a
-window past its recorded prompt, a malformed envelope, a malformed file item,
-a malformed endpoint policy) fails alone at planning, before core's encoder
-path reads it; ``postprocess_state`` records it with the step's other failed
+A row whose request causes a planning fault (a request not shaped as the
+model's processor builds it, which ``add_request`` records; more than one
+scheduled token; a window past its recorded prompt; a malformed envelope or
+file item; a malformed endpoint policy) fails alone at planning, before core's
+encoder path reads it; ``postprocess_state`` records it with the step's other failed
 rows, and core ends those requests through ``take_failed_requests``. A
 violation of core's model-state contract raises.
 
@@ -66,8 +67,8 @@ from vllm_nemotron_asr_streaming.nemotron_asr.plan import (
     RequestRowFault,
     check_envelope_header,
     encoder_item_fault,
-    feature_placement_fault,
     file_envelope_header,
+    request_shape_fault,
     resolve_row_envelope_header,
     stream_order_key,
 )
@@ -124,12 +125,16 @@ class SlotHandle:
 @dataclass
 class _Request:
     """What ``add_request`` recorded for one held request. ``is_file``: its
-    scheduled token at its first ``add_request`` was the file carrier."""
+    scheduled token at its first ``add_request`` was the file carrier.
+    ``fault``: why the request, as its latest ``add_request`` delivered it, is
+    not shaped as the model's processor builds it (``request_shape_fault``),
+    or ``None``; a request with a fault fails at planning (REG-STATE-015)."""
 
     handle: SlotHandle
     prompt: tuple[int, ...]
     metadata: NewRequestData
     is_file: bool = False
+    fault: str | None = None
 
 
 @dataclass(frozen=True)
@@ -296,6 +301,11 @@ class NemotronASRModelState(ModelState):
         #: The stream request ``remove_request`` named last, until the next
         #: call decides it (a turn replacement or a retirement).
         self._pending_removal: str | None = None
+        #: The ID and slot of the file request ``remove_request`` retired last,
+        #: until the next call: core continues a file request only for a
+        #: direct engine client, and that continuation is the next call
+        #: (REG-STATE-012, REG-STATE-016).
+        self._retired_file: tuple[str, int] | None = None
         #: The requests added since the last ``prepare_inputs``, in order: the
         #: step's new requests, which plan before its cached ones.
         self._step_added: list[str] = []
@@ -468,7 +478,9 @@ class NemotronASRModelState(ModelState):
 
     def _decide_pending(self) -> None:
         """Retire the pending removal, if any: every model-state call other
-        than a continuing ``add_request`` of the same request decides it."""
+        than a continuing ``add_request`` of the same request decides it. The
+        call also forgets the file request retired last."""
+        self._retired_file = None
         pending = self._pending_removal
         if pending is not None:
             self._pending_removal = None
@@ -504,16 +516,15 @@ class NemotronASRModelState(ModelState):
         """Take a file request's samples and header into a request-owned
         host buffer at its first schedule and mark it a FILE request.
 
-        A malformed request fails that row alone through the transaction's
-        row-failure path; it never raises out of the step. The model's
-        processor builds no malformed file request (it refuses audio that is
-        not one-dimensional and a bad header at input processing), so only a
-        direct engine client can send one: a feature not placed as the
-        processor places it (``feature_placement_fault``) or not on the file's
-        carrier token, or an item the encoder path refuses
-        (``encoder_item_fault``, an item not shaped as the processor builds it
-        among them). Screening drops encoder inputs by the same item rule, so
-        a file row whose input screening drops also leaves core's gather.
+        ``add_request`` calls it only for a file request that the
+        request-shape rule (``request_shape_fault``) accepts: the file prompt
+        alone, with one feature on it whose item is a file's and passes the
+        item rule (``encoder_item_fault``), by which screening also drops
+        encoder inputs. A malformed header fails that row alone through the
+        transaction's row-failure path; it never raises out of the step. The
+        model's processor builds no malformed file request (it refuses audio
+        that is not one-dimensional and a bad header at input processing), so
+        only a direct engine client can send one.
         """
         req_id = request.req_id
         try:
@@ -526,24 +537,8 @@ class NemotronASRModelState(ModelState):
 
     def _take_file_checked(self, request: NewRequestData) -> None:
         req_id = request.req_id
-        if len(request.mm_features) != 1:
-            raise ValueError(f"file request {req_id!r} needs exactly one audio item")
         (feature,) = request.mm_features
-        placement = feature_placement_fault(request.mm_features)
-        if placement is not None:
-            raise ValueError(f"file request {req_id!r} is refused: {placement}")
-        if int(feature.mm_position.offset) != int(request.num_computed_tokens):
-            # The processor places the item on the file carrier, the token
-            # that made this a file request.
-            raise ValueError(f"file request {req_id!r} item is not on its carrier")
         item = feature.data
-        if item is None:
-            raise ValueError(f"file request {req_id!r} arrived without its samples")
-        fault = encoder_item_fault(
-            feature, carrier_width=int(self.model.config.hidden_size)
-        )
-        if fault is not None:
-            raise ValueError(f"file request {req_id!r} item is refused: {fault}")
         record = self._requests.get(req_id)
         if record is None:
             raise ValueError(f"file request {req_id!r} has no state slot")
@@ -686,6 +681,7 @@ class NemotronASRModelState(ModelState):
         return StepPlan(rows=rows, groups=file_rows.plan_chunk_groups(rows))
 
     # @spec REG-STATE-002, REG-STATE-007, REG-STATE-011, REG-STATE-012
+    # @spec REG-STATE-015
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         del req_index
         req_id = new_req_data.req_id
@@ -696,9 +692,11 @@ class NemotronASRModelState(ModelState):
                 f"cache group, got block_ids {[list(g) for g in groups]}"
             )
         slot = int(groups[0][0])
+        retired_file, self._retired_file = self._retired_file, None
         continues = self._pending_removal == req_id and self._continues(
             req_id, new_req_data, slot
         )
+        fault: str | None = None
         if continues:
             # A turn replacement: the session keeps its bookkeeping.
             self._pending_removal = None
@@ -710,11 +708,16 @@ class NemotronASRModelState(ModelState):
                     f"request {req_id!r} was added again without a removal"
                 )
             if int(new_req_data.num_computed_tokens) != 0:
-                raise RuntimeError(
-                    f"request {req_id!r} arrived with prior state "
-                    f"({new_req_data.num_computed_tokens} computed tokens) but "
-                    "continues no live request on its slot"
-                )
+                if retired_file != (req_id, slot):
+                    raise RuntimeError(
+                        f"request {req_id!r} arrived with prior state "
+                        f"({new_req_data.num_computed_tokens} computed tokens) but "
+                        "continues no live request on its slot"
+                    )
+                # REG-STATE-012: the file request remove_request just retired,
+                # continued by core because a direct engine client opened it
+                # as a stream; the model serves a file as one request.
+                fault = "core continued a file request, which is one request"
         tokens = new_req_data.prefill_token_ids
         if tokens is None:
             raise ValueError("state step omitted new host token slice")
@@ -730,9 +733,11 @@ class NemotronASRModelState(ModelState):
         else:
             self._generation += 1
             handle = SlotHandle(slot, self._generation)
-            is_file = carrier is not None and window == (int(carrier),)
+            is_file = start == 0 and carrier is not None and window == (int(carrier),)
+        if fault is None:
+            fault = self._request_shape_fault(tokens, new_req_data)
         self._requests[req_id] = _Request(
-            handle, tuple(tokens), new_req_data, is_file=is_file
+            handle, tuple(tokens), new_req_data, is_file=is_file, fault=fault
         )
         self._step_added.append(req_id)
         handoff = self.model._native_burst_handoff
@@ -754,7 +759,34 @@ class NemotronASRModelState(ModelState):
             )
         self._scheduled_tokens[req_id] = window
         if is_file and not continues:
-            self._take_file(new_req_data)
+            if fault is None:
+                self._take_file(new_req_data)
+            else:
+                # Not shaped as the processor builds a file request: nothing
+                # is taken, and the file fails at planning.
+                self._failed_files.add(req_id)
+
+    # @spec REG-STATE-015
+    def _request_shape_fault(
+        self, tokens: Any, new_req_data: NewRequestData
+    ) -> str | None:
+        """Why ``new_req_data``, as core delivered it, is not shaped as the
+        model's processor builds it (``request_shape_fault``), or ``None``. A
+        feature without position metadata raises: core's msgpack decoder
+        refuses one, so only core can deliver it (REG-STATE-015)."""
+        config = getattr(self.model, "config", None)
+        chunk = getattr(config, "audio_chunk_token_id", None)
+        file_carrier = getattr(config, "file_carrier_token_id", None)
+        if chunk is None or file_carrier is None:
+            return None
+        return request_shape_fault(
+            tokens,
+            new_req_data.mm_features,
+            num_computed_tokens=int(new_req_data.num_computed_tokens),
+            chunk_token_id=int(chunk),
+            file_carrier_id=int(file_carrier),
+            carrier_width=int(config.hidden_size),
+        )
 
     # @spec REG-STATE-011, REG-STATE-016, FILE-BUF-003
     def remove_request(self, req_id: str) -> None:
@@ -767,6 +799,9 @@ class NemotronASRModelState(ModelState):
             return
         if record.is_file:
             self._retire(req_id)
+            # Kept until the next call, which core's continuation of the file
+            # would be (REG-STATE-012, REG-STATE-016).
+            self._retired_file = (req_id, record.handle.slot)
         else:
             self._pending_removal = req_id
 
@@ -856,8 +891,10 @@ class NemotronASRModelState(ModelState):
     ) -> _Screen | None:
         """Classify a real step's rows before any of them is read: each row's
         scheduled host tokens, the rows that fail at planning for a fault
-        their request caused (a stream row's features or envelope, a file
-        whose item ``add_request`` could not take, any row's endpoint policy),
+        their request caused (a request not shaped as the model's processor
+        builds it, which ``add_request`` recorded; a stream row's features or
+        envelope; a file whose item ``add_request`` could not take; any row's
+        endpoint policy),
         each clean stream CHUNK row's validated envelope header and the
         encoder inputs core's encoder may run (``_runnable_encoder_inputs``).
         ``None`` for a dummy step (a row the model state does not hold). A
@@ -898,6 +935,12 @@ class NemotronASRModelState(ModelState):
                 continue
             token = int(window[0])
             token_rows.append((token,))
+            if record.fault is not None:
+                # A request not shaped as the model's processor builds it, as
+                # its latest add_request delivered it (REG-STATE-015): it
+                # fails before any check of the row's window could raise.
+                failed.add(req_id)
+                continue
             try:
                 if endpoint_controls is not None:
                     # Every request's endpoint policy is the client's, a
@@ -954,11 +997,11 @@ class NemotronASRModelState(ModelState):
         the processor builds it, an envelope smaller than its header or wider
         than the carrier) is dropped; its row fails at planning, and a
         request whose feature has the same identifier has the same item and
-        fails too. A row that fails for its prompt's structure or for its
-        feature's placement (``feature_placement_fault``) keeps its valid
-        inputs, which another request sharing their identifier gathers, in
-        this step or a later one. An input that names no feature of its
-        request is core's to refuse."""
+        fails too. A row that fails for its request's prompt or its features'
+        placement (``request_shape_fault``, ``feature_placement_fault``) keeps
+        its valid inputs, which another request sharing their identifier
+        gathers, in this step or a later one. An input that names no feature
+        of its request is core's to refuse."""
         runnable: dict[str, list[int]] = {}
         for req_id, inputs in scheduled_encoder_inputs.items():
             record = self._requests.get(req_id)

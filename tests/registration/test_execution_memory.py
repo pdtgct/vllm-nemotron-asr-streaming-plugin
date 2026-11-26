@@ -1261,6 +1261,24 @@ def test_a_failed_fresh_row_beside_a_clean_one_keeps_its_initialized_page(build)
     assert statuses.get("s1") == 0
 
 
+#: A label token: neither a carrier nor a control token.
+LABEL = 7
+
+
+def _prompted(request, prompt):
+    """``request`` with the prompt ``prompt``; its features are unchanged."""
+    return dataclasses.replace(
+        request, prompt_token_ids=list(prompt), prefill_token_ids=list(prompt)
+    )
+
+
+def _unit_at(env, req_id: str, offset: int):
+    """A regular unit's feature at ``offset``, with its own identifier."""
+    return _envelope_feature(
+        env, req_id, offset=offset, identifier=f"uuid-{req_id}-at-{offset}"
+    )
+
+
 def _carrier_request(env, req_id: str, *, token=None, features=()):
     """A stream request with the given scheduled token (the stream carrier
     by default) and multimodal features."""
@@ -1483,11 +1501,26 @@ def _far_feature(env, req_id: str):
     return _envelope_feature(env, req_id, offset=5, identifier=f"uuid-{req_id}-far")
 
 
+def _later_input(env, request):
+    """``request`` as the next input of the stream ``bad``, whose first unit
+    a step before has run: the runner folds it into the stream as core does
+    (the frontier token, then the input, ``num_computed_tokens`` 1). A
+    non-CHUNK row of a request shaped as the processor builds it is a
+    continuing stream's row: a fresh stream starts with a CHUNK row
+    (REG-STATE-015)."""
+    env.runner.real_step(
+        h.scheduler_output(new=(stream(env, "bad"),), handles={"bad": 3})
+    )
+    return request
+
+
 #: Faults of a stream row's envelope header that core's scheduling or
 #: multimodal plumbing produces and no request input can (REG-STATE-015):
-#: name -> (request builder, scheduled encoder inputs). Core's msgpack
-#: decoder refuses a feature whose position is null; a feature's other
-#: placement faults are the request's (``_UNPLACED_FEATURES``).
+#: name -> (request builder, scheduled encoder inputs). Each request is
+#: otherwise shaped as the processor builds it, or the request's fault would
+#: decide the class. Core's msgpack decoder refuses a feature whose position
+#: is null; a feature's other placement faults are the request's
+#: (``_UNPLACED_FEATURES``).
 _CONTRACT_FAULTS = {
     "feature without position metadata": (
         lambda env: _carrier_request(
@@ -1496,8 +1529,13 @@ _CONTRACT_FAULTS = {
         [0],
     ),
     "non-CHUNK row with a scheduled encoder input": (
-        lambda env: _carrier_request(
-            env, "bad", token=7, features=[_far_feature(env, "bad")]
+        # a label row, then a unit whose feature does not overlap the row
+        lambda env: _later_input(
+            env,
+            _prompted(
+                _carrier_request(env, "bad", features=[_unit_at(env, "bad", 1)]),
+                [LABEL, int(env.config.audio_chunk_token_id)],
+            ),
         ),
         [0],
     ),
@@ -1508,10 +1546,15 @@ _CONTRACT_FAULTS = {
         [0, 0],
     ),
     "scheduled encoder input naming another feature": (
-        lambda env: _carrier_request(
-            env,
-            "bad",
-            features=[_envelope_feature(env, "bad"), _far_feature(env, "bad")],
+        # two units, at the prompt's first and last positions
+        lambda env: _prompted(
+            _carrier_request(
+                env,
+                "bad",
+                features=[_envelope_feature(env, "bad"), _far_feature(env, "bad")],
+            ),
+            [int(env.config.audio_chunk_token_id), *[LABEL] * 4]
+            + [int(env.config.audio_chunk_token_id)],
         ),
         [1],
     ),
@@ -1556,7 +1599,9 @@ def test_a_contract_fault_of_the_envelope_header_raises(build, fault):
         isinstance(error, cls) and re.search(pattern, message)
         for cls, pattern in expected
     ), (fault, repr(error))
-    assert env.runner.failed_log == [], "a contract fault was recorded as a row failure"
+    assert not any(env.runner.failed_log), (
+        "a contract fault was recorded as a row failure"
+    )
 
 
 @pytest.mark.parametrize("step", ["stream-step", "with-a-file-row"])
@@ -2208,6 +2253,342 @@ def test_the_processor_refuses_audio_that_is_not_one_dimensional(build, kind, ro
     items = MultiModalDataParser(target_sr=16000).parse_mm_data({"audio": [audio]})
     with pytest.raises(ValueError, match=re.escape(str((rows, 300)))):
         processor._apply_hf_processor_main(items, kwargs)
+
+
+#: Requests whose prompt is not shaped as the model's processor and core's
+#: session turns build it (REG-STATE-015), each with well-formed items and
+#: placements: name -> request builder. The processor and the session
+#: packer build a stream unit as the one stream-carrier token with its
+#: unit's feature on it, and a complete file as the one file-carrier token
+#: with the file's feature on it; core puts the frontier token before a later
+#: turn's input. So a fresh stream request starts with a CHUNK row, every
+#: carrier token of a stream has one unit's feature and every feature sits on
+#: one, and a file's prompt is its carrier alone. A direct engine client can
+#: send each of these. On the head before this rule, the fresh non-CHUNK rows
+#: (any token but the stream carrier, alone or before a unit) raised for the
+#: whole step at registry binding ("continuing row ... is not registered"),
+#: and the others ran as if the processor had built them.
+_UNSHAPED_REQUESTS = {
+    "fresh label row": lambda env: h.new_request("bad", LABEL),
+    "fresh park row": lambda env: h.new_request("bad", int(env.config.eos_token_id)),
+    "fresh EOU row": lambda env: h.new_request("bad", int(env.config.eou_token_id)),
+    "fresh continuation row": lambda env: h.new_request(
+        "bad", int(env.config.continuation_token_id)
+    ),
+    "label row before a unit": lambda env: _prompted(
+        _carrier_request(env, "bad", features=[_unit_at(env, "bad", 1)]),
+        [LABEL, int(env.config.audio_chunk_token_id)],
+    ),
+    "stream carrier without a feature": lambda env: _prompted(
+        stream(env, "bad"), [int(env.config.audio_chunk_token_id)] * 2
+    ),
+    "feature on a label token": lambda env: _prompted(
+        _carrier_request(
+            env,
+            "bad",
+            features=[_envelope_feature(env, "bad"), _unit_at(env, "bad", 1)],
+        ),
+        [int(env.config.audio_chunk_token_id), LABEL],
+    ),
+    "file carrier in a stream": lambda env: _prompted(
+        stream(env, "bad"),
+        [int(env.config.audio_chunk_token_id), int(env.config.file_carrier_token_id)],
+    ),
+    "file prompt longer than its carrier": lambda env: _prompted(
+        file(env, "bad"), [int(env.config.file_carrier_token_id), LABEL]
+    ),
+}
+
+
+def _mixed_step(env, delivered, order: str):
+    """One real step of the delivered ``bad`` request beside the healthy
+    ``s1`` stream and ``f1`` file (``delivered`` maps each name to its
+    request and scheduled encoder inputs), ``bad`` first, last or alone; each
+    feature has its own identifier. Returns the error the step raised."""
+    names = {
+        "bad first": ("bad", "s1", "f1"),
+        "bad last": ("f1", "s1", "bad"),
+        "alone": ("bad",),
+    }[order]
+    rows = tuple(delivered[name][0] for name in names)
+    identifiers = [f.identifier for r in rows for f in r.mm_features]
+    assert len(set(identifiers)) == len(identifiers)
+    output = h.scheduler_output(
+        new=rows,
+        handles={"bad": 3, "s1": 1, "f1": 2},
+        encoder_inputs={
+            name: delivered[name][1] for name in names if delivered[name][1]
+        },
+    )
+    return h.call_with(env.runner.real_step, output)
+
+
+def _assert_healthy_rows_committed(env, s1) -> None:
+    """``s1`` and ``f1`` committed, and ``s1``'s encoder output is its own
+    envelope's encoding."""
+    statuses, _ = env.runner.commit_log[-1]
+    assert statuses.get("s1") == 0 and statuses.get("f1") == 0, statuses
+    (feature,) = s1.mm_features
+    (own,) = env.model.embed_multimodal(audio=[feature.data["audio"].data])
+    cached = env.state.encoder_cache.encoder_outputs[feature.identifier]
+    assert torch.equal(cached, own), "a neighbour's request changed s1's input"
+
+
+@pytest.mark.parametrize("order", ["bad first", "bad last", "alone"])
+@pytest.mark.parametrize("case", list(_UNSHAPED_REQUESTS))
+# @spec REG-STATE-015
+def test_a_request_not_shaped_as_the_processor_builds_it_fails_alone(
+    build, case, order
+):
+    """A request's prompt is the client's: core's msgpack decoder, its
+    encoder-input scheduling and its ``NewRequestData`` keep the prompt
+    tokens and their relation to the features as a direct engine client
+    sends them. A request whose prompt is not shaped as the processor builds
+    it, delivered and scheduled as core delivers and schedules it, sits first
+    or last beside a healthy stream and a healthy file, or alone in its step.
+    The step does not raise, the bad request alone fails through
+    ``take_failed_requests`` on the step that delivers it, the healthy
+    requests commit, and the healthy stream's encoder output is its own
+    envelope's encoding."""
+    env = build(max_num_seqs=3)
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    delivered = {
+        "bad": _through_core(_UNSHAPED_REQUESTS[case](env)),
+        "s1": _through_core(stream(env, "s1")),
+        "f1": _through_core(file(env, "f1")),
+    }
+    error = _mixed_step(env, delivered, order)
+    assert error is None, repr(error)
+    assert env.runner.failed_log == [{"bad"}]
+    if order != "alone":
+        _assert_healthy_rows_committed(env, delivered["s1"][0])
+
+
+def _with_identifier(request, identifier: str):
+    """``request`` whose one feature has the encoder-cache identifier
+    ``identifier``."""
+    (feature,) = request.mm_features
+    return dataclasses.replace(
+        request, mm_features=[dataclasses.replace(feature, identifier=identifier)]
+    )
+
+
+#: What a direct engine client sends as the next input of a file request it
+#: opened as a stream: a stream unit, or another complete file.
+_FILE_CONTINUATIONS = {
+    "stream unit": lambda env: stream(env, "bad", sequence=1),
+    "file prompt": lambda env: _with_identifier(file(env, "bad"), "uuid-bad-again"),
+}
+
+
+@pytest.mark.parametrize("order", ["bad first", "bad last", "alone"])
+@pytest.mark.parametrize("given", list(_FILE_CONTINUATIONS))
+# @spec REG-STATE-012, REG-STATE-015, REG-STATE-016
+def test_core_continuing_a_file_request_fails_that_request_alone(build, given, order):
+    """The model's file prompt is one request that core never continues, but
+    a direct engine client can open a stream whose first input is a file
+    prompt: the file parks at its end, and core folds the client's next input
+    into it (``remove_request``, then ``add_request`` with the compacted
+    prompt and ``num_computed_tokens`` 1 on the same slot). The model state
+    has retired the file at that ``remove_request``. The step does not raise:
+    the continued request alone fails at planning, and a healthy stream and a
+    healthy file beside it commit. On the head before this rule the
+    ``add_request`` raised for the whole step ("continues no live
+    request")."""
+    env = build(max_num_seqs=3)
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    env.runner.real_step(
+        h.scheduler_output(new=(file(env, "bad"),), handles={"bad": 3})
+    )
+    drain_to_park(env, ["bad"], {"bad": 3}, watch="bad")
+    assert env.runner.failed_log[-1] is None
+    delivered = {
+        "bad": (_FILE_CONTINUATIONS[given](env), [0]),
+        "s1": (stream(env, "s1"), [0]),
+        "f1": (file(env, "f1"), [0]),
+    }
+    before = len(env.runner.failed_log)
+    error = _mixed_step(env, delivered, order)
+    assert error is None, repr(error)
+    assert env.runner.failed_log[before:] == [{"bad"}]
+    if order != "alone":
+        _assert_healthy_rows_committed(env, delivered["s1"][0])
+
+
+def _received(request, *, resumable: bool = False):
+    """Core's ``Request`` for ``request`` as a direct engine client sends it:
+    an ``EngineCoreRequest`` through core's msgpack encoder and decoder."""
+    from vllm.v1.engine import EngineCoreRequest
+    from vllm.v1.request import Request
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    sent = EngineCoreRequest(
+        request_id=request.req_id,
+        prompt_token_ids=np.array(request.prompt_token_ids, dtype=np.int32),
+        mm_features=list(request.mm_features),
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        resumable=resumable,
+    )
+    received = MsgpackDecoder(EngineCoreRequest).decode(MsgpackEncoder().encode(sent))
+    return Request.from_engine_core_request(received, None)
+
+
+def _core_folded_turn(env, first, second):
+    """``second``, the next input of the parked stream whose first input was
+    ``first``, as core's scheduler folds it into the stream
+    (``Scheduler._update_request_as_session``, which compacts the stream's
+    history to its frontier token followed by the new input, shifts the new
+    input's features past the frontier and sets ``num_computed_tokens`` to
+    1), with the encoder inputs core schedules for its next token and the
+    ``NewRequestData`` core delivers. The stream's history is the tokens the
+    harness fed it, then the park token it sampled last."""
+    from collections import deque
+
+    from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
+    from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.request import RequestStatus, StreamingUpdate
+
+    session = _received(first, resumable=True)
+    fed = env.runner._fed[first.req_id]
+    park = env.runner._sampled[first.req_id]
+    assert park == int(env.config.eos_token_id), "the stream has not parked"
+    session.append_output_token_ids([*fed[1:], park])
+    session.num_computed_tokens = session.num_tokens - 1
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.streaming_queue = deque()
+    # the attributes the fold and the scheduling routine read, as core's
+    # scheduler sets them for this model (a non-recomputable state group
+    # whose history core compacts, positions not read)
+    scheduler = object.__new__(Scheduler)
+    scheduler.has_unrecomputable_state = True
+    scheduler.compacts_state_history = True
+    scheduler.state_reads_positions = False
+    scheduler.max_model_len = int(env.vllm_config.model_config.max_model_len)
+    scheduler.num_sampled_tokens_per_step = 1
+    scheduler.hash_block_size = 16
+    scheduler.num_waiting_for_streaming_input = 1
+    scheduler.resumed_streaming_sessions = set()
+    scheduler.dropped_streaming_updates = []
+    scheduler.log_stats = False
+    scheduler.is_encoder_decoder = False
+    scheduler.scheduler_config = SimpleNamespace(disable_chunked_mm_input=False)
+    scheduler.encoder_cache_manager = EncoderCacheManager(1 << 20)
+    scheduler.ec_connector = None
+    scheduler.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(multimodal_config=None)
+    )
+    update = StreamingUpdate.from_request(_received(second, resumable=True))
+    assert scheduler._update_request_as_session(session, update)
+    scheduled, num_new_tokens, *_ = scheduler._try_schedule_encoder_inputs(
+        session, session.num_computed_tokens, 1, 1 << 20
+    )
+    assert num_new_tokens == 1, "core's scheduler does not schedule the row"
+    delivered = NewRequestData.from_request(
+        session, second.block_ids, list(session.prefill_token_ids)
+    )
+    return delivered, list(scheduled)
+
+
+def _shape_fault(env, request) -> str | None:
+    """The request-shape rule's verdict on a delivered request."""
+    from vllm_nemotron_asr_streaming.nemotron_asr.plan import request_shape_fault
+
+    return request_shape_fault(
+        request.prefill_token_ids,
+        request.mm_features,
+        num_computed_tokens=int(request.num_computed_tokens),
+        chunk_token_id=int(env.config.audio_chunk_token_id),
+        file_carrier_id=int(env.config.file_carrier_token_id),
+        carrier_width=int(env.config.hidden_size),
+    )
+
+
+@pytest.mark.parametrize("right_context", LOOKAHEADS)
+# @spec REG-STATE-015, REG-STATE-008, FILE-PROMPT-003
+def test_requests_the_processor_and_core_build_pass_the_shape_rule_and_commit(
+    build, right_context
+):
+    """Positive control of the request-shape rule at every chunk size: two
+    streams' first units and a complete file, each as the model's processor
+    builds its request from what the session packer and the file prompt send
+    and core delivers and schedules it, pass the rule and commit; then one
+    stream's next regular unit and the other's final tail, each folded into
+    its parked stream by core's own scheduler (the frontier token, then the
+    unit's carrier with its feature, ``num_computed_tokens`` 1), pass the
+    rule and commit, with no row failed."""
+    from vllm_nemotron_asr_streaming.session.packer import Packer
+
+    env = build(right_context=right_context, max_num_seqs=3)
+    env.runner.profile_run(core_embeds=False)
+    pool(env)
+    rng = np.random.default_rng(2)
+
+    def packed(units: int):
+        """A session packer's rows for ``units`` regular units of audio and
+        300 samples more: the regular units and the final tail."""
+        packer = Packer(
+            right_context=right_context,
+            geometry_index=geometry_of(right_context),
+            locale_row=0,
+            carrier_token_id=int(env.config.audio_chunk_token_id),
+        )
+        audio = rng.standard_normal(units * 1280 * (right_context + 1) + 300) * 0.1
+        regular = packer.append(audio.astype(np.float32))
+        return [unit.row for unit in regular] + [packer.close().row]
+
+    rows = {"s1": packed(2)[:2], "s2": packed(1)}
+    samples = (rng.standard_normal(5000) * 0.1).astype(np.float32)
+    handles = {"s1": 1, "s2": 2, "f1": 3}
+    first = {
+        name: _processor_request(env, name, envelope=rows[name][0])
+        for name in ("s1", "s2")
+    }
+    turns = {name: _through_core(request) for name, request in first.items()}
+    turns["f1"] = _through_core(_processor_request(env, "f1", samples=samples))
+    # s1's next regular unit and s2's final tail
+    later = {
+        name: _processor_request(env, name, envelope=rows[name][1])
+        for name in ("s1", "s2")
+    }
+
+    def run(step, label):
+        for name, (request, inputs) in step.items():
+            assert inputs == [0], (label, name, inputs)
+            assert _shape_fault(env, request) is None, (label, name)
+        output = h.scheduler_output(
+            new=tuple(request for request, _ in step.values()),
+            handles=handles,
+            encoder_inputs={name: inputs for name, (_, inputs) in step.items()},
+        )
+        error = h.call_with(env.runner.real_step, output)
+        assert error is None, (label, repr(error))
+        assert env.runner.failed_log[-1] is None, (label, env.runner.failed_log)
+        statuses, _ = env.runner.commit_log[-1]
+        assert all(statuses.get(name) == 0 for name in step), (label, statuses)
+
+    run(turns, "first inputs")
+    for name in later:
+        drain_to_park(env, [name], handles, watch=name)
+    folded = {
+        name: _core_folded_turn(
+            env, first[name], _with_identifier(request, f"uuid-{name}-1")
+        )
+        for name, request in later.items()
+    }
+    chunk = int(env.config.audio_chunk_token_id)
+    for request, _ in folded.values():
+        assert request.num_computed_tokens == 1
+        assert list(request.prefill_token_ids)[1:] == [chunk]
+        assert [f.mm_position.offset for f in request.mm_features] == [1]
+    run(folded, "folded turns")
 
 
 def _masked(feature):

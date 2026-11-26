@@ -753,7 +753,7 @@ these overrides, which the runner calls on the worker:
 
 | Method | What the model state does |
 | --- | --- |
-| `add_request(req_index, new_req_data)` | Decides a pending removal, records the request (its prompt, slot, admission generation and `NewRequestData`) and takes a file request's samples (State-slot access; the `transcription` design). |
+| `add_request(req_index, new_req_data)` | Decides a pending removal, records the request (its prompt, slot, admission generation, `NewRequestData` and whether it is shaped as the processor builds it, Request shape, below) and takes a file request's samples (State-slot access; the `transcription` design). |
 | `remove_request(req_id)` | Decides a pending removal, then retires a file request at once or records a stream request as the one pending removal, which the model state's next call decides (State-slot access). |
 | `initialize_kv_cache(kv_cache_config, block_tables)` | Checks that the one KV-cache group holds exactly the state layer and that core bound its pages, then the resolved runner mode (REG-ENG-017). |
 | `prepare_inputs(input_batch, req_states)` | Decides a pending removal, classifies the step (Execution memory), fails at planning a real row that schedules more than one token (Error boundary, below), binds the step's rows to their slots and plans the step once. |
@@ -785,36 +785,40 @@ requests continue.
 
 **Error boundary.** The model state fails a request alone for every fault that the request's own
 prompt or multimodal items can cause, because a direct engine client can send any of them and a
-raise would end every stream on the server: a row that schedules more than one token, a scheduled
-window that crosses the end of the recorded prompt (State-slot access, Recorded prompt), a unit
-at another geometry (the `session` design, Geometry check in the model), and a malformed or
-foreign-geometry file item (the `transcription` design). Each such row fails at planning through
-the planning-failed set: it stays in the row plan at its scheduled position as a non-CHUNK row
-that the transaction rejects (the `transaction-graph` design, Option and configuration), and its
-request ends through `take_failed_requests`. A multi-token row's tokens are not classified; the
-step's other rows read and write at their own token positions (the `transaction-graph` design,
-Option and configuration), so the multi-token row fails its request alone. The model state raises
-for a violation of core's contract with the model state, which means that core and the model
-disagree about a request's state, so that no outcome confined to one request is safe: a
-`NewRequestData` that does not carry exactly one block, a slot outside the bound pages, and an
-`add_request` that neither starts nor continues a request (State-slot access). It also raises for
-the configuration and lifecycle refusals of Engine settings and Execution memory. A planning
-fault that no list here names takes its class by the same test: it fails the request when the
-request's own prompt or multimodal items can cause it, and raises otherwise (REG-STATE-015).
+raise would end every stream on the server: a request not shaped as the model's processor builds it
+(its prompt, features and items; Request shape, below), a row that schedules more than one token, a
+scheduled window that crosses the end of the recorded prompt (State-slot access, Recorded prompt), a
+unit at another geometry (the `session` design, Geometry check in the model), and a malformed or
+foreign-geometry file item (the `transcription` design). Each such row fails at planning through the
+planning-failed set: it stays in the row plan at its scheduled position as a non-CHUNK row that the
+transaction rejects (the `transaction-graph` design, Option and configuration), and its request ends
+through `take_failed_requests`. A multi-token row's tokens are not classified; the step's other rows
+read and write at their own token positions (the `transaction-graph` design, Option and
+configuration), so the multi-token row fails its request alone. The model state raises for a
+violation of core's contract with the model state, which means that core and the model disagree
+about a request's state, so that no outcome confined to one request is safe: a `NewRequestData` that
+does not carry exactly one block, a slot outside the bound pages, and an `add_request` that neither
+starts nor continues a request, except core's continuation of a file request (State-slot access). It
+also raises for the configuration and lifecycle refusals of Engine settings and Execution memory. A
+planning fault that no list here names takes its class by the same test: it fails the request when
+the request's own prompt or multimodal items can cause it, and raises otherwise (REG-STATE-015).
 
-A stream CHUNK row's envelope header is resolved from the request's multimodal feature that
-overlaps the row's scheduled token (`resolve_row_envelope_header` in `nemotron_asr/plan.py`).
-Core lets a direct engine client bypass the plugin's processor, so the faults of that resolution
-fall in both classes (REG-STATE-015):
+`add_request` checks each request core delivers against the shape the processor builds
+(`request_shape_fault` in `nemotron_asr/plan.py`), and a stream CHUNK row's envelope header is
+resolved from the request's multimodal feature that overlaps the row's scheduled token
+(`resolve_row_envelope_header`). Core lets a direct engine client bypass the plugin's processor, so
+the faults of the request's shape and of that resolution fall in both classes (REG-STATE-015):
 
 | Fault | Class | Why |
 | --- | --- | --- |
-| a feature of the request not placed as the processor places it | fail the request | the request chooses each placeholder range's offset, length and embedding mask (Feature and item shape, below) |
+| a request whose prompt is not shaped as the processor builds it | fail the request | the request chooses its prompt's tokens and the positions of its features (Request shape, below) |
+| core's continuation of a file request | fail the request | only a direct engine client opens a file prompt as a stream (State-slot access) |
+| a feature of the request not placed as the processor places it | fail the request | the request chooses each placeholder range's offset, length and embedding mask (Request shape, below) |
 | a non-CHUNK row that a feature overlaps | fail the request | the request's prompt places a feature at a non-carrier token |
 | a CHUNK row that no feature, or more than one, overlaps | fail the request | the request's prompt and items disagree on where the units are |
 | an overlapping feature whose modality is not audio | fail the request | the request sent another modality |
 | an overlapping feature with no kwargs payload or no envelope payload | fail the request | the request's item carries no envelope |
-| an overlapping feature whose item is not shaped as the processor builds it | fail the request | the request chooses each field's class and each tensor's dtype (Feature and item shape, below) |
+| a feature whose item is not shaped as the processor builds it | fail the request | the request chooses each field's class and each tensor's dtype (Request shape, below) |
 | an envelope smaller than its header | fail the request | the request's item is truncated |
 | an envelope wider than the carrier row (`hidden_size`) | fail the request | the request's item is oversized |
 | a feature without position metadata | raise | core's msgpack decoder refuses a feature without a placeholder range |
@@ -827,35 +831,59 @@ A row that matches both a fail-the-request fault and a raise fault fails its req
 caused it.
 
 The model state screens a step's rows in `prepare_inputs_embeds`, before it runs core's encoder
-(`execute_mm_encoder`) and gather (`gather_mm_embeddings`), so core never meets a request's fault:
-a row that fails at planning, a file whose item `add_request` could not take included, is left out
-of the gather. An encoder input is dropped only when its own item is one the encoder path refuses
-(its modality, its shape, or an envelope smaller than its header or wider than the carrier row);
-every other input runs, a failed row's included. `add_request` refuses a file's item by the same
-rule (`encoder_item_fault` in `nemotron_asr/plan.py`), so a file row whose input is dropped fails
-too and file and stream rows cannot disagree about an item. `add_request` also refuses a file whose
-feature is not placed as the processor places it or is not on its carrier token, and envelope
-resolution refuses a stream request whose features are not placed that way, both by one placement
-rule (`feature_placement_fault`). Core's scheduler encodes an item once and treats its identifier
-as cached for every request whose feature shares it, in the same step or a later one, so a row
-failed for its prompt's structure or its feature's placement must still run its valid items; an
-item the encoder path refuses fails every request that carries it.
+(`execute_mm_encoder`) and gather (`gather_mm_embeddings`), so core never meets a request's fault: a
+row that fails at planning, a request the shape rule refused at its `add_request` and a file whose
+item `add_request` could not take included, is left out of the gather. An encoder input is dropped
+only when its own item is one the encoder path refuses (its modality, its shape, or an envelope
+smaller than its header or wider than the carrier row); every other input runs, a failed row's
+included. `add_request` refuses a file's item by the same rule (`encoder_item_fault` in
+`nemotron_asr/plan.py`), so a file row whose input is dropped fails too and file and stream rows
+cannot disagree about an item. The shape rule includes one placement rule
+(`feature_placement_fault`), which envelope resolution applies again at each row. Core's scheduler
+encodes an item once and treats its identifier as cached for every request whose feature shares it,
+in the same step or a later one, so a row failed for its prompt or its feature's placement must
+still run its valid items; an item the encoder path refuses fails every request that carries it.
 
-**Feature and item shape.** Core's msgpack decoder rebuilds a feature's placeholder range with the
-`offset`, `length` and `is_embed` the sender gives, so a direct engine client chooses a feature's
-placement. The processor places each unit's feature on its one carrier token, at its prompt's first
-position, as a range of length 1 with no embedding mask (`is_embed` `None`), and core moves a later
-turn's features past the tokens before them, so a request's features sit at non-negative,
-increasing offsets. Core's encoder-input scheduling and gather read all three fields: they search a
-request's features by offset and assume that order, slice the encoder output by the mask's running
-count, and merge the mask into the step's Boolean placement mask with a logical OR. Any other
-placement fails its request (REG-STATE-015). Without that rule, an integer or floating-point mask
-makes core's gather raise for the whole step; a range that starts before the prompt marks more
-positions than core gathers rows for, so the model's merge raises; features out of offset order
-make core schedule two encoder inputs for one token; and a range of no position, of two positions
-or with a Boolean mask reaches the transaction as a request the processor never builds. A file's
-feature must also sit on its carrier token. A placement is the request's, not its item's, so its
-request's encoder inputs still run for any request that shares their identifiers.
+**Request shape.** The model serves one shape of request, the one its processor builds, and
+`request_shape_fault` defines it in one place. The processor builds a stream unit's request from the
+session packer's prompt, the stream-carrier token alone, with the unit's feature on it
+(SESS-PACK-001), and a complete file's request from the file prompt, the file-carrier token alone,
+with the file's feature on it (FILE-PROMPT-001); core folds a stream's later input into the stream
+as its frontier token followed by the input, with `num_computed_tokens` 1 and the input's features
+moved past the frontier (State-slot access, Recorded prompt). Core's msgpack decoder, its
+encoder-input scheduling and its `NewRequestData` keep the prompt tokens and the features' positions
+as a direct engine client sends them, so the client chooses them. A fresh request whose first token
+is the file carrier is a file, whose prompt must be that token alone, with one feature, on it,
+carrying a file's item. Every other request is a stream: a fresh stream's first token must be the
+stream carrier, so its first row is a CHUNK, which registers the stream with the session registry;
+from its `num_computed_tokens` on, no position may hold the file carrier, every stream-carrier token
+must carry exactly one feature, every feature must sit on one, and each must carry a stream unit's
+item. The rule refuses no other token of a stream: a later position may hold a control token, which
+the transaction's protocol checks judge, and a direct engine client's EOU token there is a
+forced-EOU candidate (the `transaction-graph` design, Forced-EOU candidates). The model state checks
+the rule at each `add_request`, a continuing turn's compacted prompt included, records the verdict
+with the request, and fails its rows at planning; envelope resolution and the window checks still
+judge each row. Without the rule, a fresh row whose token is not the stream carrier (a label, park,
+EOU or continuation token, alone or before a unit) never registered its stream, so the session
+registry raised at binding for the whole step; and a stream carrier without its feature, a feature
+on another token, the file carrier in a stream or a longer file prompt ran as a request the
+processor never builds. A feature's placement and its item complete the rule.
+
+Core's msgpack decoder rebuilds a feature's placeholder range with the `offset`, `length` and
+`is_embed` the sender gives, so a direct engine client chooses a feature's placement. The processor
+places each unit's feature on its one carrier token, at its prompt's first position, as a range of
+length 1 with no embedding mask (`is_embed` `None`), and core moves a later turn's features past the
+tokens before them, so a request's features sit at non-negative, increasing offsets. Core's
+encoder-input scheduling and gather read all three fields: they search a request's features by
+offset and assume that order, slice the encoder output by the mask's running count, and merge the
+mask into the step's Boolean placement mask with a logical OR. Any other placement fails its request
+(REG-STATE-015). Without that rule, an integer or floating-point mask makes core's gather raise for
+the whole step; a range that starts before the prompt marks more positions than core gathers rows
+for, so the model's merge raises; features out of offset order make core schedule two encoder inputs
+for one token; and a range of no position, of two positions or with a Boolean mask reaches the
+transaction as a request the processor never builds. A file's feature must also sit on its carrier
+token. A placement is the request's, not its item's, so its request's encoder inputs still run for
+any request that shares their identifiers.
 
 The decoder also rebuilds each field of an item from the factory name the sender gives and each
 tensor with the dtype it was sent with, so a direct engine client chooses both. Core's encoder path
@@ -927,23 +955,29 @@ its cells captured (TXG-LIFE-009).
   (Future roadmap 11).
 - **Retirement and turn continuation.** For each input after a stream's first, core calls
   `remove_request` and then `add_request` for the same request, with the compacted prompt and
-  `num_computed_tokens` 1 (Recorded prompt, below). For a finished request it calls
-  `remove_request` alone, also on a step with no forward work, and before it adds any request it
-  calls `remove_request` for that request's ID. A file request (File requests, below) is one
-  request that core never continues, so `remove_request` retires it within the call, dropping its
-  record, admission generation, file buffer, progress and failed-file mark; an idle engine keeps
-  none of them. A stream request's `remove_request` may precede its next turn, so the model state
-  holds that request as its one pending removal and decides the removal at its next model-state
-  call: the next call of `add_request`, `remove_request`, `prepare_attn` or `prepare_inputs`. An
-  `add_request` of the same request, with `num_computed_tokens` above 0 and the same slot,
-  continues the request: it keeps the request's admission generation and replaces its recorded
-  prompt and `NewRequestData`. Every other such call retires the pending request first, dropping
-  its record and admission generation. A finished stream's record therefore stays until the next
-  model-state call; it holds no host buffer, and core has already freed its page. A
-  `remove_request` for an ID the model state does not hold only decides an earlier pending
-  removal. An `add_request` for a live request (one held with no removal since its latest
-  `add_request`) raises, naming the request, whatever its `num_computed_tokens`, 0 included; so
-  does an `add_request` with `num_computed_tokens` above 0 that continues no request.
+  `num_computed_tokens` 1 (Recorded prompt, below). For a finished request it calls `remove_request`
+  alone, also on a step with no forward work, and before it adds any request it calls
+  `remove_request` for that request's ID. A file request (File requests, below) is one request that
+  core never continues as the plugin sends it, so `remove_request` retires it within the call,
+  dropping its record, admission generation, file buffer, progress and failed-file mark; an idle
+  engine keeps none of them. It keeps only the request's ID and slot, until its next model-state
+  call: a direct engine client can open a file prompt as a stream, which parks at the file's end,
+  and core then folds the client's next input into it with `remove_request` followed at once by
+  `add_request` on the same slot, `num_computed_tokens` 1. That `add_request` records the request
+  with a new admission generation and fails it at planning (Request shape). A stream request's
+  `remove_request` may precede its next turn, so the model state holds that request as its one
+  pending removal and decides the removal at its next model-state call: the next call of
+  `add_request`, `remove_request`, `prepare_attn` or `prepare_inputs`. An `add_request` of the same
+  request, with `num_computed_tokens` above 0 and the same slot, continues the request: it keeps the
+  request's admission generation and replaces its recorded prompt and `NewRequestData`. Every other
+  such call retires the pending request first, dropping its record and admission generation. A
+  finished stream's record therefore stays until the next model-state call; it holds no host buffer,
+  and core has already freed its page. A `remove_request` for an ID the model state does not hold
+  only decides an earlier pending removal. An `add_request` for a live request (one held with no
+  removal since its latest `add_request`) raises, naming the request, whatever its
+  `num_computed_tokens`, 0 included; so does an `add_request` with `num_computed_tokens` above 0
+  that continues no request, other than core's continuation of the file request retired by the call
+  before it.
 - **Views per step.** During a real step, the model reads state only through the layer's views
   as bound at that step (`component_pools`, read when the step's `StateBatch` is built), for the
   slots of the step's rows, and refuses a slot outside the bound pages before it reads any. The
@@ -1154,7 +1188,7 @@ adding it here and to the import-time check.
 | Rows that schedule more than one token | Fail the row's request alone at planning (REG-STATE-014), through the planning-failed set and `take_failed_requests`; the step's other rows run at their own token positions | Sample the row's last token and drop the others; run the row's tokens in order as several stream units, as vLLM's and SGLang's Mamba prefill scan a multi-token row from the request's state | Each token of this model's stream is one unit of audio, and the design keeps per-step work and per-request state constant: one unit per request per step, so a step's cost does not depend on what one client sends. A multi-token row would let one request's work grow within a step. Sampling the last token and dropping the rest discards audio and returns a wrong transcript with no error. Running the tokens as several units costs `k` dependent encoder and decoder passes for a `k`-unit row, which every co-batched row waits for; it needs the intermediate units' labels to pass through the model's own output queue, since core samples one position per row; and the transaction-graph cells and their per-unit checks (TXG-TXN-010, TXG-EXEC-007) would address units, not rows. Plugin-packed input never schedules a multi-token row. A consumer that needs multi-token input uses a design that re-prefills or scans history, such as Mamba prefill or bounded sessions. Running the tokens as several units is Future roadmap 14 |
 | State-layer view lifetime | Views held by reference in a cache keyed on the bound `kv_cache` object, dropped at a binding, at an identity mismatch and in `clear_cudagraphs` (State-slot access, View lifetime) | Derive the views on every read; hold weak references to the bound tensors; keep the views as plain attributes replaced at each binding | Deriving on every read needs no hook but costs about 2.7 µs per read, and weak references about 3.8 µs, against about 0.02 µs for the identity comparison (CPU measurements). Plain attributes hold the profiling KV cache until the serving binding, after core has allocated the serving KV cache |
 | Envelope-header faults | Each fault in one of REG-STATE-015's two classes, by whether a request's input can cause it (Model-state interface, Error boundary) | Raise for every envelope fault; fail the request for every one | Core lets a direct engine client bypass the processor, so a malformed item reaches planning, and a raise would end every stream on the server. A fault that no request input can cause means core and the model disagree about the step, which no per-request outcome makes safe |
-| Feature and item shape | Accept only the feature the processor builds: its placement (one carrier position, no embedding mask, in offset order) by one rule shared by file intake and envelope resolution, and its item (fields, field class, dtype, rank, a file's host placement) by one rule shared by file intake, encoder-input screening and envelope resolution (Model-state interface, Feature and item shape) | Refuse each fault as it is found; check only the item; accept any real floating-point envelope | Core's decoder lets a client choose each placeholder range, each field's class and each tensor's dtype, so a list of found faults leaves every shape not yet found free to end the server, and core's gather reads the placement as well as the item. Core stacks a batch into its first tensor's dtype before the model's own cast, so a lower-precision envelope rounds or fails its neighbours |
+| Request shape | Accept only the request the processor builds, by one rule (`request_shape_fault`) checked at each `add_request`: its prompt (a stream's first row a CHUNK, one feature on each stream carrier and none elsewhere, no file carrier in a stream, a file prompt of its carrier alone), its features' placement (one carrier position, no embedding mask, in offset order) and its items (fields, field class, dtype, rank, a file's host placement), the placement and item rules shared by file intake, encoder-input screening and envelope resolution (Model-state interface, Request shape) | Refuse each fault as it is found; check only placements and items; register a stream at a fresh non-CHUNK row and let the transaction judge it; refuse every control token in a stream | Core's decoder lets a client choose the prompt, each placeholder range, each field's class and each tensor's dtype, so a list of found faults leaves every shape not yet found free to end the server; five review rounds each found one more. Core's gather reads the placement as well as the item, and core stacks a batch into its first tensor's dtype before the model's own cast, so a lower-precision envelope rounds or fails its neighbours. A stream registered at a non-CHUNK row would have no admitted geometry or prompt from its first unit. A control token in a continuing turn is a direct client's forced EOU, which the transaction already judges (TXG-COV-012) |
 | Retirement of a finished request | A file request within `remove_request`; a stream request at the next model-state call | Every request at the next model-state call; every request within `remove_request` | A file is one request that core never continues, so nothing after its removal reads its buffer, and a deferred retirement would keep the last file's buffer (64,000 bytes per second of audio) on an idle engine. A stream's `remove_request` may precede its next turn's `add_request`, which keeps the admission generation, so retiring it at once would lose the generation a continuing turn needs; the deferred stream record holds no host buffer |
 | Settings core refuses before the configuration hook | Core's message, which names one setting (Engine settings, Core's checks first); the plugin keeps its own rules for them | Ask core to defer its check to the hook; drop the plugin's rules for those settings | Core's check runs while it builds the engine configuration, before the hook, and its message names the setting to remove, which is the remedy. The plugin's rules still list every failed check when the hook is called directly, and keep the plugin's refusals independent of core's list |
 | `generate` task | Not advertised (model-state override) | Advertise for compatibility | The model emits transcript labels, not text generation |
@@ -1297,9 +1331,15 @@ Each item names what is deferred, the trigger that reopens it and the shape of t
     core validates client-supplied identifiers against content, or a client is seen reusing them.
     Shape: the model screens a scheduled encoder input whose identifier another live request uses
     with different content.
-17. **Embedding masks core's scheduler refuses.** A direct engine client can send a feature whose
-    `is_embed` is empty or not one-dimensional; core's scheduler indexes that mask while it plans
-    encoder inputs, before any model-state hook runs, so the error ends the engine step and the
-    model's placement rule (REG-STATE-015) never sees the request. Trigger: core validates a
-    feature's placeholder range when it decodes or admits a request. Shape: none in the model; the
-    request is then refused at admission, and the model's rule still covers masks core admits.
+17. **Embedding masks core's scheduler mishandles.** A direct engine client can send a feature
+    whose `is_embed` mask is empty or not one-dimensional, or whose count (the mask's sum) is not a
+    non-negative integer: negative, NaN or fractional. Core's scheduler reads the mask before any
+    model-state hook runs: it indexes the mask while it plans encoder inputs, and it feeds the
+    mask's running count into the encoder-compute budget and `EncoderCacheManager.allocate`. An
+    empty or two-dimensional mask raises there, ending the engine step; a negative count inflates
+    every request's encoder-cache capacity, and a large negative count stops eviction, so the
+    worker's encoder outputs grow without bound; a NaN count makes `allocate` raise an
+    `AssertionError` that ends the scheduler. The model's placement rule (REG-STATE-015) refuses
+    every mask, but only after core's scheduler has read it, and it cannot undo core's accounting.
+    Trigger: core validates a feature's placeholder range when it decodes or admits a request.
+    Shape: none in the model; the request is then refused at admission.
