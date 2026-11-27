@@ -97,15 +97,23 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
 ```
 
 - `--max-num-seqs 64` is an interim value from an unpublished A40 measurement at 320 ms under
-  `--enforce-eager`. No tier has been met on the target core, so no value is verified for it.
+  `--enforce-eager`. No tier has been met on the target core in this configuration, so no value is
+  verified for it.
 - The hook configuration replaces `--enforce-eager` with `-cc.cudagraph_mode none -cc.mode none`;
   core then captures the model's graphs through vllm#67583's capture hook. On the earlier
   state-pool build, `--max-num-seqs 64` fit one A40 at 320 ms in that configuration.
-- Asynchronous scheduling is accepted with transaction graphs off, but no run has qualified it, so
-  the command sets `--no-async-scheduling`. On the target core an unset option means asynchronous
+- Asynchronous scheduling is accepted with transaction graphs off. On one A40 at FP32 on the target
+  core, asynchronous scheduling with `--enforce-eager` or with no runner flag matched the
+  synchronous `--enforce-eager` server on 200 utterances at each of 80, 160, 320, 560 and 1120 ms,
+  at the manual's context lengths ([evidence](docs/evidence.md#runner-mode-matrix-on-the-target-core)).
+  No latency tier has been met with it, so the command sets `--no-async-scheduling`. On the target core an unset option means asynchronous
   scheduling.
 - The server fixes one lookahead at startup. The default is the checkpoint's: 3 (320 ms) on the
-  published card. At that lookahead, `--max-model-len 77000` holds a 600 s file.
+  published card. At that lookahead, `--max-model-len 77000` holds a 600 s file. It also raises
+  core's token budget to 77,000; at 320 ms on one A40 that left 13.67 GiB less available KV cache
+  memory under `--enforce-eager` than a 2048-token budget (14.19 GiB less with no runner flag). A server
+  that serves only streams can run `--max-model-len 144` instead
+  ([user manual, Serving streams only](docs/manual.md#serving-streams-only)).
 - The [user manual's Serving configurations](docs/manual.md#serving-configurations) explains each
   flag, other lookaheads, `--max-model-len` sizing, the memory cost of `--max-num-seqs`, the eager
   arms and the refused settings.

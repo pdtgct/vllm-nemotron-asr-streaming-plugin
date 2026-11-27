@@ -176,7 +176,7 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
 ```
 
 `--max-num-seqs 64` is an interim value from an unpublished A40 measurement at 320 ms under
-`--enforce-eager`; no tier has verified a value on the target core. On the earlier state-pool
+`--enforce-eager`; no tier has verified this value in this configuration. On the earlier state-pool
 build, `--max-num-seqs 64` fit one A40 at 320 ms in the hook configuration
 ([evidence](evidence.md#tier-2-on-the-state-pool-build)).
 
@@ -265,9 +265,40 @@ far smaller than this bound.
   | Tokens for 600 s | 82,513 | 78,773 | 76,918 | 76,114 | 75,578 |
 
 `--max-model-len 77000` therefore holds a 600 s file at lookahead 3, 6 and 13. An override to 0
-needs at least 82,513, and an override to 1 at least 78,773. Streams need only 144 tokens, and a `--max-model-len` below 144 is refused. If you raise
-`VLLM_MAX_AUDIO_DECODE_DURATION_S`, raise `--max-model-len` with it. Each token costs no KV memory
-and about 4 bytes of token history per slot (`max_num_seqs × max_model_len` tokens in all).
+needs at least 82,513, and an override to 1 at least 78,773. Streams need only 144 tokens, and a
+`--max-model-len` below 144 is refused. If you raise `VLLM_MAX_AUDIO_DECODE_DURATION_S`, raise
+`--max-model-len` with it. Each token costs no KV memory and about 4 bytes of token history per slot
+(`max_num_seqs × max_model_len` tokens in all).
+
+`--max-model-len` also sets the token budget. Without chunked prefill, which this model does not
+use, core raises an unset `--max-num-batched-tokens` to at least `--max-model-len` and rejects an
+explicit budget below it (`vllm/engine/arg_utils.py:3217-3226` and
+`vllm/config/scheduler.py:402-414` at `9503e3b878`). At 320 ms on one A40 at FP32, core `9503e3b878` with a 77,000-token budget reported 13.67 GiB less available
+KV cache memory under `--enforce-eager`, and 14.19 GiB less with no runner flag, than core
+`cbf13fed4a` with chunked prefill and a 2048-token budget
+([evidence](evidence.md#stream-only-servers-at---max-model-len-144)). These figures are available
+memory, not the memory of the allocated KV blocks.
+
+#### Serving streams only
+
+A server that serves only `/v1/realtime` streams can run `--max-model-len 144`, the smallest value
+that holds one stream unit. Its token budget stays at core's default of 2048. On one A40, the
+`--enforce-eager` stream-only servers at 80, 320 and 1120 ms matched the startup-memory figures and
+all 200 transcripts of the corresponding servers on core `cbf13fed4a`, which used chunked prefill
+and the manual's full context lengths
+([evidence](evidence.md#stream-only-servers-at---max-model-len-144)). Core stops a file request at 144 tokens, so send files to a server whose `--max-model-len` holds the
+longest file. Change only the last flag of the serve command:
+
+```bash
+vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
+    --dtype float32 \
+    --enforce-eager \
+    --no-async-scheduling \
+    --config-format nemotron_asr_streaming \
+    --tokenizer-mode nemotron_asr_streaming \
+    --max-num-seqs 64 \
+    --max-model-len 144
+```
 
 ### `--max-num-seqs` and graph memory
 
