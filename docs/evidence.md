@@ -27,6 +27,8 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 - [Unpublished measurement under `--enforce-eager`](#unpublished-measurement-under---enforce-eager)
 - [Served accuracy on the target core](#served-accuracy-on-the-target-core)
 - [Light round on the parent of the target core](#light-round-on-the-parent-of-the-target-core)
+- [Block-0 capture under every KV-cache sizing](#block-0-capture-under-every-kv-cache-sizing)
+- [Stream-only servers at `--max-model-len 144`](#stream-only-servers-at---max-model-len-144)
 - [Transaction graphs, tier 5](#transaction-graphs-tier-5)
 - [Owed](#owed)
 - [Historical entries](#historical-entries)
@@ -145,6 +147,47 @@ core's persistent-state detokenizer, and records measurements that the owed tier
   stream reference through the session factory, which is not available on stage 1; the three
   transaction-graph tests start an engine without the restricted startup, or pass a Python function
   to a multiprocess engine.
+
+## Block-0 capture under every KV-cache sizing
+
+No tier is met by this round. It records the GPU checks of transaction graphs whose capture rows
+sit on block 0, under each KV-cache sizing core offers, on stage 1.
+
+- Build: `pdtgct/vllm` `pstate-impl-20261122` @ `9503e3b878`, with precompiled wheel `842f74fa8d`
+  (cu132); plugin `feat/core-graphs-20261123` @ `21b5981`, with the test-support fixes and the
+  capture record's plain torch version that `37115a1` and `3a0a046` carry; one NVIDIA A40 at FP32;
+  2026-11-27. Evidence: `pdtgct/nemotron-omni-port` `experiments/2026-11-27-plugin-followup-b-a40/`
+  and `experiments/2026-11-27-plugin-hlc-a40/`.
+- TXG-QUAL-028 at 80 and 160 ms, under the extensible KV cache, a profiled budget with
+  `--no-enable-extensible-kv-cache` and a fixed `--num-gpu-blocks-override`: one stream served alone
+  and each of TXG-QUAL-004's files transcribed alone replayed cells with no fallback of reason
+  `signature` and produced transcripts equal to `B_hook`'s under the same sizing.
+- TXG-QUAL-029: the exactness runs under the extensible KV cache, `Q` and `M` and the fallback steps,
+  compared equal, with every committed page outside the detached copy unchanged, inside the
+  preregistered headroom.
+- TXG-QUAL-022 (the uncharged-memory WARNING under a fixed `--kv-cache-memory-bytes`), TXG-CAP-018
+  and TXG-EQ-003 on CUDA, the rest of the transaction-graph GPU tests, REG-ENG-032's and
+  REG-STATE-019's arms with transaction graphs on, and the transcription GPU tests passed.
+- Served transcripts at 32 sessions with transaction graphs on under the default sizing were not
+  measured in this round; no served throughput, latency or tier 5 claim rests on it.
+
+## Stream-only servers at `--max-model-len 144`
+
+No tier is met by this round. A server that serves only streams runs at `--max-model-len 144`, the
+smallest context that holds one stream unit, and so keeps core's default token budget of 2048.
+
+- Build: as [Block-0 capture under every KV-cache sizing](#block-0-capture-under-every-kv-cache-sizing),
+  at plugin `21b5981`. Evidence: `experiments/2026-11-27-plugin-followup-b-a40/`.
+- 200 paced LibriSpeech test-clean utterances at 32 sessions on `/v1/realtime` under
+  `--enforce-eager`: word-error rate 3.15% at 80 ms, 2.55% at 320 ms and 2.44% at 1120 ms, every
+  transcript equal to the same server's at the full `--max-model-len`, and every request finished
+  with `stop`, none length-capped. At 320 ms with no runner flag, all 200 transcripts equal those
+  under `--enforce-eager`.
+- The startup equals the full-length server's at a token budget of 2048: the same available KV
+  cache memory, block count, encoder cache and graph memory. At `--max-model-len 77000` core raises
+  the token budget to the context length, which takes about 14 GiB of available KV cache memory on
+  the A40 (`experiments/2026-11-26-plugin-budget-9503e3b878/`).
+- One unprofiled run per setting with no repeats: no latency claim rests on this round.
 
 ## Transaction graphs, tier 5
 
@@ -296,8 +339,8 @@ and `E ≤ N` make up at least 99 % of served steps. At `N` = 63 they make up 10
   unprofiled run per chunk size).
 - Tier 5 for transaction graphs at 80 and 160 ms on the target core, under the restricted startup;
   served equality is measured above.
-- The plugin GPU tests whose setup failed in the light round, rerun with their corrected setup on
-  `9503e3b878`: four of the file-against-stream text checks need its detokenizer fix.
+- Served transcripts at 32 sessions with transaction graphs on under core's default KV-cache sizing,
+  against `B_hook`, at 80 and 160 ms.
 
 ## Historical entries
 
