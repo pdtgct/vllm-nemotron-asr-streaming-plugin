@@ -901,3 +901,53 @@ def test_the_alone_mode_serves_through_a_multiprocess_engine_with_its_probes():
     )
     assert done.returncode == 0, done.stderr[-3000:]
     assert d.ALONE_READER == "support.txg_alone_worker.AloneReader"
+
+
+# @spec TXG-QUAL-029
+def test_the_probes_read_the_torch_memory_limit_core_sets_after_engine_logging():
+    """The startup probes hold the torch memory limit core sets when it sizes
+    the extensible KV cache, though the engine's start reapplies vLLM's
+    logging configuration (which drops handlers added to ``vllm`` loggers)
+    after the probes are installed; core lifting the cap afterwards keeps the
+    reading. It runs in a child process, so this process keeps core's own
+    classes and logging."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    tests = Path(__file__).resolve().parents[1]
+    code = (
+        "from vllm.v1.worker import extensible_kv_cache as e\n"
+        "calls = []\n"
+        "# Stands in for core's setter, which needs CUDA.\n"
+        "e.ExtensibleKVCache.set_torch_memory_limit = (\n"
+        "    lambda cache, n: calls.append(n))\n"
+        "from support import txg_qual_driver as d\n"
+        "probes = d.StartupProbes().install()\n"
+        "from vllm.config.logging import LoggingConfig\n"
+        "from vllm.logger import configure_logging\n"
+        "configure_logging(LoggingConfig())  # as LLMEngine's start does\n"
+        "limit = (26 << 30) + 12345\n"
+        "e.logger.info('Torch may reserve up to %s GiB.', e.format_gib(limit))\n"
+        "cache = object.__new__(e.ExtensibleKVCache)\n"
+        "cache.set_torch_memory_limit(limit)\n"
+        "cache.set_torch_memory_limit(None)  # free() lifts the cap\n"
+        "assert calls == [limit, None], calls\n"
+        "assert probes.torch_memory_limit == limit, probes.torch_memory_limit\n"
+        "assert probes.reply()['torch_memory_limit'] == limit\n"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(tests), env.get("PYTHONPATH", "")) if p
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tests,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr[-3000:]

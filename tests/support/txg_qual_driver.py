@@ -81,7 +81,6 @@ import dataclasses
 import hashlib
 import json
 import os
-import re
 import statistics
 import sys
 import time
@@ -1681,16 +1680,17 @@ def _worker(worker: Any) -> Any:
 class StartupProbes:
     """Readings taken while the engine starts in this process (TXG-QUAL-001,
     TXG-QUAL-028, TXG-QUAL-029): the plugin's log lines at INFO and above
-    (``records``); core's logged torch memory limit (``torch_memory_limit``,
-    bytes); at each capture's entry (``captures``, by ``"profiling"`` and
-    ``"serving"``) the extensible KV cache's committed block count (``None``
-    when it is off) and the state layer's bound views; per capture, the
-    sorted distinct block IDs of every capture-only row plan
-    (``capture_rows``); and after core's extension (``extension``) the same
-    views, the committed and configured block counts and the binding's
-    latch. A view is plain values ``[address, shape, strides, dtype]``."""
-
-    TORCH_LIMIT = re.compile(r"Torch may reserve up to ([0-9.]+) GiB")
+    (``records``); the torch memory limit core sets, and logs, when it sizes
+    the extensible KV cache (``torch_memory_limit``, bytes; read at core's
+    setter, since the engine's start reapplies vLLM's logging configuration,
+    which drops handlers added to ``vllm`` loggers); at each capture's entry
+    (``captures``, by ``"profiling"`` and ``"serving"``) the extensible KV
+    cache's committed block count (``None`` when it is off) and the state
+    layer's bound views; per capture, the sorted distinct block IDs of every
+    capture-only row plan (``capture_rows``); and after core's extension
+    (``extension``) the same views, the committed and configured block counts
+    and the binding's latch. A view is plain values
+    ``[address, shape, strides, dtype]``."""
 
     def __init__(self) -> None:
         self.records: list[list[str]] = []
@@ -1712,20 +1712,10 @@ class StartupProbes:
             def emit(self, record: logging.LogRecord) -> None:
                 probes.records.append([record.levelname, record.getMessage()])
 
-        class Core(logging.Handler):
-            def emit(self, record: logging.LogRecord) -> None:
-                found = probes.TORCH_LIMIT.search(record.getMessage())
-                if found:
-                    probes.torch_memory_limit = int(float(found.group(1)) * (1 << 30))
-
         plugin = logging.getLogger("vllm_nemotron_asr_streaming")
         plugin.addHandler(Plugin(logging.INFO))
         if plugin.getEffectiveLevel() > logging.INFO:
             plugin.setLevel(logging.INFO)
-        core = logging.getLogger("vllm")
-        core.addHandler(Core(logging.INFO))
-        if core.getEffectiveLevel() > logging.INFO:
-            core.setLevel(logging.INFO)
         self._wrap_core()
         return self
 
@@ -1750,7 +1740,7 @@ class StartupProbes:
         return None
 
     def _wrap_core(self) -> None:
-        from vllm.v1.worker import gpu_worker
+        from vllm.v1.worker import extensible_kv_cache, gpu_worker
         from vllm.v1.worker.gpu import model_runner
 
         from vllm_nemotron_asr_streaming.nemotron_asr.model_state_v2 import (
@@ -1765,6 +1755,17 @@ class StartupProbes:
             probes._runners.append(runner)
 
         model_runner.GPUModelRunner.__init__ = runner_init
+        cache_class = extensible_kv_cache.ExtensibleKVCache
+        set_limit = cache_class.set_torch_memory_limit
+
+        def set_torch_memory_limit(cache: Any, num_bytes: int | None) -> None:
+            # Core lifts the cap (None) when the cache is freed; keep the
+            # limit it set when sizing the cache (TXG-QUAL-029).
+            if num_bytes is not None:
+                probes.torch_memory_limit = int(num_bytes)
+            set_limit(cache, num_bytes)
+
+        cache_class.set_torch_memory_limit = set_torch_memory_limit
         capture = NemotronASRModelState.capture_cudagraphs
 
         def capture_cudagraphs(state: Any, *args: Any, **kwargs: Any) -> Any:
