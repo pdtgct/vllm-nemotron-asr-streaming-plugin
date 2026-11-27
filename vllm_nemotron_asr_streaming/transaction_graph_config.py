@@ -263,32 +263,10 @@ def _runner_mode_condition(vllm_config: Any) -> str | None:
     )
 
 
-def _pool_condition(vllm_config: Any) -> str | None:
-    cache = getattr(vllm_config, "cache_config", None)
-    if getattr(cache, "num_gpu_blocks_override", None) is not None:
-        return None
-    budget = getattr(cache, "kv_cache_memory_bytes", None)
-    if _is_int(budget) and budget > 0:
-        return None
-    limit, _ = _admission_limit(vllm_config)
-    least = "the admission limit plus one" + (
-        "" if limit is None else f" ({limit + 1})"
-    )
-    return (
-        f"{KEY} needs an explicit block count or KV budget on this core, which "
-        "turns core's extensible KV cache off, and neither "
-        "num_gpu_blocks_override nor a positive kv_cache_memory_bytes "
-        f"({'unset' if budget is None else budget!r}) is set (give a "
-        "--num-gpu-blocks-override of at least "
-        f"{least}, or a positive --kv-cache-memory-bytes that holds at least "
-        "that many state pages)"
-    )
-
-
 # @spec TXG-CFG-003, TXG-CFG-004, TXG-CFG-005, TXG-CFG-006, TXG-CFG-007
 # @spec TXG-CFG-008, TXG-CFG-009, TXG-CFG-010, TXG-CFG-011, TXG-CFG-012
 # @spec TXG-CFG-013, TXG-CFG-015, TXG-CFG-016, TXG-CFG-017, TXG-CFG-018
-# @spec TXG-CFG-019, TXG-CFG-020
+# @spec TXG-CFG-020
 def transaction_graph_config_errors(
     vllm_config: Any, *, has_state_group_layouts: bool
 ) -> list[str]:
@@ -347,5 +325,4 @@ def transaction_graph_config_errors(
             f"{shown} (pass --no-async-scheduling)"
         )
     errors.append(_runner_mode_condition(vllm_config))
-    errors.append(_pool_condition(vllm_config))
     return [error for error in errors if error is not None]

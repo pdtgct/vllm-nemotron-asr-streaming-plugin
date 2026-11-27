@@ -228,7 +228,9 @@ def test_profiling_capture_runs_segments_warm_up_cells_then_the_margin(on_cpu):
     assert pools == {"profiling-pool"}, pools
     # Over block 0 of the profiling pools: core's profiling KV cache, which
     # holds num_gpu_blocks_override blocks when that is set. Every scatter
-    # row of the call, the warm-up's and the capture rows', names block 0.
+    # into the profiling pools, the warm-up's and the capture rows', names
+    # block 0; the segment graphs' scatters write the model's own scratch,
+    # outside those pools.
     blocks = env.vllm_config.cache_config.num_gpu_blocks_override
     assert blocks is not None, "the environment sets no block count"
     assert {
@@ -239,7 +241,8 @@ def test_profiling_capture_runs_segments_warm_up_cells_then_the_margin(on_cpu):
     profiling_pool = h.pool_tensor(core.profiling_bindings)
     warmed = [env.events[mark + i][1] for i in warmups]
     assert all(t.within(profiling_pool, c["pool"]) for c in warmed), warmed
-    rows = [e[1] for e in env.events[mark:] if e[0] == "scatter"]
+    scatters = [e[1] for e in env.events[mark:] if e[0] == "scatter"]
+    rows = [c for c in scatters if t.within(profiling_pool, c["pool"])]
     assert rows and all(set(c["pages"]) == {0} for c in rows), rows
 
 

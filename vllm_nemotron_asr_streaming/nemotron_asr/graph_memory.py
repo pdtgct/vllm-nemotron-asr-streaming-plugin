@@ -185,20 +185,40 @@ class ProfilingRequirement:
     estimate: bool
     extensible_kv_cache: bool
 
+    @property
+    def measured(self) -> bool:
+        """Whether core measures the graph memory instead of charging it:
+        the effective extensible KV cache is on, whatever the budget or
+        estimate setting, so core sizes the KV cache from the device memory
+        left after the captures (TXG-MEM-018, REG-MEM-023)."""
+        return self.extensible_kv_cache
 
-# @spec REG-MEM-027
+
+# @spec REG-MEM-027, TXG-MEM-007, TXG-MEM-018
 def profiling_requirement(vllm_config: Any) -> ProfilingRequirement:
     """The required-capture predicate: a profiling capture was required
     exactly when the effective ``kv_cache_memory_bytes`` is unset or 0,
     ``VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS`` is not 0 and the effective
-    extensible KV cache is off."""
+    extensible KV cache is off.
+
+    The reason checks the extensible KV cache first: with it on, core sizes
+    the KV cache from the memory left after the captures whatever the budget
+    (a startup plan sets one with the extensible KV cache left on) or the
+    estimate setting, so the graph memory is measured, never uncharged."""
     import vllm.envs as envs
 
     cache = getattr(vllm_config, "cache_config", None)
     budget = getattr(cache, "kv_cache_memory_bytes", None)
     estimate = bool(envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS)
     extensible = bool(getattr(cache, "enable_extensible_kv_cache", False))
-    if budget:
+    if extensible:
+        reason = (
+            "the extensible KV cache is on: core sizes the KV cache from the "
+            "device memory left after the captures instead of estimating them"
+            + (f" (kv_cache_memory_bytes={budget})" if budget else "")
+            + ("" if estimate else " (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0)")
+        )
+    elif budget:
         reason = (
             f"a fixed budget (kv_cache_memory_bytes={budget}): core runs no "
             "graph-memory estimate"
@@ -207,11 +227,6 @@ def profiling_requirement(vllm_config: Any) -> ProfilingRequirement:
         reason = (
             "core's graph-memory estimate is disabled "
             "(VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0)"
-        )
-    elif extensible:
-        reason = (
-            "the extensible KV cache is on: core measures the capture after "
-            "warm-up instead of estimating it"
         )
     else:
         reason = (
@@ -226,6 +241,108 @@ def profiling_requirement(vllm_config: Any) -> ProfilingRequirement:
         kv_cache_memory_bytes=budget,
         estimate=estimate,
         extensible_kv_cache=extensible,
+    )
+
+
+#: Core's KV-cache sizings, as :func:`kv_cache_sizing` names them.
+SIZING_EXTENSIBLE = "extensible"
+SIZING_BUDGET = "budget"
+SIZING_BLOCK_COUNT = "block_count"
+SIZING_PROFILED = "profiled"
+
+
+@dataclass(frozen=True)
+class KvCacheSizing:
+    """The KV-cache sizing of the worker's effective cache configuration:
+    ``kind`` is one of the ``SIZING_*`` names, with the values that select
+    it."""
+
+    kind: str
+    kv_cache_memory_bytes: Any
+    num_gpu_blocks_override: int | None
+    gpu_memory_utilization: Any
+    estimate: bool
+
+    @property
+    def extensible(self) -> bool:
+        return self.kind == SIZING_EXTENSIBLE
+
+    @property
+    def fixed_budget(self) -> bool:
+        return self.kind == SIZING_BUDGET
+
+    @property
+    def profiled(self) -> bool:
+        """A profiled budget with the extensible KV cache off: the only
+        sizing under which a lower ``--gpu-memory-utilization`` leaves a
+        serving capture more device memory (REG-MEM-017, TXG-MEM-019)."""
+        return self.kind == SIZING_PROFILED
+
+    def describe(
+        self, *, page_count: int | None = None, startup_plan: bool | None = None
+    ) -> str:
+        """The sizing as the messages name it (TXG-MEM-010, REG-MEM-017):
+        the extensible KV cache, with its layout's ``page_count`` when known,
+        whatever the budget or estimate setting; or, with it off, a budget
+        fixed at the given ``kv_cache_memory_bytes`` (``startup_plan`` says
+        whether a persisted startup plan set it, when known), a block count
+        fixed at the given ``num_gpu_blocks_override`` or a profiled budget,
+        each with the estimate's setting where core would run it."""
+        estimate = (
+            "with core's graph-memory estimate "
+            f"{'enabled' if self.estimate else 'disabled'}"
+        )
+        if self.kind == SIZING_EXTENSIBLE:
+            return "the extensible KV cache" + (
+                "" if page_count is None else f" (layout page count {page_count})"
+            )
+        if self.kind == SIZING_BUDGET:
+            budget = format_bytes(int(self.kv_cache_memory_bytes))
+            plan = ""
+            if startup_plan is not None:
+                plan = (
+                    ", fixed by a persisted startup plan after the model was built"
+                    if startup_plan
+                    else ", fixed by configuration, not by a startup plan"
+                )
+            return f"a budget fixed at --kv-cache-memory-bytes {budget}{plan}"
+        if self.kind == SIZING_BLOCK_COUNT:
+            return (
+                "a block count fixed at --num-gpu-blocks-override "
+                f"{self.num_gpu_blocks_override}, {estimate}"
+            )
+        return (
+            "a profiled budget with the extensible KV cache off "
+            f"(gpu_memory_utilization {self.gpu_memory_utilization}), {estimate}"
+        )
+
+
+# @spec REG-MEM-017, REG-MEM-023, TXG-MEM-010, TXG-MEM-019
+def kv_cache_sizing(vllm_config: Any) -> KvCacheSizing:
+    """The one sizing function the capture messages share (REG-MEM-017,
+    REG-MEM-023, TXG-MEM-010, TXG-MEM-019): the effective extensible KV
+    cache first, whatever the budget or estimate setting (a startup plan
+    sets ``kv_cache_memory_bytes`` with it left on); then a fixed budget,
+    then a fixed block count; otherwise a profiled budget."""
+    import vllm.envs as envs
+
+    cache = getattr(vllm_config, "cache_config", None)
+    budget = getattr(cache, "kv_cache_memory_bytes", None)
+    override = getattr(cache, "num_gpu_blocks_override", None)
+    if getattr(cache, "enable_extensible_kv_cache", False):
+        kind = SIZING_EXTENSIBLE
+    elif budget:
+        kind = SIZING_BUDGET
+    elif override is not None:
+        kind = SIZING_BLOCK_COUNT
+    else:
+        kind = SIZING_PROFILED
+    return KvCacheSizing(
+        kind=kind,
+        kv_cache_memory_bytes=budget,
+        num_gpu_blocks_override=None if override is None else int(override),
+        gpu_memory_utilization=getattr(cache, "gpu_memory_utilization", None),
+        estimate=bool(envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS),
     )
 
 
@@ -273,13 +390,19 @@ def serving_excess(serving_total: int | None, profiling_total: int | None) -> in
 
 __all__ = [
     "MARGIN_BYTES",
+    "SIZING_BLOCK_COUNT",
+    "SIZING_BUDGET",
+    "SIZING_EXTENSIBLE",
+    "SIZING_PROFILED",
     "CaptureCall",
     "ChargedMargin",
+    "KvCacheSizing",
     "ProfilingRequirement",
     "allocate_margin",
     "begin_transient_peak",
     "format_bytes",
     "free_memory",
+    "kv_cache_sizing",
     "profiling_requirement",
     "release_error_frames",
     "retained",

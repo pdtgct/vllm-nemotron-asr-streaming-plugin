@@ -1044,23 +1044,49 @@ def test_only_a_capture_calls_cell_programs_pass_the_capture_only_mode(
     ), "advance_model_rows's interface changed"
     run = on_cpu(n=2, max_num_seqs=3)
     env, core = run.env, run.core
+    # Each prepare_model_rows call as (through advance_model_rows, mode).
     calls = []
-    original = advance.prepare_model_rows
+    depth = [0]
+    original_prepare = advance.prepare_model_rows
+    original_advance = advance.advance_model_rows
 
     def spy(*args, **kwargs):
-        calls.append(bool(kwargs.get(CAPTURE_ONLY_KEYWORD, False)))
-        return original(*args, **kwargs)
+        calls.append((depth[0] > 0, bool(kwargs.get(CAPTURE_ONLY_KEYWORD, False))))
+        return original_prepare(*args, **kwargs)
+
+    def advance_spy(*args, **kwargs):
+        depth[0] += 1
+        try:
+            return original_advance(*args, **kwargs)
+        finally:
+            depth[0] -= 1
 
     monkeypatch.setattr(advance, "prepare_model_rows", spy)
+    monkeypatch.setattr(advance, "advance_model_rows", advance_spy)
+    # profile_execution binds the name at import.
+    import importlib
+
+    profile_execution = importlib.import_module(
+        advance.__name__.rsplit(".", 1)[0] + ".profile_execution"
+    )
+    monkeypatch.setattr(profile_execution, "advance_model_rows", advance_spy)
     ready_to_capture(run)
+    assert not any(mode for _, mode in calls), calls
+    calls.clear()
     core.serving_capture()
-    assert calls == [True] * (2 * env.n), calls
+    # The warm-ups inside the capture call prepare rows through
+    # advance_model_rows, without the mode; the cell programs call
+    # prepare_model_rows directly, each with it, one call per cell.
+    assert not any(mode for through, mode in calls if through), calls
+    direct = [mode for through, mode in calls if not through]
+    assert direct == [True] * (2 * env.n), calls
+    calls.clear()
     calls.clear()
     core.post_warmup()
     core.extend()
     core.step(t.stream_unit(env, "cap17-s1"))
     run_fallback_classes_at_any_n(env, core, first_slot=2)
-    assert calls and not any(calls), calls
+    assert calls and not any(mode for _, mode in calls), calls
 
 
 # ---------------------------------------------------------------------------

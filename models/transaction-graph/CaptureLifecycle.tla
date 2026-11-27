@@ -14,47 +14,59 @@
 \* part of each hook call. SplitStep.tla refines the scheduled step.
 \*
 \* WHAT IS MODELLED (TXG-MODEL-001, TXG-MODEL-002)
-\*  Every hook call in core's startup order, under the restricted startup
-\*  (TXG-CFG-019), whose fixed block count or fixed budget is a
-\*  nondeterministic choice (the extensible KV cache stays off):
-\*  construction (or a failed construction), needs_cudagraph_capture,
+\*  Every hook call in core's startup order under each of core's four
+\*  KV-cache sizings, a nondeterministic choice: the extensible KV cache, a
+\*  profiled budget with it off, a fixed block count and a fixed budget.
+\*  Construction (or a failed construction), needs_cudagraph_capture,
 \*  prepare_execution_memory (after an optional startup plan that fixes the
 \*  budget), the profiling forward pass (a dummy step), then core's
-\*  estimate: skipped, its temporary profiling pool failing, or core's
-\*  binding of the profiling KV cache's views (bind_kv_cache), which sets
-\*  the state-group layout, followed by capture_cudagraphs(profile_only=True)
-\*  (or a core failure before that call is reached), clear_cudagraphs, also
+\*  estimate, which never runs under the extensible KV cache: skipped, its
+\*  temporary profiling pool failing, or core's binding of the profiling KV
+\*  cache's views (bind_kv_cache), which sets the state-group layout and
+\*  binds the views, followed by capture_cudagraphs(profile_only=True) (or a
+\*  core failure before that call is reached), clear_cudagraphs, also
 \*  after a failed or skipped capture, and the release of the profiling KV
-\*  cache, which clears the state-group layout; core's binding of the
-\*  serving KV cache's views, which sets the layout again;
-\*  capture_cudagraphs(profile_only=False); post_warmup; serving with
-\*  scheduled steps, dummy steps and cleanup-only steps; a scheduled step
-\*  before post-warmup verification, after whose propagated error the
+\*  cache, which clears the state-group layout and the views; core's binding
+\*  of the serving KV cache's views, which sets the layout again;
+\*  capture_cudagraphs(profile_only=False); post_warmup; under the
+\*  extensible KV cache, core's extension after post_warmup (CoreExtends),
+\*  which binds views of no more pages over the same base while the
+\*  state-group layout stays unchanged, and which serving waits for; serving
+\*  with scheduled steps, dummy steps and cleanup-only steps; a scheduled
+\*  step before post-warmup verification, after whose propagated error the
 \*  engine dies or survives (the environment's choice, TXG-EXEC-015);
 \*  all-failed bypass steps after the serving capture on an unlatched
 \*  worker, before and after verification, behind the latch check
 \*  (TXG-FAIL-010; here a latch fails the worker at once, so SplitStep.tla
 \*  checks the latched refusal); a binding by core after the serving
-\*  capture with an equal or a changed layout (TXG-LIFE-009); a later
-\*  serving capture call after a
-\*  successful serving capture (an elastic reconfiguration) and after a
-\*  failed or refused one (ServingCaptureRetry), which core never makes but
-\*  the model does, so that TXG-MODEL-009 holds by the entry refusal and not
-\*  by core's order; shutdown from any state between hook calls; and a
-\*  killed worker. Each capture call runs its entry checks, then the
-\*  segment graphs, the pool-access check (TXG-CAP-008: it reads the
-\*  state-group layout and records its plain values; it fails on a broken
-\*  layout contract, or on too few blocks, which only a fixed budget can
-\*  give), the binding buffers, the scatter warm-up, the 2N cells
+\*  capture with views that fit the recorded layout (equal views, or the
+\*  extension's views of no more pages), accepted, and with views that do
+\*  not fit, at the extension included, latched (TXG-LIFE-009); the
+\*  state-group layout the accessor returns and the views core bound are
+\*  separate state (stateGroupLayout, boundViews), because a binding after
+\*  the serving capture rebinds the views and never the layout; a later
+\*  serving capture call after a successful serving capture (an elastic
+\*  reconfiguration) and after a failed or refused one
+\*  (ServingCaptureRetry), which core never makes but the model does, so
+\*  that TXG-MODEL-009 holds by the entry refusal and not by core's order;
+\*  shutdown from any state between hook calls; and a killed worker. Each
+\*  capture call runs its entry checks, then the segment graphs, the
+\*  pool-access check (TXG-CAP-008: it reads the state-group layout and
+\*  records its plain values; it fails on a broken layout contract, or, in
+\*  the serving capture only, on too few pages, which every sizing but a
+\*  fixed block count can give), the binding buffers, the scatter warm-up,
+\*  the 2N cells
 \*  (chunk N..1 then echo N..1, each with its validation replay on rejected
 \*  capture rows), then the margin (profiling) or the aggregate memory
 \*  comparison (serving), then synchronizes and returns; every phase can
 \*  fail, and a failure runs the whole-call cleanup (transaction-graph part,
 \*  then segment graphs, then synchronize) before it propagates. Whether a
-\*  profiling capture is required (effective budget fixed, by the startup
-\*  setting or by a startup plan after construction; estimate setting) and
-\*  whether one runs are independent nondeterministic choices. Call totals
-\*  are abstract units in 0..MaxMem chosen nondeterministically.
+\*  profiling capture is required (never under the extensible KV cache, a
+\*  budget a startup plan sets there included; with it off, effective
+\*  budget fixed, by the startup setting or by a startup plan after
+\*  construction; estimate setting) and whether one runs are independent
+\*  nondeterministic choices. Call totals are abstract units in 0..MaxMem
+\*  chosen nondeterministically.
 \*
 \* ENTRY CHECKS (TXG-LIFE-006, TXG-LIFE-007, TXG-LIFE-008, REG-MEM-024,
 \* TXG-MEM-009)
@@ -85,7 +97,9 @@
 \*  the step's execute order, reservations and latch interplay, which
 \*  SplitStep.tla models; the layout's contents (a state-group layout here
 \*  is the KV cache it describes, and the failed pool-access check stands
-\*  for every broken condition); core's own teardown of the views after a
+\*  for every broken condition); page counts (a binding's views either fit
+\*  the recorded layout, with no more pages over the same base, or do not;
+\*  too few pages is the pool-access check's failure); core's own teardown of the views after a
 \*  failed startup. A capture call, a hook's two release halves and core's
 \*  release of the profiling KV cache after clear_cudagraphs are atomic with
 \*  respect to other hook calls; only a kill interrupts them.
@@ -113,10 +127,13 @@
 \*    call has returned or raised; and a call's buffers, cells and margin
 \*    exist only once its pool-access check passed and recorded the
 \*    layout's plain values.
-\*  PoolAccessBlockCountUnderBudget (TXG-CAP-008, TXG-CFG-019,
-\*    TXG-MEM-017): the pool-access check fails for too few blocks only
-\*    under a startup with a fixed budget; a fixed block count below the
-\*    admission limit plus one is refused before any capture.
+\*  PoolAccessPageCountAtServingOnly (TXG-CAP-008, TXG-CFG-005,
+\*    TXG-MEM-017): the pool-access check fails for too few pages only in
+\*    the serving capture (the profiling capture makes no page-count check)
+\*    and only under a sizing other than a fixed block count (a fixed
+\*    budget, a profiled budget or the extensible KV cache); a fixed block
+\*    count below the admission limit plus one is refused before any
+\*    capture.
 \*  AtMostOneServingCapture (TXG-MODEL-009, TXG-LIFE-008, REG-MEM-024): at
 \*    most one serving capture call passes its entry checks and captures
 \*    graphs in the worker; every later serving call, after a successful or
@@ -128,10 +145,14 @@
 \*  EntryChecksExclusive (TXG-LIFE-006, TXG-LIFE-007, TXG-LIFE-008,
 \*    REG-MEM-024, TXG-MEM-009): between hook calls at most one of the
 \*    defects the entry checks detect holds (ENTRY CHECKS above).
-\*  UnprofiledServingCapture (TXG-MODEL-010, TXG-MEM-007 to TXG-MEM-009):
-\*    a serving capture with no completed profiling capture before it either
-\*    succeeded with the uncharged WARNING because none was required, or
-\*    startup failed; when one was required, the call captured nothing.
+\*  UnprofiledServingCapture (TXG-MODEL-010, TXG-MEM-007 to TXG-MEM-009,
+\*    TXG-MEM-018): a serving capture with no completed profiling capture
+\*    before it either succeeded because none was required, reported as
+\*    measured and not as uncharged under the extensible KV cache (the INFO
+\*    line: core sizes the cache from the memory left after the captures)
+\*    and as uncharged and not as measured with the extensible KV cache off
+\*    (the uncharged WARNING), or startup failed; when one was required,
+\*    the call captured nothing.
 \*  OverrunFailsStartup (TXG-MODEL-011, TXG-MEM-005, REG-MEM-027): a serving
 \*    capture whose call total exceeds the profiling call total never
 \*    succeeds, and startup fails once its call has returned.
@@ -158,17 +179,24 @@
 \*    2N serving cells, and only a profiling call has a margin.
 \*  VerifiedBeforeServing (TXG-VER-002, TXG-EXEC-015): the worker serves
 \*    only after post_warmup verification passed.
+\*  ViewsFitOrLatch (TXG-LIFE-009, TXG-MODEL-002): a binding after the
+\*    serving capture rebinds the views and leaves the state-group layout
+\*    the serving KV cache's; views that do not fit the recorded layout
+\*    latch the binding; and under the extensible KV cache the worker
+\*    serves only over the extension's views, so every scheduled step
+\*    follows core's extension.
 \*
 \* PROPERTIES (CaptureLifecycle.cfg), under the fairness in Spec: WF on
-\* startup progress (every hook call, capture-call phase and the second half
-\* of a shutdown) and WF on the shutdown of a failed or latched worker, the
+\* startup progress (every hook call, capture-call phase, core's extension
+\* and the second half of a shutdown) and WF on the shutdown of a failed or latched worker, the
 \* cooperative-teardown assumption (TXG-MODEL-004). A healthy serving worker
 \* is never forced to shut down; no property is claimed for a killed worker
 \* or a failed construction.
 \*  StartupSettles (TXG-MODEL-004): every startup whose construction
 \*    succeeded and that is neither shut down cooperatively nor killed
 \*    before it serves eventually serves or fails with a reported error; no
-\*    startup stalls.
+\*    startup stalls, and under the extensible KV cache it serves only once
+\*    core's extension (CoreExtends, part of startup progress) has run.
 \*  FailedWorkerShutsDown (TXG-MODEL-004, TXG-LIFE-010): every latched or
 \*    failed worker reaches shutdown, unless it is killed.
 \*  LatchIsStable (TXG-FAIL-003): the failed latch is never cleared.
@@ -228,18 +256,26 @@ ReplayRecs ==
     [ctx : {"step", "validation"}, pool : CallKinds, verified : BOOLEAN,
      inCall : BOOLEAN, rejected : BOOLEAN]
 
-\* The state-group layout core sets at each binding of the state layer's views
-\* (bind_kv_cache): none, the profiling KV cache's, the serving KV cache's, or
-\* a serving layout changed by a binding after the serving capture.
-Layouts == {"none", "prof", "serv", "serv-changed"}
+\* The state-group layout the accessor returns, set by core at its binding of
+\* the profiling and of the serving KV cache: none, the profiling KV cache's
+\* or the serving KV cache's. A binding after the serving capture never
+\* changes it (TXG-LIFE-009).
+Layouts == {"none", "prof", "serv"}
+
+\* The state layer's views core bound last: none, the profiling KV cache's,
+\* the serving KV cache's, the extension's views of no more pages over the
+\* same base ("serv-extended"), or views that do not fit the recorded layout
+\* ("serv-moved").
+Views == {"none", "prof", "serv", "serv-extended", "serv-moved"}
 
 \* A read of the layout through ModelState.state_group_layouts: by which
 \* call, what it returned, and whether inside that capture call.
 LayoutReadRecs == [call : CallKinds, layout : Layouts, inCall : BOOLEAN]
 
-\* The restricted startup's setting (TXG-CFG-019): a fixed block count
-\* (num_gpu_blocks_override) or a fixed budget (kv_cache_memory_bytes).
-Startups == {"blockCount", "budget"}
+\* Core's KV-cache sizing: a fixed block count (num_gpu_blocks_override), a
+\* fixed budget (kv_cache_memory_bytes), a profiled budget with the
+\* extensible KV cache off, or the extensible KV cache.
+Startups == {"blockCount", "budget", "profiled", "extensible"}
 
 NoCall == [kind |-> "none", pc |-> "none", i |-> 0]
 CallPCs == {"none", "seg", "pool", "buf", "scatter", "cell", "margin", "compare", "sync",
@@ -256,7 +292,7 @@ Needed(s) ==
 Phases == {
     "constructing", "construction-failed", "constructed", "asked", "prepared",
     "forwarded", "prof-bound", "clearing", "clearing-seg", "releasing", "estimated",
-    "serv-bound", "captured", "serving", "failed", "shutting-down",
+    "serv-bound", "captured", "warmed", "serving", "failed", "shutting-down",
     "shutdown", "killed"}
 Terminal == {"construction-failed", "shutdown", "killed"}
 \* Between hook calls a cooperative shutdown can start in any of these.
@@ -269,7 +305,7 @@ Errors == {
     "profiling-segment-graphs-exist", "pool-access-contract", "pool-access-block-count",
     "profiling-capture-required", "segment-capture", "buffer-allocation",
     "scatter-warmup", "cell-capture", "margin", "serving-overrun",
-    "verification", "layout-changed", "execute-before-verification",
+    "verification", "views-unfit", "execute-before-verification",
     "step-after-launch"}
 
 VARIABLES
@@ -277,12 +313,13 @@ VARIABLES
     call,           \* the capture call in progress, or NoCall
     captured,       \* objects currently captured or allocated
     replays,        \* replay records seen so far
-    stateGroupLayout, \* the layout core set at its last binding: "none", "prof", "serv", "serv-changed"
+    stateGroupLayout, \* the layout the accessor returns: "none", "prof", "serv"
+    boundViews,     \* the views core bound last (Views)
     heldLayout,     \* the capture call holds the layout object it read from the accessor
     layoutReads,    \* the transaction-graph part's reads of the state-group layout
     profReleased,   \* core released the profiling KV cache, clearing the layout
     budgetFixed,    \* effective kv_cache_memory_bytes set
-    startup,        \* the restricted startup's setting (TXG-CFG-019): "blockCount", "budget"
+    startup,        \* the KV-cache sizing (Startups)
     estimateOn,     \* VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS not 0
     profAttempted,  \* capture_cudagraphs(profile_only=True) was called
     profRan,        \* a profiling capture completed in the worker
@@ -294,6 +331,7 @@ VARIABLES
     servTotal,      \* serving call total
     servMeasured,   \* the aggregate comparison read servTotal
     uncharged,      \* the uncharged-memory WARNING was logged (TXG-MEM-008)
+    measuredMemory, \* the measured-memory INFO line was logged (TXG-MEM-018)
     failedCalls,    \* calls that raised after passing their entry checks
     refusedCalls,   \* calls refused at their entry
     cleared,        \* clear_cudagraphs has returned
@@ -308,16 +346,17 @@ VARIABLES
     bypassUnverified \* an all-failed bypass ran before verification passed
 
 cfgVars == <<budgetFixed, startup, estimateOn>>
-layoutVars == <<stateGroupLayout, heldLayout, layoutReads, profReleased>>
+layoutVars == <<stateGroupLayout, boundViews, heldLayout, layoutReads, profReleased>>
 
 vars == <<phase, call, captured, replays, layoutVars, budgetFixed, startup,
           estimateOn, profAttempted, profRan, servAttempted, servCapturing, servOk,
-          requiredAtServ, profTotal, servTotal, servMeasured, uncharged,
+          requiredAtServ, profTotal, servTotal, servMeasured, uncharged, measuredMemory,
           failedCalls, refusedCalls, cleared, pendingFailure, verified, latched,
           devicePending, outcome, error, steps, dummySeen, bypassUnverified>>
 
 memVars == <<profAttempted, profRan, servAttempted, servCapturing, servOk,
-             requiredAtServ, profTotal, servTotal, servMeasured, uncharged>>
+             requiredAtServ, profTotal, servTotal, servMeasured, uncharged,
+             measuredMemory>>
 histVars == <<failedCalls, refusedCalls, cleared, pendingFailure>>
 
 TypeOK ==
@@ -325,14 +364,14 @@ TypeOK ==
     /\ call.kind \in CallKinds \cup {"none"} /\ call.pc \in CallPCs /\ call.i \in 0..2 * N
     /\ captured \subseteq Objects
     /\ replays \subseteq ReplayRecs
-    /\ stateGroupLayout \in Layouts /\ heldLayout \in BOOLEAN
+    /\ stateGroupLayout \in Layouts /\ boundViews \in Views /\ heldLayout \in BOOLEAN
     /\ layoutReads \subseteq LayoutReadRecs /\ profReleased \in BOOLEAN
     /\ budgetFixed \in BOOLEAN /\ startup \in Startups /\ estimateOn \in BOOLEAN
     /\ profAttempted \in BOOLEAN /\ profRan \in BOOLEAN /\ servAttempted \in BOOLEAN
     /\ servCapturing \in 0..2 /\ servOk \in BOOLEAN
     /\ requiredAtServ \in {"undecided", "yes", "no"}
     /\ profTotal \in 0..MaxMem /\ servTotal \in 0..MaxMem
-    /\ servMeasured \in BOOLEAN /\ uncharged \in BOOLEAN
+    /\ servMeasured \in BOOLEAN /\ uncharged \in BOOLEAN /\ measuredMemory \in BOOLEAN
     /\ failedCalls \subseteq CallKinds /\ refusedCalls \subseteq CallKinds
     /\ cleared \in BOOLEAN /\ pendingFailure \in BOOLEAN
     /\ verified \in BOOLEAN /\ latched \in BOOLEAN /\ devicePending \in BOOLEAN
@@ -347,7 +386,8 @@ Init ==
     /\ call = NoCall
     /\ captured = {}
     /\ replays = {}
-    /\ stateGroupLayout = "none" /\ heldLayout = FALSE /\ layoutReads = {}
+    /\ stateGroupLayout = "none" /\ boundViews = "none"
+    /\ heldLayout = FALSE /\ layoutReads = {}
     /\ profReleased = FALSE
     /\ startup \in Startups
     /\ budgetFixed = (startup = "budget")
@@ -355,14 +395,15 @@ Init ==
     /\ profAttempted = FALSE /\ profRan = FALSE /\ servAttempted = FALSE
     /\ servCapturing = 0 /\ servOk = FALSE /\ requiredAtServ = "undecided"
     /\ profTotal = 0 /\ servTotal = 0 /\ servMeasured = FALSE /\ uncharged = FALSE
+    /\ measuredMemory = FALSE
     /\ failedCalls = {} /\ refusedCalls = {} /\ cleared = FALSE /\ pendingFailure = FALSE
     /\ verified = FALSE /\ latched = FALSE /\ devicePending = FALSE
     /\ outcome = "pending" /\ error = "none" /\ steps = 0 /\ dummySeen = FALSE
     /\ bypassUnverified = FALSE
 
-\* The required-capture predicate of REG-MEM-027 on the effective values;
-\* the extensible KV cache is off under the restricted startup (TXG-CFG-019).
-Required == ~budgetFixed /\ estimateOn
+\* The required-capture predicate of REG-MEM-027 on the effective values:
+\* never under the extensible KV cache, whatever the budget or estimate.
+Required == ~budgetFixed /\ estimateOn /\ startup # "extensible"
 
 \* The serving inventory a scheduled step classifies against (TXG-COV-002).
 Inventory == {o \in captured : o[2] = "cell" /\ o[1] \in ReplayablePools}
@@ -419,7 +460,8 @@ ProfilingForwardPass ==
                    verified, latched, devicePending, outcome, error, steps,
                    bypassUnverified>>
 
-\* Core's estimate does not run: no profiling capture, no clear_cudagraphs.
+\* Core's estimate does not run: no profiling capture, no clear_cudagraphs;
+\* under the extensible KV cache this is the only way on.
 EstimateSkipped ==
     /\ phase = "forwarded"
     /\ phase' = "estimated"
@@ -428,8 +470,9 @@ EstimateSkipped ==
                    bypassUnverified>>
 
 \* Core's temporary profiling pool does not fit: neither capture hook runs.
+\* Under the extensible KV cache core runs no estimate.
 ProfilingPoolFails ==
-    /\ phase = "forwarded"
+    /\ phase = "forwarded" /\ startup # "extensible"
     /\ phase' = "failed"
     /\ error' = FirstError("profiling-pool")
     /\ outcome' = StartupFails
@@ -440,9 +483,11 @@ ProfilingPoolFails ==
 \* Core's estimate allocates its profiling KV cache, binds the state layer's
 \* views (bind_kv_cache) and sets the state-group layout to the profiling
 \* KV cache's. The transaction-graph part records nothing (TXG-LIFE-003).
+\* Never under the extensible KV cache.
 BindKvCacheProfiling ==
-    /\ phase = "forwarded"
+    /\ phase = "forwarded" /\ startup # "extensible"
     /\ stateGroupLayout' = "prof"
+    /\ boundViews' = "prof"
     /\ phase' = "prof-bound"
     /\ UNCHANGED <<heldLayout, layoutReads, profReleased>>
     /\ UNCHANGED <<call, captured, replays, cfgVars, memVars, histVars,
@@ -487,7 +532,7 @@ CaptureCudagraphsProfiling ==
             /\ UNCHANGED call
     /\ UNCHANGED <<captured, replays, layoutVars, cfgVars, profRan, servAttempted,
                    servCapturing, servOk, requiredAtServ, profTotal, servTotal,
-                   servMeasured, uncharged, failedCalls, cleared, verified, latched,
+                   servMeasured, uncharged, measuredMemory, failedCalls, cleared, verified, latched,
                    devicePending, steps, dummySeen,
                    bypassUnverified>>
 
@@ -511,7 +556,7 @@ OrderingRefusal ==
 \* passed every entry check. A refusal is worker-fatal and leaves the latch
 \* and every captured object unchanged (TXG-LIFE-008).
 ServingEntry(c) ==
-    /\ call.kind = "none" /\ stateGroupLayout \in {"serv", "serv-changed"}
+    /\ call.kind = "none" /\ stateGroupLayout = "serv"
     /\ servAttempted' = (servAttempted \/ ServEntryRefusal = "none")
     /\ requiredAtServ' =
            IF OrderingRefusal THEN requiredAtServ
@@ -526,7 +571,7 @@ ServingEntry(c) ==
             /\ outcome' = StartupFails
             /\ UNCHANGED <<call, servCapturing>>
     /\ UNCHANGED <<captured, replays, layoutVars, cfgVars, profAttempted, profRan,
-                   servOk, profTotal, servTotal, servMeasured, uncharged,
+                   servOk, profTotal, servTotal, servMeasured, uncharged, measuredMemory,
                    failedCalls, cleared, pendingFailure, verified, latched,
                    devicePending, steps, dummySeen,
                    bypassUnverified>>
@@ -544,7 +589,7 @@ LaterServingCall ==
 \* post_warmup, or on a worker that failed later): refused at its entry
 \* (TXG-LIFE-008); the recovery is an engine restart, so the worker fails.
 SecondServingCapture ==
-    /\ servOk /\ phase \in {"captured", "serving", "failed"}
+    /\ servOk /\ phase \in {"captured", "warmed", "serving", "failed"}
     /\ LaterServingCall
 
 \* A retry after the serving capture failed or was refused, which core never
@@ -603,24 +648,25 @@ PoolAccess ==
     /\ heldLayout' = TRUE
     /\ layoutReads' = layoutReads \cup {LayoutRead}
     /\ GoTo("buf")
-    /\ UNCHANGED <<phase, replays, stateGroupLayout, profReleased, cfgVars, memVars,
+    /\ UNCHANGED <<phase, replays, stateGroupLayout, boundViews, profReleased, cfgVars, memVars,
                    histVars, verified, latched, devicePending, outcome, error, steps,
                    dummySeen, bypassUnverified>>
 
 \* The check fails: a break of core's layout contract (not exactly one
 \* layout, a layout that does not hold exactly the state layer, or a
-\* component tensor that is not the layer's bound view), or fewer blocks than
-\* the admission limit plus one, which under the restricted startup only a
-\* fixed budget can give (a fixed block count below it is refused by the
-\* configuration checks, TXG-CFG-019).
+\* component tensor that is not the layer's bound view), or, in the serving
+\* capture only, fewer pages than the admission limit plus one, which every
+\* sizing but a fixed block count can give (a fixed block count below it is
+\* refused by the configuration checks, TXG-CFG-005).
 PoolAccessFails ==
     /\ InCall("pool")
     /\ heldLayout' = TRUE
     /\ layoutReads' = layoutReads \cup {LayoutRead}
     /\ \E e \in {"pool-access-contract"}
-                \cup (IF startup = "budget" THEN {"pool-access-block-count"} ELSE {}) :
+                \cup (IF C \in ServingCalls /\ startup # "blockCount"
+                     THEN {"pool-access-block-count"} ELSE {}) :
          FailTo(e)
-    /\ UNCHANGED <<phase, captured, replays, stateGroupLayout, profReleased, cfgVars,
+    /\ UNCHANGED <<phase, captured, replays, stateGroupLayout, boundViews, profReleased, cfgVars,
                    memVars, histVars, verified, latched, devicePending, outcome, steps,
                    dummySeen, bypassUnverified>>
 
@@ -696,7 +742,7 @@ MarginAllocated ==
     /\ GoTo("sync")
     /\ UNCHANGED <<phase, replays, layoutVars, cfgVars, profAttempted, profRan,
                    servAttempted, servCapturing, servOk, requiredAtServ, servTotal,
-                   servMeasured, uncharged, histVars, verified, latched, outcome,
+                   servMeasured, uncharged, measuredMemory, histVars, verified, latched, outcome,
                    error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -711,7 +757,9 @@ MarginAllocationFails ==
 \* TXG-MEM-005: when a profiling capture ran, the serving call total may not
 \* exceed the profiling call total; an overrun is a failure of the call
 \* (TXG-LIFE-012). With no profiling capture (none was required, or the
-\* entry would have refused), the WARNING of TXG-MEM-008 is logged.
+\* entry would have refused), the serving capture is reported as measured
+\* under the extensible KV cache (TXG-MEM-018) and as uncharged with it off
+\* (the WARNING of TXG-MEM-008), never both.
 MemoryComparison ==
     /\ InCall("compare")
     /\ \E t \in 0..MaxMem :
@@ -719,9 +767,10 @@ MemoryComparison ==
          /\ servMeasured' = TRUE
          /\ IF profRan /\ t > profTotal
             THEN /\ FailTo("serving-overrun")
-                 /\ UNCHANGED uncharged
+                 /\ UNCHANGED <<uncharged, measuredMemory>>
             ELSE /\ GoTo("sync")
-                 /\ uncharged' = ~profRan
+                 /\ uncharged' = (~profRan /\ startup # "extensible")
+                 /\ measuredMemory' = (~profRan /\ startup = "extensible")
                  /\ UNCHANGED error
     /\ UNCHANGED <<phase, captured, replays, layoutVars, cfgVars, profAttempted,
                    profRan, servAttempted, servCapturing, servOk, requiredAtServ,
@@ -741,10 +790,10 @@ CaptureCallReturns ==
                   [] OTHER -> phase
     /\ profRan' = (profRan \/ C = "prof")
     /\ servOk' = (servOk \/ C = "serv")
-    /\ UNCHANGED <<stateGroupLayout, layoutReads, profReleased>>
+    /\ UNCHANGED <<stateGroupLayout, boundViews, layoutReads, profReleased>>
     /\ UNCHANGED <<captured, replays, cfgVars, profAttempted,
                    servAttempted, servCapturing, requiredAtServ, profTotal,
-                   servTotal, servMeasured, uncharged, histVars, verified, latched,
+                   servTotal, servMeasured, uncharged, measuredMemory, histVars, verified, latched,
                    outcome, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -755,7 +804,7 @@ FailureCleanupTxg ==
     /\ captured' = captured \ TxgOf(captured, C)
     /\ heldLayout' = FALSE
     /\ GoTo("cleanup-seg")
-    /\ UNCHANGED <<stateGroupLayout, layoutReads, profReleased>>
+    /\ UNCHANGED <<stateGroupLayout, boundViews, layoutReads, profReleased>>
     /\ UNCHANGED <<phase, replays, cfgVars, memVars, histVars, verified,
                    latched, devicePending, outcome, error, steps, dummySeen,
                    bypassUnverified>>
@@ -819,11 +868,12 @@ ClearCudagraphsSegment ==
                    bypassUnverified>>
 
 \* After clear_cudagraphs, on success and on failure alike, core releases
-\* the profiling KV cache and clears the state-group layout. A pending
-\* estimate failure then propagates and startup fails.
+\* the profiling KV cache and clears the state-group layout and the views. A
+\* pending estimate failure then propagates and startup fails.
 ReleaseProfilingKvCache ==
     /\ phase = "releasing"
     /\ stateGroupLayout' = "none"
+    /\ boundViews' = "none"
     /\ profReleased' = TRUE
     /\ phase' = IF pendingFailure THEN "failed" ELSE "estimated"
     /\ UNCHANGED <<heldLayout, layoutReads>>
@@ -837,6 +887,7 @@ ReleaseProfilingKvCache ==
 BindKvCacheServing ==
     /\ phase = "estimated"
     /\ stateGroupLayout' = "serv"
+    /\ boundViews' = "serv"
     /\ phase' = "serv-bound"
     /\ UNCHANGED <<heldLayout, layoutReads, profReleased>>
     /\ UNCHANGED <<call, captured, replays, cfgVars, memVars, histVars, verified,
@@ -845,14 +896,35 @@ BindKvCacheServing ==
 
 \* TXG-VER-001: segment-graph check, then layout, projected roles, all 2N
 \* cells holding their graphs, external buffers and process constants; no
-\* replay, no allocation (TXG-VER-003).
+\* replay, no allocation (TXG-VER-003). Under the extensible KV cache the
+\* worker then waits for core's extension (CoreExtends) before it serves.
 PostWarmupPasses ==
     /\ phase = "captured" /\ ~latched
     /\ ServingCells \subseteq captured
     /\ verified' = TRUE
+    /\ IF startup = "extensible"
+       THEN /\ phase' = "warmed"
+            /\ UNCHANGED outcome
+       ELSE /\ phase' = "serving"
+            /\ outcome' = IF outcome = "pending" THEN "served" ELSE outcome
+    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars, histVars,
+                   latched, devicePending, error, steps, dummySeen,
+                   bypassUnverified>>
+
+\* Under the extensible KV cache, after post_warmup and the free-memory
+\* reading that sizes the cache, core extends it and binds the state layer's
+\* views of the final page count, no more pages over the same base, while
+\* the state-group layout stays unchanged (TXG-LIFE-009). The views fit the
+\* recorded layout, so the binding accepts them and changes nothing else;
+\* the worker serves from here on. A binding at the extension whose views
+\* do not fit is BindKvCacheAfterServingUnfitViews in "warmed".
+CoreExtends ==
+    /\ phase = "warmed" /\ startup = "extensible" /\ ~latched /\ call.kind = "none"
+    /\ boundViews' = "serv-extended"
     /\ phase' = "serving"
     /\ outcome' = IF outcome = "pending" THEN "served" ELSE outcome
-    /\ UNCHANGED <<call, captured, replays, layoutVars, cfgVars, memVars, histVars,
+    /\ UNCHANGED <<stateGroupLayout, heldLayout, layoutReads, profReleased>>
+    /\ UNCHANGED <<call, captured, replays, cfgVars, memVars, histVars, verified,
                    latched, devicePending, error, steps, dummySeen,
                    bypassUnverified>>
 
@@ -869,23 +941,26 @@ PostWarmupMismatch ==
 
 \* TXG-LIFE-009: core binds the state layer's views again after the serving
 \* capture; the state layer reports them to the binding, which compares
-\* their plain-value layout with the one the serving capture recorded. An
-\* equal layout changes nothing ...
-BindKvCacheAfterServingSameLayout ==
-    /\ phase \in {"captured", "serving"} /\ call.kind = "none"
-    /\ Lay("serv") \in captured /\ stateGroupLayout = "serv"
+\* them with the plain-value layout the serving capture recorded, without
+\* reading the state-group layout, which core leaves unchanged. Views equal
+\* to the bound ones change nothing (the extension's views of no more pages
+\* are CoreExtends) ...
+BindKvCacheAfterServingEqualViews ==
+    /\ phase \in {"captured", "warmed", "serving"} /\ call.kind = "none"
+    /\ Lay("serv") \in captured /\ boundViews \in {"serv", "serv-extended"}
     /\ UNCHANGED vars
 
-\* ... a changed layout latches and raises (worker-fatal).
-BindKvCacheAfterServingChangedLayout ==
-    /\ phase \in {"captured", "serving"} /\ call.kind = "none"
+\* ... views that do not fit the recorded layout latch and raise
+\* (worker-fatal); the state-group layout stays as core set it.
+BindKvCacheAfterServingUnfitViews ==
+    /\ phase \in {"captured", "warmed", "serving"} /\ call.kind = "none"
     /\ Lay("serv") \in captured
-    /\ stateGroupLayout' = "serv-changed"
+    /\ boundViews' = "serv-moved"
     /\ latched' = TRUE
     /\ phase' = "failed"
-    /\ error' = FirstError("layout-changed")
+    /\ error' = FirstError("views-unfit")
     /\ outcome' = StartupFails
-    /\ UNCHANGED <<heldLayout, layoutReads, profReleased>>
+    /\ UNCHANGED <<stateGroupLayout, heldLayout, layoutReads, profReleased>>
     /\ UNCHANGED <<call, captured, replays, cfgVars, memVars, histVars,
                    verified, devicePending, steps, dummySeen,
                    bypassUnverified>>
@@ -1011,7 +1086,7 @@ StartupProgress ==
     \/ ProfilingCaptureNotReached \/ CaptureCudagraphsProfiling
     \/ CallProgress \/ ClearCudagraphsTxg \/ ClearCudagraphsSegment
     \/ ReleaseProfilingKvCache \/ BindKvCacheServing \/ CaptureCudagraphsServing
-    \/ PostWarmupPasses \/ PostWarmupMismatch \/ ShutdownSegment
+    \/ PostWarmupPasses \/ PostWarmupMismatch \/ CoreExtends \/ ShutdownSegment
 
 \* Cooperative teardown: a failed or latched worker's runner shuts down.
 FailedTeardown == (phase = "failed" \/ latched) /\ ShutdownTxg
@@ -1019,7 +1094,7 @@ FailedTeardown == (phase = "failed" \/ latched) /\ ShutdownTxg
 Next ==
     \/ StartupProgress
     \/ SecondServingCapture \/ ServingCaptureRetry
-    \/ BindKvCacheAfterServingSameLayout \/ BindKvCacheAfterServingChangedLayout
+    \/ BindKvCacheAfterServingEqualViews \/ BindKvCacheAfterServingUnfitViews
     \/ ScheduledStep \/ PrematureScheduledStep \/ AllFailedStep
     \/ DummyStep \/ CleanupOnlyStep
     \/ ShutdownTxg \/ Kill \/ Done
@@ -1047,8 +1122,8 @@ LayoutReadOnlyInCapture ==
     /\ call.kind = "none" => ~heldLayout
     /\ \A o \in captured : o[2] \in {"buf", "margin", "cell"} => Lay(o[1]) \in captured
 
-PoolAccessBlockCountUnderBudget ==
-    error = "pool-access-block-count" => startup = "budget"
+PoolAccessPageCountAtServingOnly ==
+    error = "pool-access-block-count" => (startup # "blockCount" /\ servAttempted)
 
 AtMostOneServingCapture == servCapturing <= 1
 
@@ -1065,7 +1140,10 @@ EntryChecksExclusive ==
                        \/ d = "required" /\ RequiredCaptureMissing}) <= 1
 
 UnprofiledServingCapture ==
-    /\ (servOk /\ ~profRan) => (requiredAtServ = "no" /\ uncharged)
+    /\ (servOk /\ ~profRan) =>
+           /\ requiredAtServ = "no"
+           /\ IF startup = "extensible" THEN measuredMemory /\ ~uncharged
+                                        ELSE uncharged /\ ~measuredMemory
     /\ (requiredAtServ = "yes" /\ ~profRan) => (servCapturing = 0 /\ ~servOk)
     /\ (servAttempted /\ ~profRan /\ call.kind = "none")
            => (servOk \/ outcome = "failed")
@@ -1092,12 +1170,17 @@ NothingOutsideCaptures ==
         /\ o[1] \in ServingCalls => servCapturing > 0
 
 ServingInventoryComplete ==
-    /\ (servOk /\ phase \in {"captured", "serving"})
+    /\ (servOk /\ phase \in {"captured", "warmed", "serving"})
            => OfCall(captured, "serv") =
                   ServingCells \cup {Seg("serv"), Lay("serv"), Buf("serv")}
     /\ \A c \in ServingCalls : Margin(c) \notin captured
 
 VerifiedBeforeServing == phase = "serving" => verified
+
+ViewsFitOrLatch ==
+    /\ boundViews \in {"serv", "serv-extended", "serv-moved"} => stateGroupLayout = "serv"
+    /\ boundViews = "serv-moved" => latched
+    /\ (phase = "serving" /\ startup = "extensible") => boundViews = "serv-extended"
 
 -------------------------------------------------------------------------------
 (* Temporal properties                                                     *)

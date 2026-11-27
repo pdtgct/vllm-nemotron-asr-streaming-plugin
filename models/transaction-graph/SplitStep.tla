@@ -53,8 +53,11 @@
 \*  transaction holds no binding to latch), and runs no later step. A
 \*  request may be aborted after the first launch.
 \*  Between steps: core's binding of the state layer's views (bind_kv_cache)
-\*  with a changed state-group layout latches (TXG-LIFE-009; an equal one
-\*  changes nothing, see CaptureLifecycle.tla); a delayed device fault
+\*  with views that fit the layout the serving capture recorded, no more
+\*  pages over the same base (an equal binding, or the extensible KV cache's
+\*  growth), is accepted and changes nothing, and one with views that do not
+\*  fit latches (TXG-LIFE-009; CaptureLifecycle.tla orders core's extension
+\*  before the first scheduled step); a delayed device fault
 \*  surfaces at the sink's collection,
 \*  which neither latches nor cancels the staged reservation
 \*  (TXG-FAIL-004); the engine dies, while serving or after a step raised
@@ -246,7 +249,7 @@ stepVars == <<pc, shape, launched, rec, log, last>>
 TypeOK ==
     /\ phase \in Phases
     /\ verified \in BOOLEAN /\ latched \in BOOLEAN
-    /\ error \in {"none", "verification", "layout-changed", "async-fault",
+    /\ error \in {"none", "verification", "views-unfit", "async-fault",
                   "engine-dead", "step", "cancel-failed"}
     /\ pc \in PCs
     /\ shape \in Shapes \cup {<<0, 0>>}
@@ -600,13 +603,19 @@ PostWarmupMismatch ==
     /\ UNCHANGED <<verified, fault, stepVars>>
 
 \* TXG-LIFE-009: core binds the state layer's views (bind_kv_cache) after the
-\* serving capture with a state-group layout whose plain values differ from
-\* the recorded one: worker-fatal; later steps see the latch until the
-\* worker is torn down.
-BindKvCacheChangedLayout ==
+\* serving capture with views of no more pages over the same base, which
+\* fit the plain-value layout the serving capture recorded: the binding
+\* accepts them and nothing changes, latched or not ...
+BindKvCacheFitViews ==
+    /\ phase \in {"captured", "serving"} /\ Between
+    /\ UNCHANGED vars
+
+\* ... with views that do not fit the recorded layout: worker-fatal; later
+\* steps see the latch until the worker is torn down.
+BindKvCacheUnfitViews ==
     /\ phase \in {"captured", "serving"} /\ Between
     /\ latched' = TRUE
-    /\ error' = FirstError("layout-changed")
+    /\ error' = FirstError("views-unfit")
     /\ UNCHANGED <<phase, verified, fault, stepVars>>
 
 \* TXG-FAIL-004: a delayed device fault of the last replayed step surfaces at
@@ -655,7 +664,8 @@ FailedTeardown == (latched \/ phase = "failed") /\ Shutdown
 
 Next ==
     \/ StartStep \/ StepProgress \/ PostWarmup
-    \/ BindKvCacheChangedLayout \/ DelayedFaultAtCollection \/ EngineDies
+    \/ BindKvCacheFitViews \/ BindKvCacheUnfitViews
+    \/ DelayedFaultAtCollection \/ EngineDies
     \/ Shutdown \/ Kill \/ Done
 
 Spec ==

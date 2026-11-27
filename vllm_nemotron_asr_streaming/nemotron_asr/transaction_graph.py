@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import operator
 import os
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -103,10 +104,25 @@ R_EFFECTIVE = "effective_cache"
 R_REQUIRED = "profiling_required"
 R_REASON = "profiling_reason"
 R_RAN = "profiling_ran"
-R_BUDGET = "budget_setting"
+R_SIZING = "kv_cache_sizing"
+R_PAGE_COUNT = "page_count"
+R_FINAL_BOUND_COUNT = "final_bound_count"
 R_ALLOC_CONF = "PYTORCH_CUDA_ALLOC_CONF"
 R_CUBLAS = "CUBLAS_WORKSPACE_CONFIG"
 R_VERIFICATION_SECONDS = "verification_seconds"
+#: The marking of a capture-record field that does not apply to this
+#: worker's startup (TXG-MEM-006, TXG-OBS-003): never zero, never ``None``,
+#: so no reader takes it for a measurement.
+NOT_APPLICABLE = "not applicable"
+#: The capture-record fields only a profiling capture produces (TXG-MEM-006).
+PROFILING_ONLY = (
+    PROFILING,
+    R_MARGIN,
+    R_FREE_BEFORE,
+    R_FREE_AFTER,
+    R_CHARGE,
+    R_ABSORBED,
+)
 
 # The step arena (TXG-EXEC-005): ``int64``, one row per section. A section
 # holds, for ``N`` rows, one vector of ``N`` entries per scalar field, then
@@ -295,6 +311,59 @@ def _views_layout(views: Mapping[str, torch.Tensor]) -> dict[str, tuple[Any, ...
     return {name: _layout(view) for name, view in views.items()}
 
 
+# @spec TXG-CAP-013, TXG-LIFE-009, TXG-VER-001, TXG-CELL-004
+def _fits(layout: Any, recorded: Any) -> bool:
+    """The one fit rule: a view's plain-value layout fits a recorded one
+    when it has the same address, page shape, strides and dtype and a first
+    dimension (page count) no larger than the recorded one, as the views do
+    that core binds when its extensible KV cache grows. Values that are not
+    layouts fit only when equal."""
+    if layout == recorded:
+        return True
+    if not (
+        isinstance(layout, tuple)
+        and isinstance(recorded, tuple)
+        and len(layout) == len(recorded) == 4
+    ):
+        return False
+    address, shape, strides, dtype = layout
+    known_address, known_shape, known_strides, known_dtype = recorded
+    return (
+        address == known_address
+        and strides == known_strides
+        and dtype == known_dtype
+        and len(shape) == len(known_shape) >= 1
+        and tuple(shape[1:]) == tuple(known_shape[1:])
+        and shape[0] <= known_shape[0]
+    )
+
+
+def _all_fit(layouts: Any, recorded: Any) -> bool:
+    """Every layout fits the recorded entry at the same position (a sequence)
+    or of the same name (a mapping)."""
+    if isinstance(layouts, Mapping) and isinstance(recorded, Mapping):
+        return list(layouts) == list(recorded) and all(
+            _fits(layouts[name], recorded[name]) for name in layouts
+        )
+    if isinstance(layouts, tuple) and isinstance(recorded, tuple):
+        return len(layouts) == len(recorded) and all(
+            _fits(mine, theirs) for mine, theirs in zip(layouts, recorded, strict=True)
+        )
+    return False
+
+
+def _misfits(layouts: Mapping[str, Any], recorded: Mapping[str, Any]) -> list[str]:
+    """The names whose layout does not fit the recorded one, or is in only
+    one of the two."""
+    return sorted(
+        name
+        for name in set(layouts) | set(recorded)
+        if name not in layouts
+        or name not in recorded
+        or not _fits(layouts[name], recorded[name])
+    )
+
+
 class _PoolAccessError(RuntimeError):
     """A failed pool-access check (TXG-CAP-008). ``contract`` is true for a
     break of core's state-group layout contract, which no configuration
@@ -327,16 +396,27 @@ def _describe_layouts(layouts: tuple[Any, ...]) -> str:
     )
 
 
+#: Per-field comparators of a step's signature with a cell's (TXG-CELL-004):
+#: the step's resident pool layouts equal the cell's when each fits the
+#: cell's entry at the same position; every other field compares exactly.
+_SIGNATURE_COMPARATORS: dict[str, Callable[[Any, Any], bool]] = {
+    "pools": lambda cell, step: _all_fit(step, cell),
+}
+
+
+# @spec TXG-CELL-004
 def _first_difference(
     captured: tuple[tuple[str, Any], ...], step: tuple[tuple[str, Any], ...]
 ) -> str | None:
-    """The first field in which a step's signature differs from a cell's."""
+    """The first field in which a step's signature differs from a cell's,
+    each field compared by its comparator."""
     if len(captured) != len(step):
         return "fields"
     for (name, mine), (other_name, theirs) in zip(captured, step, strict=True):
         if name != other_name:
             return name
-        if mine != theirs:
+        same = _SIGNATURE_COMPARATORS.get(name, operator.eq)
+        if not same(mine, theirs):
             return name
     return None
 
@@ -447,7 +527,7 @@ class _CaptureWork:
         self.pool_kwargs: dict[str, Any] = {}
         self.resident: Any = None
         self.capacity = 0
-        #: Pages ``1 … N`` of every component pool, in host memory.
+        #: Block 0 of every component pool, in host memory.
         self.snapshot: dict[str, torch.Tensor] = {}
         self.started = time.perf_counter()
         self.transaction_before: int | None = None
@@ -506,6 +586,9 @@ class TransactionGraphBinding:
         #: layer's views and post-warmup verification compare with
         #: (TXG-LIFE-009, TXG-VER-001). Plain values only (TXG-CAP-008).
         self._serving_layout: dict[str, tuple[Any, ...]] | None = None
+        #: Whether the effective extensible KV cache was on at the serving
+        #: capture's entry: core's extension then binds the final count.
+        self._extensible = False
         self._margin: Any = None
         self._device: torch.device | None = None
         self._reserved_at_start: int | None = None
@@ -551,7 +634,8 @@ class TransactionGraphBinding:
             R_REQUIRED: None,
             R_REASON: None,
             R_RAN: None,
-            R_BUDGET: None,
+            R_SIZING: None,
+            R_FINAL_BOUND_COUNT: None,
             R_VERIFICATION_SECONDS: None,
         }
         self._record_settings()
@@ -607,37 +691,17 @@ class TransactionGraphBinding:
     def _name(self) -> str:
         return f"{KEY}={list(self.populations)!r}, N = {self.n}"
 
-    def _budget_setting(self, requirement: Any) -> tuple[str, bool]:
-        """The budget setting as the messages name it (TXG-MEM-010): a
-        budget fixed at the given ``kv_cache_memory_bytes``, or a block count
-        fixed at the given ``num_gpu_blocks_override`` with core's estimate
-        enabled or disabled; and whether it is a fixed budget."""
-        budget = requirement.kv_cache_memory_bytes
-        if budget:
-            plan = (
-                "by a persisted startup plan after the model was built"
-                if not self._constructed_budget
-                else "by configuration, not by a startup plan"
-            )
-            return (
-                "a budget fixed at --kv-cache-memory-bytes "
-                f"{graph_memory.format_bytes(int(budget))}, fixed {plan}",
-                True,
-            )
-        estimate = "enabled" if requirement.estimate else "disabled"
-        override = self._block_override()
-        if override is not None:
-            return (
-                f"a block count fixed at --num-gpu-blocks-override {override}, "
-                f"with core's graph-memory estimate {estimate}",
-                False,
-            )
-        return f"a profiled budget, with core's graph-memory estimate {estimate}", False
-
-    def _block_override(self) -> int | None:
-        cache = getattr(self._vllm_config, "cache_config", None)
-        override = getattr(cache, "num_gpu_blocks_override", None)
-        return None if override is None else int(override)
+    def _sizing(self, page_count: int | None = None) -> tuple[Any, str]:
+        """The worker's effective KV-cache sizing and its name in the
+        messages and the record (TXG-MEM-010, TXG-OBS-003), from the sizing
+        function the segment-graph messages share (REG-MEM-017): under the
+        extensible KV cache with the layout's ``page_count`` when known;
+        under a fixed budget whether a persisted startup plan set it (a
+        value core sets after the model was built)."""
+        sizing = graph_memory.kv_cache_sizing(self._vllm_config)
+        return sizing, sizing.describe(
+            page_count=page_count, startup_plan=not self._constructed_budget
+        )
 
     def _admission_limit(self) -> tuple[int, str]:
         """The admission limit and the setting it came from:
@@ -662,7 +726,7 @@ class TransactionGraphBinding:
         """The counters and the capture record, as plain host values."""
         record = dict(self._record)
         for capture in (PROFILING, SERVING):
-            if record[capture] is not None:
+            if isinstance(record[capture], dict):
                 figures = dict(record[capture])
                 figures[R_CELLS] = [dict(cell) for cell in figures[R_CELLS]]
                 figures[R_KIND_TOTALS] = dict(figures[R_KIND_TOTALS])
@@ -695,30 +759,34 @@ class TransactionGraphBinding:
 
     # -- bindings -------------------------------------------------------------
 
-    # @spec TXG-LIFE-009, TXG-LIFE-003
+    # @spec TXG-LIFE-009, TXG-LIFE-003, TXG-OBS-003
     def check_bindings(self, layer: Any) -> None:
         """The state layer reports views core just bound (``bind_kv_cache``).
         Before a serving capture was attempted (the profiling KV cache's
         bindings included) this takes no part and records nothing. After it,
-        views with the plain-value layout the serving capture read change
-        nothing; any other layout latches the binding and raises, because
-        the cells bake in the captured addresses."""
+        views that fit the plain-value layout the serving capture read (the
+        same address, page shape, strides and dtype, and no more pages), as
+        core's extension of the extensible KV cache binds them, change
+        nothing but the recorded final bound count; any other view latches
+        the binding and raises, because the cells bake in the captured
+        addresses."""
         if not self._serving_attempted or self._serving_layout is None:
             return
         live = _views_layout(layer.component_pools)
-        if live != self._serving_layout:
+        changed = _misfits(live, self._serving_layout)
+        if changed or list(live) != list(self._serving_layout):
             self.failed = True
-            changed = [
-                name
-                for name in (*self._serving_layout, *live)
-                if live.get(name) != self._serving_layout.get(name)
-            ]
             raise RuntimeError(
-                f"{KEY}: core bound the state layer's views over pools whose "
-                "layout differs from the layout the serving capture read "
-                f"(components {sorted(set(changed))[:4]}); the captured cells "
-                "bake in those addresses. " + LATCHED
+                f"{KEY}: core bound the state layer's views over pools that do "
+                "not fit the layout the serving capture read (the same "
+                "address, page shape, strides and dtype, and no more pages; "
+                f"components {changed[:4]}); the captured cells bake in those "
+                "addresses. " + LATCHED
             )
+        if self._extensible and live:
+            # The first dimension of the views core's extension bound
+            # (TXG-OBS-003), separate from the capture layouts' page counts.
+            self._record[R_FINAL_BOUND_COUNT] = int(next(iter(live.values()))[1][0])
 
     # -- capture entry ----------------------------------------------------------
 
@@ -759,14 +827,22 @@ class TransactionGraphBinding:
     ) -> None:
         """At the serving capture's entry: record whether a profiling capture
         was required, from the worker's effective cache configuration, and
-        refuse the call when one was required and none ran."""
-        setting, _fixed = self._budget_setting(requirement)
+        refuse the call when one was required and none ran. Where none ran,
+        the profiling-only fields are marked not applicable (TXG-MEM-006),
+        as the final bound count is under every sizing but the extensible
+        KV cache (TXG-OBS-003)."""
+        sizing, setting = self._sizing()
+        self._extensible = sizing.extensible
+        if not profiling_ran:
+            self._record.update(dict.fromkeys(PROFILING_ONLY, NOT_APPLICABLE))
+        if not sizing.extensible:
+            self._record[R_FINAL_BOUND_COUNT] = NOT_APPLICABLE
         self._record.update(
             {
                 R_REQUIRED: bool(requirement.required),
                 R_REASON: requirement.reason,
                 R_RAN: bool(profiling_ran),
-                R_BUDGET: setting,
+                R_SIZING: setting,
                 R_EFFECTIVE: {
                     "kv_cache_memory_bytes": requirement.kv_cache_memory_bytes,
                     "enable_extensible_kv_cache": bool(requirement.extensible_kv_cache),
@@ -1020,20 +1096,23 @@ class TransactionGraphBinding:
             ("remaining queue counts", self._remaining_step[:count]),
         )
 
+    # @spec TXG-CAP-005
     def _capture_plan(self, kind: str, count: int, capacity: int) -> Any:
-        """The row plan of a cell's capture rows: the non-null free pages
-        ``1 … count``, the server's geometry, alternating fresh and file
-        bits (TXG-CAP-005)."""
+        """The row plan of a cell's capture rows: every row on block 0 (the
+        null page) over an empty live set, the server's geometry,
+        alternating fresh and file bits (TXG-CAP-005). Only the structural
+        preflight's capture-only mode accepts it (TXG-CAP-017)."""
         chunk = kind == CHUNK
+        null_block = int(NULL_BLOCK_ID)
         fresh = [index % 2 == 0 for index in range(count)]
         file = [index % 2 == 1 for index in range(count)]
-        blocks = torch.arange(1, count + 1, dtype=torch.int64)
+        blocks = torch.full((count,), null_block, dtype=torch.int64)
         deadlines = [index + 1 if chunk else 0 for index in range(count)]
         request_ids = tuple(f"txg-capture-{index}" for index in range(count))
         bindings = tuple(
             advance.PreparedRowBinding(
                 request_id=request_ids[index],
-                block_id=index + 1,
+                block_id=null_block,
                 admission_generation=1,
                 geometry_id=self.geometry,
                 prompt_index=0,
@@ -1051,9 +1130,9 @@ class TransactionGraphBinding:
             state_indices_p=blocks,
             num_prefills=count,
             has_initial_states_p=~torch.tensor(fresh, dtype=torch.bool),
-            null_block_id=int(NULL_BLOCK_ID),
+            null_block_id=null_block,
             num_pool_blocks=capacity,
-            live_block_ids=blocks.clone(),
+            live_block_ids=torch.zeros(0, dtype=torch.int64),
             geometry_id=torch.full((count,), self.geometry, dtype=torch.int64),
             prompt_index=torch.zeros(count, dtype=torch.int64),
             is_chunk=torch.full((count,), chunk, dtype=torch.bool),
@@ -1146,15 +1225,17 @@ class TransactionGraphBinding:
         with torch.cuda.stream(stream):
             yield
 
-    # @spec TXG-CAP-008, TXG-LIFE-003, TXG-MEM-017
+    # @spec TXG-CAP-008, TXG-CAP-018, TXG-LIFE-003, TXG-MEM-017, TXG-OBS-003
     def _pool_access(self, work: _CaptureWork) -> None:
         """Reach the state pools through the state-group layout core's
         ``ModelState.state_group_layouts`` returns during this call, after
         checking core's layout contract (exactly one layout, holding exactly
         the state layer, each component tensor the layer's bound view of
-        that name and position) and that the pools hold at least the
-        admission limit plus one blocks. Only the call's work holds the
-        tensors; the binding keeps plain values (TXG-LIFE-003)."""
+        that name and position) and, in the serving capture only, that the
+        pools hold at least the admission limit plus one blocks; the
+        profiling capture makes no page-count check, because its cells use
+        block 0 alone. Only the call's work holds the tensors; the binding
+        keeps plain values (TXG-LIFE-003)."""
         from vllm_nemotron_asr_streaming.nemotron_asr.state_profile import (
             project_nemotron_state_pools,
         )
@@ -1214,7 +1295,7 @@ class TransactionGraphBinding:
         blocks = int(components[0].tensor.shape[0])
         limit, setting = self._admission_limit()
         required = max(limit, self.n) + 1
-        if blocks < required:
+        if not work.call.profile_only and blocks < required:
             raise _PoolAccessError(
                 f"the state pools hold {blocks} blocks, fewer than the "
                 f"admission limit {limit} (from {setting}) plus one, "
@@ -1248,20 +1329,21 @@ class TransactionGraphBinding:
             "endpoint_book_pool": roles.endpoint_book,
         }
         work.resident = advance.resident_layout(**work.pool_kwargs)
-        # The null page and the capture rows' pages, to prove that no capture
-        # stores a page, the null page included (TXG-CAP-008): copied to host
+        # Block 0, the null page every capture row names, to prove that no
+        # capture stores a page (TXG-CAP-004, TXG-CAP-008): copied to host
         # memory once per call, so the snapshot adds no device memory beside
-        # the state pages and the KV cache.
+        # the state pages and the KV cache, and reads no page but block 0
+        # (TXG-CAP-018).
         work.snapshot = {
-            name: pool[: self.n + 1].to("cpu", copy=True)
-            for name, pool in pools.items()
+            name: pool[:1].to("cpu", copy=True) for name, pool in pools.items()
         }
 
     # @spec TXG-CAP-006, TXG-CAP-013
     def _scatter_warmup(self, work: _CaptureWork) -> None:
         """Launch, for each component pool and then for each projected
         resident-pool view a transaction passes to the kernel, one scatter
-        row with a rejected status that names the first non-null free page.
+        row with a rejected status that names block 0, the only page core
+        guarantees backed at a capture.
         The kernel's status predicate returns before it reads the page ID or
         any resident address. A projected view with the address, shape,
         strides and dtype of an argument already launched is the same
@@ -1273,7 +1355,7 @@ class TransactionGraphBinding:
             if layout in launched:
                 continue
             launched.add(layout)
-            state_scatter.launch_rejected_row_scatter(pool, page=1)
+            state_scatter.launch_rejected_row_scatter(pool, page=0)
 
     def _reading(self, work: _CaptureWork) -> int | None:
         call = work.call
@@ -1316,6 +1398,7 @@ class TransactionGraphBinding:
             file_carrier_id=int(config.file_carrier_token_id),
             continuation_id=int(config.continuation_token_id),
             geometry_order=None,
+            capture_only=True,
         )
         bucket = prepared.buckets[0] if chunk else None
         signature = self._signature(
@@ -1363,15 +1446,16 @@ class TransactionGraphBinding:
             )
         return _CellProgram(prepared, encoder_transition, signature, tier)
 
-    # @spec TXG-CAP-001, TXG-CAP-004, TXG-CAP-005, TXG-CAP-009, TXG-CELL-001
+    # @spec TXG-CAP-001, TXG-CAP-004, TXG-CAP-005, TXG-CAP-009, TXG-CAP-018
+    # @spec TXG-CELL-001
     def _capture_cell(self, work: _CaptureWork, kind: str, count: int) -> None:
         """Capture one cell: an eager reference of the body on its rejected
         capture rows (launching the nested segment graphs), three warm-ups
         and the capture with the nested bindings running eagerly, and one
         validation replay. The replay's outputs must equal the reference's
-        bit for bit, and the null page and the capture rows' pages 1 ... k of
-        every component pool (k the cell's count) must equal the snapshot
-        taken before the call. Only then is the cell published."""
+        bit for bit, and block 0 (the null page, the only page the capture
+        rows name) of every component pool must equal the snapshot taken
+        before the call. Only then is the cell published."""
         import vllm.compilation.cudagraph_pool as cudagraph_pool
 
         config = self._model.config
@@ -1429,19 +1513,15 @@ class TransactionGraphBinding:
             run()
         self._phase = PHASE_VALIDATION
         self._graphs[-1].replay()
-        # The pages are compared in host memory with the call's snapshot: the
-        # null page and the cell's capture rows' pages. They are compared
-        # before the outputs: fresh capture rows gather the null page
-        # (TXG-MASK-001), so a store to it also changes the outputs, and the
-        # store is the defect to report.
+        # Block 0 is compared in host memory with the call's snapshot, and
+        # no other page is read (TXG-CAP-018). It is compared before the
+        # outputs: the capture rows gather block 0, so a store to it also
+        # changes the outputs, and the store is the defect to report.
         for name, pool in work.components.items():
-            if not _same_bits(
-                pool[: count + 1].cpu(), work.snapshot[name][: count + 1]
-            ):
+            if not _same_bits(pool[:1].cpu(), work.snapshot[name]):
                 raise RuntimeError(
-                    f"the null page or the capture rows' pages of state pool "
-                    f"{name!r} changed: the reference and the validation "
-                    "replay store no page"
+                    f"block 0 (the null page) of state pool {name!r} changed: "
+                    "the reference and the validation replay store no page"
                 )
         for (name, reference), (_name, actual) in zip(
             expected, self._outputs(count), strict=True
@@ -1552,6 +1632,7 @@ class TransactionGraphBinding:
             R_CELLS: work.cells,
             R_PEAK: graph_memory.transient_peak(call.device, self._reserved_at_start),
             R_SECONDS: call.segment_seconds + (time.perf_counter() - work.started),
+            R_PAGE_COUNT: work.capacity,
         }
         self._record[capture] = figures
         if call.profile_only:
@@ -1580,9 +1661,12 @@ class TransactionGraphBinding:
             figures[R_SECONDS],
         )
 
+    # @spec TXG-MEM-005, TXG-MEM-008, TXG-MEM-018
     def _finish_serving(self, call: Any, figures: dict[str, Any]) -> None:
         """End a serving capture: the aggregate comparison with the
-        profiling call (or the uncharged-memory warning), and the plain
+        profiling call; with none, the measured-memory INFO line under the
+        effective extensible KV cache, whatever the budget or estimate
+        setting, and otherwise the uncharged-memory warning; and the plain
         values post-warmup verification compares."""
         record = self._record
         serving_total = figures[R_CALL_TOTAL]
@@ -1610,18 +1694,35 @@ class TransactionGraphBinding:
             if serving_total is not None and profiling_total is not None:
                 charge = record[R_CHARGE] or 0
                 record[R_ABSORBED] = serving_total - (profiling_total - charge)
+        elif self._extensible:
+            totals = figures[R_KIND_TOTALS]
+            logger.info(
+                "Nemotron transaction graphs (%s): core sizes the KV cache from "
+                "the device memory left after the captures, which includes the "
+                "transaction graphs and segment graphs (%s; %s). The serving "
+                "capture retains call total %s (segment graphs %s; transaction "
+                "graphs %s: chunk cells %s, echo cells %s).",
+                self._name(),
+                record[R_REASON],
+                record[R_SIZING],
+                graph_memory.format_bytes(serving_total),
+                graph_memory.format_bytes(call.segment_total),
+                graph_memory.format_bytes(figures[R_TXN_TOTAL]),
+                graph_memory.format_bytes(totals[CHUNK]),
+                graph_memory.format_bytes(totals[ECHO]),
+            )
         else:
             totals = figures[R_KIND_TOTALS]
             logger.warning(
                 "Nemotron transaction graphs and segment graphs were not "
                 "charged to the budget (%s): no profiling capture ran in this "
-                "worker, and none was required (%s; budget %s). The serving "
-                "capture retains call total %s (segment graphs %s; transaction "
-                "graphs %s: chunk cells %s, echo cells %s); the budget must "
-                "leave room for them.",
+                "worker, and none was required (%s; KV-cache sizing %s). The "
+                "serving capture retains call total %s (segment graphs %s; "
+                "transaction graphs %s: chunk cells %s, echo cells %s); the "
+                "budget must leave room for them.",
                 self._name(),
                 record[R_REASON],
-                record[R_BUDGET],
+                record[R_SIZING],
                 graph_memory.format_bytes(serving_total),
                 graph_memory.format_bytes(call.segment_total),
                 graph_memory.format_bytes(figures[R_TXN_TOTAL]),
@@ -1632,11 +1733,12 @@ class TransactionGraphBinding:
         self._verify = self._verification_values()
 
     # @spec TXG-MEM-010, TXG-MEM-011, TXG-MEM-012, TXG-MEM-013, TXG-MEM-017
+    # @spec TXG-MEM-019
     def _failure_message(self, work: _CaptureWork, error: BaseException) -> str:
         """The message of a failure in a capture call's transaction-graph
         part: the option, the capture, the phase, the failing cell when the
         phase is a cell's, what was retained so far, the transient peak, the
-        budget setting, the allocator settings and the remedies for its case.
+        KV-cache sizing, the allocator settings and the remedies for its case.
         A pool-access failure that breaks core's state-group layout contract
         names the broken condition (in the original error) and gives no
         configuration remedy; one that finds too few blocks gives
@@ -1650,8 +1752,7 @@ class TransactionGraphBinding:
             peak = graph_memory.transient_peak(call.device, self._reserved_at_start)
         except Exception:  # noqa: BLE001
             peak = None
-        requirement = graph_memory.profiling_requirement(self._vllm_config)
-        setting, fixed = self._budget_setting(requirement)
+        sizing, setting = self._sizing(work.capacity or None)
         where = (
             "the profiling capture, before the state pages are planned"
             if call.profile_only
@@ -1663,9 +1764,9 @@ class TransactionGraphBinding:
             _geometry, kind, count = self._phase_cell
             cell = f" of the {kind} cell at count {count} ({self.label})"
         if phase == PHASE_POOL_ACCESS:
-            remedies = self._pool_access_remedies(error)
+            remedies = self._pool_access_remedies(error, sizing)
         else:
-            remedies = "Remedies: " + self._capture_remedies(work, fixed) + "."
+            remedies = "Remedies: " + self._capture_remedies(work, sizing) + "."
         call_so_far = graph_memory.format_bytes(
             graph_memory.retained(call.call_free_before, now)
         )
@@ -1678,22 +1779,30 @@ class TransactionGraphBinding:
             f"({type(error).__name__}: {error}). Retained so far: call total "
             f"{call_so_far}, transaction graphs {cells_so_far}"
             f" in {len(work.cells)} captured cells; transient peak "
-            f"{graph_memory.format_bytes(peak)}. Budget setting: {setting}. "
+            f"{graph_memory.format_bytes(peak)}. KV-cache sizing: {setting}. "
             f"Allocator settings: {self._allocator_settings()}. {remedies}"
         )
 
-    def _pool_access_remedies(self, error: BaseException) -> str:
-        """TXG-MEM-017's remedies for too few blocks; none for a break of
-        core's state-group layout contract (TXG-CAP-008, TXG-MEM-010)."""
+    def _pool_access_remedies(self, error: BaseException, sizing: Any) -> str:
+        """TXG-MEM-017's remedies for too few blocks, a larger
+        ``--gpu-memory-utilization`` among them under a profiled budget or
+        the extensible KV cache; none for a break of core's state-group
+        layout contract (TXG-CAP-008, TXG-MEM-010)."""
         if isinstance(error, _PoolAccessError) and not error.contract:
             limit, _setting = self._admission_limit()
             required = max(limit, self.n) + 1
+            utilization = (
+                ", or a larger --gpu-memory-utilization,"
+                if sizing.profiled or sizing.extensible
+                else ","
+            )
             return (
-                "Remedies: a larger --kv-cache-memory-bytes, or a larger "
-                f"--num-gpu-blocks-override, that holds at least {required} "
-                "state pages (the admission limit plus one); or a lower "
-                "admission limit (--max-num-active-seqs, or --max-num-seqs) "
-                f"with the largest population in {KEY} at most it."
+                "Remedies: a larger --kv-cache-memory-bytes, a larger "
+                f"--num-gpu-blocks-override{utilization} that holds at least "
+                f"{required} state pages (the admission limit plus one); or a "
+                "lower admission limit (--max-num-active-seqs, or "
+                f"--max-num-seqs) with the largest population in {KEY} at most "
+                "it."
             )
         return (
             "This breaks core's state-group layout contract, which no "
@@ -1701,18 +1810,20 @@ class TransactionGraphBinding:
             "layout the plugin requires."
         )
 
-    def _capture_remedies(self, work: _CaptureWork, fixed: bool) -> str:
+    def _capture_remedies(self, work: _CaptureWork, sizing: Any) -> str:
         """The remedies of a failure after pool access: TXG-MEM-011 for the
         profiling capture; for the serving capture, TXG-MEM-013's projected
-        remainder under a fixed budget, otherwise TXG-MEM-012's under a fixed
-        block count."""
+        remainder under a fixed budget, TXG-MEM-012's under a fixed block
+        count, TXG-MEM-019's under a profiled budget, and TXG-MEM-011's
+        under the extensible KV cache, whose serving capture precedes core's
+        sizing of the KV cache."""
         smaller = (
             f"a smaller largest population in {KEY}; a smaller --max-num-seqs; "
             f"or transaction graphs off (remove {KEY})"
         )
         if work.call.profile_only:
             return smaller
-        if fixed:
+        if sizing.fixed_budget:
             parts, total, unavailable = [], 0, []
             for kind in KINDS:
                 growths = [
@@ -1742,7 +1853,7 @@ class TransactionGraphBinding:
                     "captured in this call"
                 )
             return f"{projected}; or {smaller}"
-        if self._block_override() is not None:
+        if sizing.kind == graph_memory.SIZING_BLOCK_COUNT:
             limit, _setting = self._admission_limit()
             return (
                 f"{smaller}; or a smaller --num-gpu-blocks-override that still "
@@ -1750,6 +1861,13 @@ class TransactionGraphBinding:
                 "admission limit plus one; core's scheduler refuses fewer), "
                 "which helps only when the allocated state pages leave too "
                 "little device memory for the capture's transient peak"
+            )
+        if sizing.profiled:
+            return (
+                f"{smaller}; or a lower --gpu-memory-utilization, which helps "
+                "only when the allocated state pages leave too little device "
+                "memory for the capture's transient peak, which core's "
+                "estimate does not charge"
             )
         return smaller
 
@@ -1925,8 +2043,8 @@ class TransactionGraphBinding:
         recorded = self._verify
         if self._cells_capture != SERVING or recorded is None:
             return "no serving capture recorded its cells in this worker"
-        # 1. the plain-value layout of the state layer's currently bound
-        # views, addresses included, and the pools' device
+        # 1. whether the state layer's currently bound views fit the
+        # plain-value layout the serving capture recorded, and their device
         try:
             views = self._model._persistent_state_layer.component_pools
         except RuntimeError as error:
@@ -1934,15 +2052,12 @@ class TransactionGraphBinding:
         live = _views_layout(views)
         devices = {view.device for view in views.values()}
         del views
-        if live != recorded["layout"]:
-            changed = sorted(
-                name
-                for name in set(live) | set(recorded["layout"])
-                if live.get(name) != recorded["layout"].get(name)
-            )
+        changed = _misfits(live, recorded["layout"])
+        if changed or list(live) != list(recorded["layout"]):
             return (
-                "the state pool layout differs from the layout the serving "
-                f"capture recorded (pools {changed[:4]})"
+                "the state layer's bound views do not fit the layout the "
+                "serving capture recorded (the same address, page shape, "
+                f"strides and dtype, and no more pages; pools {changed[:4]})"
             )
         parameter = next(self._model.core.encoder.parameters(), None)
         if parameter is not None and devices != {parameter.device}:

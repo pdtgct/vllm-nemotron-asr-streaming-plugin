@@ -1387,11 +1387,23 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
         figures = self._profiling_figures
         if figures is None:
             requirement = call.requirement
+            reason = requirement.reason if requirement is not None else "unknown"
+            if requirement is not None and requirement.measured:
+                # REG-MEM-023: the effective extensible KV cache, checked
+                # before the budget and the estimate setting.
+                logger.info(
+                    "Nemotron segment graphs: core sizes the KV cache from the "
+                    "device memory left after the captures, which includes "
+                    "the segment graphs (%s). The serving capture retains %s.",
+                    reason,
+                    graph_memory.format_bytes(serving_total),
+                )
+                return
             logger.warning(
                 "Nemotron segment graphs were not charged to the budget: no "
                 "profiling capture ran, and none was required (%s). The serving "
                 "capture retains %s; the budget must leave room for it.",
-                requirement.reason if requirement is not None else "unknown",
+                reason,
                 graph_memory.format_bytes(serving_total),
             )
             return
@@ -1591,21 +1603,11 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
             return f"the encoder graph at CHUNK count {count} ({labels[geometry]})"
         return "a segment graph (before its first CHUNK count or tier)"
 
-    def _budget_setting(self) -> tuple[str, bool]:
-        """The budget setting, and whether it is a fixed budget."""
-        cache = getattr(self._vllm_config, "cache_config", None)
-        fixed = getattr(cache, "kv_cache_memory_bytes", None)
-        if fixed:
-            return f"a fixed budget (--kv-cache-memory-bytes {fixed})", True
-        utilization = getattr(cache, "gpu_memory_utilization", None)
-        return (
-            f"a profiled budget (--gpu-memory-utilization {utilization})",
-            False,
-        )
-
+    # @spec REG-MEM-017
     def _capture_remedies(self, *, serving: bool) -> str:
-        """REG-MEM-017's remedies for this capture and budget."""
-        budget, fixed = self._budget_setting()
+        """REG-MEM-017's remedies for this capture and KV-cache sizing, the
+        sizing named by the function REG-MEM-023 and TXG-MEM-019 share."""
+        sizing = graph_memory.kv_cache_sizing(self._vllm_config)
         remedies = [
             "a smaller --max-num-seqs",
             "--hf-overrides '{\"encoder_execution_arm\": \"eager\", "
@@ -1613,11 +1615,17 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
             '"chunk_bucket_graph_populations": [], '
             '"transaction_graph_populations": []}\' together with --enforce-eager',
         ]
-        if fixed:
+        if sizing.fixed_budget:
             remedies.append("a smaller --kv-cache-memory-bytes")
-        elif serving:
+        elif serving and sizing.profiled:
+            # Under the extensible KV cache the serving capture precedes
+            # core's sizing of the KV cache, so utilization frees nothing.
             remedies.append("a lower --gpu-memory-utilization")
-        return f"Budget: {budget}. Remedies: " + "; or ".join(remedies) + "."
+        return (
+            f"Budget setting: {sizing.describe()}. Remedies: "
+            + "; or ".join(remedies)
+            + "."
+        )
 
     def _capture_failure_message(
         self,

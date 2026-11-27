@@ -1931,10 +1931,18 @@ class HostStaging:
         return buf.to(device, non_blocking=True)
 
 
-# @spec REG-STATE-022
-def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Tensor:
+# @spec REG-STATE-022, TXG-CAP-017
+def _structural_preflight(
+    plan: RowPlan, n_ids: int, n_embeds: int, *, capture_only: bool = False
+) -> torch.Tensor:
     """PORT-STATE-007: whole-call structural validation, HOST-side
     over the plan's CPU authority tensors, before any page read.
+
+    ``capture_only`` is the mode a capture call's cell programs pass
+    (TXG-CAP-017): every row must name the null block ID and the live set
+    must be empty, and exactly three row checks are waived (a real row naming
+    the null block ID, a block ID two rows name, a block ID outside the live
+    set). Every other check holds in the mode.
 
     Returns:
         The composed decode-then-prefill CPU index tensor.
@@ -2073,16 +2081,26 @@ def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Ten
     if plan.execution_tier < 0:
         raise ValueError("plan.execution_tier must be >= 0")
     idx = torch.cat([real_d, p])
+    if capture_only:
+        # Capture rows hold no page: each names the null page, and no block
+        # is live, so the mode can never name a page a request holds.
+        if live.numel():
+            raise ValueError("a capture-only plan must have an empty live block set")
+        if idx.numel() and bool((idx != plan.null_block_id).any()):
+            raise ValueError(
+                "a capture-only plan's rows must all name the null block id "
+                f"{plan.null_block_id}"
+            )
     if idx.numel():
-        if bool((idx == plan.null_block_id).any()):
+        if not capture_only and bool((idx == plan.null_block_id).any()):
             raise ValueError("null block id claimed by a real row")
         if bool((idx < 0).any()) or bool((idx >= plan.num_pool_blocks).any()):
             raise ValueError(f"state index out of range [0, {plan.num_pool_blocks})")
-        if int(torch.unique(idx).numel()) != int(idx.numel()):
+        if not capture_only and int(torch.unique(idx).numel()) != int(idx.numel()):
             raise ValueError(
                 "duplicate state index across the decode/prefill composition"
             )
-        if bool((~torch.isin(idx, plan.live_block_ids)).any()):
+        if not capture_only and bool((~torch.isin(idx, plan.live_block_ids)).any()):
             raise ValueError(
                 "state index outside the live (registry-allocated) block set"
             )
@@ -2955,7 +2973,7 @@ def rejected_row_output(
     return out
 
 
-# @spec TXG-TXN-001
+# @spec TXG-TXN-001, TXG-CAP-017
 def prepare_model_rows(
     core: NemotronASRCore,
     input_ids: torch.Tensor,
@@ -2974,6 +2992,7 @@ def prepare_model_rows(
     file_carrier_id: int | None = None,
     continuation_id: int | None = None,
     geometry_order: Sequence[int] | None = None,
+    capture_only: bool = False,
 ) -> PreparedRows:
     """Phase 1 of :func:`advance_model_rows` (host only).
 
@@ -2984,6 +3003,11 @@ def prepare_model_rows(
     authority with one entry per row, so no shape depends on the number of
     fresh, file or planning-failed rows. It reads no device memory and
     receives no resident pool (only their :class:`ResidentLayout`).
+
+    ``capture_only`` is the structural preflight's capture-only mode
+    (TXG-CAP-017), which only a capture call's cell programs pass: their
+    capture rows all name the null page over an empty live set.
+    :func:`advance_model_rows` never passes it.
 
     Raises:
         ValueError: a structural mapping defect or a missing/invalid
@@ -3015,7 +3039,10 @@ def prepare_model_rows(
     hidden = int(inputs_embeds.shape[1])
     device = inputs_embeds.device
     idx_cpu = _structural_preflight(
-        plan, int(input_ids.shape[0]), int(inputs_embeds.shape[0])
+        plan,
+        int(input_ids.shape[0]),
+        int(inputs_embeds.shape[0]),
+        capture_only=capture_only,
     )
     has_chunk = bool(plan.is_chunk.any())
     is_file_cpu = (
