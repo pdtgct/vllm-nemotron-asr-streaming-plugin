@@ -966,7 +966,7 @@ async def run_alone(spec: dict[str, Any]) -> dict[str, Any]:
         "plugin_version": md.version("vllm-nemotron-asr-streaming"),
         "vllm_file": vllm.__file__,
         "vllm_version": md.version("vllm"),
-        "torch": torch.__version__,
+        "torch": str(torch.__version__),
         "device": worker["device"],
         "settings": engine_settings(spec),
         "env": engine_env(spec),
@@ -1898,7 +1898,7 @@ def identity(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
         "plugin_version": md.version("vllm-nemotron-asr-streaming"),
         "vllm_file": vllm.__file__,
         "vllm_version": md.version("vllm"),
-        "torch": torch.__version__,
+        "torch": str(torch.__version__),
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
         "settings": engine_settings(spec),
         "env": engine_env(spec),
@@ -1988,8 +1988,13 @@ def _plain(value: Any) -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [_plain(v) for v in value]
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None:
         return value
+    # The exact builtin type: core's message serializer refuses a subclass
+    # (``torch.__version__`` is a ``str`` subclass).
+    for kind in (bool, int, float, str):
+        if isinstance(value, kind):
+            return kind(value)
     return repr(value)
 
 

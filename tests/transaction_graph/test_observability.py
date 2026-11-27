@@ -129,3 +129,26 @@ def test_without_core_rebinding_the_final_count_is_the_bound_views_page_count(
     run.core.startup(extend=False)
     rec = t.record(run.env)
     assert rec[api.Record.FINAL_BOUND_COUNT] == t.CAPACITY, rec
+
+
+# @spec TXG-OBS-003
+def test_the_capture_record_crosses_core_s_message_serializer(on_cpu):
+    """The capture record holds plain values only, so a worker can return it
+    through core's ``collective_rpc``: core's msgpack encoder, which refuses
+    a ``str`` subclass such as ``torch.__version__``'s type, encodes it."""
+    from support import txgcap_harness as t
+    from vllm.v1.serial_utils import MsgpackEncoder
+
+    run = on_cpu(n=2, sizing=Sizing.EXTENSIBLE)
+    run.core.startup()
+    rec = t.record(run.env)
+    MsgpackEncoder().encode(dict(rec))
+    plain = (type(None), bool, int, float, str, list, dict)
+    stack = [rec]
+    while stack:
+        value = stack.pop()
+        assert type(value) in plain or isinstance(value, tuple), (type(value), value)
+        if isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            stack.extend(value)

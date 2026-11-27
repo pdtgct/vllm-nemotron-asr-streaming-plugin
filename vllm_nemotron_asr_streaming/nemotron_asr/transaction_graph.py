@@ -677,7 +677,9 @@ class TransactionGraphBinding:
         record = self._record
         record[R_ALLOC_CONF] = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
         record[R_CUBLAS] = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
-        record["torch_version"] = torch.__version__
+        # A plain str: torch.__version__ is a str subclass that core's message
+        # serializer refuses, and a worker returns the record through it.
+        record["torch_version"] = str(torch.__version__)
         record["cuda_version"] = torch.version.cuda
         record["driver_version"] = _driver_version()
 
