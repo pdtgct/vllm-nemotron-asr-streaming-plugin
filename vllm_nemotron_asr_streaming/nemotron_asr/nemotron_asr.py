@@ -1621,10 +1621,34 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
             # Under the extensible KV cache the serving capture precedes
             # core's sizing of the KV cache, so utilization frees nothing.
             remedies.append("a lower --gpu-memory-utilization")
+        elif sizing.kind == graph_memory.SIZING_BLOCK_COUNT:
+            remedies.append(self._smaller_block_count_remedy())
         return (
             f"Budget setting: {sizing.describe()}. Remedies: "
             + "; or ".join(remedies)
             + "."
+        )
+
+    # @spec REG-MEM-017, TXG-CFG-005
+    def _smaller_block_count_remedy(self) -> str:
+        """The remedy under ``--num-gpu-blocks-override``: a smaller block
+        count that still holds the null block and a page for every request
+        that can be active, and, while transaction graphs are on, one for
+        every row of the largest population."""
+        scheduler = self._vllm_config.scheduler_config
+        active = getattr(scheduler, "max_num_active_seqs", None)
+        if active is not None:
+            limit, setting = int(active), "--max-num-active-seqs"
+        else:
+            limit, setting = int(scheduler.max_num_seqs), "--max-num-seqs"
+        pages = f"a page for each of the {limit} requests {setting} admits"
+        binding = getattr(self, "_transaction_graph_binding", None)
+        if binding is not None:
+            pages += f" and for each row of the largest population, {binding.n}"
+            limit = max(limit, binding.n)
+        return (
+            f"a smaller --num-gpu-blocks-override that still holds at least "
+            f"{limit + 1} blocks: besides the null block, {pages}"
         )
 
     def _capture_failure_message(

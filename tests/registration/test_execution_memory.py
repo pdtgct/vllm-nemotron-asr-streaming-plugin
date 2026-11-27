@@ -3945,6 +3945,45 @@ def test_a_serving_capture_failure_under_the_extensible_kv_cache_names_its_sizin
     _release(error)
 
 
+# @spec REG-MEM-017
+def test_a_serving_capture_failure_under_a_fixed_block_count_names_a_smaller_one(
+    hook,
+):
+    """Under ``--num-gpu-blocks-override`` the remedies also name a smaller
+    block count that still holds, besides the null block, a page for every
+    request that can be active (TXG-CFG-005): at least the admission limit
+    (``max_num_seqs`` here, transaction graphs off) plus one. The budget
+    setting the error names is the fixed block count, so no lower
+    ``--gpu-memory-utilization`` is a remedy."""
+    from support.txg_api import SIZING_NAMES, Sizing
+
+    env = hook(sizing=Sizing.BLOCK_COUNT, blocks=9)
+    env.runner.profile_run(core_embeds=False)
+    _capture(env, profile_only=True)
+    env.state.clear_cudagraphs()
+    pool(env)
+    env.graphs.fail_capture_after = len(env.graphs.captures) + 1
+    env.graphs.captures_completed = len(env.graphs.captures)
+    error = h.call_with(
+        _capture, env, profile_only=False, stream=_stream(env, "serving")
+    )
+    assert error is not None
+    _assert_failure_message(error, env)
+    message = str(error)
+    assert re.search(SIZING_NAMES[Sizing.BLOCK_COUNT], message), message
+    remedy = re.search(
+        r"(?i)\bsmaller\b[^;]{0,40}--num-gpu-blocks-override[^;]*", message
+    )
+    assert remedy is not None, message
+    assert re.search(rf"\b{env.max_num_seqs + 1}\b", remedy.group(0)), message
+    assert re.search(r"(?i)null block", remedy.group(0)), message
+    assert not _LOWER_UTILIZATION.search(message), message
+    env.graphs.disarm()
+    gc.collect()
+    assert env.graphs.captured() == [] and env.graphs.live_graphs() == 0
+    _release(error)
+
+
 # ===========================================================================
 # GPU: the hook configuration on CUDA
 # ===========================================================================

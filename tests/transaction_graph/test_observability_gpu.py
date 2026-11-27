@@ -30,6 +30,12 @@ def info_lines(caplog, *needles):
     ]
 
 
+def capture_line_needles(name, cells):
+    """The needles of a capture call's OBS-004 INFO line: the capture, its
+    cell count, the transient peak and the capture time, with the setting."""
+    return (name, f"{cells} cells", "transient peak", "capture time", api.KEY)
+
+
 # @spec TXG-OBS-001, TXG-OBS-002
 def test_counters_count_cells_replays_shapes_fallbacks_and_the_histogram(
     on_cuda,
@@ -160,7 +166,10 @@ def test_capture_and_verification_log_one_info_line_each(
     tmp_path, single_process_dist, caplog, monkeypatch, sizing
 ):
     """One INFO line per capture that ran: the serving capture alone under
-    the extensible KV cache, both under a fixed block count."""
+    the extensible KV cache, both under a fixed block count. The needles are
+    the OBS-004 line's own (its cell count, transient peak and capture time),
+    so TXG-MEM-018's measured INFO line in the serving call, which names the
+    serving capture and byte counts, does not count."""
     caplog.set_level(logging.INFO)
     env = g.build_option_on(
         tmp_path, lookahead=0, n=N, sizing=sizing, monkeypatch=monkeypatch
@@ -168,7 +177,7 @@ def test_capture_and_verification_log_one_info_line_each(
     ran = ("serving",) if sizing == Sizing.EXTENSIBLE else ("profiling", "serving")
     try:
         for name in ("profiling", "serving"):
-            lines = info_lines(caplog, name, str(2 * N), api.KEY)
+            lines = info_lines(caplog, *capture_line_needles(name, 2 * N))
             expected = 1 if name in ran else 0
             assert len(lines) == expected, (
                 name,

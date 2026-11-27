@@ -1081,7 +1081,6 @@ def test_only_a_capture_calls_cell_programs_pass_the_capture_only_mode(
     direct = [mode for through, mode in calls if not through]
     assert direct == [True] * (2 * env.n), calls
     calls.clear()
-    calls.clear()
     core.post_warmup()
     core.extend()
     core.step(t.stream_unit(env, "cap17-s1"))

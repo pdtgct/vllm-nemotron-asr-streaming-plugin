@@ -99,8 +99,11 @@
 \*  is the KV cache it describes, and the failed pool-access check stands
 \*  for every broken condition); page counts (a binding's views either fit
 \*  the recorded layout, with no more pages over the same base, or do not;
-\*  too few pages is the pool-access check's failure); core's own teardown of the views after a
-\*  failed startup. A capture call, a hook's two release halves and core's
+\*  too few pages is the pool-access check's failure); the KV cache's layout
+\*  (CoreExtends always binds extended views, while for a layout that is
+\*  not block-compact core's extension binds nothing and the views the
+\*  serving capture read stay bound, a case no binding check sees); core's
+\*  own teardown of the views after a failed startup. A capture call, a hook's two release halves and core's
 \*  release of the profiling KV cache after clear_cudagraphs are atomic with
 \*  respect to other hook calls; only a kill interrupts them.
 \*
@@ -302,7 +305,7 @@ Shutdownable ==
 Errors == {
     "none", "profiling-pool", "core-capture", "profiling-after-serving",
     "profiling-cells-exist", "recapture-over-live-pools",
-    "profiling-segment-graphs-exist", "pool-access-contract", "pool-access-block-count",
+    "profiling-segment-graphs-exist", "pool-access-contract", "pool-access-page-count",
     "profiling-capture-required", "segment-capture", "buffer-allocation",
     "scatter-warmup", "cell-capture", "margin", "serving-overrun",
     "verification", "views-unfit", "execute-before-verification",
@@ -664,7 +667,7 @@ PoolAccessFails ==
     /\ layoutReads' = layoutReads \cup {LayoutRead}
     /\ \E e \in {"pool-access-contract"}
                 \cup (IF C \in ServingCalls /\ startup # "blockCount"
-                     THEN {"pool-access-block-count"} ELSE {}) :
+                     THEN {"pool-access-page-count"} ELSE {}) :
          FailTo(e)
     /\ UNCHANGED <<phase, captured, replays, stateGroupLayout, boundViews, profReleased, cfgVars,
                    memVars, histVars, verified, latched, devicePending, outcome, steps,
@@ -1123,7 +1126,7 @@ LayoutReadOnlyInCapture ==
     /\ \A o \in captured : o[2] \in {"buf", "margin", "cell"} => Lay(o[1]) \in captured
 
 PoolAccessPageCountAtServingOnly ==
-    error = "pool-access-block-count" => (startup # "blockCount" /\ servAttempted)
+    error = "pool-access-page-count" => (startup # "blockCount" /\ servAttempted)
 
 AtMostOneServingCapture == servCapturing <= 1
 

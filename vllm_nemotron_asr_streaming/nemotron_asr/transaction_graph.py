@@ -821,7 +821,7 @@ class TransactionGraphBinding:
                 "slots); recover with an engine restart"
             )
 
-    # @spec TXG-MEM-007, TXG-MEM-009
+    # @spec TXG-MEM-007, TXG-MEM-009, TXG-MEM-006, TXG-OBS-003
     def check_profiling_requirement(
         self, requirement: Any, *, profiling_ran: bool
     ) -> None:
@@ -1314,6 +1314,11 @@ class TransactionGraphBinding:
             # Plain values only: what a later binding and post-warmup
             # verification compare with (TXG-LIFE-009, TXG-VER-001).
             self._serving_layout = _views_layout(pools)
+            if self._extensible:
+                # TXG-OBS-003: the bound views' page count until core's
+                # extension reports others; for a layout that is not
+                # block-compact core binds nothing and these views stay.
+                self._record[R_FINAL_BOUND_COUNT] = blocks
         work.pool_kwargs = {
             "channel_pools": list(roles.channel),
             "time_pools": list(roles.convolution),

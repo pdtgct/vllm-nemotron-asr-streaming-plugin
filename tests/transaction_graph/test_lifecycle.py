@@ -241,9 +241,13 @@ def test_profiling_capture_runs_segments_warm_up_cells_then_the_margin(on_cpu):
     profiling_pool = h.pool_tensor(core.profiling_bindings)
     warmed = [env.events[mark + i][1] for i in warmups]
     assert all(t.within(profiling_pool, c["pool"]) for c in warmed), warmed
-    scatters = [e[1] for e in env.events[mark:] if e[0] == "scatter"]
-    rows = [c for c in scatters if t.within(profiling_pool, c["pool"])]
+    scatters = [(i, e[1]) for i, e in enumerate(env.events[mark:]) if e[0] == "scatter"]
+    rows = [c for _, c in scatters if t.within(profiling_pool, c["pool"])]
     assert rows and all(set(c["pages"]) == {0} for c in rows), rows
+    # The scatters outside the profiling pools are the segment graphs': all
+    # of them precede the warm-up.
+    outside = [i for i, c in scatters if not t.within(profiling_pool, c["pool"])]
+    assert all(i < min(warmups) for i in outside), (outside, min(warmups))
 
 
 # @spec TXG-LIFE-004
