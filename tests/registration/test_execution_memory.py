@@ -63,6 +63,7 @@ import torch
 from support import model_harness as h
 from support.core_order import PROFILING_POOL, SERVING_POOL, CoreOrder
 from support.fake_cuda import MARGIN_BYTES, FakeCuda
+from support.isolation import ran_in_child
 
 from vllm_nemotron_asr_streaming.nemotron_asr.model_state_v2 import SAMPLED_TOKEN
 
@@ -3016,12 +3017,19 @@ def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph_cpu(
 @pytest.mark.gpu
 # @spec REG-MEM-002, REG-MEM-006
 def test_serving_refuses_a_graphed_step_whose_wrapper_entry_lost_its_graph(
-    monkeypatch, tmp_path, single_process_dist
+    tmp_path, single_process_dist, monkeypatch
 ):
     """CUDA, core's own graph runtime and static graph wrapper, the card's
     default arms under ``--enforce-eager``: as the CPU test. Wrapper
     invocations are counted by instrumenting core's
-    ``CUDAGraphWrapper.__call__`` (no model-internal attribute is read)."""
+    ``CUDAGraphWrapper.__call__`` (no model-internal attribute is read).
+
+    ``monkeypatch`` is requested after ``single_process_dist`` so that it is
+    torn down first: the instrumented ``__call__`` holds ``calls``, and with
+    it the wrappers, their graphs and the model, until the patch is undone;
+    undone first, they are collected and their cached device memory released
+    by the distributed teardown (a collection, then ``empty_cache``) instead
+    of outliving the test."""
     from vllm.compilation.cuda_graph import CUDAGraphWrapper
     from vllm.forward_context import get_forward_context
 
@@ -3992,12 +4000,20 @@ def test_a_serving_capture_failure_under_a_fixed_block_count_names_a_smaller_one
 @pytest.mark.gpu
 # @spec REG-MEM-016, REG-MEM-020, REG-MEM-021, REG-MEM-022, REG-MEM-025
 # @spec REG-MEM-026, REG-MEM-027
-def test_hook_lifecycle_on_cuda(monkeypatch, tmp_path, single_process_dist):
+def test_hook_lifecycle_on_cuda(monkeypatch, tmp_path, single_process_dist, request):
     """CUDA, core's graph runtime, the card's default arms under the hook
     configuration: the profiling capture retains the segment graphs and the
     charged margin (``MARGIN_BYTES``), ``clear_cudagraphs`` returns them, the
     serving capture passes the aggregate comparison, a real step replays,
-    ``post_warmup`` passes, ``shutdown`` releases the serving graphs."""
+    ``post_warmup`` passes, ``shutdown`` releases the serving graphs.
+
+    The test runs alone in a child pytest process (``support.isolation``).
+    The plugin measures each capture's graph memory as a change in the
+    driver's free memory, so device memory that state left by earlier
+    in-process CUDA tests releases or takes inside a capture window would
+    move its figures and the aggregate comparison."""
+    if ran_in_child(request):
+        return
     card = h.write_runnable_card(tmp_path / "card")
     # The hook configuration from construction on, so the engine hook and
     # the model state's re-check see it.
