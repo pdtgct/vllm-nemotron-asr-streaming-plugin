@@ -1574,7 +1574,9 @@ def engine_settings(spec: dict[str, Any]) -> dict[str, Any]:
     of a device of ``device_total_bytes``; it is refused with any sizing but
     the extensible KV cache. A run that compares with a detached copy
     (``compare`` in the ``qm`` or ``fallback`` mode) under the extensible KV
-    cache is refused without a preregistered headroom."""
+    cache is refused without a preregistered headroom. A ``fallback`` spec
+    whose ``max_num_seqs`` is below ``N + 1`` is refused: its ``K = N + 1``
+    step would exceed the commit sink's row bound."""
     from support import txgcap_qual as q
     from support.txg_api import Sizing
 
@@ -1602,6 +1604,14 @@ def engine_settings(spec: dict[str, Any]) -> dict[str, Any]:
     if active is not None:
         settings["max_num_active_seqs"] = int(active)
     settings.update(spec.get("engine_extra") or {})
+    if spec.get("mode") == "fallback":
+        rows = int(spec.get("n") or 0) + 1
+        if max_num_seqs < rows:
+            raise ValueError(
+                f"the fallback steps' K = N + 1 step holds {rows} rows, more than "
+                f"max_num_seqs {max_num_seqs}, which bounds the commit sink's rows: "
+                "set max_num_seqs to at least N + 1 (TXG-QUAL-007)"
+            )
     headroom = spec.get("headroom")
     max_requests = q.spec_max_requests(spec)
     if (
@@ -1903,6 +1913,9 @@ def identity(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
         "corpus_sha256": ctx.corpus.manifest_sha256,
         "corpus_count": ctx.corpus.count,
         "git_head": os.environ.get("TXG_QUAL_PLUGIN_HEAD"),
+        # The exactness margin's allocator terms assume PyTorch's default
+        # caching-allocator configuration (TXG-QUAL-029); the record shows it.
+        "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
     }
     return out
 

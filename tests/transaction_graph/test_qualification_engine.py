@@ -538,7 +538,9 @@ def test_an_exactness_run_leaves_its_headroom_and_records_the_allocator(tmp_path
         "mode": mode,
         "card": card,
         "max_model_len": 82513,
-        "max_num_seqs": n,
+        # The fallback steps hold N + 4 requests and a K = N + 1 step, so
+        # their run admits N + 4 with graph population N (TXG-QUAL-007).
+        "max_num_seqs": n + 1 + q.FALLBACK_EXTRA_REQUESTS if mode == "fallback" else n,
         "n": n,
         "lookahead": 0,
         "hf_overrides": {"num_lookahead_tokens": 0, t.OPTION: [n]},

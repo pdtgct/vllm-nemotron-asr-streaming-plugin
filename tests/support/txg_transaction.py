@@ -133,7 +133,7 @@ def digest(
 ) -> str:
     """A SHA-256 digest of every bit of ``tensor``, read where it lives one
     bounded chunk at a time (TXG-QUAL-003). The hash takes the view's
-    identity (``name``, shape, strides, dtype) and then, for each chunk of at
+    identity (``name``, shape and dtype) and then, for each chunk of at
     most ``chunk_elements`` elements (:data:`DIGEST_CHUNK_ELEMENTS`), its
     element offset in the view, its shape and its bytes, copied to one
     host buffer of at most one chunk. Two views with different bytes at any

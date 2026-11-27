@@ -511,6 +511,21 @@ def test_the_driver_refuses_a_comparing_run_without_a_preregistered_headroom():
     assert d.engine_settings(_spec(mode="steprule", compare=True))
 
 
+# @spec TXG-QUAL-007
+def test_the_driver_refuses_fallback_steps_above_the_sink_row_bound():
+    """The fallback steps' ``K = N + 1`` step holds ``N + 1`` rows, and the
+    commit sink holds at most ``max_num_seqs``: a ``fallback`` spec with
+    ``max_num_seqs`` below ``N + 1`` is refused before the engine starts,
+    naming the remedy; at ``N + 1`` it starts."""
+    from support import txg_qual_driver as d
+
+    spec = _spec(mode="fallback", n=4, max_num_seqs=4)
+    with pytest.raises(ValueError, match=r"at least N \+ 1") as refused:
+        d.engine_settings(spec)
+    assert "TXG-QUAL-007" in str(refused.value), refused.value
+    assert d.engine_settings(spec | {"max_num_seqs": 5})
+
+
 # @spec TXG-QUAL-029
 def test_the_margin_counts_what_the_caching_allocator_reserves():
     """Each margin term is the bytes the CUDA caching allocator reserves for
@@ -658,7 +673,8 @@ def test_both_modes_take_their_copy_extent_from_one_function():
     for bad in (0, -1, None, True):
         with pytest.raises(ValueError):
             q.copy_extent(bad)
-    spec = _spec(mode="fallback", n=64, device_total_bytes=48 << 30)
+    # The fallback run admits the N + 4 requests it holds (TXG-QUAL-007).
+    spec = _spec(mode="fallback", n=64, max_num_seqs=68, device_total_bytes=48 << 30)
     assert q.spec_max_requests(spec) == 68
     headroom = q.preregistered_headroom(68, PAGE_BYTES)
     assert headroom["copy_bytes"] == q.copy_extent(68) * PAGE_BYTES == 69 * PAGE_BYTES
