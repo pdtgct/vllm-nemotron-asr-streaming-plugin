@@ -1439,6 +1439,11 @@ _INDEXED = {
 _MASKED_SCATTER = "nemotron_asr_masked_page_scatter_"
 
 
+class _Unread(Exception):
+    """An index or status tensor a CUDA capture computed and has not yet
+    written (``BlockAccesses``)."""
+
+
 def _tensors(value: Any) -> list[torch.Tensor]:
     if isinstance(value, torch.Tensor):
         return [value]
@@ -1470,9 +1475,15 @@ class BlockAccesses(torch.overrides.TorchFunctionMode):
     (``CUDAGraph.replay``) and a Triton kernel launched directly, not
     through a torch op, address pages unrecorded. While a CUDA stream
     captures, an index or status tensor on the device cannot be read without
-    ending the capture: the reading then takes the values it last read from
-    the same tensor (the capture's own warm-ups), or, with none, charges the
-    whole view.
+    ending the capture, and a tensor the capture itself computes (from the
+    graph's private memory pool, so at another address than in the
+    warm-ups) holds no value until a replay writes it. The reading then
+    takes the values it last read from the same tensor (the capture's own
+    warm-ups); with none, it keeps the call and its arguments and reads them
+    when the context exits, after the call's validation replay has written
+    them. Holding the tensor keeps the capture from reusing its memory, so
+    the value read is the one the replayed graph indexed by. An index value
+    outside the view's first dimension charges the whole view.
     """
 
     def __init__(self, pool: torch.Tensor) -> None:
@@ -1485,6 +1496,30 @@ class BlockAccesses(torch.overrides.TorchFunctionMode):
         #: The values last read from each index or status tensor, by its
         #: device, address, shape and dtype.
         self._read: dict[tuple[Any, ...], list[int]] = {}
+        #: Calls recorded while a capture could not read their index or
+        #: status values: ``(position in accesses, name, args, kwargs,
+        #: pooled)``, read when the context exits.
+        self._pending: list[tuple[int, str, Any, Any, list[torch.Tensor]]] = []
+
+    def __exit__(self, *exc: Any) -> Any:
+        out = super().__exit__(*exc)
+        self._resolve()
+        return out
+
+    def _resolve(self) -> None:
+        """Read the calls a capture kept, now that a replay has written
+        their index and status tensors."""
+        pending, self._pending = self._pending, []
+        if pending and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        for position, name, args, kwargs, pooled in pending:
+            blocks = self._classify(name, args, kwargs, pooled)
+            self.accesses[position] = (name, tuple(sorted(blocks)))
+
+    def _unreadable(self, index: torch.Tensor) -> bool:
+        """Whether ``index``'s values cannot be read now: it is on the
+        device while a CUDA stream captures."""
+        return index.is_cuda and torch.cuda.is_current_stream_capturing()
 
     def _aliases(self, tensor: torch.Tensor) -> bool:
         try:
@@ -1508,14 +1543,16 @@ class BlockAccesses(torch.overrides.TorchFunctionMode):
             )
         )
 
-    def _values(self, index: Any) -> list[int] | None:
+    def _values(self, index: Any) -> list[int]:
         """The row indices ``index`` holds (a boolean mask's true
         positions), or, while a CUDA stream captures, the values last read
-        from the same device tensor (``None`` when there are none)."""
+        from the same device tensor (``_Unread`` when there are none)."""
         if isinstance(index, torch.Tensor):
             key = (index.device, index.data_ptr(), tuple(index.shape), index.dtype)
-            if index.is_cuda and torch.cuda.is_current_stream_capturing():
-                return self._read.get(key)
+            if self._unreadable(index):
+                if key not in self._read:
+                    raise _Unread
+                return self._read[key]
             values = index.reshape(-1)
         else:
             key, values = None, torch.as_tensor(index).reshape(-1)
@@ -1531,14 +1568,14 @@ class BlockAccesses(torch.overrides.TorchFunctionMode):
         dimension (every block the view spans when the values cannot be
         read)."""
         values = self._values(index)
-        if values is None:
-            return self._span(tensor)
         rows = tensor[0] if tensor.dim() > 1 else tensor[:1]
         first = tensor.data_ptr() - self._base
         step = int(tensor.stride(0)) * tensor.element_size()
         blocks: set[int] = set()
         for value in set(values):
             value = value + tensor.shape[0] if value < 0 else value
+            if not 0 <= value < tensor.shape[0]:
+                return self._span(tensor)
             blocks |= self._span(rows, start=first + value * step)
         return blocks
 
@@ -1546,11 +1583,8 @@ class BlockAccesses(torch.overrides.TorchFunctionMode):
         self, pool: torch.Tensor, rows: int, block_ids: Any, status: Any
     ) -> set[int]:
         """The blocks the masked page scatter stores over its ``rows`` rows:
-        the block IDs of the rows whose status is 0 (every block the pool
-        view spans when the arguments cannot be read)."""
+        the block IDs of the rows whose status is 0."""
         ids, statuses = self._values(block_ids), self._values(status)
-        if ids is None or statuses is None:
-            return self._span(pool)
         stored = [i for i, s in zip(ids[:rows], statuses[:rows]) if s == 0]
         return self._rows(pool, stored) if stored else set()
 
@@ -1574,6 +1608,27 @@ class BlockAccesses(torch.overrides.TorchFunctionMode):
         if not pooled:
             return result
         if (
+            name.split(".")[0] != _MASKED_SCATTER
+            and name not in _IN_PLACE
+            and isinstance(result, torch.Tensor)
+            and self._aliases(result)
+        ):
+            return result  # a view, or a no-op such as ``cpu()`` on CPU
+        try:
+            blocks = self._classify(name, args, kwargs, pooled)
+        except _Unread:
+            self._pending.append((len(self.accesses), name, args, kwargs, pooled))
+            self.accesses.append((name, ()))
+            return result
+        self.accesses.append((name, tuple(sorted(blocks))))
+        return result
+
+    def _classify(
+        self, name: str, args: Any, kwargs: Any, pooled: list[torch.Tensor]
+    ) -> set[int]:
+        """The blocks one recorded call addresses (``_Unread`` while a
+        capture cannot read its index or status values)."""
+        if (
             name.split(".")[0] == _MASKED_SCATTER
             and len(args) >= 4
             and isinstance(args[0], torch.Tensor)
@@ -1584,14 +1639,7 @@ class BlockAccesses(torch.overrides.TorchFunctionMode):
             for tensor in pooled:
                 if tensor is not pool:
                     blocks |= self._span(tensor)
-            self.accesses.append((name, tuple(sorted(blocks))))
-            return result
-        if (
-            name not in _IN_PLACE
-            and isinstance(result, torch.Tensor)
-            and self._aliases(result)
-        ):
-            return result  # a view, or a no-op such as ``cpu()`` on CPU
+            return blocks
         blocks: set[int] = set()
         target = args[0] if args and isinstance(args[0], torch.Tensor) else None
         if target is not None and self._aliases(target):
@@ -1616,8 +1664,7 @@ class BlockAccesses(torch.overrides.TorchFunctionMode):
             pooled = [t for t in pooled if t is not args[1]]
         for tensor in pooled:
             blocks |= self._span(tensor)
-        self.accesses.append((name, tuple(sorted(blocks))))
-        return result
+        return blocks
 
     def blocks(self) -> set[int]:
         """Every block any recorded call addressed."""

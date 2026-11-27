@@ -1098,6 +1098,44 @@ def assert_only_block_zero(recorder, what):
     assert outside == [], (f"{what} addressed pages other than block 0", outside)
 
 
+class _CapturingAccesses(t.BlockAccesses):
+    """``BlockAccesses`` with the CUDA capture's unreadable index tensors
+    simulated on CPU: while ``capturing`` is set, no index tensor can be
+    read."""
+
+    capturing = False
+
+    def _unreadable(self, index):
+        return self.capturing
+
+
+# @spec TXG-CAP-018
+def test_the_block_reading_reads_a_captured_index_after_the_capture():
+    """A gather index the capture itself computes (a fresh tensor, at
+    another address than any warm-up read) is read when the reading's
+    context exits, not charged as the whole view: a gather of block 0
+    addresses block 0, and a gather of another block still addresses that
+    block. A warm-up's values still answer for the same tensor."""
+    pool = torch.zeros(6, 1, 1, 8, dtype=torch.uint8)
+    view = pool.view(6, 8)
+    warm = torch.tensor([0])
+    with _CapturingAccesses(pool) as rec:
+        view.index_select(0, warm)
+        rec.capturing = True
+        view.index_select(0, warm)
+        view.index_select(0, torch.where(torch.tensor([True]), 0, 3))
+        view.index_select(0, torch.where(torch.tensor([False]), 0, 3))
+        assert rec.accesses[2:] == [("index_select", ())] * 2
+        rec.capturing = False
+    assert rec.accesses == [
+        ("index_select", (0,)),
+        ("index_select", (0,)),
+        ("index_select", (0,)),
+        ("index_select", (3,)),
+    ]
+    assert rec.outside({0}) == [("index_select", (3,))]
+
+
 # @spec TXG-CAP-018, TXG-CAP-004, TXG-CAP-005, TXG-CAP-006
 def test_a_capture_call_addresses_only_block_zero_of_the_state_pools(on_cpu):
     """Every operation of the serving capture that reads or writes a
