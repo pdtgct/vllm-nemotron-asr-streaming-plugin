@@ -115,8 +115,9 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
 
 ## Expected performance
 
-No acceptance tier has been measured on the target core. All figures below come from one serving run of the
-last release, `v0.1.0b2`, on the earlier state-pool build (`hook-build-20261114b`, which carried
+On the target core, tier 2 is met only for the batch-invariant configuration
+([evidence](docs/evidence.md#runner-mode-matrix-on-the-target-core)), not for the serve command
+above. All figures below come from one serving run of the last release, `v0.1.0b2`, on the earlier state-pool build (`hook-build-20261114b`, which carried
 the state pool and stream admission of vllm#67374 and #67375), on one NVIDIA A40 at FP32, at
 320 ms, in the hook configuration with `--max-num-seqs 64` and the default segment arms
 ([evidence](docs/evidence.md#tier-2-on-the-state-pool-build)). They are a historical record for this

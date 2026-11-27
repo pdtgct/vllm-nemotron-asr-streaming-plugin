@@ -4,8 +4,14 @@ This manual covers `vllm-nemotron-asr-streaming` at `main` on the target core, R
 layer (`pdtgct/vllm` at `9503e3b878`). For the shortest path to a running server, use the
 [quick start](quickstart.md).
 
-No acceptance tier has been met on the target core. The last release, `v0.1.0b2`, ran on the
-earlier state-pool build (`hook-build-20261114b`), where it partly met tier 2 (the installed-engine
+On the target core, tier 2 (the installed-engine cycle) is met for one configuration, batch
+invariance (`VLLM_BATCH_INVARIANT=1`, `--async-scheduling`, no runner flag), at all five chunk
+sizes; it is not met for the serve command's configuration. There, the hook configuration, no
+runner flag and asynchronous scheduling with or without `--enforce-eager` gave served transcripts
+equal to `--enforce-eager --no-async-scheduling` at every chunk size, and under batch invariance a
+session's transcript did not depend on how many sessions shared its batches
+([evidence](evidence.md#runner-mode-matrix-on-the-target-core)). The last release, `v0.1.0b2`, ran
+on the earlier state-pool build (`hook-build-20261114b`), where it partly met tier 2 (the installed-engine
 cycle) at 320 ms in the hook configuration and did not meet tier 5 (transaction graphs), on one
 NVIDIA A40 at FP32. Those runs are a historical record for this plugin until they are repeated on
 the target core. The [evidence document](evidence.md) defines the tiers and lists the revisions of
@@ -182,8 +188,11 @@ harmless.
 ### Scheduling
 
 With transaction graphs off, the plugin accepts asynchronous scheduling: core's per-request barrier
-for state models advances each stream one step at a time. No run has qualified asynchronous
-scheduling with this model, so the serve command sets `--no-async-scheduling`. On the target core
+for state models advances each stream one step at a time. On the target core,
+asynchronous scheduling with no runner flag or with `--enforce-eager` gave served transcripts equal
+to `--enforce-eager --no-async-scheduling` at every chunk size
+([evidence](evidence.md#runner-mode-matrix-on-the-target-core)), but no latency tier has been met
+with it, so the serve command sets `--no-async-scheduling`. On the target core
 an unset option means asynchronous scheduling. With transaction graphs on, the plugin requires
 `--no-async-scheduling` ([Transaction graphs](#transaction-graphs-opt-in)).
 
@@ -199,7 +208,7 @@ that:
 | Graph memory charged by | core's graph-memory estimate | the profiled budget |
 | Transaction graphs | accepted (opt-in) | refused |
 | Eager arms | refused (no graph to capture) | accepted |
-| Measured | tier 2 partly met at 320 ms on the earlier state-pool build; not run on the target core | `--max-num-seqs 64` is interim, from an unpublished A40 measurement |
+| Measured | tier 2 partly met at 320 ms on the earlier state-pool build; on the target core, transcripts equal `--enforce-eager`'s at every chunk size | `--max-num-seqs 64` is interim, from an unpublished A40 measurement |
 
 The hook configuration requires at least one graph that the hook captures: the `eager-graphed`
 encoder, the `dense-graphed` decoder or transaction graphs. The default segment arms include two of
@@ -235,7 +244,10 @@ server's lookahead.
   `num_lookahead_tokens`.
 
 A larger lookahead gives the encoder more right context per chunk, so two lookaheads can give
-different transcripts for the same audio. Tier 2 has been measured only at 320 ms.
+different transcripts for the same audio. On the target core, tier 2 is met for the batch-invariant
+configuration at all five lookaheads
+([evidence](evidence.md#runner-mode-matrix-on-the-target-core)); the earlier state-pool measurement
+covered only 320 ms.
 
 ### Sizing `--max-model-len`
 
@@ -354,7 +366,9 @@ state must equal the option-off transaction's bit for bit.
 
 The option is opt-in and has met no tier. Release `v0.1.0b2` did not meet tier 5, the
 transaction-graph acceptance tier, on the state-pool build: the step rule and `U_api` failed at
-80 ms and at 160 ms. Tier 5 has not been run on the target core. The
+80 ms and at 160 ms. Full tier 5 qualification remains outstanding on the target core; there, 32 served sessions with the
+option on gave transcripts equal to the option off at 80 and at 160 ms
+([evidence](evidence.md#runner-mode-matrix-on-the-target-core)). The
 [evidence document](evidence.md#transaction-graphs-tier-5) gives the measured figures and what
 passed and failed.
 

@@ -29,6 +29,7 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 - [Light round on the parent of the target core](#light-round-on-the-parent-of-the-target-core)
 - [Block-0 capture under every KV-cache sizing](#block-0-capture-under-every-kv-cache-sizing)
 - [Stream-only servers at `--max-model-len 144`](#stream-only-servers-at---max-model-len-144)
+- [Runner-mode matrix on the target core](#runner-mode-matrix-on-the-target-core)
 - [Transaction graphs, tier 5](#transaction-graphs-tier-5)
 - [Owed](#owed)
 - [Historical entries](#historical-entries)
@@ -194,6 +195,43 @@ smallest context that holds one stream unit, and so keeps core's default token b
   the A40 (`experiments/2026-11-26-plugin-budget-9503e3b878/`).
 - One unprofiled run per setting with no repeats: no latency claim rests on this round.
 
+## Runner-mode matrix on the target core
+
+This round meets tier 2 on stage 1 for the batch-invariant configuration below
+(`VLLM_BATCH_INVARIANT=1`, `--async-scheduling`, no runner flag, transaction graphs off), at all
+five chunk sizes. It also measures REG-ENG-013, REG-ENG-014 and REG-ENG-015 at every chunk size,
+and transaction graphs on against off at core's default KV-cache sizing.
+
+- Build: `pdtgct/vllm` `pstate-impl-20261122` @ `9503e3b878`, with precompiled wheel `842f74fa8d`
+  (cu132); plugin `feat/core-graphs-20261123` @ `f64c83a`; card revision `ea30d66d`; one NVIDIA
+  A40 at FP32; 2026-11-27. Evidence: `pdtgct/nemotron-omni-port`
+  `experiments/2026-11-27-plugin-matrix-9503e3b878/`.
+- Every server: the manual's `--max-model-len`, `--max-num-seqs 64`, the default segment arms, and
+  200 paced LibriSpeech test-clean utterances at 32 sessions on `/v1/realtime`, compared by utterance
+  id.
+- REG-ENG-013 and REG-ENG-014: at 80, 160, 320, 560 and 1120 ms, the hook configuration
+  (`-cc.cudagraph_mode none -cc.mode none`) and no runner flag, each with `--no-async-scheduling`,
+  and `--async-scheduling` with no runner flag and with `--enforce-eager`, each give 200 of 200
+  final transcripts equal to `--enforce-eager --no-async-scheduling`.
+- REG-ENG-015: under `VLLM_BATCH_INVARIANT=1` with `--async-scheduling` and no runner flag, at each
+  chunk size, 8 sessions give the same 200 transcripts as 32 sessions, and 1 session the same first
+  20. These servers' segment graphs retain 15,986 to 17,692 MiB, against 1,358 to 2,344 MiB
+  without the variable, and their KV cache holds 210 to 439 blocks.
+- Transaction graphs (`transaction_graph_populations=[63]`) under the restricted startup and core's
+  default KV-cache sizing, against the same flags without them (`B_hook`): 200 of 200 transcripts
+  equal at 80 and at 160 ms. Each serving capture took 126 cells and passed its post-warm-up check.
+  The fallback counts were not logged. `B_hook` equals `--enforce-eager` at both chunk sizes.
+- Word-error rate: 3.15 % at 80 ms, 2.63 % at 160 ms, 2.55 % at 320 ms, 2.70 % at 560 ms and 2.44 %
+  at 1120 ms in every server without `VLLM_BATCH_INVARIANT=1`.
+- Tier 2's checks pass at 32 sessions in every server: each request finished with `stop`, none
+  length-capped, and `vllm:kv_cache_usage_perc` read 0 before the first pass and after every pass.
+  Only the batch-invariant servers ran a one-session pass, which also read 0; their startup logs
+  report the segment graphs' retained memory and capture time. This meets tier 2 for the
+  batch-invariant configuration. Tier 2 remains outstanding for the serve command's configuration,
+  which ran no one-session pass.
+- TXG-EQ-002's exhaustive and random-plan CUDA cases passed (20 tests), first run on this core.
+- One unprofiled run per server, with no repeats: no latency claim rests on this round.
+
 ## Transaction graphs, tier 5
 
 - Not met (state-pool build `9c40a6ffd6`; transaction level, body check and the revised TXG-QUAL-008 at
@@ -337,18 +375,20 @@ and `E ≤ N` make up at least 99 % of served steps. At `N` = 63 they make up 10
 
 ## Owed
 
-- Tiers 1 to 4 on the target core at the current plugin, at every chunk size (80, 160, 320, 560 and
-  1120 ms), under `--enforce-eager` and the hook configuration, with and without asynchronous
-  scheduling and batch invariance.
+- Tier 2 on the target core with a one-session pass in the serve command's runner configuration,
+  at every chunk size; tiers 1, 3 and 4 on the target core at the current plugin. Served transcript
+  equality across runner modes, scheduling and batch invariance is measured
+  ([Runner-mode matrix on the target core](#runner-mode-matrix-on-the-target-core)).
 - Served latency on the target core, with repeats (Served accuracy on the target core gives one
   unprofiled run per chunk size).
 - Tier 5 for transaction graphs at 80 and 160 ms on the target core, under the restricted startup.
   The revised served comparison (TXG-QUAL-008) passed only on the state-pool build `9c40a6ffd6` at
-  `N` = 63 ([Transaction graphs, tier 5](#transaction-graphs-tier-5)); on the target core one
+  `N` = 63 ([Transaction graphs, tier 5](#transaction-graphs-tier-5)). On the target core, one
   stream or one file at a time was served at `N` = 8
-  ([Block-0 capture under every KV-cache sizing](#block-0-capture-under-every-kv-cache-sizing)).
-- Served transcripts at 32 sessions with transaction graphs on under core's default KV-cache sizing,
-  against `B_hook`, at 80 and 160 ms.
+  ([Block-0 capture under every KV-cache sizing](#block-0-capture-under-every-kv-cache-sizing)), and
+  32 sessions at `N` = 63 under core's default KV-cache sizing gave transcripts equal to `B_hook`'s
+  ([Runner-mode matrix on the target core](#runner-mode-matrix-on-the-target-core)); the fallback
+  counts of that run were not logged.
 
 ## Historical entries
 
@@ -406,3 +446,9 @@ Owed lists the records due on the target core now. These records wait on a trigg
 - **The state-pool comparison.** Trigger: tier 2 and tier 5 met on the target core. Shape: an
   entry that compares them with the state-pool build's records above, by which RFC 1 retires the
   state pool.
+- **Segment-graph memory under batch invariance.** Trigger: a batch-invariant deployment needs more
+  KV blocks than the 210 to 439 the matrix round recorded. Shape: an entry that measures which
+  segment graphs grow under `VLLM_BATCH_INVARIANT=1` and by how much.
+- **Fallback counts of served transaction-graph runs.** Trigger: a served transaction-graph run whose
+  claim needs its fallback count. Shape: the count, read from the server log or the plugin's
+  counters, in that run's entry.
