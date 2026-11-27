@@ -24,11 +24,11 @@ that core bound and captured over. Per step, as core's
    step's commit event, then ``take_failed_requests``.
 
 Each request holds one block below the final committed block count
-(:attr:`QualAdapter.final_committed_blocks`), which the driver assigns at the
-request's first step (``Blocks``), keeps until its terminal finish and reuses
-only after that; the block reaches the model state as the request's
-``block_ids``. The lifecycle calls run outside any timer: the monitor times
-only the transaction call.
+(:attr:`QualAdapter.final_committed_blocks`), the lowest free block above
+block 0, which the driver assigns at the request's first step (``Blocks``),
+keeps until its terminal finish and reuses only after that; the block
+reaches the model state as the request's ``block_ids``. The lifecycle calls
+run outside any timer: the monitor times only the transaction call.
 
 ``before_forward(blocks, views)`` runs inside the step, after
 ``prepare_inputs`` and before the forward, with the blocks of the step's rows
@@ -47,16 +47,24 @@ progress and remaining queue counts through a proxy commit sink, and, with
 step on a detached copy of the pools taken before the call: new storage with
 the same resident layout, test-only storage outside REG-STATE-003 and
 TXG-CAP-013. The copy holds pages ``0 … copy_extent - 1`` and no more
-(:attr:`TransactionMonitor.copy_extent`, the final committed block count):
-each view is narrowed to that extent before anything is read or allocated,
-and ``txg_transaction.layout_clone`` copies only the bytes the narrowed
-views cover, so no page at or above the extent is read or cloned. The
-reference receives no view of the serving pools, so it can neither read nor
-write them; the monitor checks that, and compares rows, status, progress,
-queue counts and every copied page bit for bit (TXG-QUAL-003). With
-``memory``, it records ``torch.cuda.memory_reserved`` and
-``max_memory_reserved`` before and after each copy and the copy's bytes
-(TXG-QUAL-029). The pool copy, the option-off reference, the checks and the
+(:attr:`TransactionMonitor.copy_extent`): block 0 and one page per request
+the run's mode can hold (:func:`exactness_extent`; for ``qm`` pages 0 to the
+admission limit, for ``fallback`` pages 0 to ``N + 4``), the only pages the
+driver assigns its requests; without a request count, the final committed
+block count. Each view is narrowed to that extent before anything is read or
+allocated, and ``txg_transaction.layout_clone`` copies only the bytes the
+narrowed views cover, so no page at or above the extent is read or cloned.
+The committed pages from the extent to the final committed block count are
+digested in place before the run's first step (:meth:`watch_untouched`) and
+after its last (:meth:`untouched_problems`), in bounded chunks and with no
+copy of them; a changed digest is a problem of the run. The reference
+receives no view of the serving pools, so it can neither read nor write
+them; the monitor checks that, and compares rows, status, progress, queue
+counts and every copied page bit for bit (TXG-QUAL-003). With ``memory``,
+it records ``torch.cuda.memory_reserved`` and ``max_memory_reserved``
+before and after each copy, the bytes the copy copies (``copy_bytes``) and
+its allocation, alignment slack included (``copy_allocation_bytes``;
+TXG-QUAL-029). The pool copy, the option-off reference, the checks and the
 comparison are outside the timer.
 ``force_off`` makes ``execute`` decline without counting, so the forward
 runs the option-off transaction (the step rule's OFF legs).
@@ -609,6 +617,30 @@ def detached_problems(
     return problems
 
 
+def exactness_extent(final_blocks: int | None, max_requests: int | None) -> int | None:
+    """The pages a detached copy holds (TXG-QUAL-003, TXG-QUAL-007):
+    ``txgcap_qual.copy_extent`` of the mode's most requests when
+    ``max_requests`` is given (block 0 and one page per request), else
+    ``final_blocks`` (``None``: every page of the views). The precondition
+    is a final committed block count of at least that extent: a smaller
+    ``final_blocks`` raises, naming both counts, before the run's first
+    step; the copy never grows to the whole cache instead. (For ``qm``,
+    core's scheduler already refuses a final count below the admission limit
+    plus one at one block per request.)"""
+    from support import txgcap_qual as q
+
+    if max_requests is None:
+        return final_blocks
+    extent = q.copy_extent(max_requests)
+    if final_blocks is not None and int(final_blocks) < extent:
+        raise ValueError(
+            f"the final committed block count {final_blocks} is below the copy "
+            f"extent {extent} (block 0 and {max_requests} requests); the run "
+            "cannot copy every page its requests can write"
+        )
+    return extent
+
+
 def _sync(cuda: bool) -> None:
     if cuda:
         torch.cuda.synchronize()
@@ -625,6 +657,7 @@ class TransactionMonitor:
         compare: bool = False,
         check_off: bool = False,
         final_blocks: int | None = None,
+        max_requests: int | None = None,
         memory: bool = False,
     ) -> None:
         import importlib
@@ -632,10 +665,16 @@ class TransactionMonitor:
         self.model = model
         #: The final committed block count (TXG-QUAL-003).
         self.final_blocks = final_blocks
+        #: The most requests the run's mode holds (``txgcap_qual``'s
+        #: ``mode_max_requests``), or ``None``.
+        self.max_requests = max_requests
         #: The pages each detached copy holds, ``0 … copy_extent - 1`` (every
         #: page of the views when ``None``): the one value that sets the
-        #: copy's extent, here the final committed block count.
-        self.copy_extent = final_blocks
+        #: copy's extent (:func:`exactness_extent`).
+        self.copy_extent = exactness_extent(final_blocks, max_requests)
+        #: The committed pages above the copy's extent and their digests at
+        #: the run's start (:meth:`watch_untouched`).
+        self._untouched: tuple[tx.Pools, dict[str, str]] | None = None
         #: Record the allocator around each copy (TXG-QUAL-029).
         self.memory = memory
         #: ``{"copy_bytes", "memory_reserved_before", ...}`` per copy.
@@ -676,6 +715,41 @@ class TransactionMonitor:
         self.calls = []
         self._declined = None
 
+    def _untouched_pages(self) -> tuple[int, int] | None:
+        """The committed pages above the copy's extent, ``(start, stop)``,
+        or ``None`` when the copy holds every committed page."""
+        if self.copy_extent is None or self.final_blocks is None:
+            return None
+        if self.copy_extent >= self.final_blocks:
+            return None
+        return self.copy_extent, self.final_blocks
+
+    def watch_untouched(self, pools: tx.Pools) -> None:
+        """Digest, in place, the committed pages of ``pools`` above the
+        copy's extent (TXG-QUAL-003), before the run's first step."""
+        pages = self._untouched_pages()
+        if pages is None:
+            return
+        rest = pools.pages(*pages)
+        self._untouched = (rest, rest.digests())
+
+    def untouched_problems(self) -> list[str]:
+        """After the run's last step: each view whose committed pages above
+        the copy's extent changed since :meth:`watch_untouched`, or the
+        missing digest when there are such pages and none was taken."""
+        pages = self._untouched_pages()
+        if pages is None:
+            return []
+        if self._untouched is None:
+            return [f"pages {pages[0]} to {pages[1] - 1} were not digested"]
+        rest, before = self._untouched
+        after = rest.digests()
+        return [
+            f"pages {pages[0]} to {pages[1] - 1} of {name} changed during the run"
+            for name in before
+            if after.get(name) != before[name]
+        ]
+
     def _live(self, kwargs: dict[str, Any]) -> tx.Pools:
         """The step's pool views narrowed to the copy's extent
         (:attr:`copy_extent`): the pages a detached copy holds and a
@@ -703,7 +777,8 @@ class TransactionMonitor:
                 reading["max_memory_reserved_after"] = int(
                     torch.cuda.max_memory_reserved()
                 )
-            reading["copy_bytes"] = copy.storage_bytes()
+            reading["copy_bytes"] = live.span_bytes()
+            reading["copy_allocation_bytes"] = copy.storage_bytes()
             self.copy_readings.append(reading)
         return copy
 
@@ -727,10 +802,17 @@ class TransactionMonitor:
         """The option-off transaction on ``pools`` (a detached copy), outside
         the timer; returns ``(rows, reservation, pools, problems)``, the
         problems being every way the reference could reach the serving pools
-        (:func:`detached_problems`)."""
+        (:func:`detached_problems`). The reference's row plan is the step's
+        with the copy's page count as its resident pool extent
+        (``num_pool_blocks``, the bound the transaction checks every pool and
+        block index against), so a row naming a block at or above the copy's
+        extent fails the reference."""
         sink = _ReferenceSink()
         own = {k: v for k, v in kwargs.items() if k not in tx.STEP_OWNED}
         problems = detached_problems(pools, tx.pools_of(kwargs), own)
+        pages = pools.first_dimensions()
+        if len(pages) == 1 and (extent := next(iter(pages))) != plan.num_pool_blocks:
+            plan = dataclasses.replace(plan, num_pool_blocks=extent)
         with torch.inference_mode():
             rows = self._real_advance(
                 core,

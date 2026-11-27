@@ -44,6 +44,7 @@ import torch
 from support import model_harness as h
 from support.txg_fakes import RecordingSink
 from support.txgcap_harness import TxgCoreOrder
+from support.txgcap_qual import DIGEST_CHUNK_ELEMENTS
 
 POOL_TENSORS = (
     "h_pool",
@@ -94,6 +95,55 @@ def config_name(config: tuple[str, bool, bool]) -> str:
 #: The allocator alignment a layout-preserving copy keeps for each storage's
 #: base address, so every view keeps its address modulo this value.
 _BASE_ALIGNMENT = 512
+
+_SAME_SIZE_INTEGERS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _digest_chunks(tensor: torch.Tensor, limit: int) -> Iterator[torch.Tensor]:
+    """Views of ``tensor`` that together cover it, each of at most ``limit``
+    elements: slices along the first dimension, descending into a slice's
+    own first dimension when one slice is still too large. Neither reads nor
+    allocates."""
+    if tensor.numel() <= limit:
+        yield tensor
+        return
+    if tensor.shape[0] == 1:
+        yield from _digest_chunks(tensor[0], limit)
+        return
+    step = max(1, limit // max(1, tensor[0].numel()))
+    for start in range(0, int(tensor.shape[0]), step):
+        yield from _digest_chunks(tensor[start : start + step], limit)
+
+
+def digest(tensor: torch.Tensor, *, chunk_elements: int | None = None) -> str:
+    """A digest of ``tensor``'s bits computed where it lives, chunk by chunk
+    (TXG-QUAL-003): each chunk, at most ``chunk_elements`` elements
+    (:data:`DIGEST_CHUNK_ELEMENTS`), is reinterpreted as integers of its
+    element size, widened to 64 bits, and reduced to its sum and its
+    position-weighted sum. The tensor is never copied whole; the workspace is
+    at most ``txgcap_qual.DIGEST_WORKSPACE_BYTES`` for the default chunk size. The
+    shape, dtype and the reductions, read with one synchronization, are
+    hashed."""
+    import hashlib
+
+    limit = int(chunk_elements or DIGEST_CHUNK_ELEMENTS)
+    integer = _SAME_SIZE_INTEGERS[tensor.element_size()]
+    weights = None
+    sums = []
+    for chunk in _digest_chunks(tensor.detach(), limit):
+        n = chunk.numel()
+        if n == 0:
+            continue
+        wide = chunk.view(integer).to(torch.int64).reshape(-1)
+        if weights is None or weights.numel() < n:
+            weights = torch.arange(
+                1, max(n, min(limit, tensor.numel())) + 1, device=tensor.device
+            )
+        sums.append(torch.stack((wide.sum(), (wide * weights[:n]).sum())))
+    h = hashlib.sha256(f"{tuple(tensor.shape)}|{tensor.dtype}".encode())
+    if sums:
+        h.update(torch.stack(sums).cpu().numpy().tobytes())
+    return h.hexdigest()
 
 
 def _view_end(tensor: torch.Tensor) -> int:
@@ -216,6 +266,38 @@ class Pools:
                 for k, v in self.tensors.items()
             }
         )
+
+    def pages(self, start: int, stop: int | None = None) -> Pools:
+        """The same views limited to pages ``start … stop - 1`` (to each
+        view's last page when ``stop`` is ``None`` or beyond it): views over
+        the same storage. Neither reads nor allocates."""
+
+        def cut(t: torch.Tensor) -> torch.Tensor:
+            end = int(t.shape[0]) if stop is None else min(stop, int(t.shape[0]))
+            return t[min(start, end) : end]
+
+        return Pools(
+            {
+                k: [cut(t) for t in v] if isinstance(v, list) else cut(v)
+                for k, v in self.tensors.items()
+            }
+        )
+
+    def digests(self, *, chunk_elements: int | None = None) -> dict[str, str]:
+        """Each view's :func:`digest`, by name, computed in place."""
+        return {
+            name: digest(t, chunk_elements=chunk_elements) for name, t in self.flat()
+        }
+
+    def span_bytes(self) -> int:
+        """The bytes :func:`layout_clone` copies of these views: for each
+        distinct storage, from its start to the end of the last view over
+        it."""
+        spans: dict[tuple[Any, int], int] = {}
+        for _, t in self.flat():
+            key = (t.device, t.untyped_storage().data_ptr())
+            spans[key] = max(spans.get(key, 0), _view_end(t))
+        return sum(spans.values())
 
     def first_dimensions(self) -> set[int]:
         """The first dimension (the page count) of every pool view."""

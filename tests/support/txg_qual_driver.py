@@ -25,11 +25,19 @@ core's extension (``identity``; TXG-QUAL-001), and the startup probes
 (``probes``: the plugin's INFO and WARNING lines, core's logged torch
 memory limit, and, under the extensible KV cache, the committed block count
 at the serving capture and the state layer's views at that capture and after
-core's extension; TXG-QUAL-028). A spec with ``headroom`` (``copy_bytes``,
-``margin_bytes``, preregistered) runs an exactness run under the extensible
-KV cache with that headroom left free through ``--gpu-memory-utilization``
-and records the allocator around the detached copies
-(``exactness_memory``; TXG-QUAL-029).
+core's extension; TXG-QUAL-028). A spec with ``headroom``
+(``txgcap_qual.preregistered_headroom``: ``admission_limit``,
+``page_bytes``, ``copy_bytes``, ``margin_bytes``, computed before the run)
+runs an exactness run under the extensible KV cache with that headroom left
+free through ``--gpu-memory-utilization`` and records the allocator around
+the detached copies (``exactness_memory``; TXG-QUAL-029). In the ``qm``
+and ``fallback`` modes the detached copies hold block 0 and one page per
+request the mode can hold (``txgcap_qual.copy_extent`` of
+``mode_max_requests``: pages 0 to the admission limit, and 0 to ``N + 4``),
+a final committed count below that extent fails the run before its first
+step, and the other committed pages are digested in place before the first
+step and after the last; a changed digest fails the run (TXG-QUAL-003,
+-007).
 
 Modes (``spec["mode"]``):
 
@@ -994,12 +1002,17 @@ def run_fallbacks(ctx: Any, n: int) -> dict[str, Any]:
     forced-EOU candidate (the signature fallbacks of a direct engine client),
     then a multi-token row among one-token rows (TXG-COV-014), which planning
     fails alone. Every declined step's outputs are compared with the
-    option-off transaction on a detached pool copy."""
+    option-off transaction on a detached pool copy. The run holds
+    ``txgcap_qual.mode_max_requests("fallback", ...)`` requests, ``N + 4``;
+    the committed pages above the copy's extent are digested before its
+    first step and after its last, and a changed digest fails it."""
     from support import txg_api
+    from support import txg_transaction as tx
 
     requests = ctx.requests
     before = _fallbacks(ctx.model)
     out: dict[str, Any] = {"steps": []}
+    ctx.monitor.watch_untouched(tx.Pools({"views": list(ctx.adapter.views)}))
 
     def step(new=(), cached=(), computed=None, tokens=None, label=""):
         blocks = ctx.blocks.of([*(x.req_id for x in new), *cached])
@@ -1113,6 +1126,9 @@ def run_fallbacks(ctx: Any, n: int) -> dict[str, Any]:
     ctx.adapter.step(finished=finished, blocks={})
     for r in finished:
         ctx.blocks.release(r)
+    untouched = ctx.monitor.untouched_problems()
+    out["untouched_problems"] = untouched
+    out["passed"] = out["passed"] and not untouched
     return out
 
 
@@ -1592,12 +1608,36 @@ def engine_settings(spec: dict[str, Any]) -> dict[str, Any]:
                 "--gpu-memory-utilization under the extensible KV cache, never "
                 "a fixed --kv-cache-memory-bytes (TXG-QUAL-029)"
             )
+        problems = q.preregistration_problems(headroom, q.spec_max_requests(spec))
+        if problems:
+            raise ValueError(
+                "the exactness run's headroom is not preregistered as "
+                "TXG-QUAL-029 computes it: " + "; ".join(problems)
+            )
         settings["gpu_memory_utilization"] = q.headroom_utilization(
             int(headroom["copy_bytes"]),
             int(headroom["margin_bytes"]),
             int(spec["device_total_bytes"]),
         )
     return settings
+
+
+def card_page_bytes(card: str | os.PathLike[str]) -> int:
+    """The state page's bytes for ``card``, read before any engine starts
+    from the card's configuration through the plugin's parser and state
+    manifest: the bytes per page of the state layer's bound views, which the
+    plugin checks against core's state page (TXG-QUAL-029)."""
+    from vllm_nemotron_asr_streaming.card_parser import (
+        NemotronAsrStreamingConfigParser,
+    )
+    from vllm_nemotron_asr_streaming.nemotron_asr.state_profile import (
+        manifest_page_bytes,
+    )
+
+    _, config = NemotronAsrStreamingConfigParser().parse(
+        str(card), trust_remote_code=False
+    )
+    return manifest_page_bytes(config)
 
 
 def engine_env(spec: dict[str, Any]) -> dict[str, str]:
@@ -1925,6 +1965,7 @@ def _plain(value: Any) -> Any:
 
 
 def build_context(spec: dict[str, Any], engine: Any, worker: Any) -> Context:
+    from support import txgcap_qual as q
     from support.txg_qual_adapter import QualAdapter, TransactionMonitor
 
     adapter = QualAdapter.from_worker(worker)
@@ -1935,6 +1976,14 @@ def build_context(spec: dict[str, Any], engine: Any, worker: Any) -> Context:
         model,
         compare=bool(spec.get("compare")),
         final_blocks=final,
+        # The ``qm`` and ``fallback`` modes copy block 0 and one page per
+        # request they can hold (TXG-QUAL-003, -007); construction raises,
+        # before the first step, when fewer pages are committed.
+        max_requests=q.mode_max_requests(
+            spec["mode"],
+            admission_limit=admission_limit(adapter),
+            n=int(spec.get("n") or 0),
+        ),
         memory=bool(spec.get("headroom")),
     )
     return Context(
@@ -1954,7 +2003,43 @@ def build_context(spec: dict[str, Any], engine: Any, worker: Any) -> Context:
     )
 
 
+def admission_limit(adapter: Any) -> int:
+    """The engine's admission limit (TXG-CFG-020): ``max_num_active_seqs``
+    when set, otherwise ``max_num_seqs``."""
+    config = adapter.vllm_config.scheduler_config
+    active = getattr(config, "max_num_active_seqs", None)
+    return int(config.max_num_seqs if active is None else active)
+
+
+def qm_result(
+    runs: list[dict[str, Any]], n: int, untouched: Sequence[str] = ()
+) -> dict[str, Any]:
+    """The ``qm`` mode's result over its ``Q`` and ``M`` summaries. A changed
+    digest of the committed pages above the copy's extent (``untouched``,
+    ``TransactionMonitor.untouched_problems``) counts as a mismatch, so it
+    fails the run as a page mismatch does (TXG-QUAL-003, -005)."""
+    from support import txgcap_qual as q
+
+    at_n = next((r for r in runs if r["name"] == f"Q{n}"), runs[0])
+    counts = {
+        "q_split_at_n": at_n["counts"]["split"],
+        "q_fresh_among_continuing_at_n": at_n["counts"]["fresh_among_continuing"],
+        "m_split_with_file": runs[-1]["counts"]["split_with_file"],
+        "m_cases": sorted(runs[-1]["cases"]),
+    }
+    return {
+        "runs": runs,
+        "counts": counts,
+        "void": q.run_void(counts),
+        "untouched_problems": list(untouched),
+        "mismatches": sum(r["mismatched_steps"] for r in runs) + len(untouched),
+        "fallbacks": sum(r["fallback_steps"] for r in runs),
+        "failed_rows": sum(r["failed_rows"] for r in runs),
+    }
+
+
 def run_mode(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
+    from support import txg_transaction as tx
     from support import txgcap_qual as q
 
     mode = spec["mode"]
@@ -1964,6 +2049,9 @@ def run_mode(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
         if spec.get("replay"):
             replay = json.loads(Path(spec["replay"]).read_text())["result"]
         runs = []
+        # The committed pages above the copy's extent, digested before the
+        # first step (TXG-QUAL-003).
+        ctx.monitor.watch_untouched(tx.Pools({"views": list(ctx.adapter.views)}))
         for index, c in enumerate(spec["concurrencies"]):
             name = f"Q{c}"
             durations = replay["runs"][index]["durations"] if replay else None
@@ -1999,21 +2087,7 @@ def run_mode(ctx: Any, spec: dict[str, Any]) -> dict[str, Any]:
         m.run()
         m.close()
         runs.append(m.summary())
-        at_n = next((r for r in runs if r["name"] == f"Q{n}"), runs[0])
-        counts = {
-            "q_split_at_n": at_n["counts"]["split"],
-            "q_fresh_among_continuing_at_n": at_n["counts"]["fresh_among_continuing"],
-            "m_split_with_file": runs[-1]["counts"]["split_with_file"],
-            "m_cases": sorted(runs[-1]["cases"]),
-        }
-        return {
-            "runs": runs,
-            "counts": counts,
-            "void": q.run_void(counts),
-            "mismatches": sum(r["mismatched_steps"] for r in runs),
-            "fallbacks": sum(r["fallback_steps"] for r in runs),
-            "failed_rows": sum(r["failed_rows"] for r in runs),
-        }
+        return qm_result(runs, n, ctx.monitor.untouched_problems())
     if mode == "fallback":
         return run_fallbacks(ctx, n)
     if mode == "steprule":

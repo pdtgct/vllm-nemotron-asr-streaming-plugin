@@ -417,12 +417,19 @@ def test_the_record_of_every_run_holds_its_sizing_page_counts_and_final_count():
 # The exactness runs' headroom (TXG-QUAL-029)
 
 
+#: The published checkpoint's state page (the manifest's ``total_page_bytes``).
+PAGE_BYTES = 6_314_944
+
+
 def _headroom_reply(**changes):
-    copy, margin, total = 10 << 30, 1 << 30, 48 << 30
+    limit, total = 64, 48 << 30
+    headroom = q.preregistered_headroom(limit, PAGE_BYTES)
+    copy, margin = headroom["copy_bytes"], headroom["margin_bytes"]
     reply = {
-        "spec": {"headroom": {"copy_bytes": copy, "margin_bytes": margin}},
+        "spec": {"mode": "qm", "max_num_seqs": limit, "headroom": headroom},
         "identity": {
             "kv_cache_sizing": Sizing.EXTENSIBLE,
+            "state_page_bytes": PAGE_BYTES,
             "settings": {
                 "gpu_memory_utilization": q.headroom_utilization(copy, margin, total)
             },
@@ -431,9 +438,10 @@ def _headroom_reply(**changes):
             "torch_memory_limit": 20 << 30,
             "memory_reserved_before": 4 << 30,
             "max_memory_reserved_before": 5 << 30,
-            "memory_reserved_after": 14 << 30,
-            "max_memory_reserved_after": 15 << 30,
-            "copy_bytes": 9 << 30,
+            "memory_reserved_after": 4 << 30,
+            "max_memory_reserved_after": 5 << 30,
+            "copy_bytes": copy,
+            "copy_allocation_bytes": copy + 512,
             "context_before": {"mem_get_info": [1, 2], "nvidia_smi": "1, 2"},
         },
     }
@@ -462,7 +470,7 @@ def test_the_headroom_is_left_through_gpu_memory_utilization_below_one():
 def test_the_driver_refuses_a_headroom_outside_the_extensible_kv_cache():
     from support import txg_qual_driver as d
 
-    headroom = {"copy_bytes": 10 << 30, "margin_bytes": 1 << 30}
+    headroom = q.preregistered_headroom(64, PAGE_BYTES)
     spec = _spec(mode="qm", headroom=headroom, device_total_bytes=48 << 30)
     settings = d.engine_settings(spec)
     assert 0.0 < settings["gpu_memory_utilization"] < 1.0
@@ -485,8 +493,17 @@ def test_the_driver_refuses_a_headroom_outside_the_extensible_kv_cache():
         ({"identity.settings.gpu_memory_utilization": 1.0}, "below 1.0"),
         ({"exactness_memory.torch_memory_limit": ...}, "torch_memory_limit"),
         ({"exactness_memory.max_memory_reserved_after": ...}, "max_memory_reserved"),
-        ({"exactness_memory.copy_bytes": 11 << 30}, "more than the preregistered"),
+        ({"exactness_memory.copy_bytes": 65 * PAGE_BYTES + 1}, "more than the"),
         ({"spec.headroom.margin_bytes": ...}, "margin_bytes"),
+        (
+            {"spec.headroom.copy_bytes": 22 << 30},
+            "copy extent times the bytes per page",
+        ),
+        ({"spec.headroom.page_bytes": PAGE_BYTES + 64}, "copy extent times the bytes"),
+        ({"identity.state_page_bytes": PAGE_BYTES + 64}, "not the bound views'"),
+        ({"spec.max_num_active_seqs": 32}, "is not the mode's 32"),
+        ({"spec.headroom.margin_bytes": 1 << 30}, "below the stated"),
+        ({"spec.headroom.max_requests": ...}, "max_requests"),
         ({"exactness_memory.memory_reserved_before": None}, "memory_reserved_before"),
         ({"exactness_memory.memory_reserved_after": 1.5e9}, "memory_reserved_after"),
         ({"exactness_memory.torch_memory_limit": "20 GiB"}, "torch_memory_limit"),
@@ -526,6 +543,124 @@ def test_the_device_level_figures_are_read_by_no_check():
     assert q.headroom_problems(reply) == []
     del reply["exactness_memory"]["context_before"]
     assert q.headroom_problems(reply) == []
+
+
+# @spec TXG-QUAL-029, TXG-QUAL-003
+def test_the_headroom_fails_when_the_copy_exceeds_its_preregistered_figure():
+    """The copy figure is the admission limit plus one pages: a recorded copy
+    of one byte more (a page beyond the limit's, or the whole committed
+    cache) fails the run; a copy of exactly the figure, or less, passes."""
+    figure = 65 * PAGE_BYTES
+    for copied, ok in (
+        (figure, True),
+        (figure - PAGE_BYTES, True),
+        (figure + 1, False),
+        (66 * PAGE_BYTES, False),
+        (22 << 30, False),
+    ):
+        problems = q.headroom_problems(
+            _headroom_reply(**{"exactness_memory.copy_bytes": copied})
+        )
+        assert (problems == []) is ok, (copied, problems)
+
+
+# @spec TXG-QUAL-003, TXG-QUAL-007, TXG-QUAL-029
+def test_both_modes_take_their_copy_extent_from_one_function():
+    """``qm`` holds at most the admission limit's requests, ``fallback``
+    ``N + 4``; both copy extents and both preregistered copy figures are
+    ``copy_extent`` of that count, so they cannot diverge. A mode with no
+    detached copy takes no headroom."""
+    from support import txg_qual_driver as d
+
+    assert q.mode_max_requests("qm", admission_limit=8, n=4) == 8
+    assert q.mode_max_requests("fallback", admission_limit=8, n=4) == 8
+    assert q.mode_max_requests("fallback", admission_limit=64, n=64) == 68
+    assert q.mode_max_requests("steprule", admission_limit=8, n=4) is None
+    assert q.copy_extent(68) == 69
+    for bad in (0, -1, None, True):
+        with pytest.raises(ValueError):
+            q.copy_extent(bad)
+    spec = _spec(mode="fallback", n=64, device_total_bytes=48 << 30)
+    assert q.spec_max_requests(spec) == 68
+    headroom = q.preregistered_headroom(68, PAGE_BYTES)
+    assert headroom["copy_bytes"] == q.copy_extent(68) * PAGE_BYTES == 69 * PAGE_BYTES
+    assert (
+        0.0
+        < d.engine_settings(spec | {"headroom": headroom})["gpu_memory_utilization"]
+        < 1.0
+    )
+    with pytest.raises(ValueError, match="preregistered"):
+        d.engine_settings(spec | {"headroom": q.preregistered_headroom(64, PAGE_BYTES)})
+    reply = _headroom_reply(
+        **{
+            "spec.mode": "fallback",
+            "spec.n": 64,
+            "spec.headroom": headroom,
+            "exactness_memory.copy_bytes": headroom["copy_bytes"],
+        }
+    )
+    assert q.headroom_problems(reply) == []
+    reply["exactness_memory"]["copy_bytes"] += 1
+    assert any("more than the" in p for p in q.headroom_problems(reply))
+    steprule = _spec(mode="steprule", headroom=q.preregistered_headroom(64, PAGE_BYTES))
+    assert q.preregistration_problems(steprule["headroom"], None)
+
+
+# @spec TXG-QUAL-029, TXG-QUAL-018
+def test_the_headroom_is_computed_before_the_run_from_limit_page_and_margin():
+    """The preregistered figure is a function of the admission limit, the
+    bound views' bytes per page and the stated margin alone, so it exists
+    before any run sample: ``preregistered_headroom`` takes no reading, the
+    driver derives ``--gpu-memory-utilization`` from the spec alone before
+    the engine starts, and refuses a headroom that is not that figure (a
+    whole-cache copy figure, another admission limit, a margin below the
+    stated one)."""
+    import inspect
+
+    from support import txg_qual_driver as d
+
+    assert list(inspect.signature(q.preregistered_headroom).parameters) == [
+        "max_requests",
+        "page_bytes",
+        "margin_bytes",
+    ]
+    headroom = q.preregistered_headroom(64, PAGE_BYTES)
+    assert headroom == {
+        "max_requests": 64,
+        "page_bytes": PAGE_BYTES,
+        "copy_bytes": 65 * PAGE_BYTES,
+        "margin_bytes": q.EXACTNESS_MARGIN_BYTES,
+    }
+    assert q.EXACTNESS_MARGIN_BYTES == (
+        q.CORE_NON_TORCH_RESERVE_BYTES
+        + q.STARTUP_ALLOWANCE_BYTES
+        + q.DIGEST_WORKSPACE_BYTES
+        + q.COPY_ALIGNMENT_ALLOWANCE_BYTES
+    )
+    assert q.CORE_NON_TORCH_RESERVE_BYTES == 1 << 29
+    limited = q.preregistered_headroom(8, PAGE_BYTES, 2 << 30)
+    assert limited["copy_bytes"] == 9 * PAGE_BYTES
+    for bad in ((0, PAGE_BYTES), (64, 0), (64, PAGE_BYTES, 0), (True, PAGE_BYTES)):
+        with pytest.raises(ValueError):
+            q.preregistered_headroom(*bad)
+    spec = _spec(mode="qm", headroom=headroom, device_total_bytes=48 << 30)
+    expected = q.headroom_utilization(
+        headroom["copy_bytes"], headroom["margin_bytes"], 48 << 30
+    )
+    assert d.engine_settings(spec)["gpu_memory_utilization"] == expected
+    for changed in (
+        headroom | {"copy_bytes": 22 << 30},
+        headroom | {"max_requests": 32},
+        headroom | {"margin_bytes": 1 << 30},
+        {k: v for k, v in headroom.items() if k != "page_bytes"},
+    ):
+        with pytest.raises(ValueError, match="preregistered"):
+            d.engine_settings(spec | {"headroom": changed})
+    active = spec | {
+        "max_num_active_seqs": 32,
+        "headroom": q.preregistered_headroom(32, PAGE_BYTES),
+    }
+    assert 0.0 < d.engine_settings(active)["gpu_memory_utilization"] < 1.0
 
 
 # @spec TXG-QUAL-029

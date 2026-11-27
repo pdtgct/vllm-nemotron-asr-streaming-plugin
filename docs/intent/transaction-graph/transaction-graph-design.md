@@ -1191,8 +1191,9 @@ Every option-on/off comparison is against `B_hook`. Runs that need core's graph-
 `B_hook`, holds the KV-cache sizing, each capture layout's page count and, under the extensible
 KV cache, the final bound count read after the extension; that the option changes exactly one
 setting (Option-off baseline) refers to the runner flags, and the engines' final counts are
-reported, not equated. The qualification driver copies the state layer's bound views and assigns
-slots only below the final committed count (TXG-QUAL-003, TXG-QUAL-026).
+reported, not equated. The qualification driver assigns slots only below the final committed
+count (TXG-QUAL-026) and copies only the pages it can assign; it digests the other committed pages
+(TXG-QUAL-003).
 
 ### Workloads
 
@@ -1206,9 +1207,18 @@ slots only below the final committed count (TXG-QUAL-003, TXG-QUAL-026).
   the next arrival. Each step holds every stream with a schedulable unit (a chunk, a label drain,
   an echo, a FLUSH), so mixed steps arise from the pacing. The driver runs every step replayed and
   as the option-off transaction on a detached copy of the state layer's bound views
-  (`component_pools`), limited to the pages below the final committed block count, taken before
-  the step, and
-  compares outputs, statuses, progress, remaining counts and every page. The replayed step runs on
+  (`component_pools`), taken before the step, and compares outputs, statuses, progress, remaining
+  counts and every page the copy holds. The copy holds pages 0 to the admission limit: `Q` and `M`
+  hold at most `N` requests, `N` is at most the admission limit (TXG-CFG-020), and the adapter
+  assigns the lowest free block, so no request holds a block above the limit. Core's scheduler,
+  built after the extension, refuses a final committed count below the admission limit plus one
+  at one state block per request (`vllm/v1/core/sched/scheduler.py:160-171`), so these pages are
+  committed. The other committed pages, from the admission limit plus one to the final committed
+  count, are digested in place, in bounded chunks, before the run's first step and after its last;
+  a changed digest fails the run as a page mismatch does. The reference runs the step's row plan
+  with the copy's page count as its resident pool extent (`num_pool_blocks`), the bound the
+  transaction checks every pool and block index against, so a row naming a block above the limit
+  fails the reference. The replayed step runs on
   the serving pools, whose addresses its graphs hold; the copy is test-only storage that the serving
   rules (REG-STATE-003, TXG-CAP-013) do not govern, and the reference never touches the serving
   pools. The driver runs on the worker of a hook-captured
@@ -1224,12 +1234,12 @@ slots only below the final committed count (TXG-QUAL-003, TXG-QUAL-026).
   it with no model-state call, and a removal would retire a running file at once (REG-STATE-016),
   after which its addition would raise (REG-STATE-012). It executes on the runner stream, then
   calls `postprocess_state`, which waits for the step's commit event, and `take_failed_requests`
-  before the next step. The adapter assigns each request one block below the final committed
-  block count at its first step, keeps it
+  before the next step. The adapter assigns each request, at its first step, the lowest free
+  block above block 0 and below the final committed block count, keeps it
   until the request's terminal finish and reuses it only after that, as core's allocator does, and
   delivers a stream's next turn as core does (its compacted prompt, `num_computed_tokens` 1). No
-  replay, restore or store runs outside a step run this way. The lifecycle calls, the pool copy
-  and the sink's collection run outside any timer.
+  replay, restore or store runs outside a step run this way. The lifecycle calls, the pool copy,
+  the digests and the sink's collection run outside any timer.
 - **Mixed workload `M`.** `N` in-flight requests at the transaction level: `max(1, ⌊N/4⌋)` file
   slots and the rest `Q`'s streams, with populations counting stream and file rows together. Each
   file slot takes the next file when its file retires, until every file has completed and at
@@ -1253,7 +1263,11 @@ slots only below the final committed count (TXG-QUAL-003, TXG-QUAL-026).
   rests on a constructed schedule; served coverage and capacity claims rest on free-running runs.
 - **Uncovered steps.** Steps with `K > N`, steps with `E > N`, a forced signature mismatch and a
   multi-token row among one-token rows, each with its expected fallback count and outputs equal to
-  the option-off transaction's.
+  the option-off transaction's. The run holds `N + 4` requests (the `K = N + 1` step's, the
+  endpoint-policy request and the multi-token step's two), so its copy follows `Q`'s rule with
+  pages 0 to `N + 4`, and the other committed pages are digested. One function of a mode's most
+  requests gives both modes' extents and copy figures. A final committed count below `N + 5`
+  fails the run before its first step, naming both counts (TXG-QUAL-007).
 - **Served runs.** An option-on engine completes two served runs on plugin-packed input (every
   unit packed by the plugin's packer, every file prompt built by `get_generation_prompt`, no
   endpoint policy), each paced by the wall clock: `Q`'s streams (concurrency `N`, the same
@@ -1280,10 +1294,18 @@ row, which planning fails and whose step falls back.
 
 Under the extensible KV cache the detached copy is a PyTorch allocation under the cap core sets
 after sizing the cache, `memory_reserved` plus what stays free after the extension
-(`vllm/v1/worker/extensible_kv_cache.py:684-699`). The run reserves a fixed, preregistered
-headroom of the copy's bytes (the bound views up to the final committed count) plus a stated
-margin through a `--gpu-memory-utilization` below 1.0, never a fixed budget, which would turn the
-extensible KV cache off; the record holds core's logged torch memory limit and
+(`vllm/v1/worker/extensible_kv_cache.py:684-699`). The run reserves a fixed headroom through a
+`--gpu-memory-utilization` below 1.0, never a fixed budget, which would turn the extensible KV
+cache off. The headroom is preregistered before the run from quantities known then: the copy
+figure, the copy's page count (the admission limit plus one for `Q` and `M`, `N + 5` for the
+uncovered steps) times the bound views' bytes per page (the state manifest's
+page, which core's state page equals), plus a stated margin. The margin covers core's reserve for
+memory outside the torch allocator (`KV_CACHE_NON_TORCH_RESERVE_BYTES`,
+`vllm/v1/worker/extensible_kv_cache.py:71`), the memory in use at startup, which the utilization
+fraction of total memory does not exclude (`vllm/v1/worker/utils.py:906`), the digest's bounded
+workspace and the copy's alignment slack. The startup allowance is a stated figure of 1 GiB,
+preregistered with the margin. The run records the bytes each copy copies and fails
+when they exceed the copy figure. The record also holds core's logged torch memory limit and
 `torch.cuda.memory_reserved` and `max_memory_reserved` before and after the copy, with
 `nvidia-smi` and `mem_get_info` as context only; served figures come from runs without the
 headroom (TXG-QUAL-029).
@@ -1353,7 +1375,9 @@ Each qualification run freezes, in a dated record before its first counted sampl
 and clock; `Q`'s and `M`'s parameters (concurrencies, seed list, clip and file manifests, offset
 rule, run lengths, file admission, idle-clock rule, minimum case coverage); the step rule's
 prefix, snapshot rule, plans, compositions, aggregation and adapter identity; `U_api`'s
-procedure, input generator and rules; and U(1)'s audio, plan and procedure. A change after that voids the run.
+procedure, input generator and rules; U(1)'s audio, plan and procedure; and the exactness runs'
+headroom: its admission limit, bytes per page, copy figure and margin (TXG-QUAL-029). A change
+after that voids the run.
 
 ### Memory, refusals and recovery
 
@@ -1599,6 +1623,7 @@ not set; and a frontend release that opens streams by locale only.
 | Block count | At least the admission limit plus one: refused in the configuration hook under `num_gpu_blocks_override` (TXG-CFG-005), and checked against the layout's page count at the serving capture's pool access under every other sizing (TXG-CAP-008); no check at the profiling capture | At least `N + 1`; a check at both captures; a check of the final count after the extension; leave every check to core's scheduler | Core builds its scheduler after the captures, so a count between `N + 1` and the limit would capture `2N` cells, twice when core's estimate runs, and then fail with core's message. The profiling cache holds one block under a profiled budget with the extensible KV cache off and the explicit NONE the restricted startup requires (core's default sizing runs no profiling capture), and its count is not the serving count, so a check there would refuse every profiled startup. Under the extensible KV cache the final count is known only after the one capture; the state layer's binding report at the extension could check it, but core's scheduler refuses a final count too small itself, with a message that names the remedy (`vllm/v1/core/sched/scheduler.py:166-170`), and only one capture has run by then |
 | Pool-access remedy | For too few blocks, a larger block count or budget, or a lower admission limit (TXG-MEM-017); for a break of core's state-group layout contract, no configuration remedy (TXG-CAP-008) | TXG-MEM-013's smaller `--kv-cache-memory-bytes`; the remedies of TXG-MEM-011 to TXG-MEM-013 for every pool-access failure | A block-count failure means the budget holds too few state pages, and a smaller budget holds fewer still. TXG-MEM-013 answers a serving capture that ran out of device memory after pool access. A layout count other than one, or a component tensor that is not the layer's bound view, is a break of core's contract that no setting changes, so a configuration remedy would direct the operator to the wrong cause |
 | Pages of rejected fresh rows | Initialized before the transaction whether or not the row is rejected; preservation starts after initialization (Fresh rows) | Initialize only the rows that commit; preserve a rejected fresh row's recycled contents | The body finds a per-row rejection on the device, after the initialization has run, so initializing only committed rows would need every rejection on the host before the step. Preserving recycled contents would leave an earlier request's state in a page that the rejected request holds |
+| Exactness copy extent | The detached copy holds block 0 and one page for each request the run can hold, the only pages the adapter's lowest-free assignment gives its requests: pages 0 to the admission limit for `Q` and `M` (TXG-QUAL-003), 0 to `N + 4` for the uncovered steps (TXG-QUAL-007), from one function of the mode's most requests; every other committed page is digested in place before the run and after it, and a changed digest fails the run; a final committed count below the extent fails the run before its first step; the headroom is the extent's pages plus a stated margin (TXG-QUAL-029) | Copy every committed page, up to the final committed count, under a headroom of the whole committed cache | Under the extensible KV cache the committed count is sized from the memory the headroom leaves, so a whole-cache copy needs a headroom near half the device: the KV cache under test would shrink far below serving's, and the copy's figure would depend on the count it shrinks. The written pages are only the extent's pages, a figure known before the run; a run whose final count falls below the extent fails, because a whole-cache copy in its place would bring back the shrunken cache. A digest still catches a write to an unassigned committed page, which a narrower copy alone would miss |
 | Qualification adapter's call order | Core's runner order: finished requests removed first, then each request delivered as `NewRequestData` in `scheduled_new_reqs` (a new request or a stream's next turn) removed and at once added; a cached request gets neither call (TXG-QUAL-026) | All removals, then all additions; a removal and an addition for every scheduled request | With all removals first, the next request's removal retires a continuing request's pending removal (REG-STATE-011), and the model state then refuses that request's continuing turn (REG-STATE-012), so the adapter would not drive the model state as core does. Core makes no model-state call for a cached request; a removal there would retire a running file at once (REG-STATE-016), and the addition after it would raise (REG-STATE-012), failing every file at its second step |
 | Option-off baseline | `B_hook`: the default segment arms under the hook configuration, no CHUNK-bucket graphs | The eager encoder; the `--enforce-eager` graphed configuration | `B_hook` is the default at the same geometry, so the option is the only difference; the eager encoder would credit the option with the encoder graphs' gain |
 | CHUNK-bucket graphs | Refused under the option | Accept the binding inside or beside the cells | The binding graphs an already-gathered bucket, which a chunk cell captures in full; it is experimental, covers three counts at 160 ms, and would only change fallback steps |
@@ -1696,6 +1721,10 @@ not set; and a frontend release that opens streams by locale only.
   Trigger: `LLM` accepts streaming input, or a deployment needs the offline single-request
   latency. Shape: a secondary arm with its own preregistered rule, reported beside `U_api` and not
   gating tier 5.
+- **A measured startup allowance.** The exactness runs' headroom margin carries a stated 1 GiB
+  for the memory in use at startup (TXG-QUAL-029). Trigger: the A40 round records the device
+  memory in use before the engine starts and the torch memory limit core logs. Shape: the
+  allowance becomes that round's measured figure plus a stated spread, preregistered in its place.
 - **Multi-unit rows.** A row that carries several units, run in order as several stream units
   (the `registration` design, Future roadmap 14). Here: the cells, the step arena and the static
   inputs address units, not rows, gathered by `query_start_loc`, or such steps keep falling back

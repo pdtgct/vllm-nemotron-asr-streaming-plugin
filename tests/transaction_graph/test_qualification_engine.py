@@ -518,14 +518,25 @@ def test_block_0_capture_serves_alone_equal_to_b_hook_under_each_sizing(
 # @spec TXG-QUAL-029, TXG-QUAL-003
 def test_an_exactness_run_leaves_its_headroom_and_records_the_allocator(tmp_path):
     """A short ``Q``/``M`` exactness run under the extensible KV cache with a
-    preregistered headroom of the detached copy's bytes plus a margin, left
-    through ``--gpu-memory-utilization`` below 1.0: its record holds core's
-    logged torch memory limit and the allocator readings around the copy,
-    and passes TXG-QUAL-029's checks; it is no source of a served figure."""
+    headroom preregistered before the run from the admission limit, the
+    card's bytes per page and the stated margin, left through
+    ``--gpu-memory-utilization`` below 1.0: the detached copies hold pages 0
+    to the admission limit and copy no more than the preregistered figure,
+    the other committed pages keep their digests, the record holds core's
+    logged torch memory limit and the allocator readings around the copy and
+    passes TXG-QUAL-029's checks, and the run is no source of a served
+    figure."""
+    from support import txg_qual_driver as d
+
     card = os.environ.get("NEMOTRON_CARD_DIR")
     if not card:
         pytest.skip("NEMOTRON_CARD_DIR not set")
     n = 4
+    # Preregistered (TXG-QUAL-018) before the run: pages 0 to the admission
+    # limit (``max_num_seqs``) of the card's state page, plus the stated
+    # margin (core's non-torch reserve, the memory in use at startup, the
+    # digest workspace and the copy's alignment slack).
+    headroom = q.preregistered_headroom(n, d.card_page_bytes(card))
     spec = {
         "mode": "qm",
         "card": card,
@@ -540,11 +551,7 @@ def test_an_exactness_run_leaves_its_headroom_and_records_the_allocator(tmp_path
         "steps": 20,
         "m_steps": 20,
         "synthetic_lengths": [24000] * 16,
-        # Preregistered (TXG-QUAL-018): the copy's bytes bound the views up
-        # to the final committed block count, which the extensible KV cache
-        # sizes from what the headroom leaves (about half an A40's memory
-        # each); the margin is stated.
-        "headroom": {"copy_bytes": 22 << 30, "margin_bytes": 2 << 30},
+        "headroom": headroom,
     }
     reply = run_driver(spec, tmp_path, "exactness")
     assert reply["ok"], reply.get("traceback")
@@ -552,8 +559,10 @@ def test_an_exactness_run_leaves_its_headroom_and_records_the_allocator(tmp_path
     memory = reply["exactness_memory"]
     assert memory["torch_memory_limit"] > 0
     assert memory["copies"] > 0
+    assert memory["copy_bytes"] <= headroom["copy_bytes"], memory
     assert q.served_figure_runs([reply]) == []
     result = reply["result"]
+    assert result["untouched_problems"] == [], result["untouched_problems"]
     assert result["mismatches"] == 0, result
 
 

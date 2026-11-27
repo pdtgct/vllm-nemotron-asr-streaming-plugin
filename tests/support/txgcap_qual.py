@@ -650,6 +650,140 @@ HEADROOM_FIGURES = (
 )
 
 
+#: The most elements one in-place digest chunk widens at once
+#: (``txg_transaction.digest``; TXG-QUAL-003).
+DIGEST_CHUNK_ELEMENTS = 1 << 21
+#: The device workspace one digest allocates at most: the widened chunk, its
+#: weights and their product, eight bytes per element each (48 MiB).
+DIGEST_WORKSPACE_BYTES = 3 * 8 * DIGEST_CHUNK_ELEMENTS
+#: Core's reserve for memory outside the torch allocator under the extensible
+#: KV cache on CUDA (``KV_CACHE_NON_TORCH_RESERVE_BYTES``,
+#: ``vllm/v1/worker/extensible_kv_cache.py:71``): the allocator's cap leaves
+#: it free, so the copy cannot use it.
+CORE_NON_TORCH_RESERVE_BYTES = 1 << 29
+#: The stated allowance for memory in use at startup (the CUDA context and
+#: any other process's memory), which ``--gpu-memory-utilization``, a
+#: fraction of the device's total memory (``vllm/v1/worker/utils.py:906``),
+#: does not exclude.
+STARTUP_ALLOWANCE_BYTES = 1 << 30
+#: The copy's alignment slack: ``_BASE_ALIGNMENT`` (512 bytes) per distinct
+#: storage, stated for up to 2,048 storages.
+COPY_ALIGNMENT_ALLOWANCE_BYTES = 1 << 20
+#: The stated margin of an exactness run's headroom (TXG-QUAL-029).
+EXACTNESS_MARGIN_BYTES = (
+    CORE_NON_TORCH_RESERVE_BYTES
+    + STARTUP_ALLOWANCE_BYTES
+    + DIGEST_WORKSPACE_BYTES
+    + COPY_ALIGNMENT_ALLOWANCE_BYTES
+)
+
+
+#: The requests TXG-QUAL-007's fallback mode holds beyond the ``N + 1`` of
+#: its ``K = N + 1`` step, all live until its end: the endpoint-policy row,
+#: the multi-token step's one-token and multi-token rows (the forced-EOU row
+#: reuses a ``K`` step's request).
+FALLBACK_EXTRA_REQUESTS = 3
+
+
+def mode_max_requests(mode: str, *, admission_limit: int, n: int) -> int | None:
+    """The most requests a driver mode that compares with a detached copy
+    holds at once: the admission limit for ``qm`` (``Q`` and ``M`` hold at
+    most ``N``, at most the limit; TXG-QUAL-003), ``N + 1`` plus
+    :data:`FALLBACK_EXTRA_REQUESTS` for ``fallback`` (TXG-QUAL-007);
+    ``None`` for a mode with no detached copy."""
+    if mode == "qm":
+        return int(admission_limit)
+    if mode == "fallback":
+        return int(n) + 1 + FALLBACK_EXTRA_REQUESTS
+    return None
+
+
+def copy_extent(max_requests: int) -> int:
+    """The pages a detached copy holds, ``0 … copy_extent - 1``, for a mode
+    that holds at most ``max_requests`` requests (TXG-QUAL-003, -007): block
+    0 and one page per request, which the lowest-free assignment
+    (TXG-QUAL-026) keeps every request's block within."""
+    if not _byte_count(max_requests) or not max_requests:
+        raise ValueError(
+            f"a copy extent needs a positive request count, not {max_requests!r}"
+        )
+    return int(max_requests) + 1
+
+
+def spec_max_requests(spec: Mapping[str, Any]) -> int | None:
+    """:func:`mode_max_requests` for a driver spec."""
+    return mode_max_requests(
+        str(spec.get("mode")),
+        admission_limit=admission_limit_of(spec),
+        n=int(spec.get("n") or 0),
+    )
+
+
+def preregistered_headroom(
+    max_requests: int, page_bytes: int, margin_bytes: int = EXACTNESS_MARGIN_BYTES
+) -> dict[str, int]:
+    """The headroom of a run that compares with a detached copy
+    (TXG-QUAL-029), computed before the run from quantities known then: the
+    copy figure, :func:`copy_extent` of the mode's most requests times the
+    bound views' bytes per page (for ``qm``, the admission limit plus one),
+    and the stated margin. It takes no run reading."""
+    for name, value in (
+        ("max_requests", max_requests),
+        ("page_bytes", page_bytes),
+        ("margin_bytes", margin_bytes),
+    ):
+        if not _byte_count(value) or not value:
+            raise ValueError(f"a preregistered headroom needs a positive {name}")
+    return {
+        "max_requests": int(max_requests),
+        "page_bytes": int(page_bytes),
+        "copy_bytes": copy_extent(max_requests) * int(page_bytes),
+        "margin_bytes": int(margin_bytes),
+    }
+
+
+def admission_limit_of(spec: Mapping[str, Any]) -> int:
+    """The admission limit a driver spec configures (TXG-CFG-020):
+    ``max_num_active_seqs`` when set, otherwise ``max_num_seqs``."""
+    active = spec.get("max_num_active_seqs")
+    return int(spec["max_num_seqs"] if active is None else active)
+
+
+def preregistration_problems(
+    headroom: Mapping[str, Any], max_requests: int | None
+) -> list[str]:
+    """Every way ``headroom`` is not the figure :func:`preregistered_headroom`
+    computes for the mode's most requests ``max_requests`` and its own bytes
+    per page and margin, or its margin is below
+    :data:`EXACTNESS_MARGIN_BYTES`; a mode with no detached copy
+    (``None``) takes no headroom."""
+    if max_requests is None:
+        return ["the mode has no detached copy, so it takes no headroom"]
+    problems = []
+    for name in ("max_requests", "page_bytes", "copy_bytes", "margin_bytes"):
+        if not _byte_count(headroom.get(name)):
+            problems.append(f"the preregistered headroom has no {name}")
+    if problems:
+        return problems
+    if headroom["max_requests"] != max_requests:
+        problems.append(
+            f"the headroom's request count {headroom['max_requests']} is not "
+            f"the mode's {max_requests}"
+        )
+    expected = copy_extent(headroom["max_requests"]) * headroom["page_bytes"]
+    if headroom["copy_bytes"] != expected:
+        problems.append(
+            f"the copy figure {headroom['copy_bytes']} is not the copy extent "
+            f"times the bytes per page ({expected})"
+        )
+    if headroom["margin_bytes"] < EXACTNESS_MARGIN_BYTES:
+        problems.append(
+            f"the margin {headroom['margin_bytes']} is below the stated "
+            f"{EXACTNESS_MARGIN_BYTES}"
+        )
+    return problems
+
+
 def headroom_utilization(
     copy_bytes: int, margin_bytes: int, device_total_bytes: int
 ) -> float:
@@ -674,9 +808,13 @@ def _byte_count(value: Any) -> bool:
 
 def headroom_problems(reply: Mapping[str, Any]) -> list[str]:
     """TXG-QUAL-029's checks of an exactness run's reply (the driver's
-    ``spec``, ``identity`` and ``exactness_memory``). Each allocator figure
-    and the copy's bytes must be a byte count; a missing figure, ``None`` or
-    a non-integer value is a problem. The device-level context
+    ``spec``, ``identity`` and ``exactness_memory``). The spec's headroom
+    must be the preregistered figure for the spec's mode and its most
+    requests (:func:`preregistration_problems`), its bytes per page the bound views'
+    (``identity["state_page_bytes"]``), and the bytes the copy copied at
+    most its copy figure. Each allocator figure and the copy's bytes must be
+    a byte count; a missing figure, ``None`` or a non-integer value is a
+    problem. The device-level context
     (``nvidia-smi``, ``torch.cuda.mem_get_info``) is recorded and read by no
     check."""
     problems = []
@@ -684,6 +822,16 @@ def headroom_problems(reply: Mapping[str, Any]) -> list[str]:
     identity = reply.get("identity") or {}
     settings = identity.get("settings") or {}
     headroom = spec.get("headroom") or {}
+    if "max_num_seqs" in spec:
+        problems += preregistration_problems(headroom, spec_max_requests(spec))
+    else:
+        problems.append("the spec has no admission limit")
+    page = identity.get("state_page_bytes")
+    if headroom.get("page_bytes") != page:
+        problems.append(
+            f"the preregistered bytes per page {headroom.get('page_bytes')!r} are "
+            f"not the bound views' {page!r}"
+        )
     if identity.get("kv_cache_sizing") != Sizing.EXTENSIBLE:
         problems.append("the run is not under the extensible KV cache")
     if "kv_cache_memory_bytes" in settings:
@@ -691,9 +839,6 @@ def headroom_problems(reply: Mapping[str, Any]) -> list[str]:
     utilization = settings.get("gpu_memory_utilization")
     if not isinstance(utilization, float) or not 0.0 < utilization < 1.0:
         problems.append(f"--gpu-memory-utilization {utilization!r} is not below 1.0")
-    for name in ("copy_bytes", "margin_bytes"):
-        if not isinstance(headroom.get(name), int):
-            problems.append(f"the preregistered headroom has no {name}")
     memory = reply.get("exactness_memory") or {}
     problems += [
         f"the record has no {name}"
@@ -707,7 +852,7 @@ def headroom_problems(reply: Mapping[str, Any]) -> list[str]:
         isinstance(headroom.get("copy_bytes"), int) and copied > headroom["copy_bytes"]
     ):
         problems.append(
-            f"the detached copy took {copied} bytes, more than the "
+            f"the detached copy copied {copied} bytes, more than the "
             f"preregistered {headroom['copy_bytes']}"
         )
     return problems

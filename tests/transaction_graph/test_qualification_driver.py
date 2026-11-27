@@ -30,6 +30,8 @@ from support.txg_qual_adapter import (
     TransactionMonitor,
     detached_problems,
 )
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_flatten
 
 pytestmark = pytest.mark.engine
 
@@ -40,14 +42,22 @@ def context(
     capacity=12,
     lengths=(9000, 4000, 12000, 7000, 5000, 11000),
     check_off=False,
+    max_requests=None,
 ):
     """Core's profiling forward, then a serving pool bound to the state layer
-    (``bind_kv_cache``), then the adapter over the worker's objects."""
+    (``bind_kv_cache``), then the adapter over the worker's objects. With
+    ``max_requests`` the monitor copies as the ``qm`` and ``fallback`` modes
+    do (block 0 and one page per request, the rest digested; TXG-QUAL-003)."""
     env.runner.profile_run(core_embeds=False)
     env.runner.bind_pool(h.real_bindings(h.model_spec(env.model), capacity=capacity))
     adapter = QualAdapter(vllm_config=env.vllm_config, model=env.model, state=env.state)
     assert adapter.capacity == capacity
-    monitor = TransactionMonitor(env.model, check_off=check_off).install()
+    monitor = TransactionMonitor(
+        env.model,
+        check_off=check_off,
+        final_blocks=capacity if max_requests is not None else None,
+        max_requests=max_requests,
+    ).install()
     return SimpleNamespace(
         adapter=adapter,
         model=env.model,
@@ -455,6 +465,266 @@ def test_the_adapter_reads_the_final_committed_block_count(off_cpu):
     assert sorted(taken) == [1, 2, 3, 4, 5] and max(taken) < 6
     with pytest.raises(RuntimeError):
         blocks.take("r5")
+
+
+# ---------------------------------------------------------------------------
+# The exactness copy extent (TXG-QUAL-003, TXG-QUAL-029)
+
+
+class Allocations(TorchDispatchMode):
+    """Records the bytes of every new storage an op creates: an output whose
+    storage is not an input's (a view, ``set_``) and not one of ``known``
+    (the pool's)."""
+
+    def __init__(self, known: set[int]) -> None:
+        super().__init__()
+        self.known = known
+        self.sizes: list[tuple[str, int]] = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        out = func(*args, **kwargs)
+        inputs = {
+            a.untyped_storage().data_ptr()
+            for a in tree_flatten((args, kwargs))[0]
+            if isinstance(a, torch.Tensor)
+        }
+        for o in tree_flatten(out)[0]:
+            if isinstance(o, torch.Tensor):
+                ptr = o.untyped_storage().data_ptr()
+                if ptr and ptr not in inputs | self.known:
+                    self.sizes.append((str(func), o.untyped_storage().nbytes()))
+        return out
+
+
+def _tiny_model() -> torch.nn.Module:
+    """A model for the monitor's copy mechanics alone: CPU parameters, no
+    binding."""
+    return torch.nn.Linear(1, 1)
+
+
+def _random(pools: tx.Pools, seed: int = 0) -> None:
+    gen = torch.Generator().manual_seed(seed)
+    for _, view in pools.flat():
+        bits = torch.randint(-100, 100, view.shape, generator=gen)
+        view.copy_(bits.to(view.dtype))
+
+
+# @spec TXG-QUAL-003
+def test_an_exactness_copy_holds_pages_0_to_the_admission_limit():
+    """With the mode's request count given (``qm``: the admission limit),
+    the detached copy holds pages ``0 … limit``, whatever the final
+    committed count; a smaller count raises rather than choosing another
+    extent. Without a request count the copy keeps the final committed
+    count (the modes with no detached copy)."""
+    from support.txg_qual_adapter import exactness_extent
+
+    assert exactness_extent(8, 3) == 4 and exactness_extent(None, 3) == 4
+    assert exactness_extent(4, 3) == 4
+    assert exactness_extent(8, None) == 8 and exactness_extent(None, None) is None
+    with pytest.raises(ValueError, match="copy extent 4"):
+        exactness_extent(3, 3)
+    pools = narrowed_pools(pages=8, storage_pages=12)
+    _random(pools)
+    monitor = TransactionMonitor(
+        _tiny_model(), compare=True, final_blocks=8, max_requests=3, memory=True
+    )
+    assert monitor.copy_extent == 4
+    copy = monitor._copy(pools.kwargs(), Call(kind="execute"))
+    assert copy.first_dimensions() == {4}
+    assert pools.narrowed(4).differences(copy) == []
+    reading = monitor.copy_readings[-1]
+    assert reading["copy_bytes"] == 4 * PAGE, reading
+    assert reading["copy_bytes"] <= reading["copy_allocation_bytes"] <= 4 * PAGE + 512
+    with pytest.raises(ValueError):
+        TransactionMonitor(_tiny_model(), final_blocks=3, max_requests=3)
+
+
+# @spec TXG-QUAL-003
+def test_a_write_above_the_admission_limit_fails_the_run_through_the_digest():
+    """The committed pages from the admission limit plus one to the final
+    committed count are digested in place before the run and after it: a
+    write to one of them (a changed byte, one flipped bit, two elements
+    swapped within a page) is a problem of the run, which counts as a
+    mismatch and fails it; a write inside the copy's extent or above the
+    committed count is not this check's, and a run whose pages were never
+    digested reports that."""
+    from support import txgcap_qual as q
+
+    def fresh():
+        pools = narrowed_pools(pages=8, storage_pages=12)
+        _random(pools)
+        monitor = TransactionMonitor(_tiny_model(), final_blocks=8, max_requests=3)
+        monitor.watch_untouched(pools)
+        return pools, monitor
+
+    pools, monitor = fresh()
+    assert monitor.untouched_problems() == []
+    pools.tensors["channel_pools"][0][2, 0] += 1  # inside the copy's extent
+    pools.tensors["channel_pools"][0]._base[10, -1] += 1  # above the count
+    assert monitor.untouched_problems() == []
+
+    writes = {
+        "byte": lambda p: p.tensors["channel_pools"][0][6].__setitem__(
+            5, p.tensors["channel_pools"][0][6, 5] + 1
+        ),
+        "bit": lambda p: p.tensors["h_pool"][7].view(torch.int32)[3].__ixor__(1),
+        "swap": lambda p: p.tensors["channel_pools"][0][4, :2].copy_(
+            p.tensors["channel_pools"][0][4, :2].flip(0).clone()
+        ),
+    }
+    for name, write in writes.items():
+        pools, monitor = fresh()
+        if name == "swap":
+            row = pools.tensors["channel_pools"][0][4]
+            row[0], row[1] = 7, 9
+            monitor.watch_untouched(pools)
+        write(pools)
+        problems = monitor.untouched_problems()
+        assert len(problems) == 1 and "changed during the run" in problems[0], (
+            name,
+            problems,
+        )
+        clean = {
+            "name": "Q4",
+            "counts": {"split": 0, "fresh_among_continuing": 0, "split_with_file": 0},
+            "cases": {},
+            "mismatched_steps": 0,
+            "fallback_steps": 0,
+            "failed_rows": 0,
+        }
+        result = d.qm_result([clean, clean | {"name": "M"}], 4, problems)
+        assert result["mismatches"] == 1 and result["untouched_problems"] == problems
+        assert q.qualification_outcome([result], [1]) == ("fail", [1])
+    assert d.qm_result([clean, clean | {"name": "M"}], 4)["mismatches"] == 0
+    unwatched = TransactionMonitor(_tiny_model(), final_blocks=8, max_requests=3)
+    assert unwatched.untouched_problems() == ["pages 4 to 7 were not digested"]
+    whole = TransactionMonitor(_tiny_model(), final_blocks=8)
+    assert whole.untouched_problems() == []
+
+
+# @spec TXG-QUAL-003, TXG-QUAL-029
+def test_the_pages_above_the_admission_limit_are_never_copied(monkeypatch):
+    """Taking the copy addresses only pages ``0 … limit``, and neither the
+    copy nor the digests allocate storage the size of the pages above the
+    limit: the copy's one allocation is the extent's pages plus its
+    alignment slack, and every digest allocation is bounded by the digest's
+    chunk, not by the pages it covers."""
+    chunk = 256
+    monkeypatch.setattr(tx, "DIGEST_CHUNK_ELEMENTS", chunk)
+    pools = narrowed_pools(pages=12, storage_pages=16)
+    _random(pools)
+    storage = pools.tensors["channel_pools"][0]._base
+    known = {storage.untyped_storage().data_ptr()}
+    above = 8 * PAGE  # pages 4 to 11
+    monitor = TransactionMonitor(
+        _tiny_model(), compare=True, final_blocks=12, max_requests=3
+    )
+    with t.BlockAccesses(storage.view(16, 1, 1, PAGE)) as rec, Allocations(known) as a:
+        copy = monitor._copy(pools.kwargs(), Call(kind="execute"))
+    assert rec.accesses and rec.outside(set(range(4))) == [], rec.accesses
+    assert copy.first_dimensions() == {4}
+    copied = [size for _, size in a.sizes]
+    assert max(copied) <= 4 * PAGE + 512 < above, a.sizes
+    with Allocations(known) as a:
+        monitor.watch_untouched(pools)
+        assert monitor.untouched_problems() == []
+    assert a.sizes, "the digests allocated no workspace (positive control)"
+    assert max(size for _, size in a.sizes) <= 8 * chunk, a.sizes
+    assert 3 * 8 * chunk < above
+
+
+# @spec TXG-QUAL-003, TXG-QUAL-026
+def test_an_exactness_run_assigns_and_writes_only_pages_up_to_the_limit(off_cpu):
+    """A paced ``Q`` run at concurrency 2, admission limit 2, over 12
+    committed pages: the adapter's lowest-free assignment gives no request a
+    block above 2, every option-off call equals its reference on a copy of
+    pages 0 to 2, and the digest of pages 3 to 11 is unchanged after the
+    run."""
+    env = off_cpu(right_context=0, max_num_seqs=4)
+    ctx = context(env, check_off=True, max_requests=2)
+    taken: list[int] = []
+    real_take = ctx.blocks.take
+
+    def take(req_id):
+        block = real_take(req_id)
+        taken.append(block)
+        return block
+
+    ctx.blocks.take = take
+    try:
+        assert ctx.monitor.copy_extent == 3
+        ctx.monitor.watch_untouched(tx.Pools({"views": list(ctx.adapter.views)}))
+        run = d.Workload(ctx, name="Q2", n_streams=2, n_files=0, steps=14, seed=3)
+        run.run()
+        run.close()
+        summary = run.summary()
+        untouched = ctx.monitor.untouched_problems()
+    finally:
+        ctx.monitor.uninstall()
+    assert taken and max(taken) <= 2, sorted(set(taken))
+    assert summary["mismatched_steps"] == 0, summary["problems"]
+    assert all(r.get("ref") for r in run.records)
+    assert untouched == []
+
+
+# @spec TXG-QUAL-007, TXG-QUAL-003
+def test_a_final_count_below_the_modes_extent_fails_before_the_first_step():
+    """The precondition: a final committed block count below the mode's copy
+    extent (block 0 and one page per request it holds) fails at the
+    monitor's construction, before any step, naming both counts; the copy
+    never falls back to the whole cache."""
+    from support import txgcap_qual as q
+
+    held = q.mode_max_requests("fallback", admission_limit=4, n=2)
+    assert held == 6 and q.copy_extent(held) == 7
+    with pytest.raises(ValueError, match=r"count 6 is below the copy extent 7"):
+        TransactionMonitor(_tiny_model(), final_blocks=6, max_requests=held)
+    with pytest.raises(ValueError, match=r"count 4 is below the copy extent 5"):
+        TransactionMonitor(_tiny_model(), final_blocks=4, max_requests=4)
+    fits = TransactionMonitor(_tiny_model(), final_blocks=7, max_requests=held)
+    assert fits.copy_extent == 7 and fits.untouched_problems() == []
+
+
+# @spec TXG-QUAL-007, TXG-QUAL-026
+def test_the_fallback_mode_writes_only_its_copy_extent(off_cpu):
+    """The fallback mode at ``N`` = 2 over 12 committed pages holds exactly
+    ``mode_max_requests`` requests (``N + 4``), on blocks 1 to 6: its copy
+    of pages 0 to 6 holds every page it writes, every option-off call
+    equals its reference on that copy, and the digest of pages 7 to 11 is
+    unchanged after the run."""
+    from support import txgcap_qual as q
+
+    held = q.mode_max_requests("fallback", admission_limit=4, n=2)
+    env = off_cpu(right_context=0, max_num_seqs=4)
+    ctx = context(env, check_off=True, max_requests=held)
+    taken: set[int] = set()
+    real_take = ctx.blocks.take
+
+    def take(req_id):
+        block = real_take(req_id)
+        taken.add(block)
+        return block
+
+    ctx.blocks.take = take
+    try:
+        assert ctx.monitor.copy_extent == q.copy_extent(held) == 7
+        out = d.run_fallbacks(ctx, 2)
+    finally:
+        ctx.monitor.uninstall()
+    assert taken == set(range(1, held + 1)), sorted(taken)
+    assert out["problems"] == [] and out["uncompared"] == [], out
+    assert out["untouched_problems"] == []
+    assert not ctx.blocks.held
+
+
+# @spec TXG-QUAL-003
+def test_the_driver_reads_the_engines_admission_limit():
+    """``max_num_active_seqs`` when set, otherwise ``max_num_seqs``."""
+    for active, expected in ((None, 8), (3, 3)):
+        config = SimpleNamespace(max_num_seqs=8, max_num_active_seqs=active)
+        adapter = SimpleNamespace(vllm_config=SimpleNamespace(scheduler_config=config))
+        assert d.admission_limit(adapter) == expected
 
 
 # ---------------------------------------------------------------------------
