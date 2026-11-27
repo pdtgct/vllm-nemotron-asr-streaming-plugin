@@ -1067,11 +1067,15 @@ def is_scatter_warmup(call: dict[str, Any]) -> bool:
     reference, warm-ups and capture also launch one rejected row, so a
     caller that needs the warm-up alone bounds its window before the first
     cell. The kernel-specialization warm-up (``warmup_masked_page_scatter``,
-    logged as ``"warmup"``) is not one."""
+    logged as ``"warmup"``) is not one. A device launch's statuses are not
+    read (``status`` is ``None``, see :class:`ScatterSpy`), so it is never
+    classed as a warm-up; the warm-up fault injection runs on host pools."""
+    status = call["status"]
     return (
         call["fn"] == "execute"
         and call["rows"] == 1
-        and all(s != 0 for s in call["status"])
+        and status is not None
+        and all(s != 0 for s in status)
     )
 
 

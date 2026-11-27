@@ -1397,3 +1397,13 @@ def test_a_capture_call_addresses_only_block_zero_cuda(on_cuda):
 
     assert len(txg_api.binding_of(env.model).cells) == 2 * env.n
     assert_only_block_zero(rec, "the serving capture")
+
+
+# @spec TXG-CAP-006
+def test_a_device_scatter_launch_with_unread_statuses_is_no_warm_up():
+    """``ScatterSpy`` reads no device values, so a CUDA launch is logged with
+    ``status`` ``None``; locating the warm-up by its shape must not read it."""
+    launch = {"fn": "execute", "rows": 1, "pages": None, "status": None}
+    assert not t.is_scatter_warmup(launch)
+    assert t.is_scatter_warmup(launch | {"pages": [0], "status": [1]})
+    assert not t.is_scatter_warmup(launch | {"pages": [0], "status": [0]})
