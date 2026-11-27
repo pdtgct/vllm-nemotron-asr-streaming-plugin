@@ -345,8 +345,10 @@ def test_max_model_len_must_fit_one_stream_unit(make_model_config, card_dir, ext
         REALTIME_MAX_TOKENS,
     )
 
-    smallest = 1 + REALTIME_MAX_TOKENS
-    assert smallest == 143
+    # A compacted stream holds core's frontier token and the unit's input
+    # token before the unit's emitted tokens.
+    smallest = 2 + REALTIME_MAX_TOKENS
+    assert smallest == 144
     if extra < 0:
         with pytest.raises(ValueError, match="max_model_len"):
             make_model_config(card_dir, max_model_len=smallest + extra)

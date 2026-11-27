@@ -388,7 +388,9 @@ class NemotronASRForRNNT(nn.Module, SupportsTranscription, SupportsPersistentSta
         if vllm_config is None:
             raise ValueError("NemotronASRForRNNT requires vllm_config")
         max_model_len = getattr(vllm_config.model_config, "max_model_len", None)
-        min_history = self.realtime_input_tokens + self.realtime_max_tokens
+        # Core keeps one frontier token when it compacts a stream's history,
+        # before the unit's input and emitted tokens (REG-VAL-001).
+        min_history = 1 + self.realtime_input_tokens + self.realtime_max_tokens
         if max_model_len is not None and max_model_len < min_history:
             raise ValueError(
                 "max_model_len must contain one streaming transaction "

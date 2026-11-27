@@ -126,13 +126,15 @@ class Nemotron3_5AsrStreamingConfig(VerifyAndUpdateConfig):
         errors = schema_errors(view, None)
         errors += _lookahead_errors(hf_config)
 
-        smallest = 1 + REALTIME_MAX_TOKENS
+        # A compacted stream holds core's frontier token and the unit's input
+        # token before the unit's emitted tokens.
+        smallest = 2 + REALTIME_MAX_TOKENS
         max_model_len = getattr(model_config, "max_model_len", None)
         if isinstance(max_model_len, int) and max_model_len < smallest:
             errors.append(
                 f"max_model_len {max_model_len} is below {smallest}, the smallest "
-                f"context that holds one stream unit (1 + {REALTIME_MAX_TOKENS} "
-                "emitted tokens)"
+                "context that holds one stream unit (the frontier token, the "
+                f"input token and {REALTIME_MAX_TOKENS} emitted tokens)"
             )
         errors += _locale_errors(hf_config)
         blank = view.get("blank_token_id")

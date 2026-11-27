@@ -207,7 +207,7 @@ The configuration hook runs twice during startup:
   `language_locales`, when given, maps language codes to locales of that language in the locale
   table (a locale's language is the lowercase letters before the first `-` or uppercase letter,
   when there are two or three of them; `auto` has none); and
-  `max_model_len ≥ 1 + realtime_max_tokens` (the smallest context in which one stream unit fits). It repeats the parser's schema check, and checks generation defaults in two places, because core
+  `max_model_len ≥ 2 + realtime_max_tokens` (the smallest context in which one stream unit fits once core has compacted the stream's history: the frontier token core keeps, the unit's input token and its emitted tokens; core caps a request whose token count reaches `max_model_len`). It repeats the parser's schema check, and checks generation defaults in two places, because core
 reads them in two places. Request EOS and stop tokens come from
 `model_config.try_get_generation_config()`, which loads the checkpoint's `generation_config.json`
 under both `--generation-config auto` and `vllm` (a directory selects another file): any `eos_token_id` there must be the park token alone, because

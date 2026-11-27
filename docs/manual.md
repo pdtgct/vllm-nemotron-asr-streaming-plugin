@@ -253,7 +253,7 @@ far smaller than this bound.
   | Tokens for 600 s | 82,513 | 78,773 | 76,918 | 76,114 | 75,578 |
 
 `--max-model-len 77000` therefore holds a 600 s file at lookahead 3, 6 and 13. An override to 0
-needs at least 82,513, and an override to 1 at least 78,773. Streams need only 143 tokens, and a `--max-model-len` below 143 is refused. If you raise
+needs at least 82,513, and an override to 1 at least 78,773. Streams need only 144 tokens, and a `--max-model-len` below 144 is refused. If you raise
 `VLLM_MAX_AUDIO_DECODE_DURATION_S`, raise `--max-model-len` with it. Each token costs no KV memory
 and about 4 bytes of token history per slot (`max_num_seqs × max_model_len` tokens in all).
 
@@ -731,7 +731,7 @@ failed start names every problem. The message begins with one of these prefixes:
 | `supported_num_lookahead_tokens ... is refused` | a server serves one lookahead | remove it; use `num_lookahead_tokens` |
 | `num_lookahead_tokens ... is not an implemented right context (one of 0, 1, 3, 6, 13)` | an unimplemented lookahead | use one of the listed values |
 | `the server's lookahead is not set` | the checkpoint sets no default lookahead | set `num_lookahead_tokens` in `--hf-overrides` |
-| `max_model_len <n> is below 143` | too small for one stream unit | raise `--max-model-len` ([sizing](#sizing---max-model-len)) |
+| `max_model_len <n> is below 144` | too small for one stream unit | raise `--max-model-len` ([sizing](#sizing---max-model-len)) |
 | `the default sampling parameters set max_tokens` | a token limit from the generation configuration | pass `--generation-config vllm` and remove any token-limit `--override-generation-config` |
 | `the generation configuration has eos_token_id ...` | an EOS other than the park token | pass `--generation-config <dir>` whose `generation_config.json` has no other EOS |
 | `language_locales entry ...` | an entry that names no locale of the table, or a locale of another language | correct the entry |
