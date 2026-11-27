@@ -1132,7 +1132,12 @@ def test_real_hook_configuration_on_cpu_is_refused_for_its_platform(
             model_config=model_config,
             device_config=DeviceConfig(device="cpu"),
             cache_config=CacheConfig(enable_prefix_caching=False),
-            scheduler_config=SchedulerConfig.default_factory(async_scheduling=False),
+            scheduler_config=SchedulerConfig.default_factory(
+                async_scheduling=False,
+                max_model_len=model_config.max_model_len,
+                max_num_batched_tokens=model_config.max_model_len,
+                enable_chunked_prefill=False,
+            ),
             compilation_config=CompilationConfig(mode=0),
         )
     assert "--enforce-eager" in str(excinfo.value)
@@ -1162,7 +1167,12 @@ def test_real_hook_configuration_constructs_on_cuda(
         model_config=model_config,
         device_config=DeviceConfig(device="cuda"),
         cache_config=CacheConfig(enable_prefix_caching=False),
-        scheduler_config=SchedulerConfig.default_factory(async_scheduling=False),
+        scheduler_config=SchedulerConfig.default_factory(
+            async_scheduling=False,
+            max_model_len=model_config.max_model_len,
+            max_num_batched_tokens=model_config.max_model_len,
+            enable_chunked_prefill=False,
+        ),
         compilation_config=CompilationConfig(mode=0),
     )
     assert config.compilation_config.cudagraph_mode not in (

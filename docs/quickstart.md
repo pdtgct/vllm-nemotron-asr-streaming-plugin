@@ -29,7 +29,7 @@ The install and serve commands below have not been run as written. The
 | Component | Repository | Revision |
 | --- | --- | --- |
 | This plugin | `pdtgct/vllm-nemotron-asr-streaming-plugin` | `main` (unreleased for the target core) |
-| vLLM, stage 1 (the target core) | `pdtgct/vllm`, branch `pstate-impl-20261122` | `cbf13fed4aff1a72cf0dfbb5cd4cb95d43773e52` |
+| vLLM, stage 1 (the target core) | `pdtgct/vllm`, branch `pstate-impl-20261122` | `9503e3b878f3b0c8e2ce4a308721971bbd524a91` |
 
 No released vLLM provides the interfaces the plugin needs. The target core is upstream vLLM `main`
 at `842f74fa8dff2c6792bd68b021c92d8fbf2b93bc` with RFC 1's state layer, vllm#67583's model-state
@@ -55,7 +55,7 @@ pip install --upgrade pip
 
 git clone --branch pstate-impl-20261122 --single-branch https://github.com/pdtgct/vllm.git
 cd vllm
-git checkout cbf13fed4aff1a72cf0dfbb5cd4cb95d43773e52
+git checkout 9503e3b878f3b0c8e2ce4a308721971bbd524a91
 VLLM_USE_PRECOMPILED=1 \
 VLLM_PRECOMPILED_WHEEL_COMMIT=842f74fa8dff2c6792bd68b021c92d8fbf2b93bc \
 VLLM_PRECOMPILED_WHEEL_VARIANT=cu132 \

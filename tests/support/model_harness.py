@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """The real model and model state on CPU, driven as core's model runner drives
-them on the target core, ``pdtgct/vllm`` at ``cbf13fed4a``
+them on the target core, ``pdtgct/vllm`` at ``9503e3b878``
 (``vllm/v1/worker/gpu/model_runner.py``:
 ``execute_model``, ``_dummy_run``, ``profile_run``, ``_dummy_sampler_run``;
 ``vllm/model_executor/warmup/kernel_warmup.py`` for later profiling steps).
@@ -167,8 +167,11 @@ def build_vllm_config(
         scheduler_config=SchedulerConfig.default_factory(
             async_scheduling=False,
             max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=max(max_num_batched_tokens, max_num_seqs),
-            enable_chunked_prefill=True,
+            max_model_len=model_config.max_model_len,
+            max_num_batched_tokens=max(
+                max_num_batched_tokens, max_num_seqs, model_config.max_model_len
+            ),
+            enable_chunked_prefill=False,
         ),
     )
 

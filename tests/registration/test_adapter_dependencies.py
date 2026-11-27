@@ -831,7 +831,11 @@ def configure(overrides=None, after=None):
         device_config=DeviceConfig(device="cpu"),
         cache_config=CacheConfig(enable_prefix_caching=False),
         scheduler_config=SchedulerConfig.default_factory(
-            async_scheduling=False, max_num_seqs=2
+            async_scheduling=False,
+            max_num_seqs=2,
+            max_model_len=model_config.max_model_len,
+            max_num_batched_tokens=model_config.max_model_len,
+            enable_chunked_prefill=False,
         ),
     )
     # Settings the engine hook would refuse under ``--enforce-eager`` (the

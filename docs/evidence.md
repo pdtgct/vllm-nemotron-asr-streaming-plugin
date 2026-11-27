@@ -34,10 +34,12 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 
 ## Builds
 
-- Stage 1 (target core): `pdtgct/vllm` `pstate-impl-20261122` @ `cbf13fed4a`, the persistent-state
+- Stage 1 (target core): `pdtgct/vllm` `pstate-impl-20261122` @ `9503e3b878`, the persistent-state
   layer with the #67583 model-state hooks. No tier has been met on it yet (Owed). The served
-  accuracy round below ran on it; the light round below ran on its parent `de0b0bccdb`, which
-  differs only in core's persistent-state detokenizer.
+  accuracy round below ran on its ancestor `cbf13fed4a`; the light round below ran on `de0b0bccdb`,
+  the parent of `cbf13fed4a`, which differs only in core's persistent-state detokenizer. The core
+  at `9503e3b878` keeps chunked prefill off for the model, which does not declare
+  `persistent_state_chunked_prefill`, and refuses an explicit `enable_chunked_prefill`.
 - State-pool build (historical; the baseline for retiring the state pool, with plugin `v0.1.0b2`):
   `pdtgct/vllm` `hook-build-20261114b` @ `9c40a6ffd66ce4019ebcc6a0efac126bdbb4f6ee`
   (with #67583), precompiled wheel `191e5d5df2` (cu132), one NVIDIA A40 at FP32, card revision
@@ -295,7 +297,7 @@ and `E ≤ N` make up at least 99 % of served steps. At `N` = 63 they make up 10
 - Tier 5 for transaction graphs at 80 and 160 ms on the target core, under the restricted startup;
   served equality is measured above.
 - The plugin GPU tests whose setup failed in the light round, rerun with their corrected setup on
-  `cbf13fed4a`: four of the file-against-stream text checks need its detokenizer fix.
+  `9503e3b878`: four of the file-against-stream text checks need its detokenizer fix.
 
 ## Historical entries
 

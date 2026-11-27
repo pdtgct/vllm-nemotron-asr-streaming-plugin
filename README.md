@@ -44,7 +44,7 @@ The builds below are defined on `pdtgct/vllm`. Neither includes RFC 3.
 ## Builds
 
 Stage 1 serves the model alone, on core's `/v1/realtime` and `/v1/audio/transcriptions`. It is
-`pdtgct/vllm` at `cbf13fed4a` (branch `pstate-impl-20261122`) alone, called the target core: RFC 1's state layer with vllm#67583's
+`pdtgct/vllm` at `9503e3b878` (branch `pstate-impl-20261122`) alone, called the target core: RFC 1's state layer with vllm#67583's
 model-state hooks, through which core captures the model's graphs, and the state-group layout
 accessor `ModelState.state_group_layouts`, through which transaction graphs address state pages.
 It carries neither vllm#67144 nor #67151, so core's transcription route has the limits of a core

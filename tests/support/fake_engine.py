@@ -4,7 +4,7 @@
 It models the stream-admission client path the session factory is designed
 over (the ``session`` design: ``AsyncLLM.generate(..., stream_admission=True)``,
 rejection outputs and ``AsyncLLM.wait_stream_retired``, vllm#67375). The
-target core (``pdtgct/vllm`` at ``cbf13fed4a``) provides none of that path:
+target core (``pdtgct/vllm`` at ``9503e3b878``) provides none of that path:
 its ``generate`` admits a persistent-state stream automatically, so
 ``create_session_factory`` refuses there (SESS-FAC-003) and a pass of the
 tests that use this double makes no claim for the target core (the session

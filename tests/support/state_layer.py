@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """The state layer and the model state's request bookkeeping on CPU, without
-weights, as the target core (``pdtgct/vllm`` at ``cbf13fed4a``) drives them.
+weights, as the target core (``pdtgct/vllm`` at ``9503e3b878``) drives them.
 
 The model state is the real class, built as core builds it, over a model
 without weights whose few attributes the hooks read are set directly; its
@@ -74,7 +74,12 @@ def served_config(card_dir: Any, *, right_context: int = 6) -> Any:
         model_config=model_config,
         device_config=DeviceConfig(device="cpu"),
         cache_config=CacheConfig(enable_prefix_caching=False),
-        scheduler_config=SchedulerConfig.default_factory(async_scheduling=False),
+        scheduler_config=SchedulerConfig.default_factory(
+            async_scheduling=False,
+            max_model_len=model_config.max_model_len,
+            max_num_batched_tokens=model_config.max_model_len,
+            enable_chunked_prefill=False,
+        ),
     )
 
 

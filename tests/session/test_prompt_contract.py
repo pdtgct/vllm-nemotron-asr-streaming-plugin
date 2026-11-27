@@ -49,7 +49,12 @@ def _input_processor(card_dir):
         model_config=model_config,
         device_config=DeviceConfig(device="cpu"),
         cache_config=CacheConfig(enable_prefix_caching=False),
-        scheduler_config=SchedulerConfig.default_factory(async_scheduling=False),
+        scheduler_config=SchedulerConfig.default_factory(
+            async_scheduling=False,
+            max_model_len=model_config.max_model_len,
+            max_num_batched_tokens=model_config.max_model_len,
+            enable_chunked_prefill=False,
+        ),
     )
     return InputProcessor(config), config
 

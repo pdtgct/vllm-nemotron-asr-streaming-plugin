@@ -25,7 +25,7 @@ under a restricted startup: synchronous scheduling and an explicit NONE runner a
 mode (Configuration checks).
 
 **Interface.** The rules of this design use the target core's state layer, `pdtgct/vllm` at
-`cbf13fed4a` (the `registration` design, State-slot access): the state layer's views, which core
+`9503e3b878` (the `registration` design, State-slot access): the state layer's views, which core
 binds through `MambaBase.bind_kv_cache` and the layer exposes as `component_pools`, views of the
 bound storage that the layer drops when core rebinds and in `clear_cudagraphs` (REG-STATE-018);
 the model state's step classification (REG-MEM-001) and its record of each request's slot
@@ -1687,7 +1687,7 @@ not set; and a frontend release that opens streams by locale only.
 
 ## References
 
-- Core hooks: vllm#67583. The target core, `pdtgct/vllm` at `cbf13fed4a`:
+- Core hooks: vllm#67583. The target core, `pdtgct/vllm` at `9503e3b878`:
   `vllm/v1/worker/gpu/model_states/interface.py` (the hooks and `state_group_layouts`);
   `vllm/v1/worker/utils.py` (`StateGroupLayout`, `StateComponentLayout`,
   `get_state_group_layouts`); `vllm/v1/worker/gpu/model_runner.py` (the layout set after each
@@ -1725,7 +1725,7 @@ not set; and a frontend release that opens streams by locale only.
   warm-up domains and qualification rows.
 - **Runner-captured graphs.** Cells replayed inside core's breakable graphs. Trigger and shape:
   the `registration` design, Future roadmap items 5 and 6.
-- **An offline arm of `U_api`.** At `cbf13fed4a`, `LLM.generate` takes complete prompts only, with
+- **An offline arm of `U_api`.** At `9503e3b878`, `LLM.generate` takes complete prompts only, with
   no streaming input, so an `LLM` arm can time only a whole one-unit request (admission, the unit,
   the park and the request's finish), not the feed into an open stream that TXG-QUAL-016 times;
   it would be a second measurement with a rule of its own, so it is not an arm of TXG-QUAL-016.

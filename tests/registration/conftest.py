@@ -203,7 +203,10 @@ def make_vllm_config(registered) -> Callable[..., Any]:
             device_config=DeviceConfig(device="cpu"),
             cache_config=CacheConfig(enable_prefix_caching=prefix_caching),
             scheduler_config=SchedulerConfig.default_factory(
-                async_scheduling=async_scheduling
+                async_scheduling=async_scheduling,
+                max_model_len=model_config.max_model_len,
+                max_num_batched_tokens=model_config.max_model_len,
+                enable_chunked_prefill=False,
             ),
         )
 

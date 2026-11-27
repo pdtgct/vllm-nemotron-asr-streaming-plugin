@@ -8,7 +8,7 @@ The session specs hold two kinds of obligation (their scope). The current
 model-side and shared ones (SESS-FAC-001 to SESS-FAC-003, server geometry, the
 packer, the geometry check in the model, core ``/v1/realtime`` and
 SESS-EP-001) are conformance on the target core, ``pdtgct/vllm`` at
-``cbf13fed4a``. The session factory's groups run on the stream-admission
+``9503e3b878``. The session factory's groups run on the stream-admission
 client path, which the target core does not provide; their tests drive the
 factory through ``support.fake_engine``, which models that path, and a pass
 makes no claim for the target core. Each such module says so in its
