@@ -166,8 +166,10 @@ sit on block 0, under each KV-cache sizing core offers, on stage 1.
   compared equal, with every committed page outside the detached copy unchanged, inside the
   preregistered headroom.
 - TXG-QUAL-022 (the uncharged-memory WARNING under a fixed `--kv-cache-memory-bytes`), TXG-CAP-018
-  and TXG-EQ-003 on CUDA, the rest of the transaction-graph GPU tests, REG-ENG-032's and
-  REG-STATE-019's arms with transaction graphs on, and the transcription GPU tests passed.
+  and TXG-EQ-003 on CUDA, the other transaction-graph GPU tests except TXG-EQ-002's exhaustive and
+  random-plan cases, which the round did not run (two of these tests passed only on rerun, after
+  plugin fixes `37115a1` and `3a0a046`), REG-ENG-032's and REG-STATE-019's arms with transaction
+  graphs on, and the transcription GPU tests (36 passed, 2 skipped) passed.
 - Served transcripts at 32 sessions with transaction graphs on under the default sizing were not
   measured in this round; no served throughput, latency or tier 5 claim rests on it.
 
@@ -178,13 +180,16 @@ smallest context that holds one stream unit, and so keeps core's default token b
 
 - Build: as [Block-0 capture under every KV-cache sizing](#block-0-capture-under-every-kv-cache-sizing),
   at plugin `21b5981`. Evidence: `experiments/2026-11-27-plugin-followup-b-a40/`.
+- Baseline: the servers of [Served accuracy on the target core](#served-accuracy-on-the-target-core)
+  (core `cbf13fed4a`, plugin `0951319`, chunked prefill on, a token budget of 2048, the manual's
+  `--max-model-len`).
 - 200 paced LibriSpeech test-clean utterances at 32 sessions on `/v1/realtime` under
   `--enforce-eager`: word-error rate 3.15% at 80 ms, 2.55% at 320 ms and 2.44% at 1120 ms, every
-  transcript equal to the same server's at the full `--max-model-len`, and every request finished
+  transcript equal to the baseline server's, and every request finished
   with `stop`, none length-capped. At 320 ms with no runner flag, all 200 transcripts equal those
   under `--enforce-eager`.
-- The startup equals the full-length server's at a token budget of 2048: the same available KV
-  cache memory, block count, encoder cache and graph memory. At `--max-model-len 77000` core raises
+- The startup memory figures match the baseline's: the same available KV cache memory, block count,
+  encoder cache and graph memory. Initialization times differ. At `--max-model-len 77000` core raises
   the token budget to the context length, which takes about 14 GiB of available KV cache memory on
   the A40 (`experiments/2026-11-26-plugin-budget-9503e3b878/`).
 - One unprofiled run per setting with no repeats: no latency claim rests on this round.
@@ -337,8 +342,11 @@ and `E ≤ N` make up at least 99 % of served steps. At `N` = 63 they make up 10
   scheduling and batch invariance.
 - Served latency on the target core, with repeats (Served accuracy on the target core gives one
   unprofiled run per chunk size).
-- Tier 5 for transaction graphs at 80 and 160 ms on the target core, under the restricted startup;
-  served equality is measured above.
+- Tier 5 for transaction graphs at 80 and 160 ms on the target core, under the restricted startup.
+  The revised served comparison (TXG-QUAL-008) passed only on the state-pool build `9c40a6ffd6` at
+  `N` = 63 ([Transaction graphs, tier 5](#transaction-graphs-tier-5)); on the target core one
+  stream or one file at a time was served at `N` = 8
+  ([Block-0 capture under every KV-cache sizing](#block-0-capture-under-every-kv-cache-sizing)).
 - Served transcripts at 32 sessions with transaction graphs on under core's default KV-cache sizing,
   against `B_hook`, at 80 and 160 ms.
 

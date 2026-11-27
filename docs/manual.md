@@ -392,11 +392,13 @@ cache; a profiled budget with `--no-enable-extensible-kv-cache`; a fixed
 block 0 of the state pages, the one page core backs at every capture, and the cells reach each
 held page by its block ID when they replay. The command fixes the block count:
 `--num-gpu-blocks-override 65` holds the null block and one page for each of the 64 requests that
-`--max-num-seqs 64` lets be active. On the stage 1 build (core `9503e3b878`) an installed-engine check on an A40 shows,
-under the extensible KV cache, a profiled budget and a fixed override, one stream and each test file
-served alone with transcripts equal to the same server with transaction graphs off
-([evidence](evidence.md#block-0-capture-under-every-kv-cache-sizing)); no KV-cache sizing carries a
-tier 5 claim on that build (below).
+`--max-num-seqs 64` lets be active. On the stage 1 build (core `9503e3b878`), an installed-engine
+check on an A40 at 80 and 160 ms, with graph population 8 and an admission limit of 8
+(`--max-num-seqs 8`), shows that under the extensible KV cache, a profiled budget and a fixed
+override, one stream and each test file served alone produce transcripts equal to the same
+server's with transaction graphs off
+([evidence](evidence.md#block-0-capture-under-every-kv-cache-sizing)); no KV-cache sizing carries
+a tier 5 claim on that build (below).
 
 The state pages must number at least the admission limit plus one (`--max-num-active-seqs`, or
 `--max-num-seqs` when it is unset). Core refuses fewer when it builds its scheduler, after the
