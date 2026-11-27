@@ -515,13 +515,15 @@ def test_block_0_capture_serves_alone_equal_to_b_hook_under_each_sizing(
 
 
 @pytest.mark.card
-# @spec TXG-QUAL-029, TXG-QUAL-003
-def test_an_exactness_run_leaves_its_headroom_and_records_the_allocator(tmp_path):
-    """A short ``Q``/``M`` exactness run under the extensible KV cache with a
-    headroom preregistered before the run from the admission limit, the
-    card's bytes per page and the stated margin, left through
-    ``--gpu-memory-utilization`` below 1.0: the detached copies hold pages 0
-    to the admission limit and copy no more than the preregistered figure,
+@pytest.mark.parametrize("mode", ["qm", "fallback"])
+# @spec TXG-QUAL-029, TXG-QUAL-003, TXG-QUAL-007
+def test_an_exactness_run_leaves_its_headroom_and_records_the_allocator(tmp_path, mode):
+    """A short exactness run under the extensible KV cache, ``Q``/``M``
+    (``qm``) and the uncovered steps (``fallback``), each with a headroom
+    preregistered before the run from the mode's most requests, the card's
+    bytes per page and the stated margin, left through
+    ``--gpu-memory-utilization`` below 1.0: the detached copies hold block 0
+    and one page per request and copy no more than the preregistered figure,
     the other committed pages keep their digests, the record holds core's
     logged torch memory limit and the allocator readings around the copy and
     passes TXG-QUAL-029's checks, and the run is no source of a served
@@ -532,16 +534,12 @@ def test_an_exactness_run_leaves_its_headroom_and_records_the_allocator(tmp_path
     if not card:
         pytest.skip("NEMOTRON_CARD_DIR not set")
     n = 4
-    # Preregistered (TXG-QUAL-018) before the run: pages 0 to the admission
-    # limit (``max_num_seqs``) of the card's state page, plus the stated
-    # margin (core's non-torch reserve, the memory in use at startup, the
-    # digest workspace and the copy's alignment slack).
-    headroom = q.preregistered_headroom(n, d.card_page_bytes(card))
     spec = {
-        "mode": "qm",
+        "mode": mode,
         "card": card,
         "max_model_len": 82513,
         "max_num_seqs": n,
+        "n": n,
         "lookahead": 0,
         "hf_overrides": {"num_lookahead_tokens": 0, t.OPTION: [n]},
         "kv_cache_sizing": Sizing.EXTENSIBLE,
@@ -551,19 +549,29 @@ def test_an_exactness_run_leaves_its_headroom_and_records_the_allocator(tmp_path
         "steps": 20,
         "m_steps": 20,
         "synthetic_lengths": [24000] * 16,
-        "headroom": headroom,
     }
-    reply = run_driver(spec, tmp_path, "exactness")
+    # Preregistered (TXG-QUAL-018) before the run: block 0 and one page per
+    # request the mode holds (the admission limit for ``qm``, ``N + 4`` for
+    # ``fallback``) of the card's state page, plus the stated margin.
+    spec["headroom"] = q.preregistered_headroom(
+        q.spec_max_requests(spec), d.card_page_bytes(card)
+    )
+    headroom = spec["headroom"]
+    reply = run_driver(spec, tmp_path, f"exactness-{mode}")
     assert reply["ok"], reply.get("traceback")
     assert q.headroom_problems(reply) == [], reply["exactness_memory"]
     memory = reply["exactness_memory"]
     assert memory["torch_memory_limit"] > 0
     assert memory["copies"] > 0
     assert memory["copy_bytes"] <= headroom["copy_bytes"], memory
+    assert memory["copy_allocations"] <= q.COPY_ALLOCATIONS, memory
     assert q.served_figure_runs([reply]) == []
     result = reply["result"]
     assert result["untouched_problems"] == [], result["untouched_problems"]
-    assert result["mismatches"] == 0, result
+    if mode == "qm":
+        assert result["mismatches"] == 0, result
+    else:
+        assert result["passed"], result
 
 
 # ---------------------------------------------------------------------------

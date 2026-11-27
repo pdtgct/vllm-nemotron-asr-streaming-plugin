@@ -484,6 +484,84 @@ def test_the_driver_refuses_a_headroom_outside_the_extensible_kv_cache():
             d.engine_settings(spec | named)
 
 
+# @spec TXG-QUAL-029
+def test_the_driver_refuses_a_comparing_run_without_a_preregistered_headroom():
+    """A ``qm`` or ``fallback`` run that compares with a detached copy under
+    the extensible KV cache is refused before the engine starts unless its
+    spec holds the preregistered headroom, and the refusal names the
+    remedy; the same run with its headroom, a run that does not compare, a
+    mode with no detached copy and a comparing run under a fixed block count
+    start."""
+    from support import txg_qual_driver as d
+
+    total = {"device_total_bytes": 48 << 30}
+    for mode, extra in (("qm", {}), ("fallback", {"n": 4})):
+        spec = _spec(mode=mode, compare=True, **extra, **total)
+        assert d.run_sizing(spec) == Sizing.EXTENSIBLE
+        with pytest.raises(ValueError, match="preregistered_headroom") as refused:
+            d.engine_settings(spec)
+        assert "TXG-QUAL-029" in str(refused.value), refused.value
+        headroom = q.preregistered_headroom(q.spec_max_requests(spec), PAGE_BYTES)
+        settings = d.engine_settings(spec | {"headroom": headroom})
+        assert 0.0 < settings["gpu_memory_utilization"] < 1.0, (mode, settings)
+        assert "gpu_memory_utilization" not in d.engine_settings(
+            spec | {"compare": False}
+        )
+        assert d.engine_settings(spec | {"num_gpu_blocks_override": 80})
+    assert d.engine_settings(_spec(mode="steprule", compare=True))
+
+
+# @spec TXG-QUAL-029
+def test_the_margin_counts_what_the_caching_allocator_reserves():
+    """Each margin term is the bytes the CUDA caching allocator reserves for
+    its allocations: 2 MiB for at most 1 MiB, a 20 MiB segment below 10 MiB,
+    and the size rounded up to 2 MiB above; the digest's and the
+    comparison's one-chunk workspaces, and the copy's slack per allocation
+    (its 512-byte shift plus that rounding), for the copy allocations the
+    margin states."""
+    mib = 1 << 20
+    assert q.allocator_reserved_bound(512) == 2 * mib
+    assert q.allocator_reserved_bound(mib) == 2 * mib
+    assert q.allocator_reserved_bound(mib + 1) == 20 * mib
+    assert q.allocator_reserved_bound(16 * mib) == 20 * mib
+    assert q.allocator_reserved_bound(21 * mib + 1) == 22 * mib
+    assert q.digest_workspace_bytes() == 16 * mib
+    assert q.DIGEST_WORKSPACE_BYTES == q.allocator_reserved_bound(16 * mib)
+    assert q.COMPARISON_WORKSPACE_BYTES == (
+        q.allocator_reserved_bound(q.comparison_workspace_bytes()) + 2 * mib
+    )
+    assert q.COPY_ALLOCATIONS == 1
+    assert q.COPY_ALIGNMENT_ALLOWANCE_BYTES == q.COPY_ALLOCATIONS * (512 + 20 * mib)
+    for copy in (64 * PAGE_BYTES, 4 * mib, 12 * mib + 3):
+        slack = q.allocator_reserved_bound(copy + 512) - copy
+        assert 0 < slack <= q.COPY_ALIGNMENT_ALLOWANCE_BYTES, (copy, slack)
+
+
+# @spec TXG-QUAL-029
+def test_a_copy_with_more_allocations_than_the_margin_states_fails():
+    """Under the allocator reading, a detached copy that makes more
+    allocations (distinct storages) than ``COPY_ALLOCATIONS`` fails the run
+    and names the remedy; one allocation is recorded and passes."""
+    import torch
+    from support import txg_transaction as tx
+    from support.txg_qual_adapter import Call, TransactionMonitor
+
+    def pools(*views):
+        return tx.Pools(
+            {"channel_pools": list(views), "time_pools": [], "len_pools": []}
+        )
+
+    one = torch.zeros(8, 64, dtype=torch.int8)
+    monitor = TransactionMonitor(torch.nn.Linear(1, 1), compare=True, memory=True)
+    monitor._copy(pools(one[:, :32], one[:, 32:]).kwargs(), Call(kind="execute"))
+    assert monitor.copy_readings[-1]["copy_allocations"] == 1
+    two = pools(
+        torch.zeros(8, 32, dtype=torch.int8), torch.zeros(8, 32, dtype=torch.int8)
+    )
+    with pytest.raises(RuntimeError, match="COPY_ALLOCATIONS"):
+        monitor._copy(two.kwargs(), Call(kind="execute"))
+
+
 @pytest.mark.parametrize(
     "changes, problem",
     [
@@ -635,6 +713,7 @@ def test_the_headroom_is_computed_before_the_run_from_limit_page_and_margin():
         q.CORE_NON_TORCH_RESERVE_BYTES
         + q.STARTUP_ALLOWANCE_BYTES
         + q.DIGEST_WORKSPACE_BYTES
+        + q.COMPARISON_WORKSPACE_BYTES
         + q.COPY_ALIGNMENT_ALLOWANCE_BYTES
     )
     assert q.CORE_NON_TORCH_RESERVE_BYTES == 1 << 29

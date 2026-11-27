@@ -374,38 +374,79 @@ BLOCK_ZERO_CONTENTS = [
 @pytest.mark.parametrize("content", BLOCK_ZERO_CONTENTS)
 # @spec TXG-CAP-005
 def test_each_capture_row_keeps_its_rejection_whatever_block_zero_holds(
-    on_cpu, content
+    on_cpu, monkeypatch, content
 ):
     """The rejection predicate does not read the page a capture row gathers:
     with block 0 holding bounded bookkeeping values, NaN or an infinity,
-    every captured row of every cell, fresh stream and continuing file rows
-    alike, keeps its rejection bit (``ROW_STATUS_ENVELOPE`` for a CHUNK row,
-    ``ROW_STATUS_ROLE_MISMATCH`` for an echo row) and no page changes. The
-    cells need not publish: a validation replay may find NaN outputs."""
+    every capture row of every cell keeps its rejection bit
+    (``ROW_STATUS_ENVELOPE`` for a CHUNK row, ``ROW_STATUS_ROLE_MISMATCH``
+    for an echo row) and no page changes. Chunk and echo cells are checked
+    independently: every cell is captured even when an earlier cell fails
+    to publish, and the rows of every cell, at both of the fresh and file
+    combinations the capture rows alternate (fresh stream, continuing
+    file), are inspected one by one. A cell may fail only at its validation
+    replay (a replay may find NaN outputs), so publication may fail; a
+    failure at any earlier phase of any cell fails the test."""
+    from support import txg_api
+
+    graph = txg_api.graph_module()
     run = on_cpu(n=3, max_num_seqs=3)
     env = run.env
     ready_to_capture(run)
     fill_block_zero(run, content)
+    t.spy_phases(monkeypatch, env, "prepare_model_rows")
+    binding_type = type(txg_api.binding_of(env.model))
+    real_capture_cell = binding_type._capture_cell
+    attempted, unpublished = [], []
+
+    def capture_cell(self, work, kind, count):
+        attempted.append((kind, count))
+        try:
+            real_capture_cell(self, work, kind, count)
+        except Exception as error:
+            if self._phase != graph.PHASE_VALIDATION:
+                raise
+            unpublished.append((kind, count, repr(error)))
+
+    monkeypatch.setattr(binding_type, "_capture_cell", capture_cell)
     before = pool_snapshot(run.core.serving_bindings)
     mark = len(env.events)
+    # Publication after the cells may fail too; every cell has run by then.
     h.call_with(run.core.serving_capture)
+    order = t.largest_first(env.n)
+    assert attempted == order, (content, attempted, unpublished)
     windows = cell_windows(env, mark)
-    assert windows, f"{content}: no cell reached its capture"
-    seen = set()
-    for (kind, count), (begin, end) in zip(t.largest_first(env.n), windows):
+    assert len(windows) == len(order), (content, len(windows), unpublished)
+    spans = windows_before(env, mark, windows)
+    inspected: dict[str, set[tuple[bool, bool]]] = {"chunk": set(), "echo": set()}
+    cells: dict[str, list[int]] = {"chunk": [], "echo": []}
+    for (kind, count), (start, begin), (_, end) in zip(
+        order, spans, windows, strict=True
+    ):
+        plans = [
+            e[1] for e in env.events[start:begin] if e[0] == "phase.prepare_model_rows"
+        ]
+        assert plans and plans[-1] is not None, f"{kind} {count}: no capture-row plan"
+        fresh, file = t.row_bits(plans[-1])
+        assert len(fresh) == len(file) == count, (content, kind, count, fresh, file)
         scatters = [e[1] for e in env.events[begin:end] if e[0] == "scatter"]
         assert scatters, f"{kind} cell {count}: no predicated scatter captured"
         expected = ROW_STATUS_ENVELOPE if kind == "chunk" else ROW_STATUS_ROLE_MISMATCH
         for call in scatters:
             assert call["rows"] == count, (content, kind, count, call)
-            assert all(s & expected for s in call["status"]), (
-                content,
-                kind,
-                count,
-                call,
-            )
-        seen.add(kind)
-    assert "chunk" in seen, (content, seen)
+            for row, (f, fl, status) in enumerate(
+                zip(fresh, file, call["status"], strict=True)
+            ):
+                assert status & expected, (content, kind, count, row, status)
+                inspected[kind].add((f, fl))
+        cells[kind].append(count)
+    for kind in ("chunk", "echo"):
+        assert cells[kind] == list(range(env.n, 0, -1)), (content, kind, cells)
+        assert inspected[kind] == {(True, False), (False, True)}, (
+            content,
+            kind,
+            inspected,
+        )
     assert_pools_equal(before, pool_snapshot(run.core.serving_bindings))
 
 

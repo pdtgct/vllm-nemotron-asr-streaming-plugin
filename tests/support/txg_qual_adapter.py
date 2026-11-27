@@ -760,7 +760,11 @@ class TransactionMonitor:
         """The detached copy of the step's pools (TXG-QUAL-003): the views
         are narrowed to :attr:`copy_extent` before any byte is read or
         allocated, so the copy holds no page at or above it. The allocator
-        is read around it when ``memory`` is set (TXG-QUAL-029)."""
+        is read around it when ``memory`` is set (TXG-QUAL-029); a copy
+        that makes more allocations than the margin states
+        (``txgcap_qual.COPY_ALLOCATIONS``) then fails the run."""
+        from support import txgcap_qual as q
+
         live = self._live(kwargs)
         reading: dict[str, int] = {}
         if self.memory and self.cuda:
@@ -779,7 +783,16 @@ class TransactionMonitor:
                 )
             reading["copy_bytes"] = live.span_bytes()
             reading["copy_allocation_bytes"] = copy.storage_bytes()
+            reading["copy_allocations"] = copy.storage_count()
             self.copy_readings.append(reading)
+            if reading["copy_allocations"] > q.COPY_ALLOCATIONS:
+                raise RuntimeError(
+                    f"the detached copy made {reading['copy_allocations']} "
+                    f"allocations, more than the {q.COPY_ALLOCATIONS} the "
+                    "headroom's margin states (txgcap_qual.COPY_ALLOCATIONS); "
+                    "state the larger count and preregister its margin "
+                    "(TXG-QUAL-029)"
+                )
         return copy
 
     def memory_summary(self) -> dict[str, Any]:

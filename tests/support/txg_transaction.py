@@ -99,50 +99,65 @@ _BASE_ALIGNMENT = 512
 _SAME_SIZE_INTEGERS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
 
 
-def _digest_chunks(tensor: torch.Tensor, limit: int) -> Iterator[torch.Tensor]:
-    """Views of ``tensor`` that together cover it, each of at most ``limit``
-    elements: slices along the first dimension, descending into a slice's
-    own first dimension when one slice is still too large. Neither reads nor
-    allocates."""
+def _digest_chunks(
+    tensor: torch.Tensor, limit: int, offset: int = 0
+) -> Iterator[tuple[int, torch.Tensor]]:
+    """``(offset, chunk)`` views of ``tensor`` that together cover it, each
+    of at most ``limit`` elements, with the chunk's first element's index in
+    ``tensor``'s row-major order: slices along the first dimension,
+    descending into a slice's own first dimension when one slice is still
+    too large. Neither reads nor allocates; two tensors of one shape are cut
+    into the same chunks at the same offsets, whatever their strides."""
     if tensor.numel() <= limit:
-        yield tensor
+        yield offset, tensor
         return
     if tensor.shape[0] == 1:
-        yield from _digest_chunks(tensor[0], limit)
+        yield from _digest_chunks(tensor[0], limit, offset)
         return
-    step = max(1, limit // max(1, tensor[0].numel()))
+    row = int(tensor[0].numel())
+    step = max(1, limit // max(1, row))
     for start in range(0, int(tensor.shape[0]), step):
-        yield from _digest_chunks(tensor[start : start + step], limit)
+        yield from _digest_chunks(
+            tensor[start : start + step], limit, offset + start * row
+        )
 
 
-def digest(tensor: torch.Tensor, *, chunk_elements: int | None = None) -> str:
-    """A digest of ``tensor``'s bits computed where it lives, chunk by chunk
-    (TXG-QUAL-003): each chunk, at most ``chunk_elements`` elements
-    (:data:`DIGEST_CHUNK_ELEMENTS`), is reinterpreted as integers of its
-    element size, widened to 64 bits, and reduced to its sum and its
-    position-weighted sum. The tensor is never copied whole; the workspace is
-    at most ``txgcap_qual.DIGEST_WORKSPACE_BYTES`` for the default chunk size. The
-    shape, dtype and the reductions, read with one synchronization, are
-    hashed."""
+def _bits(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor``'s elements reinterpreted, in place, as integers of the
+    same size (any strides; NaN payloads and signed zeros kept apart)."""
+    return tensor.detach().view(_SAME_SIZE_INTEGERS[tensor.element_size()])
+
+
+def digest(
+    tensor: torch.Tensor, *, name: str = "", chunk_elements: int | None = None
+) -> str:
+    """A SHA-256 digest of every bit of ``tensor``, read where it lives one
+    bounded chunk at a time (TXG-QUAL-003). The hash takes the view's
+    identity (``name``, shape, strides, dtype) and then, for each chunk of at
+    most ``chunk_elements`` elements (:data:`DIGEST_CHUNK_ELEMENTS`), its
+    element offset in the view, its shape and its bytes, copied to one
+    host buffer of at most one chunk. Two views with different bytes at any
+    position therefore digest differently, except by a SHA-256 collision.
+    The tensor is never copied whole: on a device the only workspace is a
+    strided chunk's contiguous staging for its copy to the host, at most
+    ``txgcap_qual.digest_workspace_bytes`` of the chunk size."""
     import hashlib
 
     limit = int(chunk_elements or DIGEST_CHUNK_ELEMENTS)
-    integer = _SAME_SIZE_INTEGERS[tensor.element_size()]
-    weights = None
-    sums = []
-    for chunk in _digest_chunks(tensor.detach(), limit):
+    t = tensor.detach()
+    h = hashlib.sha256(repr((name, tuple(t.shape), str(t.dtype))).encode())
+    host = None
+    for offset, chunk in _digest_chunks(t, limit):
         n = chunk.numel()
         if n == 0:
             continue
-        wide = chunk.view(integer).to(torch.int64).reshape(-1)
-        if weights is None or weights.numel() < n:
-            weights = torch.arange(
-                1, max(n, min(limit, tensor.numel())) + 1, device=tensor.device
-            )
-        sums.append(torch.stack((wide.sum(), (wide * weights[:n]).sum())))
-    h = hashlib.sha256(f"{tuple(tensor.shape)}|{tensor.dtype}".encode())
-    if sums:
-        h.update(torch.stack(sums).cpu().numpy().tobytes())
+        bits = _bits(chunk)
+        if host is None:
+            host = torch.empty(min(limit, t.numel()), dtype=bits.dtype)
+        staged = host[:n]
+        staged.view(chunk.shape).copy_(bits)
+        h.update(repr((offset, tuple(chunk.shape))).encode())
+        h.update(staged.view(torch.uint8).numpy())
     return h.hexdigest()
 
 
@@ -247,6 +262,11 @@ class Pools:
             seen[(t.device, storage.data_ptr())] = storage.nbytes()
         return sum(seen.values())
 
+    def storage_count(self) -> int:
+        """The distinct storages the pools view (for a copy :meth:`clone`
+        made, the allocations it made)."""
+        return len({(t.device, t.untyped_storage().data_ptr()) for _, t in self.flat()})
+
     def narrowed(self, pages: int | None) -> Pools:
         """The same views limited to their first ``pages`` pages (every page
         when ``pages`` is ``None``): views over the same storage, at the same
@@ -286,7 +306,8 @@ class Pools:
     def digests(self, *, chunk_elements: int | None = None) -> dict[str, str]:
         """Each view's :func:`digest`, by name, computed in place."""
         return {
-            name: digest(t, chunk_elements=chunk_elements) for name, t in self.flat()
+            name: digest(t, name=name, chunk_elements=chunk_elements)
+            for name, t in self.flat()
         }
 
     def span_bytes(self) -> int:
@@ -344,31 +365,51 @@ class Pools:
     def differences(
         self, other: Pools, blocks: Sequence[int] | None = None
     ) -> list[str]:
+        """The views whose bits differ from ``other``'s (only at ``blocks``
+        when given), compared in place (:func:`same_bits`)."""
         out = []
         theirs = dict(other.flat())
         for name, t in self.flat():
             a, b = t, theirs[name]
-            if blocks is not None:
-                index = torch.tensor(list(blocks), dtype=torch.long, device=a.device)
-                a, b = a.index_select(0, index), b.index_select(0, index)
-            if not same_bits(a, b):
+            if blocks is None:
+                same = same_bits(a, b)
+            else:
+                same = all(same_bits(a[int(i)], b[int(i)]) for i in blocks)
+            if not same:
                 out.append(name)
         return out
 
 
-def same_bits(a: torch.Tensor | None, b: torch.Tensor | None) -> bool:
-    """Bit-for-bit equality (NaN payloads included)."""
+def same_bits(
+    a: torch.Tensor | None,
+    b: torch.Tensor | None,
+    *,
+    chunk_elements: int | None = None,
+) -> bool:
+    """Bit-for-bit equality (NaN payloads included), compared where the
+    tensors live one bounded chunk at a time: each pair of chunks of at most
+    ``chunk_elements`` elements (:data:`DIGEST_CHUNK_ELEMENTS`) is compared
+    as same-size integer views of the strided tensors, and the results are
+    folded into one flag read with one synchronization. Neither tensor is
+    copied whole: the workspace is one chunk's equality, or, for tensors on
+    different devices, a chunk's copy to the host
+    (``txgcap_qual.comparison_workspace_bytes``)."""
     if a is None or b is None:
         return a is None and b is None
     if a.shape != b.shape or a.dtype != b.dtype:
         return False
-    if a.device != b.device:
-        a, b = a.cpu(), b.cpu()
-    # Compared where they live: one comparison and one synchronization per
-    # tensor on CUDA, no device-to-host copy of every pool.
-    a = a.detach().contiguous().reshape(-1).view(torch.uint8)
-    b = b.detach().contiguous().reshape(-1).view(torch.uint8)
-    return bool(torch.equal(a, b))
+    limit = int(chunk_elements or DIGEST_CHUNK_ELEMENTS)
+    flag = None
+    for (_, x), (_, y) in zip(
+        _digest_chunks(_bits(a), limit), _digest_chunks(_bits(b), limit), strict=True
+    ):
+        if x.numel() == 0:
+            continue
+        if x.device != y.device:
+            x, y = x.cpu(), y.cpu()
+        same = torch.eq(x, y).all()
+        flag = same if flag is None else flag.logical_and_(same)
+    return True if flag is None else bool(flag)
 
 
 def pools_of(kwargs: dict[str, Any]) -> Pools:

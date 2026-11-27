@@ -650,12 +650,59 @@ HEADROOM_FIGURES = (
 )
 
 
-#: The most elements one in-place digest chunk widens at once
-#: (``txg_transaction.digest``; TXG-QUAL-003).
+#: The native CUDA caching allocator's segments (PyTorch's CUDA semantics
+#: notes on ``PYTORCH_CUDA_ALLOC_CONF``, and ``c10/cuda/CUDACachingAllocator.cpp``):
+#: an allocation of at most 1 MiB is packed into a 2 MiB segment, one below
+#: 10 MiB takes a 20 MiB segment (``large_segment_size_mb``, 20 by default),
+#: and a larger one is rounded up to a multiple of 2 MiB.
+ALLOCATOR_SMALL_ALLOCATION_BYTES = 1 << 20
+ALLOCATOR_SMALL_SEGMENT_BYTES = 2 << 20
+ALLOCATOR_LARGE_SEGMENT_BYTES = 20 << 20
+ALLOCATOR_ROUNDING_BYTES = 2 << 20
+
+
+def allocator_reserved_bound(nbytes: int) -> int:
+    """The most bytes the caching allocator reserves for one allocation of
+    at most ``nbytes`` bytes: a 2 MiB segment up to 1 MiB, otherwise the
+    larger of a 20 MiB segment and ``nbytes`` rounded up to 2 MiB."""
+    if nbytes <= ALLOCATOR_SMALL_ALLOCATION_BYTES:
+        return ALLOCATOR_SMALL_SEGMENT_BYTES
+    rounded = -(-int(nbytes) // ALLOCATOR_ROUNDING_BYTES) * ALLOCATOR_ROUNDING_BYTES
+    return max(ALLOCATOR_LARGE_SEGMENT_BYTES, rounded)
+
+
+#: The most elements one in-place chunk of the digest or the bit comparison
+#: covers (``txg_transaction.digest`` and ``same_bits``; TXG-QUAL-003).
 DIGEST_CHUNK_ELEMENTS = 1 << 21
-#: The device workspace one digest allocates at most: the widened chunk, its
-#: weights and their product, eight bytes per element each (48 MiB).
-DIGEST_WORKSPACE_BYTES = 3 * 8 * DIGEST_CHUNK_ELEMENTS
+#: The largest element, in bytes, of a pool view the chunks cover.
+LARGEST_ELEMENT_BYTES = 8
+
+
+def digest_workspace_bytes(chunk_elements: int = DIGEST_CHUNK_ELEMENTS) -> int:
+    """The device bytes one digest holds at most: one chunk at a time, which
+    a strided chunk stages contiguously for its device-to-host copy (its
+    host copy is host memory)."""
+    return LARGEST_ELEMENT_BYTES * int(chunk_elements)
+
+
+def comparison_workspace_bytes(chunk_elements: int = DIGEST_CHUNK_ELEMENTS) -> int:
+    """The device bytes one bit comparison holds at most for its chunk: one
+    chunk at a time, either its element-wise equality (one byte per element)
+    or, for tensors on different devices, a strided chunk's contiguous
+    staging for its copy to the host. The chunks' results are folded into
+    one one-byte flag beside it."""
+    return LARGEST_ELEMENT_BYTES * int(chunk_elements)
+
+
+#: The digest's device workspace (16 MiB) and what the allocator reserves
+#: for it at most.
+DIGEST_WORKSPACE_BYTES = allocator_reserved_bound(digest_workspace_bytes())
+#: The comparison's device workspace and what the allocator reserves for it
+#: at most: the chunk's segment and the flag's small segment.
+COMPARISON_WORKSPACE_BYTES = (
+    allocator_reserved_bound(comparison_workspace_bytes())
+    + ALLOCATOR_SMALL_SEGMENT_BYTES
+)
 #: Core's reserve for memory outside the torch allocator under the extensible
 #: KV cache on CUDA (``KV_CACHE_NON_TORCH_RESERVE_BYTES``,
 #: ``vllm/v1/worker/extensible_kv_cache.py:71``): the allocator's cap leaves
@@ -666,14 +713,24 @@ CORE_NON_TORCH_RESERVE_BYTES = 1 << 29
 #: fraction of the device's total memory (``vllm/v1/worker/utils.py:906``),
 #: does not exclude.
 STARTUP_ALLOWANCE_BYTES = 1 << 30
-#: The copy's alignment slack: ``_BASE_ALIGNMENT`` (512 bytes) per distinct
-#: storage, stated for up to 2,048 storages.
-COPY_ALIGNMENT_ALLOWANCE_BYTES = 1 << 20
+#: The allocations one detached copy makes: one per distinct storage the
+#: bound views span (``txg_transaction.layout_clone``). The plugin's one state
+#: layer binds its views over one storage; a copy that makes more fails the
+#: run (``TransactionMonitor``).
+COPY_ALLOCATIONS = 1
+#: The copy's slack over the bytes it copies, per allocation: the base
+#: address's shift (``txg_transaction._BASE_ALIGNMENT``, 512 bytes) and the
+#: allocator's rounding, less than 2 MiB for a copy of at least 10 MiB and at
+#: most a 20 MiB segment for a smaller one.
+COPY_ALIGNMENT_ALLOWANCE_BYTES = COPY_ALLOCATIONS * (
+    512 + ALLOCATOR_LARGE_SEGMENT_BYTES
+)
 #: The stated margin of an exactness run's headroom (TXG-QUAL-029).
 EXACTNESS_MARGIN_BYTES = (
     CORE_NON_TORCH_RESERVE_BYTES
     + STARTUP_ALLOWANCE_BYTES
     + DIGEST_WORKSPACE_BYTES
+    + COMPARISON_WORKSPACE_BYTES
     + COPY_ALIGNMENT_ALLOWANCE_BYTES
 )
 

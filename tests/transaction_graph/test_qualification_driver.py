@@ -610,6 +610,8 @@ def test_the_pages_above_the_admission_limit_are_never_copied(monkeypatch):
     limit: the copy's one allocation is the extent's pages plus its
     alignment slack, and every digest allocation is bounded by the digest's
     chunk, not by the pages it covers."""
+    from support import txgcap_qual as q
+
     chunk = 256
     monkeypatch.setattr(tx, "DIGEST_CHUNK_ELEMENTS", chunk)
     pools = narrowed_pools(pages=12, storage_pages=16)
@@ -630,8 +632,92 @@ def test_the_pages_above_the_admission_limit_are_never_copied(monkeypatch):
         monitor.watch_untouched(pools)
         assert monitor.untouched_problems() == []
     assert a.sizes, "the digests allocated no workspace (positive control)"
-    assert max(size for _, size in a.sizes) <= 8 * chunk, a.sizes
-    assert 3 * 8 * chunk < above
+    assert max(size for _, size in a.sizes) <= q.digest_workspace_bytes(chunk), a.sizes
+    assert q.digest_workspace_bytes(chunk) < above
+
+
+# @spec TXG-QUAL-003
+def test_the_digest_tells_apart_every_change_within_a_chunk():
+    """The digest hashes each chunk's bytes, not a reduction of them: chunks
+    with equal sums and equal position-weighted sums (``[4, 4, 4]`` and
+    ``[5, 2, 5]``) digest differently, and so does one flipped bit or two
+    values swapped within one chunk, for every element size, on a strided
+    view and across chunk boundaries; equal bits digest equally, and the
+    view's identity and each chunk's offset are part of the digest."""
+    counter = (
+        torch.tensor([4, 4, 4], dtype=torch.int32),
+        torch.tensor([5, 2, 5], dtype=torch.int32),
+    )
+    assert counter[0].sum() == counter[1].sum()
+    weights = torch.arange(1, 4, dtype=torch.int32)
+    assert (counter[0] * weights).sum() == (counter[1] * weights).sum()
+    assert tx.digest(counter[0]) != tx.digest(counter[1])
+    assert tx.digest(counter[0]) == tx.digest(counter[0].clone())
+    gen = torch.Generator().manual_seed(5)
+    for dtype in (torch.int8, torch.float16, torch.float32, torch.int64):
+        storage = torch.randint(-50, 50, (16, 40), generator=gen).to(dtype)
+        view = storage[:, 3:35:2]  # strided, as a page-strided state slice
+        for chunk in (None, 7, 64):
+            reference = tx.digest(view, chunk_elements=chunk)
+            assert tx.digest(view.clone(), chunk_elements=chunk) == reference
+            flipped = view.clone()
+            flipped.view(tx._SAME_SIZE_INTEGERS[flipped.element_size()])[9, 4] ^= 1
+            assert tx.digest(flipped, chunk_elements=chunk) != reference, (dtype, chunk)
+            swapped = view.clone()
+            swapped[2, 1], swapped[2, 2] = 11, 13
+            before = tx.digest(swapped, chunk_elements=chunk)
+            swapped[2, 1], swapped[2, 2] = 13, 11
+            assert tx.digest(swapped, chunk_elements=chunk) != before, (dtype, chunk)
+    flat = torch.arange(8, dtype=torch.int32)
+    assert tx.digest(flat, name="a") != tx.digest(flat, name="b")
+    assert tx.digest(flat) != tx.digest(flat.view(2, 4))
+    halves = torch.tensor([1, 2, 1, 2], dtype=torch.int32)
+    assert tx.digest(halves, chunk_elements=2) != tx.digest(
+        torch.tensor([1, 2, 2, 1], dtype=torch.int32), chunk_elements=2
+    )
+
+
+# @spec TXG-QUAL-003, TXG-QUAL-029
+def test_the_comparison_reads_in_place_within_its_stated_workspace(monkeypatch):
+    """Comparing a page-strided copy with the live views allocates no
+    contiguous copy of either side: every allocation the comparison makes is
+    at most ``txgcap_qual.comparison_workspace_bytes`` of its chunk, far
+    below the views' bytes, and the comparison still finds one flipped bit,
+    a swap and a NaN payload change, and equates NaNs with equal bits."""
+    from support import txgcap_qual as q
+
+    chunk = 256
+    monkeypatch.setattr(tx, "DIGEST_CHUNK_ELEMENTS", chunk)
+    pools = narrowed_pools(pages=12, storage_pages=16)
+    _random(pools)
+    copy = pools.clone()
+    known = {t.untyped_storage().data_ptr() for p in (pools, copy) for _, t in p.flat()}
+    view_bytes = min(t.numel() * t.element_size() for _, t in pools.flat())
+    with Allocations(known) as a:
+        assert pools.differences(copy) == []
+        assert pools.differences(copy, blocks=[0, 5, 11]) == []
+    assert a.sizes, "the comparison allocated no workspace (positive control)"
+    assert max(size for _, size in a.sizes) <= q.comparison_workspace_bytes(chunk)
+    assert q.comparison_workspace_bytes(chunk) < view_bytes, view_bytes
+    h_pool = copy.tensors["h_pool"]
+    h_pool.view(torch.int32)[7, 3] ^= 1
+    assert pools.differences(copy) == ["h_pool"]
+    assert pools.differences(copy, blocks=[6, 8]) == []
+    h_pool.view(torch.int32)[7, 3] ^= 1
+    assert pools.differences(copy) == []
+    live, copied = (
+        pools.tensors["channel_pools"][0][4],
+        copy.tensors["channel_pools"][0][4],
+    )
+    live[0], live[1] = 7, 9
+    copied[0], copied[1] = 9, 7
+    assert pools.differences(copy) == ["channel_pools[0]"]
+    nan = torch.tensor([float("nan")] * 3)
+    assert tx.same_bits(nan, nan.clone(), chunk_elements=2)
+    payload = nan.clone()
+    payload.view(torch.int32)[1] ^= 1
+    assert not tx.same_bits(nan, payload, chunk_elements=2)
+    assert not tx.same_bits(torch.tensor(0.0), torch.tensor(-0.0))
 
 
 # @spec TXG-QUAL-003, TXG-QUAL-026

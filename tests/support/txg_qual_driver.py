@@ -26,7 +26,7 @@ core's extension (``identity``; TXG-QUAL-001), and the startup probes
 memory limit, and, under the extensible KV cache, the committed block count
 at the serving capture and the state layer's views at that capture and after
 core's extension; TXG-QUAL-028). A spec with ``headroom``
-(``txgcap_qual.preregistered_headroom``: ``admission_limit``,
+(``txgcap_qual.preregistered_headroom``: ``max_requests``,
 ``page_bytes``, ``copy_bytes``, ``margin_bytes``, computed before the run)
 runs an exactness run under the extensible KV cache with that headroom left
 free through ``--gpu-memory-utilization`` and records the allocator around
@@ -1572,7 +1572,9 @@ def engine_settings(spec: dict[str, Any]) -> dict[str, Any]:
     A spec with ``headroom`` (TXG-QUAL-029) also sets the
     ``--gpu-memory-utilization`` that leaves the preregistered headroom free
     of a device of ``device_total_bytes``; it is refused with any sizing but
-    the extensible KV cache."""
+    the extensible KV cache. A run that compares with a detached copy
+    (``compare`` in the ``qm`` or ``fallback`` mode) under the extensible KV
+    cache is refused without a preregistered headroom."""
     from support import txgcap_qual as q
     from support.txg_api import Sizing
 
@@ -1601,6 +1603,20 @@ def engine_settings(spec: dict[str, Any]) -> dict[str, Any]:
         settings["max_num_active_seqs"] = int(active)
     settings.update(spec.get("engine_extra") or {})
     headroom = spec.get("headroom")
+    max_requests = q.spec_max_requests(spec)
+    if (
+        not headroom
+        and spec.get("compare")
+        and max_requests is not None
+        and sizing == Sizing.EXTENSIBLE
+    ):
+        raise ValueError(
+            f"a {spec.get('mode')} run that compares with a detached copy under "
+            "the extensible KV cache needs a preregistered headroom: set the "
+            "spec's headroom to txgcap_qual.preregistered_headroom of the "
+            "mode's most requests (txgcap_qual.spec_max_requests) and the "
+            "card's bytes per page (TXG-QUAL-029)"
+        )
     if headroom:
         if sizing != Sizing.EXTENSIBLE or "kv_cache_memory_bytes" in settings:
             raise ValueError(
@@ -1608,7 +1624,7 @@ def engine_settings(spec: dict[str, Any]) -> dict[str, Any]:
                 "--gpu-memory-utilization under the extensible KV cache, never "
                 "a fixed --kv-cache-memory-bytes (TXG-QUAL-029)"
             )
-        problems = q.preregistration_problems(headroom, q.spec_max_requests(spec))
+        problems = q.preregistration_problems(headroom, max_requests)
         if problems:
             raise ValueError(
                 "the exactness run's headroom is not preregistered as "

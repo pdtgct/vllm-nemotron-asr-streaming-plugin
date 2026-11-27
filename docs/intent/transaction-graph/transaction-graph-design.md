@@ -1214,8 +1214,12 @@ count (TXG-QUAL-026) and copies only the pages it can assign; it digests the oth
   built after the extension, refuses a final committed count below the admission limit plus one
   at one state block per request (`vllm/v1/core/sched/scheduler.py:160-171`), so these pages are
   committed. The other committed pages, from the admission limit plus one to the final committed
-  count, are digested in place, in bounded chunks, before the run's first step and after its last;
-  a changed digest fails the run as a page mismatch does. The reference runs the step's row plan
+  count, are digested in place before the run's first step and after its last: each view, one
+  bounded chunk at a time, has its bytes copied to the host and hashed with SHA-256 together with
+  the view's identity and the chunk's offset, so any changed bit changes the digest. A changed
+  digest fails the run as a page mismatch does. The comparisons read both sides in place, in the
+  same bounded chunks, as same-size integer views of the strided pool views, so neither the
+  digest nor a comparison needs workspace beyond one chunk. The reference runs the step's row plan
   with the copy's page count as its resident pool extent (`num_pool_blocks`), the bound the
   transaction checks every pool and block index against, so a row naming a block above the limit
   fails the reference. The replayed step runs on
@@ -1302,9 +1306,15 @@ uncovered steps) times the bound views' bytes per page (the state manifest's
 page, which core's state page equals), plus a stated margin. The margin covers core's reserve for
 memory outside the torch allocator (`KV_CACHE_NON_TORCH_RESERVE_BYTES`,
 `vllm/v1/worker/extensible_kv_cache.py:71`), the memory in use at startup, which the utilization
-fraction of total memory does not exclude (`vllm/v1/worker/utils.py:906`), the digest's bounded
-workspace and the copy's alignment slack. The startup allowance is a stated figure of 1 GiB,
-preregistered with the margin. The run records the bytes each copy copies and fails
+fraction of total memory does not exclude (`vllm/v1/worker/utils.py:906`), the digest's and the
+comparison's one-chunk workspaces, and the copy's slack over the bytes it copies. Each term counts
+what PyTorch's CUDA caching allocator reserves: an allocation of at most 1 MiB takes a 2 MiB
+segment, one below 10 MiB a 20 MiB segment, and a larger one is rounded up to a multiple of
+2 MiB. The copy makes one allocation per distinct storage of the bound views, one for the state
+layer's single storage; a copy that makes more fails the run, because the margin states one. The
+startup allowance is a stated figure of 1 GiB, preregistered with the margin. A run that compares
+with a detached copy under the extensible KV cache without a preregistered headroom is refused
+before the engine starts. The run records the bytes each copy copies and fails
 when they exceed the copy figure. The record also holds core's logged torch memory limit and
 `torch.cuda.memory_reserved` and `max_memory_reserved` before and after the copy, with
 `nvidia-smi` and `mem_get_info` as context only; served figures come from runs without the
@@ -1376,8 +1386,9 @@ and clock; `Q`'s and `M`'s parameters (concurrencies, seed list, clip and file m
 rule, run lengths, file admission, idle-clock rule, minimum case coverage); the step rule's
 prefix, snapshot rule, plans, compositions, aggregation and adapter identity; `U_api`'s
 procedure, input generator and rules; U(1)'s audio, plan and procedure; and the exactness runs'
-headroom: its admission limit, bytes per page, copy figure and margin (TXG-QUAL-029). A change
-after that voids the run.
+headroom: the run's maximum request count (the admission limit for `Q` and `M`, `N + 4` for
+the uncovered steps), bytes per page, copy figure and margin (TXG-QUAL-029). A change after that
+voids the run.
 
 ### Memory, refusals and recovery
 
