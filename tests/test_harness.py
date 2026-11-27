@@ -385,10 +385,12 @@ def test_block_accesses_classify_the_masked_scatter_by_its_stored_rows():
     assert rec.blocks() == set(range(6)), rec.accesses
 
 
-def test_block_accesses_charge_the_whole_view_for_values_they_cannot_read():
+def test_block_accesses_reuse_or_defer_values_they_cannot_read():
     """Index values the reading cannot read (a CUDA stream capturing) are
-    taken from the same tensor's last reading, else the call is charged with
-    every block of its view."""
+    taken from the same tensor's last reading; with none, the call is kept
+    for reading after the replay (``_Unread``); an index value outside the
+    view's first dimension charges every block of the view."""
+    import pytest
     import torch
     from support import txgcap_harness as t
 
@@ -398,7 +400,10 @@ def test_block_accesses_charge_the_whole_view_for_values_they_cannot_read():
     assert rec._rows(pool.view(4, 8), index) == {2}
     key = (index.device, index.data_ptr(), tuple(index.shape), index.dtype)
     assert rec._read[key] == [2]
-    unread = t.BlockAccesses(pool)
-    unread._values = lambda index: None
-    assert unread._rows(pool.view(4, 8), index) == {0, 1, 2, 3}
-    assert unread._scattered(pool.view(4, 8), 1, index, index) == {0, 1, 2, 3}
+    rec._unreadable = lambda index: True
+    assert rec._rows(pool.view(4, 8), index) == {2}
+    fresh = torch.tensor([3])
+    with pytest.raises(t._Unread):
+        rec._rows(pool.view(4, 8), fresh)
+    rec._unreadable = lambda index: False
+    assert rec._rows(pool.view(4, 8), torch.tensor([7])) == {0, 1, 2, 3}
