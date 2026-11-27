@@ -30,6 +30,7 @@ figures, and the [user manual](manual.md) explains the settings they depend on.
 - [Block-0 capture under every KV-cache sizing](#block-0-capture-under-every-kv-cache-sizing)
 - [Stream-only servers at `--max-model-len 144`](#stream-only-servers-at---max-model-len-144)
 - [Runner-mode matrix on the target core](#runner-mode-matrix-on-the-target-core)
+- [Tier 2 on the target core](#tier-2-on-the-target-core)
 - [Transaction graphs, tier 5](#transaction-graphs-tier-5)
 - [Owed](#owed)
 - [Historical entries](#historical-entries)
@@ -81,14 +82,15 @@ Figures from the same run (state-pool build `9c40a6ffd6`, plugin `8166d85`, one 
 Final latency runs from the client's final commit to `transcription.done`. With
 `--max-num-seqs 64`, the server started, both segment-graph captures fit, and 64 concurrent sessions
 completed. The largest sampled step held 38 rows. Paced arrivals spread the chunks, so no 64-row
-step was observed. Tier 2 figures under `--enforce-eager` and at lookaheads other than 320 ms are
-owed.
+step was observed. On the state-pool build, tier 2 figures under `--enforce-eager` and at
+lookaheads other than 320 ms remain unmeasured; the target core's are in
+[Tier 2 on the target core](#tier-2-on-the-target-core).
 
 ## Unpublished measurement under `--enforce-eager`
 
 These figures carry no acceptance tier. They come from an unpublished A40 measurement at 320 ms
-under `--enforce-eager`, the runner configuration of the README's serve command. They are the source
-of that command's interim `--max-num-seqs 64`.
+under `--enforce-eager`, the runner configuration of the README's serve command. They supplied that
+command's former interim `--max-num-seqs 64`, which the target core's tier 2 record now verifies.
 
 | `--max-num-seqs` | Segment graphs retained | Device memory in use during capture, weights included | Startup |
 |---|---|---|---|
@@ -227,9 +229,40 @@ and transaction graphs on against off at core's default KV-cache sizing.
   length-capped, and `vllm:kv_cache_usage_perc` read 0 before the first pass and after every pass.
   Only the batch-invariant servers ran a one-session pass, which also read 0; their startup logs
   report the segment graphs' retained memory and capture time. This meets tier 2 for the
-  batch-invariant configuration. Tier 2 remains outstanding for the serve command's configuration,
-  which ran no one-session pass.
+  batch-invariant configuration. This round ran no one-session pass in the serve command's
+  configuration; [Tier 2 on the target core](#tier-2-on-the-target-core) supplies it.
 - TXG-EQ-002's exhaustive and random-plan CUDA cases passed (20 tests), first run on this core.
+- One unprofiled run per server, with no repeats: no latency claim rests on this round.
+
+## Tier 2 on the target core
+
+Achieved, tier 2 (installed-engine cycle), on stage 1 (core `9503e3b878`, plugin `f64c83a`) at 80,
+160, 320, 560 and 1120 ms, in the
+README's configuration (`--enforce-eager --no-async-scheduling`) and in the hook configuration
+(`-cc.cudagraph_mode none -cc.mode none --no-async-scheduling`), with transaction graphs off.
+
+- Build: `pdtgct/vllm` `pstate-impl-20261122` @ `9503e3b878`, with precompiled wheel `842f74fa8d`
+  (cu132); plugin `feat/core-graphs-20261123` @ `f64c83a`; card revision `ea30d66d`; one NVIDIA
+  A40 at FP32; 2026-11-27. Evidence: `pdtgct/nemotron-omni-port`
+  `experiments/2026-11-27-plugin-tier2-9503e3b878/`.
+- Every server: `--max-num-seqs 64`, the manual's `--max-model-len`, the default segment arms, and
+  two passes on `/v1/realtime`: 32 sessions over 200 paced LibriSpeech test-clean utterances, then
+  1 session over the first 20.
+- In every server and pass, each utterance finalized with a non-empty transcript and each request
+  finished with `stop`, none length-capped; `vllm:kv_cache_usage_perc` read 0 before the first pass
+  and after each pass.
+- The startup log reports the segment graphs' retained memory and capture time. Under
+  `--enforce-eager`, where the model captures them on the profiling step: 1,636 MiB at 80 ms,
+  1,804 MiB at 160 ms, 2,404 MiB at 320 ms, 3,034 MiB at 560 ms and 5,882 MiB at 1120 ms. In the
+  hook configuration, the serving capture: 1,358, 1,408, 1,544, 1,820 and 2,344 MiB. Capture times
+  were 34 to 56 s.
+- Not claimed by this record: tier 2 with asynchronous scheduling or with no runner flag (not run in
+  this round; the matrix round meets tier 2 for the batch-invariant configuration, which uses
+  asynchronous scheduling); 64 concurrent sessions (the runs held 32); `--max-num-seqs` values other
+  than 64; GPUs other than the A40.
+- Information: each server's one-session transcripts equal its 32-session transcripts of the same
+  20 utterances, the hook configuration's transcripts equal the README configuration's, and the
+  word-error rate at 32 sessions is the matrix round's (3.15 % at 80 ms to 2.44 % at 1120 ms).
 - One unprofiled run per server, with no repeats: no latency claim rests on this round.
 
 ## Transaction graphs, tier 5
@@ -375,8 +408,9 @@ and `E ≤ N` make up at least 99 % of served steps. At `N` = 63 they make up 10
 
 ## Owed
 
-- Tier 2 on the target core with a one-session pass in the serve command's runner configuration,
-  at every chunk size; tiers 1, 3 and 4 on the target core at the current plugin. Served transcript
+- Tiers 1, 3 and 4 on the target core at the current plugin. Tier 2 is met for the README's
+  configuration and the hook configuration ([Tier 2 on the target core](#tier-2-on-the-target-core));
+  with asynchronous scheduling outside the batch-invariant configuration it is owed. Served transcript
   equality across runner modes, scheduling and batch invariance is measured
   ([Runner-mode matrix on the target core](#runner-mode-matrix-on-the-target-core)).
 - Served latency on the target core, with repeats (Served accuracy on the target core gives one

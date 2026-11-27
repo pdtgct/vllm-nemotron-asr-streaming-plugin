@@ -96,9 +96,9 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --max-model-len 77000
 ```
 
-- `--max-num-seqs 64` is an interim value from an unpublished A40 measurement at 320 ms under
-  `--enforce-eager`. No tier has been met on the target core in this configuration, so no value is
-  verified for it.
+- Tier 2 verified `--max-num-seqs 64` on one A40 at FP32 at every chunk size, under
+  `--enforce-eager` and in the hook configuration
+  ([evidence](docs/evidence.md#tier-2-on-the-target-core)).
 - The hook configuration replaces `--enforce-eager` with `-cc.cudagraph_mode none -cc.mode none`;
   core then captures the model's graphs through vllm#67583's capture hook. On the earlier
   state-pool build, `--max-num-seqs 64` fit one A40 at 320 ms in that configuration.
@@ -123,13 +123,13 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
 
 ## Expected performance
 
-On the target core, tier 2 is met only for the batch-invariant configuration
-([evidence](docs/evidence.md#runner-mode-matrix-on-the-target-core)), not for the serve command
-above. All figures below come from one serving run of the last release, `v0.1.0b2`, on the earlier state-pool build (`hook-build-20261114b`, which carried
+On the target core, tier 2 is met for the serve command above and the hook configuration at every
+chunk size ([evidence](docs/evidence.md#tier-2-on-the-target-core)); no latency tier is met there.
+All figures below come from one serving run of the last release, `v0.1.0b2`, on the earlier state-pool build (`hook-build-20261114b`, which carried
 the state pool and stream admission of vllm#67374 and #67375), on one NVIDIA A40 at FP32, at
 320 ms, in the hook configuration with `--max-num-seqs 64` and the default segment arms
 ([evidence](docs/evidence.md#tier-2-on-the-state-pool-build)). They are a historical record for this
-plugin until tier 2 is met on the target core. Other GPUs, other lookaheads and stage 2 are
+plugin until tier 4 is met on the target core. Other GPUs, other lookaheads and stage 2 are
 unmeasured.
 
 - Accuracy: 5,559 LibriSpeech `/v1/realtime` sessions at concurrency 32 all ended `stop`. WER was
@@ -214,8 +214,8 @@ The [high-level design's Future roadmap](docs/high-level-design.md#future-roadma
 deferred item with its trigger and shape. The items that change this README:
 
 - **Measured figures on the target core.** Expected performance cites only the state-pool build.
-  Trigger: tiers 2, 4 and 5 met on the target core. Shape: Expected performance cites those
-  records, and the serve command gives the `--max-num-seqs` and runner flags tier 2 verified.
+  Trigger: tiers 4 and 5 met on the target core. Shape: Expected performance cites those
+  records.
 - **Frontend streaming.** A frontend's streaming routes do not run on either build. Trigger: the
   session factory runs on core's automatic admission. Shape: Builds and What you can serve name a
   stage 2 commit that serves them.

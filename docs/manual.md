@@ -4,9 +4,10 @@ This manual covers `vllm-nemotron-asr-streaming` at `main` on the target core, R
 layer (`pdtgct/vllm` at `9503e3b878`). For the shortest path to a running server, use the
 [quick start](quickstart.md).
 
-On the target core, tier 2 (the installed-engine cycle) is met for one configuration, batch
-invariance (`VLLM_BATCH_INVARIANT=1`, `--async-scheduling`, no runner flag), at all five chunk
-sizes; it is not met for the serve command's configuration. There, the hook configuration, no
+On the target core, tier 2 (the installed-engine cycle) is met at all five chunk sizes for the
+serve command's configuration and the hook configuration, both with `--no-async-scheduling`
+([evidence](evidence.md#tier-2-on-the-target-core)), and for batch invariance (`VLLM_BATCH_INVARIANT=1`, `--async-scheduling`, no
+runner flag). The hook configuration, no
 runner flag and asynchronous scheduling with or without `--enforce-eager` gave served transcripts
 equal to `--enforce-eager --no-async-scheduling` at every chunk size, and under batch invariance a
 session's transcript did not depend on how many sessions shared its batches
@@ -175,10 +176,8 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --max-model-len 77000
 ```
 
-`--max-num-seqs 64` is an interim value from an unpublished A40 measurement at 320 ms under
-`--enforce-eager`; no tier has verified this value in this configuration. On the earlier state-pool
-build, `--max-num-seqs 64` fit one A40 at 320 ms in the hook configuration
-([evidence](evidence.md#tier-2-on-the-state-pool-build)).
+Tier 2 verified `--max-num-seqs 64` on one A40 at FP32 at every chunk size, under
+`--enforce-eager` and in the hook configuration ([evidence](evidence.md#tier-2-on-the-target-core)).
 
 `--config-format nemotron_asr_streaming` and `--tokenizer-mode nemotron_asr_streaming` are required.
 They select the plugin's translation of the Hub card and its tokenizer mode. Core resolves no
@@ -208,7 +207,7 @@ that:
 | Graph memory charged by | core's graph-memory estimate | the profiled budget |
 | Transaction graphs | accepted (opt-in) | refused |
 | Eager arms | refused (no graph to capture) | accepted |
-| Measured | tier 2 partly met at 320 ms on the earlier state-pool build; on the target core, transcripts equal `--enforce-eager`'s at every chunk size | `--max-num-seqs 64` is interim, from an unpublished A40 measurement |
+| Measured | on the target core, tier 2 met at every chunk size with `--max-num-seqs 64`, and transcripts equal `--enforce-eager`'s | on the target core, tier 2 met at every chunk size with `--max-num-seqs 64` |
 
 The hook configuration requires at least one graph that the hook captures: the `eager-graphed`
 encoder, the `dense-graphed` decoder or transaction graphs. The default segment arms include two of
@@ -244,10 +243,8 @@ server's lookahead.
   `num_lookahead_tokens`.
 
 A larger lookahead gives the encoder more right context per chunk, so two lookaheads can give
-different transcripts for the same audio. On the target core, tier 2 is met for the batch-invariant
-configuration at all five lookaheads
-([evidence](evidence.md#runner-mode-matrix-on-the-target-core)); the earlier state-pool measurement
-covered only 320 ms.
+different transcripts for the same audio. On the target core, tier 2 is met at all five lookaheads
+([evidence](evidence.md#tier-2-on-the-target-core)); the earlier state-pool measurement covered only 320 ms.
 
 ### Sizing `--max-model-len`
 
@@ -327,7 +324,9 @@ Figures at 320 ms on one A40, measured with release `v0.1.0b2` on the earlier st
 In the hook configuration run, 35.74 GiB was available for KV memory, and the KV budget admitted 65
 requests. The largest sampled step held 38 rows; no 64-row step was observed. Under
 `--enforce-eager` at 64 rows, 160 ms retained 1.8 GiB and 80 ms retained 1.6 GiB (unpublished
-measurement). Tier 2 figures under `--enforce-eager`, and at lookaheads other than 320 ms, are owed.
+measurement). On the target core, tier 2 recorded the retained segment-graph memory at every
+lookahead in both configurations ([evidence](evidence.md#tier-2-on-the-target-core)): under `--enforce-eager` it grows from 1,636 MiB
+at 80 ms to 5,882 MiB at 1120 ms.
 
 If a segment-graph capture cannot allocate, startup fails and reports the capture's figures. The
 remedies are a smaller `--max-num-seqs`, or the eager arms with `--enforce-eager`.
@@ -882,9 +881,9 @@ The design is in [`docs/high-level-design.md`](high-level-design.md) and [`docs/
 Each item names a limit this manual states, the trigger that lifts it and what changes here. The
 [high-level design's Future roadmap](high-level-design.md#future-roadmap) owns the design of each.
 
-- **A verified serve command.** `--max-num-seqs 64` is interim, and the serve command runs
-  `--enforce-eager` and `--no-async-scheduling`. Trigger: tier 2 met on the target core, in the hook
-  configuration and with asynchronous scheduling (`registration`, REG-ENG-007, REG-ENG-014).
+- **Asynchronous scheduling in the serve command.** The serve command runs `--no-async-scheduling`.
+  Trigger: tier 2 and the latency tier 4 met with asynchronous scheduling (`registration`,
+  REG-ENG-007, REG-ENG-014).
   Change: the serve command and Serving configurations give the verified values and flags.
 - **Frontend streaming on the target core.** The session factory is not available there. Trigger:
   the session factory runs on core's automatic admission. Change: Builds and compatibility records

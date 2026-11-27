@@ -14,8 +14,8 @@ The [user manual](manual.md) covers every setting, the clients, operations and t
 
 ## What has been measured
 
-On the target core, tier 2 is met only for the batch-invariant configuration, not for this page's
-serve command ([evidence](evidence.md#runner-mode-matrix-on-the-target-core)). The last release, `v0.1.0b2`, ran on the
+On the target core, tier 2 is met for this page's serve command at every chunk size
+([evidence](evidence.md#tier-2-on-the-target-core)). The last release, `v0.1.0b2`, ran on the
 earlier state-pool build, where it partly met tier 2, the installed-engine acceptance tier, on one
 NVIDIA A40 at FP32 at 320 ms in the hook configuration
 ([evidence](evidence.md#tier-2-on-the-state-pool-build)). That release does not run on the target
@@ -83,10 +83,10 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
 ```
 
 This is the README's serve command. It runs `--enforce-eager`, so the model captures its own segment
-graphs on core's memory-profiling step, inside the profiled budget. `--max-num-seqs 64` is an
-interim value from an unpublished A40 measurement at 320 ms under `--enforce-eager`.
+graphs on core's memory-profiling step, inside the profiled budget. Tier 2 verified
+`--max-num-seqs 64` on one A40 at every chunk size ([evidence](evidence.md#tier-2-on-the-target-core)).
 `--no-async-scheduling` keeps the step order every earlier run used; on the target core an unset
-option means asynchronous scheduling, which the plugin accepts but no run has qualified. The command
+option means asynchronous scheduling, which the plugin accepts but no latency tier has qualified. The command
 serves the checkpoint's default lookahead: 3 (320 ms) on the published card.
 
 To run the hook configuration instead, replace `--enforce-eager` with
@@ -122,9 +122,9 @@ The response is JSON with the transcript in `text`.
 
 ## Future roadmap
 
-- **A measured quick start.** No command on this page has been run as written on the target
-  core. Trigger: tier 2 met on the target core. Shape: the evidence document records the install
-  and serve commands, and this page gives the `--max-num-seqs` that tier 2 verified.
+- **A measured quick start.** Tier 2 ran this page's serve flags on the target core, but no record
+  runs the page's install commands as written. Trigger: an evidence record of this page's install
+  and serve commands. Shape: the evidence document records them, and this page links it.
 - **Stage 2.** This page installs no frontend. Trigger: the session factory runs on core's
   automatic admission ([high-level design, Future roadmap](high-level-design.md#future-roadmap)).
   Shape: an optional step installs the RFC 2 build and the frontend and checks a streaming route.
