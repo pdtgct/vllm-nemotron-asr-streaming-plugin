@@ -530,9 +530,10 @@ def realtime_token_budget(
 ) -> int:
     """Constant per-burst budget: queue capacity plus the park token.
 
-    ``realtime_max_tokens = frames_per_chunk × max_symbols + 1``
-    (PORT-INT-002; the output counter clears per update, so the budget
-    is per-burst, not per-session).
+    ``frames_per_chunk × max_symbols + 1`` (PORT-INT-002; the output
+    counter clears per update, so the budget is per-burst, not
+    per-session). The served ``realtime_max_tokens``
+    (``manifests.max_emission_tokens``) also counts the optional EOU.
     """
     return frames_per_chunk * max_symbols + 1
 

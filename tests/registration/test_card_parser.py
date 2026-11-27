@@ -708,7 +708,11 @@ def test_realtime_max_tokens_has_one_definition(repo_root):
     assert REALTIME_MAX_TOKENS == 142
     for path in _runtime_sources(repo_root):
         constants = _int_constants(path)
-        for literal in (REALTIME_MAX_TOKENS, REALTIME_MAX_TOKENS + 1):
+        for literal in (
+            REALTIME_MAX_TOKENS,
+            REALTIME_MAX_TOKENS + 1,
+            REALTIME_MAX_TOKENS + 2,
+        ):
             assert literal not in constants, (
                 f"{path.name}:{constants[literal]} repeats the per-unit token bound"
             )
